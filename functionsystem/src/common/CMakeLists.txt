@@ -98,6 +98,7 @@ add_subdirectory(yaml_tool)
 add_subdirectory(schedule_plugin/prefilter/default_prefilter)
 add_subdirectory(schedule_plugin/filter/default_filter)
 add_subdirectory(schedule_plugin/filter/resource_selector_filter)
+add_subdirectory(schedule_plugin/filter/usage_aware_filter)
 add_subdirectory(schedule_plugin/scorer/default_scorer)
 add_subdirectory(schedule_plugin/filter/default_heterogeneous_filter)
 add_subdirectory(schedule_plugin/scorer/default_heterogeneous_scorer)
@@ -112,7 +113,7 @@ set(PLUGIN
         -Wl,--whole-archive
         default_prefilter default_filter resource_selector_filter default_scorer default_heterogeneous_filter
         default_heterogeneous_scorer label_affinity_filter label_affinity_scorer disk_filter disk_scorer
-        numa_affinity_filter numa_affinity_scorer
+        numa_affinity_filter numa_affinity_scorer usage_aware_filter
         -Wl,--no-whole-archive)
 
 set_property(GLOBAL PROPERTY PLUGIN_LIB "${PLUGIN}")

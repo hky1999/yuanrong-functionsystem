@@ -32,6 +32,8 @@ public:
 
     void AddOomFlags();
 
+    void AddInstanceMetricsFlags();
+
     void AddDiskUsageMonitorFlags();
 
     const std::string &GetRuntimePath() const
@@ -336,6 +338,16 @@ public:
         return memoryDetectionInterval_;
     }
 
+    const std::string &GetInstanceMemorySource() const
+    {
+        return instanceMemorySource_;
+    }
+
+    const std::string &GetInstanceCgroupRoot() const
+    {
+        return instanceCgroupRoot_;
+    }
+
     bool GetOomKillEnable() const
     {
         return oomKillEnable_;
@@ -474,6 +486,8 @@ protected:
     bool runtimeDirectConnectionEnable_ = false;
     bool cleanStreamProducerEnable_ = true;
     int memoryDetectionInterval_ = 1000; // ms
+    std::string instanceMemorySource_ = "vmrss"; // vmrss | cgroup | auto
+    std::string instanceCgroupRoot_ = "/sys/fs/cgroup";
     bool oomKillEnable_ = false;
     int oomKillControlLimit_ = 0; // MB
     int oomConsecutiveDetectionCount_ = 3;

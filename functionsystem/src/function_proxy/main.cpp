@@ -60,6 +60,7 @@
 #include "function_proxy/config/direct_routing_config.h"
 #include "grpc/grpc_security_constants.h"
 #include "grpcpp/security/server_credentials.h"
+#include "common/schedule_plugin/filter/usage_aware_filter/usage_aware_filter.h"
 #include "local_scheduler/instance_control/posix_api_handler/posix_api_handler.h"
 #include "local_scheduler/local_sched_driver.h"
 #include "memory_monitor/memory_monitor.h"
@@ -433,6 +434,11 @@ LocalSchedStartParam InitLocalSchedParam(const function_proxy::Flags &flags,
     auto controlPlaneObserver = std::make_shared<function_proxy::ControlPlaneObserver>(observer);
     auto pingCycleMs = flags.GetSystemTimeout() / DEFAULT_HEARTBEAT_TIMES;
     auto pingTimeoutMs = flags.GetSystemTimeout() / 2;
+
+    // usage-aware admission knobs (consumed by the UsageAwareFilter plugin;
+    // set before the scheduler registers any policy)
+    ::functionsystem::schedule_plugin::filter::UsageAwareFilter::SetConfig(flags.GetUsageAwareSafety(),
+                                                                        flags.GetUsageAwareFloorMb());
 
     return LocalSchedStartParam{
         .nodeID = flags.GetNodeID(),

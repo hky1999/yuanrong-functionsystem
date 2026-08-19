@@ -476,7 +476,10 @@ void FunctionAgentMgrActor::UpdateResources(const litebus::AID &from, string &&,
     if (auto resourceView = resourceView_.lock()) {
         if (funcAgentTable_[aidTable_[from]].isInit) {
             auto unit = std::make_shared<resource_view::ResourceUnit>(std::move(*req.mutable_resourceunit()));
-            // todo: pass flag to indicate whether to update only actual resources
+            // actual use must be refreshed on every report: UPDATE_DYNAMIC alone
+            // early-returns while capacity is unchanged, so the view's actualuse
+            // would stay frozen at the first AddResourceUnit value
+            (void)resourceView->UpdateResourceUnit(unit, resource_view::UpdateType::UPDATE_ACTUAL);
             (void)resourceView->UpdateResourceUnit(unit, resource_view::UpdateType::UPDATE_DYNAMIC);
         } else {
             YRLOG_DEBUG("start to add resource of agent({}) to view.", from.HashString());

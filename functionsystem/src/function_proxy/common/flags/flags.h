@@ -304,6 +304,16 @@ public:
         return schedulePlugins_;
     }
 
+    double GetUsageAwareSafety() const
+    {
+        return usageAwareSafety_;
+    }
+
+    double GetUsageAwareFloorMb() const
+    {
+        return usageAwareFloorMb_;
+    }
+
     bool GetEnableIpv4TenantIsolation() const
     {
         return enableIpv4TenantIsolation_;
@@ -546,6 +556,8 @@ protected:
     bool enablePrintResourceView_;
     int32_t serviceTTL_;
     std::string schedulePlugins_;
+    double usageAwareSafety_ = 0.9;
+    double usageAwareFloorMb_ = 2048.0;
     bool enableIpv4TenantIsolation_;
     bool runtimeDsAuthEnable_;
     bool runtimeDsEncryptEnable_;

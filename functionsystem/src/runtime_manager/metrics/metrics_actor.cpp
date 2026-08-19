@@ -238,8 +238,9 @@ Status MetricsActor::AddInstance(const messages::RuntimeInstanceInfo &instanceIn
 
     // map["deployDir-instanceId-Memory"] = InstanceMemoryCollector
     // if enable, instance memory collected and reported by runtime OOM monitor at different frequencies.
-    auto instanceMemoryCollector =
-        std::make_shared<InstanceMemoryCollector>(pid, instanceID, memLimit, deployDir, procFSTools_);
+    auto instanceMemoryCollector = std::make_shared<InstanceMemoryCollector>(pid, instanceID, memLimit, deployDir,
+                                                                             procFSTools_, instanceMemorySource_,
+                                                                             instanceCgroupRoot_);
     filter_[instanceMemoryCollector->GenFilter()] = instanceMemoryCollector;
     if (runtimeOomMonitorConfig_.enable) {
         runtimeMemoryLimitCollector_  = instanceMemoryCollector;
@@ -304,6 +305,8 @@ void MetricsActor::SetConfig(const Flags &flags)
     metricsConfig_.overheadCPU = flags.GetOverheadCPU();
     metricsConfig_.overheadMemory = flags.GetOverheadMemory();
     metricsConfig_.heteroLdLibraryPath = flags.GetRuntimeLdLibraryPath();
+    instanceMemorySource_ = flags.GetInstanceMemorySource();
+    instanceCgroupRoot_ = flags.GetInstanceCgroupRoot();
     if (flags.GetSnuserDirSizeLimit() >= 0) {
         DiskUsageMonitorConfig config{
             .description = "snuser dir",

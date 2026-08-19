@@ -35,6 +35,7 @@ const std::string RELAXED_NON_ROOT_LABEL_AFFINITY_FILTER_NAME = "RelaxedNonRootL
 const std::string STRICT_NON_ROOT_LABEL_AFFINITY_FILTER_NAME = "StrictNonRootLabelAffinityFilter";
 const std::string DISK_FILTER_NAME = "DiskFilter";
 const std::string NUMA_AFFINITY_FILTER_NAME = "NUMAAffinityFilter";
+const std::string USAGE_AWARE_FILTER_NAME = "UsageAwareFilter";
 
 // scorer name
 const std::string DEFAULT_SCORER_NAME = "DefaultScorer";

@@ -32,8 +32,19 @@ InstanceMemoryCollector::InstanceMemoryCollector(const pid_t &pid, const std::st
 InstanceMemoryCollector::InstanceMemoryCollector(const pid_t &pid, const std::string &instanceID, const double &limit,
                                                  const std::string &deployDir,
                                                  const std::shared_ptr<ProcFSTools> procFSTools)
+    : InstanceMemoryCollector(pid, instanceID, limit, deployDir, procFSTools,
+                              instance_metrics::MEMORY_SOURCE_VMRSS, instance_metrics::DEFAULT_CGROUP_ROOT)
+{
+}
+
+InstanceMemoryCollector::InstanceMemoryCollector(const pid_t &pid, const std::string &instanceID, const double &limit,
+                                                 const std::string &deployDir,
+                                                 const std::shared_ptr<ProcFSTools> procFSTools,
+                                                 const std::string &memorySource, const std::string &cgroupRoot)
     : BaseInstanceCollector(pid, instanceID, limit, deployDir),
-      BaseMetricsCollector(metrics_type::MEMORY, collector_type::INSTANCE, procFSTools)
+      BaseMetricsCollector(metrics_type::MEMORY, collector_type::INSTANCE, procFSTools),
+      memorySource_(memorySource),
+      cgroupRoot_(cgroupRoot)
 {
 }
 
@@ -46,16 +57,71 @@ Metric InstanceMemoryCollector::GetLimit() const
     return metric;
 }
 
+litebus::Option<double> InstanceMemoryCollector::GetUsageFromCgroup() const
+{
+    if (procFSTools_ == nullptr) {
+        return litebus::None();
+    }
+    // 1. resolve the cgroup v2 membership of the runtime process:
+    //    /proc/<pid>/cgroup last line "0::<relative path>"
+    auto cgroupPath = instance_metrics::CGROUP_PATH_EXPRESS;
+    cgroupPath = cgroupPath.replace(cgroupPath.find('?'), 1, std::to_string(pid_));
+    auto cgroupLines = procFSTools_->Read(cgroupPath);
+    if (cgroupLines.IsNone() || cgroupLines.Get().empty()) {
+        YRLOG_DEBUG_COUNT_60("read content from {} failed.", cgroupPath);
+        return litebus::None();
+    }
+    auto rel = cgroupLines.Get().substr(cgroupLines.Get().rfind(instance_metrics::CGROUP_V2_LINE_PREFIX));
+    if (rel.rfind(instance_metrics::CGROUP_V2_LINE_PREFIX) != 0) {
+        YRLOG_DEBUG_COUNT_60("no cgroup v2 line in {}.", cgroupPath);
+        return litebus::None();
+    }
+    rel = litebus::strings::Trim(rel.substr(instance_metrics::CGROUP_V2_LINE_PREFIX.length()));
+    // 2. read <root>/<rel>/memory.current (bytes)
+    std::string memoryFile = cgroupRoot_;
+    if (!rel.empty() && rel.front() != '/') {
+        memoryFile += "/";
+    }
+    memoryFile += rel + "/" + instance_metrics::CGROUP_MEMORY_FILE;
+    auto content = procFSTools_->Read(memoryFile);
+    if (content.IsNone() || content.Get().empty()) {
+        YRLOG_DEBUG_COUNT_60("read content from {} failed.", memoryFile);
+        return litebus::None();
+    }
+    double bytes = 0;
+    try {
+        bytes = std::stod(litebus::strings::Trim(content.Get()));
+    } catch (const std::exception &e) {
+        YRLOG_ERROR("stod fail, error:{}", e.what());
+        return litebus::None();
+    }
+    return litebus::Some(bytes / instance_metrics::CGROUP_MEMORY_SCALE);
+}
+
 litebus::Future<Metric> InstanceMemoryCollector::GetUsage() const
 {
     YRLOG_DEBUG_COUNT_60("instance memory collector get usage.");
-    // /proc/pid/status
     Metric metric;
     metric.instanceID = instanceID_;
     if (pid_ == 0) {
         return metric;
     }
 
+    if (memorySource_ == instance_metrics::MEMORY_SOURCE_CGROUP
+        || memorySource_ == instance_metrics::MEMORY_SOURCE_AUTO) {
+        auto usage = GetUsageFromCgroup();
+        if (usage.IsSome()) {
+            metric.value = usage.Get();
+            return metric;
+        }
+        if (memorySource_ == instance_metrics::MEMORY_SOURCE_CGROUP) {
+            // strict mode: never fall back to the sentry-inaccurate VmRSS
+            return metric;
+        }
+        // auto: cgroup resolve failed (e.g. cgroup v1 host), keep VmRSS
+    }
+
+    // /proc/pid/status (fallback / legacy source)
     auto path = instance_metrics::PROCESS_STATUS_PATH_EXPRESS;
     path = path.replace(path.find('?'), 1, std::to_string(pid_));
     if (procFSTools_ == nullptr) {

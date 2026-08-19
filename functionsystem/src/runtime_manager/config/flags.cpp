@@ -71,6 +71,18 @@ void Flags::AddOomFlags()
             DEFAULT_OOM_CONSECUTIVE_DETECTION_COUNT, NumCheck(1, INT_MAX));
 }
 
+void Flags::AddInstanceMetricsFlags()
+{
+    // gVisor sandbox: sentry VmRSS != sandbox memory. cgroup v2 memory.current
+    // is the authoritative per-sandbox accounting (auto falls back to VmRSS
+    // when the cgroup membership cannot be resolved).
+    AddFlag(&Flags::instanceMemorySource_, "instance_memory_source",
+            "per-instance memory usage source: vmrss | cgroup | auto", std::string("vmrss"));
+    AddFlag(&Flags::instanceCgroupRoot_, "instance_cgroup_root",
+            "cgroup v2 mount root used to resolve memory.current for instance memory collection",
+            std::string("/sys/fs/cgroup"));
+}
+
 void Flags::AddDiskUsageMonitorFlags()
 {
     AddFlag(&Flags::diskUsageMonitorNotifyFailureEnable_, "disk_usage_monitor_notify_failure_enable",
@@ -180,6 +192,7 @@ Flags::Flags()
     AddFlag(&Flags::cleanStreamProducerEnable_, "enable_clean_stream_producer",
             "whether clean stream producer, default is true", true);
     AddOomFlags();
+    AddInstanceMetricsFlags();
     AddConfigFlags();
     AddFlag(&Flags::killProcessTimeoutSeconds_, "kill_process_timeout_seconds",
             "the time interval send kill -9 after send kill -2, unit in seconds, default is 5 seconds",
