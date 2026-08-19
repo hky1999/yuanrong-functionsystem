@@ -71,13 +71,60 @@ TEST_F(SystemMemoryCollectorTest, GetLimit)
 TEST_F(SystemMemoryCollectorTest, GetLimitWithEmptyContent)
 {
     auto tools = std::make_shared<MockProcFSTools>();
-    EXPECT_CALL(*tools.get(), Read)
+    // cgroup v1 path absent AND meminfo unreadable: no signal at all
+    EXPECT_CALL(*tools.get(), Read(runtime_manager::system_metrics::MEMORY_LIMIT_PATH))
         .WillOnce(testing::Return(litebus::Option<std::string>{}));
+    EXPECT_CALL(*tools.get(), Read(runtime_manager::system_metrics::MEMINFO_PATH))
+        .WillRepeatedly(testing::Return(litebus::Option<std::string>{}));
 
     auto collector = std::make_shared<runtime_manager::SystemMemoryCollector>(tools);
     auto limit = collector->GetLimit();
     EXPECT_EQ(limit.value.IsNone(), true);
     EXPECT_EQ(limit.instanceID.IsNone(), true);
+}
+
+/**
+ * Feature: SystemMemoryCollector
+ * Description: Get Limit on a cgroup v2 (unified) host
+ * Steps: cgroup v1 path absent, /proc/meminfo readable
+ * Expectation: limit = MemTotal (in MB)
+ */
+TEST_F(SystemMemoryCollectorTest, GetLimitMeminfoFallback)
+{
+    auto tools = std::make_shared<MockProcFSTools>();
+    EXPECT_CALL(*tools.get(), Read(runtime_manager::system_metrics::MEMORY_LIMIT_PATH))
+        .WillOnce(testing::Return(litebus::Option<std::string>{}));
+    EXPECT_CALL(*tools.get(), Read(runtime_manager::system_metrics::MEMINFO_PATH))
+        .WillRepeatedly(testing::Return(litebus::Option<std::string>{
+            "MemTotal:       63390720 kB\nMemFree:         1234 kB\nMemAvailable:    60467200 kB\n"}));
+
+    auto collector = std::make_shared<runtime_manager::SystemMemoryCollector>(tools);
+    auto limit = collector->GetLimit();
+    ASSERT_EQ(limit.value.IsNone(), false);
+    EXPECT_DOUBLE_EQ(limit.value.Get(), 61905.0); // 63390720 kB / 1024
+    EXPECT_EQ(limit.instanceID.IsNone(), true);
+}
+
+/**
+ * Feature: SystemMemoryCollector
+ * Description: Get Usage on a cgroup v2 (unified) host
+ * Steps: cgroup v1 path absent, /proc/meminfo readable
+ * Expectation: usage = MemTotal - MemAvailable (in MB)
+ */
+TEST_F(SystemMemoryCollectorTest, GetUsageMeminfoFallback)
+{
+    auto tools = std::make_shared<MockProcFSTools>();
+    EXPECT_CALL(*tools.get(), Read(runtime_manager::system_metrics::MEMORY_USAGE_PATH))
+        .WillOnce(testing::Return(litebus::Option<std::string>{}));
+    EXPECT_CALL(*tools.get(), Read(runtime_manager::system_metrics::MEMINFO_PATH))
+        .WillRepeatedly(testing::Return(litebus::Option<std::string>{
+            "MemTotal:       63390720 kB\nMemAvailable:    60467200 kB\n"}));
+
+    auto collector = std::make_shared<runtime_manager::SystemMemoryCollector>(tools);
+    auto usage = collector->GetUsage().Get();
+    ASSERT_EQ(usage.value.IsNone(), false);
+    EXPECT_DOUBLE_EQ(usage.value.Get(), 61905.0 - 59050.0); // 2855 MB real usage
+    EXPECT_EQ(usage.instanceID.IsNone(), true);
 }
 
 /**
@@ -109,8 +156,11 @@ TEST_F(SystemMemoryCollectorTest, GetUsage)
 TEST_F(SystemMemoryCollectorTest, GetUsageWithEmptyContent)
 {
     auto tools = std::make_shared<MockProcFSTools>();
-    EXPECT_CALL(*tools.get(), Read)
+    // cgroup v1 path absent AND meminfo unreadable: no signal at all
+    EXPECT_CALL(*tools.get(), Read(runtime_manager::system_metrics::MEMORY_USAGE_PATH))
         .WillOnce(testing::Return(litebus::Option<std::string>{}));
+    EXPECT_CALL(*tools.get(), Read(runtime_manager::system_metrics::MEMINFO_PATH))
+        .WillRepeatedly(testing::Return(litebus::Option<std::string>{}));
 
     auto collector = std::make_shared<runtime_manager::SystemMemoryCollector>(tools);
     auto usage = collector->GetUsage().Get();

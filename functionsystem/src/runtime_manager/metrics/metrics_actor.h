@@ -182,6 +182,8 @@ private:
     litebus::Timer diskUsageMonitorTimer_;
     litebus::Timer runtimeMemoryLimitMonitorTimer_;
     std::string nodeID = "";
+    std::string instanceMemorySource_ = "vmrss"; // vmrss | cgroup | auto
+    std::string instanceCgroupRoot_ = "/sys/fs/cgroup";
     std::vector<DiskUsageMonitorConfig> diskUsageMonitorConfigs_;
     int checkDiskUsageMonitorDuration_ = -1;
     bool diskUsageMonitorNotifyFailureEnable_{ false };

@@ -146,6 +146,12 @@ Flags::Flags()
             "whether enable print resource view, which will affect performance in big scale", false);
     AddFlag(&Flags::schedulePlugins_, "schedule_plugins", "schedule plugins need to be registered",
             DEFAULT_LOCAL_SCHEDULE_PLUGINS);
+    AddFlag(&Flags::usageAwareSafety_, "usage_aware_safety",
+            "usage-aware admission safety fraction of node memory capacity, used by UsageAwareFilter", 0.9,
+            NumCheck(0.1, 1.0));
+    AddFlag(&Flags::usageAwareFloorMb_, "usage_aware_floor_mb",
+            "per-instance real memory reserve (MB) for usage-aware admission, capped by the instance request", 2048.0,
+            NumCheck(0.0, 1048576.0));
     AddFlag(&Flags::enablePerf_, "enable_print_perf", "whether enable print perf", false);
     AddFlag(&Flags::enableMetaStore_, "enable_meta_store", "for meta store enable", false);
     AddFlag(&Flags::metaStoreMode_, "meta_store_mode", "meta-store mode, eg. local", "local");
