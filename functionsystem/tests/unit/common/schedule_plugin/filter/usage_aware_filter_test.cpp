@@ -76,7 +76,8 @@ TEST_F(UsageAwareFilterTest, RejectWhenUsageExceedsLine)
     auto inst = MakeInstance(32000);
     auto out = filter.Filter(ctx, inst, unit);
     EXPECT_EQ(out.status, StatusCode::RESOURCE_NOT_ENOUGH);
-    EXPECT_EQ(out.availableForRequest, 0);
+    // DefaultFilter convention: -1 = not applicable on rejection
+    EXPECT_EQ(out.availableForRequest, -1);
 }
 
 TEST_F(UsageAwareFilterTest, BoundaryExactlyAtLine)
@@ -94,13 +95,13 @@ TEST_F(UsageAwareFilterTest, FloorCappedBySmallRequest)
 {
     UsageAwareFilter filter;
     auto ctx = std::make_shared<PreAllocatedContext>();
-    // request 512 caps the reserve: 35600 + 512 <= 36000
-    auto unit = MakeUnit(40000, 35600);
+    // request 512 caps the reserve: 35488 + 512 == 36000 exactly
+    auto unit = MakeUnit(40000, 35488);
     auto inst = MakeInstance(512);
     auto out = filter.Filter(ctx, inst, unit);
     EXPECT_EQ(out.status, StatusCode::SUCCESS);
-    // but 35700 + 512 > 36000 rejects
-    unit = MakeUnit(40000, 35700);
+    // but 35500 + 512 > 36000 rejects
+    unit = MakeUnit(40000, 35500);
     out = filter.Filter(ctx, inst, unit);
     EXPECT_EQ(out.status, StatusCode::RESOURCE_NOT_ENOUGH);
 }
@@ -120,14 +121,14 @@ TEST_F(UsageAwareFilterTest, ConfigKnobsTakeEffect)
 {
     UsageAwareFilter filter;
     auto ctx = std::make_shared<PreAllocatedContext>();
-    auto unit = MakeUnit(40000, 38000);
+    auto unit = MakeUnit(40000, 35000);
     auto inst = MakeInstance(32000);
-    // 38000 + 2048 > 36000 with default 0.9
+    // 35000 + 2048 = 37048 > 36000 with default 0.9
     EXPECT_EQ(filter.Filter(ctx, inst, unit).status, StatusCode::RESOURCE_NOT_ENOUGH);
-    // safety 0.98 -> 39200 allowed, passes
+    // safety 0.98 -> 39200 allowed: 37048 <= 39200 passes
     UsageAwareFilter::SetConfig(0.98, 2048.0);
     EXPECT_EQ(filter.Filter(ctx, inst, unit).status, StatusCode::SUCCESS);
-    // back to 0.9 with a tiny floor also passes
+    // back to 0.9 with a tiny floor: 35000 + 512 = 35512 <= 36000 passes
     UsageAwareFilter::SetConfig(0.9, 512.0);
     EXPECT_EQ(filter.Filter(ctx, inst, unit).status, StatusCode::SUCCESS);
     UsageAwareFilter::SetConfig(0.9, 2048.0);
