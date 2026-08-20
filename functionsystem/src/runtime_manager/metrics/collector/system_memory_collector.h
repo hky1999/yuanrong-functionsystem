@@ -24,6 +24,7 @@ namespace system_metrics {
 const uint32_t MEMORY_SCALE = 1 << 20; // MB
 const std::string MEMORY_USAGE_PATH = "/sys/fs/cgroup/memory/memory.usage_in_bytes";
 const std::string MEMORY_LIMIT_PATH = "/sys/fs/cgroup/memory/memory.limit_in_bytes";
+const std::string MEMINFO_PATH = "/proc/meminfo";
 }
 
 class SystemMemoryCollector : public BaseMetricsCollector {
@@ -37,6 +38,12 @@ public:
 
 private:
      Metric GetMemoryMetrics(const std::string &path) const;
+
+     // cgroup v1 hosts have no memory.usage_in_bytes; fall back to
+     // /proc/meminfo (usage = MemTotal - MemAvailable, limit = MemTotal),
+     // which on a dedicated node is exactly the real node usage the
+     // usage-aware admission needs.
+     bool GetMeminfoMb(double &totalMb, double &availableMb) const;
 };
 
 }

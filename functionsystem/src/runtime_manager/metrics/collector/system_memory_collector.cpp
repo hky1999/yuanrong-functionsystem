@@ -16,6 +16,7 @@
 
 #include "system_memory_collector.h"
 
+#include <cstring>
 #include <regex>
 
 #include "common/constants/constants.h"
@@ -35,15 +36,67 @@ SystemMemoryCollector::SystemMemoryCollector() : SystemMemoryCollector(std::make
 Metric SystemMemoryCollector::GetLimit() const
 {
     YRLOG_DEBUG_COUNT_60("system memory collector get limit.");
-    return GetMemoryMetrics(system_metrics::MEMORY_LIMIT_PATH);
+    auto metric = GetMemoryMetrics(system_metrics::MEMORY_LIMIT_PATH);
+    if (metric.value.IsNone() || metric.value.Get() <= 0) {
+        // cgroup v1 controller absent: MemTotal is the physical node limit
+        double totalMb = 0;
+        double availableMb = 0;
+        if (GetMeminfoMb(totalMb, availableMb)) {
+            metric.value = totalMb;
+        }
+    }
+    return metric;
 }
 
 litebus::Future<Metric> SystemMemoryCollector::GetUsage() const
 {
     YRLOG_DEBUG_COUNT_60("system memory collector get usage.");
     litebus::Promise<Metric> promise;
-    promise.SetValue({ GetMemoryMetrics(system_metrics::MEMORY_USAGE_PATH) });
+    auto metric = GetMemoryMetrics(system_metrics::MEMORY_USAGE_PATH);
+    if (metric.value.IsNone() || metric.value.Get() <= 0) {
+        // cgroup v1 controller absent (unified v2 host): real node usage is
+        // MemTotal - MemAvailable; on a dedicated node that is exactly what
+        // usage-aware admission must see
+        double totalMb = 0;
+        double availableMb = 0;
+        if (GetMeminfoMb(totalMb, availableMb)) {
+            metric.value = totalMb - availableMb;
+        }
+    }
+    promise.SetValue({ metric });
     return promise.GetFuture();
+}
+
+bool SystemMemoryCollector::GetMeminfoMb(double &totalMb, double &availableMb) const
+{
+    if (procFSTools_ == nullptr) {
+        return false;
+    }
+    auto content = procFSTools_->Read(system_metrics::MEMINFO_PATH);
+    if (content.IsNone() || content.Get().empty()) {
+        YRLOG_DEBUG_COUNT_60("read content from {} failed.", system_metrics::MEMINFO_PATH);
+        return false;
+    }
+    totalMb = 0;
+    availableMb = 0;
+    // lines look like "MemTotal:       61860 kB" (value always in kB)
+    auto body = content.Get();
+    try {
+        size_t pos = 0;
+        while (pos < body.size()) {
+            auto end = body.find('\n', pos);
+            auto line = body.substr(pos, end == std::string::npos ? end : end - pos);
+            pos = (end == std::string::npos) ? body.size() : end + 1;
+            if (line.rfind("MemTotal:", 0) == 0) {
+                totalMb = std::stod(line.substr(strlen("MemTotal:"))) / 1024.0;
+            } else if (line.rfind("MemAvailable:", 0) == 0) {
+                availableMb = std::stod(line.substr(strlen("MemAvailable:"))) / 1024.0;
+            }
+        }
+    } catch (const std::exception &e) {
+        YRLOG_DEBUG_COUNT_60("parse meminfo fail, error:{}", e.what());
+    }
+    return totalMb > 0;
 }
 
 std::string SystemMemoryCollector::GenFilter() const
