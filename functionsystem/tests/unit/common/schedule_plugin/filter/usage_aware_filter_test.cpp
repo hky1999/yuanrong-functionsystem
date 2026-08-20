@@ -55,7 +55,7 @@ protected:
 };
 
 // admission formula: actualuse + min(floor, request) <= capacity * safety
-TEST(UsageAwareFilterTest, PassWhenUsageWellBelowLine)
+TEST_F(UsageAwareFilterTest, PassWhenUsageWellBelowLine)
 {
     UsageAwareFilter filter;
     auto ctx = std::make_shared<PreAllocatedContext>();
@@ -67,7 +67,7 @@ TEST(UsageAwareFilterTest, PassWhenUsageWellBelowLine)
     EXPECT_FALSE(out.isFatalErr);
 }
 
-TEST(UsageAwareFilterTest, RejectWhenUsageExceedsLine)
+TEST_F(UsageAwareFilterTest, RejectWhenUsageExceedsLine)
 {
     UsageAwareFilter filter;
     auto ctx = std::make_shared<PreAllocatedContext>();
@@ -79,7 +79,7 @@ TEST(UsageAwareFilterTest, RejectWhenUsageExceedsLine)
     EXPECT_EQ(out.availableForRequest, 0);
 }
 
-TEST(UsageAwareFilterTest, BoundaryExactlyAtLine)
+TEST_F(UsageAwareFilterTest, BoundaryExactlyAtLine)
 {
     UsageAwareFilter filter;
     auto ctx = std::make_shared<PreAllocatedContext>();
@@ -90,7 +90,7 @@ TEST(UsageAwareFilterTest, BoundaryExactlyAtLine)
     EXPECT_EQ(out.status, StatusCode::SUCCESS);
 }
 
-TEST(UsageAwareFilterTest, FloorCappedBySmallRequest)
+TEST_F(UsageAwareFilterTest, FloorCappedBySmallRequest)
 {
     UsageAwareFilter filter;
     auto ctx = std::make_shared<PreAllocatedContext>();
@@ -106,7 +106,7 @@ TEST(UsageAwareFilterTest, FloorCappedBySmallRequest)
 }
 
 // no real-usage signal: stay neutral, booked fallback decides in DefaultFilter
-TEST(UsageAwareFilterTest, PassWhenActualUseMissing)
+TEST_F(UsageAwareFilterTest, PassWhenActualUseMissing)
 {
     UsageAwareFilter filter;
     auto ctx = std::make_shared<PreAllocatedContext>();
@@ -116,7 +116,7 @@ TEST(UsageAwareFilterTest, PassWhenActualUseMissing)
     EXPECT_EQ(out.status, StatusCode::SUCCESS);
 }
 
-TEST(UsageAwareFilterTest, ConfigKnobsTakeEffect)
+TEST_F(UsageAwareFilterTest, ConfigKnobsTakeEffect)
 {
     UsageAwareFilter filter;
     auto ctx = std::make_shared<PreAllocatedContext>();

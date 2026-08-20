@@ -71,12 +71,13 @@ litebus::Option<double> InstanceMemoryCollector::GetUsageFromCgroup() const
         YRLOG_DEBUG_COUNT_60("read content from {} failed.", cgroupPath);
         return litebus::None();
     }
-    auto rel = cgroupLines.Get().substr(cgroupLines.Get().rfind(instance_metrics::CGROUP_V2_LINE_PREFIX));
-    if (rel.rfind(instance_metrics::CGROUP_V2_LINE_PREFIX) != 0) {
+    auto prefixPos = cgroupLines.Get().rfind(instance_metrics::CGROUP_V2_LINE_PREFIX);
+    if (prefixPos == std::string::npos) {
         YRLOG_DEBUG_COUNT_60("no cgroup v2 line in {}.", cgroupPath);
         return litebus::None();
     }
-    rel = litebus::strings::Trim(rel.substr(instance_metrics::CGROUP_V2_LINE_PREFIX.length()));
+    auto rel = cgroupLines.Get().substr(prefixPos + instance_metrics::CGROUP_V2_LINE_PREFIX.length());
+    litebus::strings::Trim(rel);
     // 2. read <root>/<rel>/memory.current (bytes)
     std::string memoryFile = cgroupRoot_;
     if (!rel.empty() && rel.front() != '/') {
@@ -90,7 +91,8 @@ litebus::Option<double> InstanceMemoryCollector::GetUsageFromCgroup() const
     }
     double bytes = 0;
     try {
-        bytes = std::stod(litebus::strings::Trim(content.Get()));
+        auto raw = content.Get();
+        bytes = std::stod(litebus::strings::Trim(raw));
     } catch (const std::exception &e) {
         YRLOG_ERROR("stod fail, error:{}", e.what());
         return litebus::None();
