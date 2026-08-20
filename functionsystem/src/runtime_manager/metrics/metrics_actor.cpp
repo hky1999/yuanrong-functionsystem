@@ -121,7 +121,8 @@ void MetricsActor::AddCpuMemoryAndLabelCollectors(const Flags &flags)
                                           this)]() -> std::vector<litebus::Future<Metrics>> { return func(); };
         systemCPUCollector = std::make_shared<SystemProcCPUCollector>(metricsConfig_.procMetricsCPU, callback);
         systemMemoryCollector =
-            std::make_shared<SystemProcMemoryCollector>(metricsConfig_.procMetricsMemory, callback);
+            std::make_shared<SystemProcMemoryCollector>(metricsConfig_.procMetricsMemory, callback,
+                                                        instanceCgroupRoot_ + "/akernel");
     } else if (metricsConfig_.metricsCollectorType == "node") {
         systemCPUCollector = std::make_shared<NodeCPUCollector>(procFSTools_, metricsConfig_.overheadCPU);
         systemMemoryCollector = std::make_shared<NodeMemoryCollector>(procFSTools_, metricsConfig_.overheadMemory);
