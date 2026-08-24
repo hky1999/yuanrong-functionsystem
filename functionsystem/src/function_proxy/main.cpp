@@ -56,6 +56,7 @@
 #include "function_proxy/busproxy/invocation_handler/invocation_handler.h"
 #include "function_proxy/common/common_driver/common_driver.h"
 #include "function_proxy/common/observer/control_plane_observer/control_plane_observer.h"
+#include "function_proxy/common/parked_instance_registry/parked_instance_registry.h"
 #include "function_proxy/common/observer/data_plane_observer/data_plane_observer.h"
 #include "function_proxy/config/direct_routing_config.h"
 #include "grpc/grpc_security_constants.h"
@@ -538,6 +539,8 @@ Status InitLocalSchedulerDriver(const function_proxy::Flags &flags, const std::s
     auto localSchedStartParam = InitLocalSchedParam(flags, dsAuthConfig);
     InitPosixServerOption(flags, localSchedStartParam);
     InitTcpTunnelOption(flags, localSchedStartParam);
+    function_proxy::ParkedInstanceRegistry::Instance().Configure(flags.GetParkedInvokeHoldSeconds(),
+                                                                  flags.GetParkedInvokeDeferEnable());
     g_localSchedDriver = std::make_shared<LocalSchedDriver>(std::move(localSchedStartParam), metaStoreClient);
     return Status::OK();
 }

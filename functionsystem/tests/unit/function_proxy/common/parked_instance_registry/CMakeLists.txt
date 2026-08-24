@@ -1,4 +1,4 @@
-# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,17 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_subdirectory(data_view)
-add_subdirectory(data_obj_client)
-add_subdirectory(distribute_cache_client)
-add_subdirectory(observer)
-add_subdirectory(posix_client)
-add_subdirectory(posix_service)
-add_subdirectory(state_handler)
-add_subdirectory(state_machine)
-add_subdirectory(rate_limiter)
-add_subdirectory(common_driver)
-add_subdirectory(iam)
-add_subdirectory(parked_instance_registry)
+aux_source_directory(${CMAKE_CURRENT_LIST_DIR} PARKED_INSTANCE_REGISTRY_TEST_SRCS)
 
-target_include_directories(${UNIT_TEST_MODULE} PRIVATE ${SRC_BUSPROXY_INCLUDE_DIR})
+target_sources(${UNIT_TEST_MODULE} PRIVATE ${PARKED_INSTANCE_REGISTRY_TEST_SRCS})

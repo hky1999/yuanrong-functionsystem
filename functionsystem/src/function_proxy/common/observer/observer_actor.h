@@ -340,7 +340,12 @@ public:
     void BindInternalIAM(const std::shared_ptr<InternalIAM> &internalIAM);
 
 protected:
-    void Init() override{};
+    // The observer actor mailbox serializes all InstanceView bookkeeping (instance
+    // events), so parked-hold expiry timers re-enter through this AID too.
+    void Init() override
+    {
+        instanceView_->BindTimerContext(GetAID());
+    };
     void Finalize() override{};
 
 private:

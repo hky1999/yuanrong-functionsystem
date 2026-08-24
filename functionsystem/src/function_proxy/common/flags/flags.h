@@ -314,6 +314,16 @@ public:
         return usageAwareFloorMb_;
     }
 
+    bool GetParkedInvokeDeferEnable() const
+    {
+        return parkedInvokeDeferEnable_;
+    }
+
+    uint32_t GetParkedInvokeHoldSeconds() const
+    {
+        return parkedInvokeHoldSeconds_;
+    }
+
     bool GetEnableIpv4TenantIsolation() const
     {
         return enableIpv4TenantIsolation_;
@@ -558,6 +568,8 @@ protected:
     std::string schedulePlugins_;
     double usageAwareSafety_ = 0.9;
     double usageAwareFloorMb_ = 2048.0;
+    bool parkedInvokeDeferEnable_ = true;
+    uint32_t parkedInvokeHoldSeconds_ = 300;
     bool enableIpv4TenantIsolation_;
     bool runtimeDsAuthEnable_;
     bool runtimeDsEncryptEnable_;

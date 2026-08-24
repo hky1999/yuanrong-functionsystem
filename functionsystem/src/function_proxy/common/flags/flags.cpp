@@ -103,6 +103,10 @@ const uint32_t DEFAULT_SERVICE_TTL = 300000;
 const std::string DEFAULT_LOCAL_SCHEDULE_PLUGINS =
     R"("["Default", "ResourceSelector", "Label", "Heterogeneous"]")";
 
+const uint32_t PARKED_INVOKE_HOLD_SECONDS = 300;
+const uint32_t MIN_PARKED_INVOKE_HOLD_SECONDS = 10;
+const uint32_t MAX_PARKED_INVOKE_HOLD_SECONDS = 1800;
+
 }  // namespace
 using namespace litebus::flag;
 Flags::Flags()
@@ -152,6 +156,11 @@ Flags::Flags()
     AddFlag(&Flags::usageAwareFloorMb_, "usage_aware_floor_mb",
             "per-instance real memory reserve (MB) for usage-aware admission, capped by the instance request", 2048.0,
             NumCheck(0.0, 1048576.0));
+    AddFlag(&Flags::parkedInvokeDeferEnable_, "parked_invoke_defer_enable",
+            "hold data-plane invokes of parked instances until restore or hold TTL instead of failing them", true);
+    AddFlag(&Flags::parkedInvokeHoldSeconds_, "parked_invoke_hold_seconds",
+            "how long a parked instance keeps holding data-plane invokes before they fail with instance exited",
+            PARKED_INVOKE_HOLD_SECONDS, NumCheck(MIN_PARKED_INVOKE_HOLD_SECONDS, MAX_PARKED_INVOKE_HOLD_SECONDS));
     AddFlag(&Flags::enablePerf_, "enable_print_perf", "whether enable print perf", false);
     AddFlag(&Flags::enableMetaStore_, "enable_meta_store", "for meta store enable", false);
     AddFlag(&Flags::metaStoreMode_, "meta_store_mode", "meta-store mode, eg. local", "local");

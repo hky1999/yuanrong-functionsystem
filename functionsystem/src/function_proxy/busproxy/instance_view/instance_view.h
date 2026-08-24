@@ -28,6 +28,8 @@
 #include "common/status/status.h"
 #include "common/types/instance_state.h"
 #include "function_proxy/busproxy/instance_proxy/instance_proxy.h"
+#include "function_proxy/common/parked_instance_registry/parked_instance_registry.h"
+#include "timer/timertools.hpp"
 
 namespace functionsystem::busproxy {
 using EventHandler = std::function<void(const std::string &, const resources::InstanceInfo &)>;
@@ -51,6 +53,15 @@ public:
         proxyView_ = proxyView;
     }
 
+    /**
+     * Bind the AID (normally the ObserverActor) whose mailbox serializes the
+     * InstanceView bookkeeping; parked-hold expiry timers re-enter through it.
+     */
+    void BindTimerContext(const litebus::AID &timerAid)
+    {
+        timerAid_ = timerAid;
+    }
+
     Status SubscribeInstanceEvent(const std::string &subscriber, const std::string &targetInstance,
                                   bool ignoreNonExist = false);
 
@@ -69,6 +80,20 @@ private:
                        const std::shared_ptr<InstanceRouterInfo> &routeInfo);
     void NotifySubscriberInstanceReady(const std::string &, const resources::InstanceInfo &);
     void TerminateMigratedInstanceProxy(const std::string &instanceID);
+    bool IsLocalParkedInstance(const std::string &instanceID) const;
+    // Parked delete: keep the InstanceProxy actor alive with a not-ready dispatcher so
+    // invokes arriving in the park window are held in the dispatcher call cache.
+    void HandleParkedDelete(const std::string &instanceID, const resources::InstanceInfo &lastInfo);
+    // Flip a local parked instance's dispatcher to not-ready (hold) and arm the hold
+    // TTL. Shared by the parked delete path and the parked FATAL path: the deliberate
+    // sandbox kill of a park is reported as an instance exit and arrives as FATAL
+    // BEFORE the snapshot completes, so the park mark must already suppress it.
+    void HoldParkedInstance(const std::string &instanceID, const resources::InstanceInfo &info);
+    // Restore came back (RUNNING): drop the park bookkeeping; NotifyReady flushes held invokes.
+    void ClearParked(const std::string &instanceID);
+    // Hold TTL expired without restore: tear the actor down for real (held invokes get
+    // ERR_INSTANCE_EXITED), matching the legacy delete failure semantics.
+    void OnParkedExpired(const std::string &instanceID);
 
     std::shared_ptr<DataInterfaceClientManagerProxy> dataInterfaceClientManager_ { nullptr };
     std::shared_ptr<ProxyView> proxyView_ { nullptr };
@@ -82,6 +107,9 @@ private:
     std::unordered_map<std::string, std::unordered_set<std::string>> subscribers_;
     std::unordered_map<InstanceState, EventHandler> eventHandlers_;
     std::string nodeID_;
+    // parked instances: instanceID -> hold expiry timer (actor kept alive in localInstances_)
+    std::unordered_map<std::string, litebus::Timer> parkedHoldTimers_;
+    litebus::AID timerAid_;
 };
 }  // namespace functionsystem::busproxy
 #endif

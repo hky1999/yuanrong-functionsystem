@@ -30,6 +30,8 @@
 #include "local_scheduler/instance_control/instance_ctrl_message.h"
 #include "local_scheduler/local_scheduler_service/local_sched_srv.h"
 
+#include "function_proxy/common/parked_instance_registry/parked_instance_registry.h"
+
 namespace functionsystem::local_scheduler {
 
 SnapCtrlActor::SnapCtrlActor(const std::string &name, const std::string &nodeID)
@@ -120,13 +122,27 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
     YRLOG_INFO("{}|{}|start snapshot, leave_running: {}", requestID, instanceID, leaveRunning);
     auto instanceInfo = stateMachine->GetInstanceInfo();
     ASSERT_IF_NULL(functionAgentMgr_);
+    // Mark the instance as parked BEFORE the checkpoint starts: the deliberate sandbox
+    // kill of a park is reported to the control plane as an instance exit and reaches
+    // the data plane (InstanceView FATAL / delete chains) before the snapshot completes,
+    // so a mark taken only after completion races (and loses against) the teardown.
+    auto &parkedRegistry = function_proxy::ParkedInstanceRegistry::Instance();
+    const bool markParked = !leaveRunning && parkedRegistry.Enabled();
+    if (markParked) {
+        parkedRegistry.MarkParked(instanceID);
+        YRLOG_INFO("{}|{}|instance marked parked (snapshot starting), data-plane invokes will be held until restore",
+                   requestID, instanceID);
+    }
     // 2. 调用 PrepareSnap 验证实例状态并准备快照
     return PrepareSnap(requestID, instanceID)
-        .Then([aid(GetAID()), requestID, instanceID, instanceInfo, ttl,
+        .Then([aid(GetAID()), requestID, instanceID, instanceInfo, ttl, markParked,
                functionAgentMgr(functionAgentMgr_)](const Status &status)
                    -> litebus::Future<messages::SnapshotRuntimeResponse> {
             if (status.IsError()) {
                 YRLOG_ERROR("{}|{}|PrepareSnap failed: {}", requestID, instanceID, status.GetMessage());
+                if (markParked) {
+                    function_proxy::ParkedInstanceRegistry::Instance().Clear(instanceID);
+                }
                 messages::SnapshotRuntimeResponse errorRsp;
                 errorRsp.set_code(Status::GetPosixErrorCode(status.StatusCode()));
                 errorRsp.set_message(status.RawMessage());
@@ -139,9 +155,14 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
                functionType](const messages::SnapshotRuntimeResponse &runtimeRsp) -> litebus::Future<SnapshotResult> {
             return RecordSnapshotMetadata(localSchedSrv, runtimeRsp, instanceInfo, functionType);
         })
-        .Then([requestID, instanceID, leaveRunning, aid(GetAID()),
+        .Then([requestID, instanceID, leaveRunning, markParked, aid(GetAID()),
                instanceCtrl(instanceCtrl_)](const SnapshotResult &result) -> litebus::Future<SnapshotResult> {
             if (result.code != common::ERR_NONE) {
+                // snapshot failed: the instance keeps running (or died for real), drop
+                // the park mark so later exit events take the legacy teardown path.
+                if (markParked) {
+                    function_proxy::ParkedInstanceRegistry::Instance().Clear(instanceID);
+                }
                 return result;
             }
 
@@ -156,6 +177,9 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
                 }
             } else {
                 YRLOG_INFO("{}|{}|snapshot completed, instance continues running", requestID, instanceID);
+                if (markParked) {  // defensive: leaveRunning cannot change mid-flight
+                    function_proxy::ParkedInstanceRegistry::Instance().Clear(instanceID);
+                }
             }
 
             return result;
