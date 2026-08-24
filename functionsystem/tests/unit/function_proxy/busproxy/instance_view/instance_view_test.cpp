@@ -348,8 +348,7 @@ TEST_F(ParkedInstanceViewTest, HoldTtlExpiryTearsActorDown)
     EXPECT_NE(litebus::GetActor(aid), nullptr);
 
     // expiry timer re-enters through the timer-context actor mailbox
-    ASSERT_AWAIT_TRUE_FOR([=]() -> bool { return litebus::GetActor(aid) == nullptr; },
-                          std::chrono::seconds(5));
+    ASSERT_AWAIT_TRUE_FOR([=]() -> bool { return litebus::GetActor(aid) == nullptr; }, 5U);
     EXPECT_FALSE(registry.IsParked(parkedInstanceID_));
     registry.Configure(300, true);
 }
