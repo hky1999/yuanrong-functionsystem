@@ -51,6 +51,18 @@ litebus::Future<std::string> InstanceProxy::GetTenantID()
     return selfDispatcher_->GetTenantID();
 }
 
+litebus::Future<size_t> InstanceProxy::GetInFlightCount()
+{
+    ASSERT_FS(selfDispatcher_);
+    return selfDispatcher_->GetInFlightCount();
+}
+
+void InstanceProxy::ResumeAfterAbandonedDrain()
+{
+    ASSERT_FS(selfDispatcher_);
+    selfDispatcher_->ResumeAfterAbandonedDrain();
+}
+
 litebus::Future<SharedStreamMsg> InstanceProxy::Call(const CallerInfo &callerInfo,
                                                      const std::string &dstInstanceID, const SharedStreamMsg &request,
                                                      const std::shared_ptr<TimePoint> &time)

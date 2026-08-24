@@ -23,6 +23,7 @@
 #include "common/proto/pb/posix/resource.pb.h"
 #include "common/resource_view/resource_type.h"
 #include "common/types/instance_state.h"
+#include "function_proxy/common/parked_instance_registry/parked_instance_registry.h"
 #include "mocks/mock_shared_client.h"
 #include "mocks/mock_shared_client_manager_proxy.h"
 #include "utils/future_test_helper.h"
@@ -201,5 +202,256 @@ TEST_F(InstanceViewTest, SubscribeToEvictingInstance)
     // Cleanup
     instanceView_->Delete(child, -1);
     instanceView_->Delete(parent, -1);
+}
+
+class TimerContextActor : public litebus::ActorBase {
+public:
+    explicit TimerContextActor(const std::string &name) : litebus::ActorBase(name) {}
+
+protected:
+    void Init() override {}
+};
+
+class ParkedInstanceViewTest : public InstanceViewTest {
+public:
+    void SetUp() override
+    {
+        InstanceViewTest::SetUp();
+        timerActor_ = std::make_shared<TimerContextActor>("parked-timer-ctx");
+        litebus::Spawn(timerActor_);
+        instanceView_->BindTimerContext(timerActor_->GetAID());
+        auto &registry = function_proxy::ParkedInstanceRegistry::Instance();
+        registry.Configure(300, true);
+        registry.ConfigureDrain(10000, true, false);
+        parkedInstanceID_ = "inst-parked";
+        registry.Clear(parkedInstanceID_);
+    }
+
+    void TearDown() override
+    {
+        // BindTimerContext (in SetUp) registered drain providers bound to this
+        // InstanceView: drop them before the view goes away
+        auto &registry = function_proxy::ParkedInstanceRegistry::Instance();
+        registry.SetDrainProvider(nullptr);
+        registry.SetReleaseDrainProvider(nullptr);
+        registry.Clear(parkedInstanceID_);
+        litebus::Terminate(timerActor_->GetAID());
+        litebus::Await(timerActor_);
+        timerActor_ = nullptr;
+        InstanceViewTest::TearDown();
+    }
+
+protected:
+    std::shared_ptr<TimerContextActor> timerActor_;
+    std::string parkedInstanceID_;
+};
+
+TEST_F(ParkedInstanceViewTest, ParkedDeleteKeepsRoutingActor)
+{
+    InstanceProxy::BindObserver(std::make_shared<MockDataPlaneObserver>(instanceView_));
+    auto &registry = function_proxy::ParkedInstanceRegistry::Instance();
+
+    UpdateInstance(parkedInstanceID_, "driver", nodeID, nodeID);
+    litebus::AID aid(parkedInstanceID_, url_);
+    ASSERT_NE(litebus::GetActor(aid), nullptr);
+
+    // park: mark + delete keeps the routing actor alive
+    registry.MarkParked(parkedInstanceID_);
+    instanceView_->Delete(parkedInstanceID_, -1);
+    EXPECT_NE(litebus::GetActor(aid), nullptr);
+    EXPECT_TRUE(registry.IsParked(parkedInstanceID_));
+
+    // restore: RUNNING event clears the park bookkeeping, actor stays alive
+    auto instanceInfo = GenInstanceInfo(parkedInstanceID_, "driver", nodeID, InstanceState::RUNNING);
+    instanceInfo.set_version(4);
+    auto mockSharedClient = std::make_shared<MockSharedClient>();
+    EXPECT_CALL(*mockSharedClientManagerProxy_, NewDataInterfacePosixClient(_, _, _))
+        .WillRepeatedly(Return(mockSharedClient));
+    instanceView_->Update(parkedInstanceID_, instanceInfo, false);
+    EXPECT_NE(litebus::GetActor(aid), nullptr);
+    EXPECT_FALSE(registry.IsParked(parkedInstanceID_));
+
+    instanceView_->Delete(parkedInstanceID_, -1);
+    ASSERT_AWAIT_TRUE([=]() -> bool { return litebus::GetActor(aid) == nullptr; });
+}
+
+TEST_F(ParkedInstanceViewTest, ParkedFatalHoldsDispatcherInsteadOfFailing)
+{
+    InstanceProxy::BindObserver(std::make_shared<MockDataPlaneObserver>(instanceView_));
+    auto &registry = function_proxy::ParkedInstanceRegistry::Instance();
+
+    UpdateInstance(parkedInstanceID_, "driver", nodeID, nodeID);
+    litebus::AID aid(parkedInstanceID_, url_);
+    ASSERT_NE(litebus::GetActor(aid), nullptr);
+
+    // park mark first (as of snapshot entry), then the FATAL event the deliberate
+    // sandbox kill produces: must hold, not fail held invokes / drop the actor.
+    registry.MarkParked(parkedInstanceID_);
+    auto fatalInfo = GenInstanceInfo(parkedInstanceID_, "driver", nodeID, InstanceState::FATAL);
+    fatalInfo.mutable_instancestatus()->set_errcode(common::ERR_INSTANCE_EXITED);
+    fatalInfo.set_version(4);
+    instanceView_->Update(parkedInstanceID_, fatalInfo, false);
+    EXPECT_NE(litebus::GetActor(aid), nullptr);
+    EXPECT_TRUE(registry.IsParked(parkedInstanceID_));
+
+    // restore RUNNING clears the hold bookkeeping, actor stays alive
+    auto runningInfo = GenInstanceInfo(parkedInstanceID_, "driver", nodeID, InstanceState::RUNNING);
+    runningInfo.set_version(5);
+    auto mockSharedClient = std::make_shared<MockSharedClient>();
+    EXPECT_CALL(*mockSharedClientManagerProxy_, NewDataInterfacePosixClient(_, _, _))
+        .WillRepeatedly(Return(mockSharedClient));
+    instanceView_->Update(parkedInstanceID_, runningInfo, false);
+    EXPECT_NE(litebus::GetActor(aid), nullptr);
+    EXPECT_FALSE(registry.IsParked(parkedInstanceID_));
+
+    instanceView_->Delete(parkedInstanceID_, -1);
+    ASSERT_AWAIT_TRUE([=]() -> bool { return litebus::GetActor(aid) == nullptr; });
+}
+
+TEST_F(ParkedInstanceViewTest, RealDeleteWithoutParkMarkTerminatesActor)
+{
+    InstanceProxy::BindObserver(std::make_shared<MockDataPlaneObserver>(instanceView_));
+    auto &registry = function_proxy::ParkedInstanceRegistry::Instance();
+
+    UpdateInstance(parkedInstanceID_, "driver", nodeID, nodeID);
+    litebus::AID aid(parkedInstanceID_, url_);
+    ASSERT_NE(litebus::GetActor(aid), nullptr);
+
+    // no park mark: legacy delete path, actor terminated
+    ASSERT_FALSE(registry.IsParked(parkedInstanceID_));
+    instanceView_->Delete(parkedInstanceID_, -1);
+    ASSERT_AWAIT_TRUE([=]() -> bool { return litebus::GetActor(aid) == nullptr; });
+}
+
+TEST_F(ParkedInstanceViewTest, DisabledDeferBehavesLikeLegacyDelete)
+{
+    InstanceProxy::BindObserver(std::make_shared<MockDataPlaneObserver>(instanceView_));
+    auto &registry = function_proxy::ParkedInstanceRegistry::Instance();
+
+    UpdateInstance(parkedInstanceID_, "driver", nodeID, nodeID);
+    litebus::AID aid(parkedInstanceID_, url_);
+    ASSERT_NE(litebus::GetActor(aid), nullptr);
+
+    registry.Configure(300, false);
+    registry.MarkParked(parkedInstanceID_);  // no-op while disabled
+    instanceView_->Delete(parkedInstanceID_, -1);
+    ASSERT_AWAIT_TRUE([=]() -> bool { return litebus::GetActor(aid) == nullptr; });
+    registry.Configure(300, true);
+}
+
+TEST_F(ParkedInstanceViewTest, HoldTtlExpiryTearsActorDown)
+{
+    InstanceProxy::BindObserver(std::make_shared<MockDataPlaneObserver>(instanceView_));
+    auto &registry = function_proxy::ParkedInstanceRegistry::Instance();
+    registry.Configure(1, true);  // 1s hold
+
+    UpdateInstance(parkedInstanceID_, "driver", nodeID, nodeID);
+    litebus::AID aid(parkedInstanceID_, url_);
+    ASSERT_NE(litebus::GetActor(aid), nullptr);
+
+    registry.MarkParked(parkedInstanceID_);
+    instanceView_->Delete(parkedInstanceID_, -1);
+    EXPECT_NE(litebus::GetActor(aid), nullptr);
+
+    // expiry timer re-enters through the timer-context actor mailbox
+    ASSERT_AWAIT_TRUE_FOR([=]() -> bool { return litebus::GetActor(aid) == nullptr; }, 5U);
+    EXPECT_FALSE(registry.IsParked(parkedInstanceID_));
+    registry.Configure(300, true);
+}
+
+TEST_F(ParkedInstanceViewTest, DrainIdleInstanceSucceedsAndReleaseRestoresReady)
+{
+    InstanceProxy::BindObserver(std::make_shared<MockDataPlaneObserver>(instanceView_));
+    auto &registry = function_proxy::ParkedInstanceRegistry::Instance();
+    registry.ConfigureDrain(2000, true, false);
+
+    UpdateInstance(parkedInstanceID_, "driver", nodeID, nodeID);
+    litebus::AID aid(parkedInstanceID_, url_);
+    ASSERT_NE(litebus::GetActor(aid), nullptr);
+    auto actor = std::dynamic_pointer_cast<InstanceProxy>(litebus::GetActor(aid));
+    ASSERT_TRUE(actor != nullptr);
+    ASSERT_AWAIT_TRUE([actor]() -> bool { return actor->selfDispatcher_->isReady_; });
+
+    // idle instance: no in-flight invokes, the drain resolves OK on the first poll
+    auto drainFut = registry.DrainInstance(parkedInstanceID_);
+    ASSERT_AWAIT_READY(drainFut);
+    EXPECT_TRUE(drainFut.Get().IsOk());
+    ASSERT_AWAIT_TRUE([actor]() -> bool { return !actor->selfDispatcher_->isReady_; });
+
+    // park abandoned after the drain: rollback flips the dispatcher back to ready
+    registry.ReleaseDrain(parkedInstanceID_);
+    ASSERT_AWAIT_TRUE([actor]() -> bool { return actor->selfDispatcher_->isReady_; });
+
+    instanceView_->Delete(parkedInstanceID_, -1);
+    ASSERT_AWAIT_TRUE([=]() -> bool { return litebus::GetActor(aid) == nullptr; });
+}
+
+TEST_F(ParkedInstanceViewTest, DrainTimeoutAbandonsParkAndRollsBackDispatcher)
+{
+    InstanceProxy::BindObserver(std::make_shared<MockDataPlaneObserver>(instanceView_));
+    auto &registry = function_proxy::ParkedInstanceRegistry::Instance();
+    registry.ConfigureDrain(300, true, false);  // short drain window for the test
+
+    UpdateInstance(parkedInstanceID_, "driver", nodeID, nodeID);
+    litebus::AID aid(parkedInstanceID_, url_);
+    ASSERT_NE(litebus::GetActor(aid), nullptr);
+    auto actor = std::dynamic_pointer_cast<InstanceProxy>(litebus::GetActor(aid));
+    ASSERT_TRUE(actor != nullptr);
+    ASSERT_AWAIT_TRUE([actor]() -> bool { return actor->selfDispatcher_->isReady_; });
+
+    // fabricate a stuck in-flight invoke: a call context already delivered to the
+    // runtime (OnResp) whose response never arrives within the drain window
+    auto ctx = std::make_shared<CallRequestContext>();
+    ctx->from = "caller";
+    ctx->requestID = "stuck-inflight";
+    auto request = std::make_shared<runtime_rpc::StreamingMessage>();
+    auto callReq = request->mutable_callreq();
+    callReq->set_requestid(ctx->requestID);
+    callReq->set_senderid(ctx->from);
+    ctx->callRequest = request;
+    actor->selfDispatcher_->callCache_->Push(ctx);
+    actor->selfDispatcher_->callCache_->MoveToOnResp(ctx->requestID);
+    EXPECT_EQ(actor->selfDispatcher_->callCache_->InFlightCount(), 1U);
+
+    auto drainFut = registry.DrainInstance(parkedInstanceID_);
+    ASSERT_AWAIT_READY(drainFut);
+    EXPECT_TRUE(drainFut.Get().IsError());
+    EXPECT_EQ(drainFut.Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY);
+
+    // rollback: dispatcher ready again, the stuck context survives (not failed)
+    ASSERT_AWAIT_TRUE([actor]() -> bool { return actor->selfDispatcher_->isReady_; });
+    EXPECT_NE(actor->selfDispatcher_->callCache_->FindCallRequestContext("stuck-inflight"), nullptr);
+
+    // drop the fabricated context before teardown: a non-empty cache makes the final
+    // delete run SendNotify through InvocationHandler, whose instance proxy wrapper is
+    // not bound in this test binary (ASSERT_IF_NULL raises SIGINT there) — unrelated
+    // to the drain semantics under test
+    actor->selfDispatcher_->callCache_->DeleteReqOnResp("stuck-inflight");
+
+    instanceView_->Delete(parkedInstanceID_, -1);
+    ASSERT_AWAIT_TRUE([=]() -> bool { return litebus::GetActor(aid) == nullptr; });
+}
+
+TEST_F(ParkedInstanceViewTest, DrainDisabledLeavesDispatcherReady)
+{
+    InstanceProxy::BindObserver(std::make_shared<MockDataPlaneObserver>(instanceView_));
+    auto &registry = function_proxy::ParkedInstanceRegistry::Instance();
+    registry.ConfigureDrain(2000, false, false);
+
+    UpdateInstance(parkedInstanceID_, "driver", nodeID, nodeID);
+    litebus::AID aid(parkedInstanceID_, url_);
+    ASSERT_NE(litebus::GetActor(aid), nullptr);
+    auto actor = std::dynamic_pointer_cast<InstanceProxy>(litebus::GetActor(aid));
+    ASSERT_TRUE(actor != nullptr);
+    ASSERT_AWAIT_TRUE([actor]() -> bool { return actor->selfDispatcher_->isReady_; });
+
+    auto drainFut = registry.DrainInstance(parkedInstanceID_);
+    ASSERT_AWAIT_READY(drainFut);
+    EXPECT_TRUE(drainFut.Get().IsOk());
+    // drain skipped entirely: the dispatcher was never flipped
+    EXPECT_TRUE(actor->selfDispatcher_->isReady_);
+
+    instanceView_->Delete(parkedInstanceID_, -1);
+    ASSERT_AWAIT_TRUE([=]() -> bool { return litebus::GetActor(aid) == nullptr; });
 }
 }  // namespace functionsystem::test

@@ -99,6 +99,21 @@ public:
         return tenantID_;
     }
 
+    // Outstanding invokes already delivered to the runtime (OnResp + InProgress).
+    // Call on the InstanceProxy actor mailbox; CallCache has no internal locking.
+    size_t GetInFlightCount()
+    {
+        ASSERT_IF_NULL(callCache_);
+        return callCache_->InFlightCount();
+    }
+
+    // Rollback of an abandoned park drain. MUST NOT go through UpdateInfo(isReady=true):
+    // that path MoveAllToNew+resends the whole cache, which would re-deliver invokes
+    // still executing on the live sandbox (double execution, and the duplicate context
+    // can wedge the in-flight count — observed by park11). Only the New set (invokes
+    // that arrived while drained, never sent) is flushed.
+    void ResumeAfterAbandonedDrain();
+
     inline void UpdateRemoteAID(const litebus::AID &aid)
     {
         remoteAid_ = aid;

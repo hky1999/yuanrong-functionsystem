@@ -102,6 +102,11 @@ std::unordered_set<std::string> CallCache::GetInProgressReqs()
     return reqInProgress_;
 }
 
+size_t CallCache::InFlightCount()
+{
+    return reqOnResp_.size() + reqInProgress_.size();
+}
+
 void CallCache::MoveAllToNew()
 {
     for (const auto &ele : reqInProgress_) {

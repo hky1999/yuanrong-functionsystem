@@ -329,6 +329,31 @@ public:
         return usageAwareFloorMb_;
     }
 
+    bool GetParkedInvokeDeferEnable() const
+    {
+        return parkedInvokeDeferEnable_;
+    }
+
+    uint32_t GetParkedInvokeHoldSeconds() const
+    {
+        return parkedInvokeHoldSeconds_;
+    }
+
+    bool GetParkDrainEnable() const
+    {
+        return parkDrainEnable_;
+    }
+
+    uint32_t GetParkDrainTimeoutMs() const
+    {
+        return parkDrainTimeoutMs_;
+    }
+
+    bool GetParkDrainForceOnTimeout() const
+    {
+        return parkDrainForceOnTimeout_;
+    }
+
     bool GetEnableIpv4TenantIsolation() const
     {
         return enableIpv4TenantIsolation_;
@@ -571,6 +596,11 @@ protected:
     std::string schedulePlugins_;
     double usageAwareSafety_ = 0.9;
     double usageAwareFloorMb_ = 2048.0;
+    bool parkedInvokeDeferEnable_ = true;
+    uint32_t parkedInvokeHoldSeconds_ = 300;
+    bool parkDrainEnable_ = true;
+    uint32_t parkDrainTimeoutMs_ = 10000;
+    bool parkDrainForceOnTimeout_ = false;
     bool enableIpv4TenantIsolation_;
     bool runtimeDsAuthEnable_;
     bool runtimeDsEncryptEnable_;

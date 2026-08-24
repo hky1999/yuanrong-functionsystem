@@ -62,6 +62,13 @@ public:
 
     std::list<litebus::Future<SharedStreamMsg>> GetOnRespFuture();
 
+    /**
+     * Invokes already delivered to the runtime (sent-awaiting-accept + accepted-
+     * executing). This is the outstanding set a park must drain before killing the
+     * sandbox: while it is non-empty, responses still have a live channel back.
+     */
+    size_t InFlightCount();
+
     void MoveAllToNew();
 
     void SetTrafficReport(const TrafficReport &report)

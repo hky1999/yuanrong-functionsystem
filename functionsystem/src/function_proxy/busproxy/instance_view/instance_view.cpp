@@ -27,6 +27,10 @@
 #include "common/utils/struct_transfer.h"
 
 namespace functionsystem::busproxy {
+namespace {
+// drain poll interval: how often the park drain phase re-checks the in-flight count
+constexpr uint32_t PARK_DRAIN_POLL_INTERVAL_MS = 200;
+}  // namespace
 using IsReady = bool;
 const std::map<InstanceState, IsReady> STATUS_READY = {
     { InstanceState::NEW, false },
@@ -125,6 +129,9 @@ InstanceView::InstanceView(const std::string &nodeID) : nodeID_(nodeID)
 
 InstanceView::~InstanceView()
 {
+    for (auto &timer : parkedHoldTimers_) {
+        (void)litebus::TimerTools::Cancel(timer.second);
+    }
     for (auto &instance : localInstances_) {
         litebus::Terminate(instance.second->GetAID());
         litebus::Await(instance.second);
@@ -171,12 +178,23 @@ void InstanceView::Update(const std::string &instanceID, const resources::Instan
 void InstanceView::Delete(const std::string &instanceID, int64_t)
 {
     YRLOG_DEBUG("instance view delete instance({})", instanceID);
+    resources::InstanceInfo lastInfo;
+    bool hasLastInfo = false;
     if (auto iter = allInstances_.find(instanceID); iter != allInstances_.end()) {
         RemoveInstanceFromNodeMap(nodeInstanceMap_, iter->second.functionproxyid(), instanceID);
+        lastInfo = iter->second;
+        hasLastInfo = true;
     }
     (void)allInstances_.erase(instanceID);
-    // delete local instance proxy
-    if (localInstances_.find(instanceID) != localInstances_.end()) {
+    // A parked instance (removed by a successful snapshot, not a real kill) keeps its
+    // routing actor alive with a not-ready dispatcher: invokes arriving in the park
+    // window are held in the dispatcher call cache instead of failing with
+    // ERR_INSTANCE_NOT_FOUND, and are flushed when the restore reaches RUNNING.
+    const bool isParked = IsLocalParkedInstance(instanceID);
+    if (isParked && hasLastInfo) {
+        HandleParkedDelete(instanceID, lastInfo);
+    } else if (localInstances_.find(instanceID) != localInstances_.end()) {
+        // delete local instance proxy
         auto instanceProxy = localInstances_[instanceID];
         (void)litebus::Async(instanceProxy->GetAID(), &InstanceProxy::Delete).OnComplete([instanceProxy]() {
             litebus::Terminate(instanceProxy->GetAID());
@@ -270,6 +288,10 @@ void InstanceView::Creating(const std::string &instanceID, const resources::Inst
 
 void InstanceView::Running(const std::string &instanceID, const resources::InstanceInfo &instanceInfo)
 {
+    // A parked instance came back: drop the park bookkeeping before wiring the fresh
+    // data client, so the hold timer cannot race the restore. Held invokes are flushed
+    // by the dispatcher when NotifyReady delivers isReady=true.
+    ClearParked(instanceID);
     SpawnInstanceProxy(instanceID, instanceInfo);
     if (instanceInfo.functionproxyid() == nodeID_) {
         auto iter = localInstances_.find(instanceID);
@@ -283,6 +305,15 @@ void InstanceView::Running(const std::string &instanceID, const resources::Insta
 
 void InstanceView::Fatal(const std::string &instanceID, const resources::InstanceInfo &instanceInfo)
 {
+    // A park (signal 18, leaveRunning=false) deliberately kills the sandbox; the exit
+    // report reaches the control plane BEFORE the snapshot completes and arrives here
+    // as FATAL. For a parked-marked local instance this is not a real failure: hold
+    // the dispatcher instead of failing every held invoke, and let the restore RUNNING
+    // event (or the hold TTL) resolve the window.
+    if (IsLocalParkedInstance(instanceID)) {
+        HoldParkedInstance(instanceID, instanceInfo);
+        return;
+    }
     auto errCode = instanceInfo.instancestatus().errcode();
     auto msg = instanceInfo.instancestatus().msg();
     auto proxyID = instanceInfo.functionproxyid();
@@ -461,6 +492,180 @@ void InstanceView::TerminateMigratedInstanceProxy(const std::string &instanceID)
     auto futures = litebus::Async(instanceProxy->GetAID(), &InstanceProxy::GetOnRespFuture);
     (void)litebus::Collect(futures).OnComplete([instanceProxy]() { litebus::Terminate(instanceProxy->GetAID()); });
     (void)localInstances_.erase(instanceID);
+}
+
+bool InstanceView::IsLocalParkedInstance(const std::string &instanceID) const
+{
+    return localInstances_.find(instanceID) != localInstances_.end() &&
+           function_proxy::ParkedInstanceRegistry::Instance().IsParked(instanceID);
+}
+
+void InstanceView::HandleParkedDelete(const std::string &instanceID, const resources::InstanceInfo &lastInfo)
+{
+    HoldParkedInstance(instanceID, lastInfo);
+}
+
+void InstanceView::HoldParkedInstance(const std::string &instanceID, const resources::InstanceInfo &info)
+{
+    auto instanceProxy = localInstances_[instanceID];
+    ASSERT_IF_NULL(instanceProxy);
+    // Flip the dispatcher to not-ready: invokes routed to the kept-alive actor now
+    // land in the dispatcher call cache instead of the (frozen) runtime.
+    auto routeInfo = TransferInstanceInfo(info, nodeID_);
+    routeInfo->isReady = false;
+    litebus::Async(instanceProxy->GetAID(), &InstanceProxy::NotifyChanged, instanceID, routeInfo);
+
+    // Bounded hold: if the restore never comes back to this proxy, expire and fail the
+    // held invokes with the legacy delete semantics.
+    const auto holdSeconds = function_proxy::ParkedInstanceRegistry::Instance().HoldSeconds();
+    if (auto iter = parkedHoldTimers_.find(instanceID); iter != parkedHoldTimers_.end()) {
+        // FATAL-hold and delete-hold can both engage for one park: only one live timer.
+        (void)litebus::TimerTools::Cancel(iter->second);
+        (void)parkedHoldTimers_.erase(iter);
+    }
+    parkedHoldTimers_[instanceID] = litebus::TimerTools::AddTimer(
+        static_cast<uint64_t>(holdSeconds) * 1000, timerAid_, [aid(timerAid_), this, instanceID]() {
+            litebus::Async(aid, std::make_unique<litebus::MessageHandler>([this, instanceID](litebus::ActorBase *) {
+                OnParkedExpired(instanceID);
+            }));
+        });
+    YRLOG_INFO("instance view parked instance ({}): routing actor kept alive, data-plane invokes held for {}s",
+               instanceID, holdSeconds);
+}
+
+void InstanceView::ClearParked(const std::string &instanceID)
+{
+    if (auto iter = parkedHoldTimers_.find(instanceID); iter != parkedHoldTimers_.end()) {
+        (void)litebus::TimerTools::Cancel(iter->second);
+        (void)parkedHoldTimers_.erase(iter);
+        YRLOG_INFO("instance view restored parked instance ({}): held invokes flush on ready", instanceID);
+    }
+    // Clear the mark even when no hold timer was armed (e.g. the RUNNING event lands
+    // between the park mark at snapshot entry and the hold being engaged).
+    function_proxy::ParkedInstanceRegistry::Instance().Clear(instanceID);
+}
+
+void InstanceView::OnParkedExpired(const std::string &instanceID)
+{
+    if (parkedHoldTimers_.find(instanceID) == parkedHoldTimers_.end()) {
+        return;  // already restored
+    }
+    (void)parkedHoldTimers_.erase(instanceID);
+    function_proxy::ParkedInstanceRegistry::Instance().Clear(instanceID);
+    auto iter = localInstances_.find(instanceID);
+    if (iter == localInstances_.end()) {
+        return;
+    }
+    auto instanceProxy = iter->second;
+    (void)localInstances_.erase(iter);
+    YRLOG_WARN("instance view parked instance ({}) hold TTL expired without restore, failing held invokes",
+               instanceID);
+    (void)litebus::Async(instanceProxy->GetAID(), &InstanceProxy::Delete).OnComplete([instanceProxy]() {
+        litebus::Terminate(instanceProxy->GetAID());
+    });
+}
+
+litebus::Future<Status> InstanceView::DrainInstanceInFlight(const std::string &instanceID, uint64_t timeoutMs)
+{
+    auto promise = std::make_shared<litebus::Promise<Status>>();
+    // Re-enter through the serializing mailbox: localInstances_/allInstances_ are
+    // only safe to read there (same serialization the parked-hold expiry relies on).
+    litebus::Async(timerAid_, std::make_unique<litebus::MessageHandler>(
+                                  [this, instanceID, timeoutMs, promise](litebus::ActorBase *) {
+                                      auto iter = localInstances_.find(instanceID);
+                                      if (iter == localInstances_.end()) {
+                                          // not a local data-plane instance: nothing to drain
+                                          promise->SetValue(Status::OK());
+                                          return;
+                                      }
+                                      auto instanceProxy = iter->second;
+                                      // Stop accepting new sends NOW, before the sandbox kill: the same
+                                      // not-ready flip the post-kill hold uses (idempotent when the FATAL
+                                      // hold flips it again after the kill).
+                                      auto infoIter = allInstances_.find(instanceID);
+                                      if (infoIter != allInstances_.end()) {
+                                          auto routeInfo = TransferInstanceInfo(infoIter->second, nodeID_);
+                                          routeInfo->isReady = false;
+                                          litebus::Async(instanceProxy->GetAID(), &InstanceProxy::NotifyChanged,
+                                                         instanceID, routeInfo);
+                                      }
+                                      if (timeoutMs == 0) {
+                                          promise->SetValue(Status::OK());
+                                          return;
+                                      }
+                                      PollDrainInFlight(instanceID, instanceProxy->GetAID(), promise,
+                                                        std::chrono::steady_clock::now() +
+                                                            std::chrono::milliseconds(timeoutMs));
+                                  }));
+    return promise->GetFuture();
+}
+
+void InstanceView::PollDrainInFlight(const std::string &instanceID, const litebus::AID &proxyAid,
+                                     const std::shared_ptr<litebus::Promise<Status>> &promise,
+                                     const std::chrono::steady_clock::time_point &deadline)
+{
+    litebus::Async(proxyAid, &InstanceProxy::GetInFlightCount)
+        .OnComplete([this, instanceID, proxyAid, promise, deadline](const litebus::Future<size_t> &fut) {
+            if (fut.IsError()) {
+                // the proxy actor is gone (instance really exiting): nothing left to wait for
+                promise->SetValue(Status::OK());
+                return;
+            }
+            if (fut.Get() == 0) {
+                promise->SetValue(Status::OK());
+                return;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                YRLOG_WARN("instance view drain for instance ({}) timed out with in-flight invokes pending",
+                           instanceID);
+                // The park will be abandoned: roll the not-ready flip back on the
+                // InstanceView mailbox before resolving, so the still-running instance
+                // does not stay wedged with a drained dispatcher.
+                ReleaseDrainInFlight(instanceID);
+                promise->SetValue(Status(StatusCode::ERR_INSTANCE_BUSY,
+                                         "park drain timeout: in-flight invokes still pending on instance " +
+                                             instanceID));
+                return;
+            }
+            // still executing in the live sandbox: poll again shortly, re-entering
+            // through the InstanceView mailbox
+            litebus::TimerTools::AddTimer(
+                PARK_DRAIN_POLL_INTERVAL_MS, timerAid_,
+                [aid(timerAid_), this, instanceID, proxyAid, promise, deadline]() {
+                    litebus::Async(aid, std::make_unique<litebus::MessageHandler>(
+                                            [this, instanceID, proxyAid, promise, deadline](litebus::ActorBase *) {
+                                                PollDrainInFlight(instanceID, proxyAid, promise, deadline);
+                                            }));
+                });
+        });
+}
+
+void InstanceView::ReleaseDrainInFlight(const std::string &instanceID)
+{
+    litebus::Async(timerAid_, std::make_unique<litebus::MessageHandler>(
+                                  [this, instanceID](litebus::ActorBase *) {
+                                      auto iter = localInstances_.find(instanceID);
+                                      if (iter == localInstances_.end()) {
+                                          return;
+                                      }
+                                      auto infoIter = allInstances_.find(instanceID);
+                                      if (infoIter == allInstances_.end()) {
+                                          return;
+                                      }
+                                      // Only flip back when last-known state is RUNNING: a real exit
+                                      // in the meantime is governed by the FATAL-hold path instead.
+                                      if (!IsReadyStatus(
+                                              static_cast<InstanceState>(infoIter->second.instancestatus().code()))) {
+                                          return;
+                                      }
+                                      // Resume WITHOUT the UpdateInfo(ready) replay path: already-delivered
+                                      // invokes are still executing on the live sandbox and must not be
+                                      // re-sent (park11: rollback via NotifyChanged re-delivered the running
+                                      // exec — double execution and a wedged in-flight count).
+                                      litebus::Async(iter->second->GetAID(), &InstanceProxy::ResumeAfterAbandonedDrain);
+                                      YRLOG_INFO("instance view released drain for instance ({}): dispatcher back to ready",
+                                                 instanceID);
+                                  }));
 }
 
 void InstanceView::Reject(const std::string &instanceID, const resources::InstanceInfo &instanceInfo)
