@@ -19,9 +19,13 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+
+#include "async/future.hpp"
+#include "common/status/status.h"
 
 namespace functionsystem::function_proxy {
 
@@ -36,9 +40,21 @@ namespace functionsystem::function_proxy {
  * window are held in the dispatcher call cache instead of failing with
  * ERR_INSTANCE_NOT_FOUND; they are flushed when the instance is restored to
  * RUNNING, or failed with ERR_INSTANCE_EXITED once the hold TTL expires.
+ *
+ * The registry also carries the park drain phase: before a park kills the
+ * sandbox, SnapCtrl asks the data plane (InstanceView provider) to flip the
+ * dispatcher not-ready and wait for already-delivered in-flight invokes to
+ * finish, so no invoke ever straddles the sandbox kill (W6 direction A).
  */
 class ParkedInstanceRegistry {
 public:
+    /**
+     * Quiesce one instance's data plane: stop accepting new invokes and wait
+     * (bounded by timeoutMs) for the outstanding set to reach zero. Returns
+     * ERR_INSTANCE_BUSY on timeout (drain incomplete).
+     */
+    using DrainProvider = std::function<litebus::Future<Status>(const std::string &instanceID, uint64_t timeoutMs)>;
+
     static ParkedInstanceRegistry &Instance()
     {
         static ParkedInstanceRegistry registry;
@@ -57,10 +73,101 @@ public:
         holdSeconds_ = std::chrono::seconds(holdSeconds);
     }
 
+    /**
+     * Inject drain configuration from process flags at startup.
+     * @param timeoutMs how long the drain phase waits for in-flight invokes
+     * @param enable master switch for the drain phase
+     * @param forceOnTimeout true = proceed with the park even on drain timeout
+     *                       (re-introduces the in-flight breakage W6 fixes; experiments only)
+     */
+    void ConfigureDrain(uint32_t timeoutMs, bool enable, bool forceOnTimeout)
+    {
+        std::lock_guard<std::mutex> guard(lock_);
+        drainTimeoutMs_ = timeoutMs;
+        drainEnable_ = enable;
+        drainForceOnTimeout_ = forceOnTimeout;
+    }
+
     bool Enabled() const
     {
         std::lock_guard<std::mutex> guard(lock_);
         return enable_;
+    }
+
+    bool DrainEnabled() const
+    {
+        std::lock_guard<std::mutex> guard(lock_);
+        return drainEnable_;
+    }
+
+    uint32_t DrainTimeoutMs() const
+    {
+        std::lock_guard<std::mutex> guard(lock_);
+        return drainTimeoutMs_;
+    }
+
+    bool DrainForceOnTimeout() const
+    {
+        std::lock_guard<std::mutex> guard(lock_);
+        return drainForceOnTimeout_;
+    }
+
+    /**
+     * Register the data-plane drain implementation (normally InstanceView at
+     * BindTimerContext time, when its serializing mailbox becomes available).
+     * Without a provider DrainInstance succeeds immediately (e.g. unit tests
+     * that never wire an InstanceView).
+     */
+    void SetDrainProvider(const DrainProvider &provider)
+    {
+        std::lock_guard<std::mutex> guard(lock_);
+        drainProvider_ = provider;
+    }
+
+    /**
+     * Register the drain rollback: flip a drained (not-ready) dispatcher back to
+     * ready. Called when a park is abandoned after the drain phase already ran
+     * (drain timeout / PrepareSnap or snapshot failure with the instance still
+     * running) — nothing else would ever flip the dispatcher back.
+     */
+    void SetReleaseDrainProvider(const std::function<void(const std::string &instanceID)> &provider)
+    {
+        std::lock_guard<std::mutex> guard(lock_);
+        releaseDrainProvider_ = provider;
+    }
+
+    /**
+     * Run the drain phase for an instance about to be parked. Succeeds
+     * immediately when drain is disabled or no provider is registered.
+     */
+    litebus::Future<Status> DrainInstance(const std::string &instanceID)
+    {
+        DrainProvider provider;
+        uint64_t timeoutMs = 0;
+        {
+            std::lock_guard<std::mutex> guard(lock_);
+            if (!drainEnable_ || !drainProvider_) {
+                return Status::OK();
+            }
+            provider = drainProvider_;
+            timeoutMs = drainTimeoutMs_;
+        }
+        return provider(instanceID, timeoutMs);
+    }
+
+    /**
+     * Roll back a completed drain phase (park abandoned, instance keeps running).
+     */
+    void ReleaseDrain(const std::string &instanceID)
+    {
+        std::function<void(const std::string &)> provider;
+        {
+            std::lock_guard<std::mutex> guard(lock_);
+            provider = releaseDrainProvider_;
+        }
+        if (provider != nullptr) {
+            provider(instanceID);
+        }
     }
 
     uint32_t HoldSeconds() const
@@ -121,6 +228,11 @@ private:
     bool enable_{ true };
     std::chrono::seconds holdSeconds_{ 300 };
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> parkedUntil_;
+    bool drainEnable_{ true };
+    uint32_t drainTimeoutMs_{ 10000 };
+    bool drainForceOnTimeout_{ false };
+    DrainProvider drainProvider_;
+    std::function<void(const std::string &)> releaseDrainProvider_;
 };
 }  // namespace functionsystem::function_proxy
 

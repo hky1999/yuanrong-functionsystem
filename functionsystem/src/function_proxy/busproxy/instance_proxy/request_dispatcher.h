@@ -88,6 +88,14 @@ public:
         return tenantID_;
     }
 
+    // Outstanding invokes already delivered to the runtime (OnResp + InProgress).
+    // Call on the InstanceProxy actor mailbox; CallCache has no internal locking.
+    size_t GetInFlightCount()
+    {
+        ASSERT_IF_NULL(callCache_);
+        return callCache_->InFlightCount();
+    }
+
     inline void UpdateRemoteAID(const litebus::AID &aid)
     {
         remoteAid_ = aid;

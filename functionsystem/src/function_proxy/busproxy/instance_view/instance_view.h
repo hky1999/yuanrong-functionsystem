@@ -56,10 +56,19 @@ public:
     /**
      * Bind the AID (normally the ObserverActor) whose mailbox serializes the
      * InstanceView bookkeeping; parked-hold expiry timers re-enter through it.
+     * Also registers the park drain provider: the mailbox is what makes it safe
+     * to touch localInstances_/allInstances_ from the drain path.
      */
     void BindTimerContext(const litebus::AID &timerAid)
     {
         timerAid_ = timerAid;
+        auto &registry = function_proxy::ParkedInstanceRegistry::Instance();
+        registry.SetDrainProvider([this](const std::string &instanceID,
+                                         uint64_t timeoutMs) -> litebus::Future<Status> {
+            return DrainInstanceInFlight(instanceID, timeoutMs);
+        });
+        registry.SetReleaseDrainProvider(
+            [this](const std::string &instanceID) { ReleaseDrainInFlight(instanceID); });
     }
 
     Status SubscribeInstanceEvent(const std::string &subscriber, const std::string &targetInstance,
@@ -94,6 +103,18 @@ private:
     // Hold TTL expired without restore: tear the actor down for real (held invokes get
     // ERR_INSTANCE_EXITED), matching the legacy delete failure semantics.
     void OnParkedExpired(const std::string &instanceID);
+    // Park drain phase (W6 direction A): flip the instance's dispatcher not-ready
+    // (stop accepting new sends; arriving invokes land in the call cache like the
+    // post-kill hold) and wait, bounded by timeoutMs, for already-delivered in-flight
+    // invokes to finish while the sandbox is still alive. ERR_INSTANCE_BUSY on timeout.
+    litebus::Future<Status> DrainInstanceInFlight(const std::string &instanceID, uint64_t timeoutMs);
+    void PollDrainInFlight(const std::string &instanceID, const litebus::AID &proxyAid,
+                           const std::shared_ptr<litebus::Promise<Status>> &promise,
+                           const std::chrono::steady_clock::time_point &deadline);
+    // Drain rollback (park abandoned, instance still running): flip the dispatcher
+    // back to ready so held invokes flush to the live sandbox. Idempotent; skips
+    // instances no longer local or not last-known RUNNING.
+    void ReleaseDrainInFlight(const std::string &instanceID);
 
     std::shared_ptr<DataInterfaceClientManagerProxy> dataInterfaceClientManager_ { nullptr };
     std::shared_ptr<ProxyView> proxyView_ { nullptr };

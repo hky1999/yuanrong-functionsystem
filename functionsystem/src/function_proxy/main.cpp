@@ -539,8 +539,10 @@ Status InitLocalSchedulerDriver(const function_proxy::Flags &flags, const std::s
     auto localSchedStartParam = InitLocalSchedParam(flags, dsAuthConfig);
     InitPosixServerOption(flags, localSchedStartParam);
     InitTcpTunnelOption(flags, localSchedStartParam);
-    function_proxy::ParkedInstanceRegistry::Instance().Configure(flags.GetParkedInvokeHoldSeconds(),
-                                                                  flags.GetParkedInvokeDeferEnable());
+    auto &parkedRegistry = function_proxy::ParkedInstanceRegistry::Instance();
+    parkedRegistry.Configure(flags.GetParkedInvokeHoldSeconds(), flags.GetParkedInvokeDeferEnable());
+    parkedRegistry.ConfigureDrain(flags.GetParkDrainTimeoutMs(), flags.GetParkDrainEnable(),
+                                  flags.GetParkDrainForceOnTimeout());
     g_localSchedDriver = std::make_shared<LocalSchedDriver>(std::move(localSchedStartParam), metaStoreClient);
     return Status::OK();
 }

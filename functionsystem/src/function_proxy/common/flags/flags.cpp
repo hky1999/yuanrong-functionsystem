@@ -107,6 +107,10 @@ const uint32_t PARKED_INVOKE_HOLD_SECONDS = 300;
 const uint32_t MIN_PARKED_INVOKE_HOLD_SECONDS = 10;
 const uint32_t MAX_PARKED_INVOKE_HOLD_SECONDS = 1800;
 
+const uint32_t PARK_DRAIN_TIMEOUT_MS = 10000;
+const uint32_t MIN_PARK_DRAIN_TIMEOUT_MS = 0;
+const uint32_t MAX_PARK_DRAIN_TIMEOUT_MS = 60000;
+
 }  // namespace
 using namespace litebus::flag;
 Flags::Flags()
@@ -161,6 +165,14 @@ Flags::Flags()
     AddFlag(&Flags::parkedInvokeHoldSeconds_, "parked_invoke_hold_seconds",
             "how long a parked instance keeps holding data-plane invokes before they fail with instance exited",
             PARKED_INVOKE_HOLD_SECONDS, NumCheck(MIN_PARKED_INVOKE_HOLD_SECONDS, MAX_PARKED_INVOKE_HOLD_SECONDS));
+    AddFlag(&Flags::parkDrainEnable_, "park_drain_enable",
+            "quiesce in-flight invokes (dispatcher not-ready + bounded wait) before a park kills the sandbox", true);
+    AddFlag(&Flags::parkDrainTimeoutMs_, "park_drain_timeout_ms",
+            "how long the park drain phase waits for in-flight invokes before the park is abandoned (0 = flip only)",
+            PARK_DRAIN_TIMEOUT_MS, NumCheck(MIN_PARK_DRAIN_TIMEOUT_MS, MAX_PARK_DRAIN_TIMEOUT_MS));
+    AddFlag(&Flags::parkDrainForceOnTimeout_, "park_drain_force_on_timeout",
+            "proceed with the park even when the drain phase times out (in-flight invokes may break; experiments only)",
+            false);
     AddFlag(&Flags::enablePerf_, "enable_print_perf", "whether enable print perf", false);
     AddFlag(&Flags::enableMetaStore_, "enable_meta_store", "for meta store enable", false);
     AddFlag(&Flags::metaStoreMode_, "meta_store_mode", "meta-store mode, eg. local", "local");

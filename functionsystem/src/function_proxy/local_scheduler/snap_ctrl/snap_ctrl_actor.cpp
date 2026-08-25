@@ -133,23 +133,50 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
         YRLOG_INFO("{}|{}|instance marked parked (snapshot starting), data-plane invokes will be held until restore",
                    requestID, instanceID);
     }
-    // 2. 调用 PrepareSnap 验证实例状态并准备快照
-    return PrepareSnap(requestID, instanceID)
-        .Then([aid(GetAID()), requestID, instanceID, instanceInfo, ttl, markParked,
-               functionAgentMgr(functionAgentMgr_)](const Status &status)
+    // 2. 排空在途 invoke（park drain，W6 方向 A）：杀沙箱前先让数据面静默——
+    //    dispatcher 翻 not-ready 停新，等已投递的在途 invoke 在活沙箱里跑完。
+    //    超时默认放弃本次 park（实例继续运行，上层可重试）；force 策略仅实验用。
+    const bool forceOnDrainTimeout = markParked && parkedRegistry.DrainForceOnTimeout();
+    return parkedRegistry.DrainInstance(instanceID)
+        .Then([this, aid(GetAID()), requestID, instanceID, instanceInfo, ttl, markParked, forceOnDrainTimeout,
+               functionAgentMgr(functionAgentMgr_)](const Status &drainStatus)
                    -> litebus::Future<messages::SnapshotRuntimeResponse> {
-            if (status.IsError()) {
-                YRLOG_ERROR("{}|{}|PrepareSnap failed: {}", requestID, instanceID, status.GetMessage());
-                if (markParked) {
-                    function_proxy::ParkedInstanceRegistry::Instance().Clear(instanceID);
+            if (drainStatus.IsError()) {
+                YRLOG_ERROR("{}|{}|park drain failed: {}", requestID, instanceID, drainStatus.GetMessage());
+                if (!forceOnDrainTimeout) {
+                    // abandon this park: drop the mark, the drain phase already rolled
+                    // the dispatcher back to ready, the instance keeps running
+                    if (markParked) {
+                        function_proxy::ParkedInstanceRegistry::Instance().Clear(instanceID);
+                    }
+                    messages::SnapshotRuntimeResponse errorRsp;
+                    errorRsp.set_code(Status::GetPosixErrorCode(drainStatus.StatusCode()));
+                    errorRsp.set_message(drainStatus.RawMessage());
+                    return errorRsp;
                 }
-                messages::SnapshotRuntimeResponse errorRsp;
-                errorRsp.set_code(Status::GetPosixErrorCode(status.StatusCode()));
-                errorRsp.set_message(status.RawMessage());
-                return errorRsp;
+                YRLOG_WARN("{}|{}|park drain timed out but force is configured, proceeding with the park "
+                           "(in-flight invokes may break)",
+                           requestID, instanceID);
             }
-            // 2. 通过 functionAgentMgr_ 发送 SnapshotRuntime 请求到 function_agent
-            return functionAgentMgr->SnapshotRuntime(requestID, instanceInfo, ttl);
+            // 3. 调用 PrepareSnap 验证实例状态并准备快照
+            return PrepareSnap(requestID, instanceID)
+                .Then([aid, requestID, instanceID, instanceInfo, ttl, markParked,
+                       functionAgentMgr](const Status &status) -> litebus::Future<messages::SnapshotRuntimeResponse> {
+                        if (status.IsError()) {
+                            YRLOG_ERROR("{}|{}|PrepareSnap failed: {}", requestID, instanceID, status.GetMessage());
+                            if (markParked) {
+                                // park abandoned before the kill: roll the drain back too
+                                function_proxy::ParkedInstanceRegistry::Instance().ReleaseDrain(instanceID);
+                                function_proxy::ParkedInstanceRegistry::Instance().Clear(instanceID);
+                            }
+                            messages::SnapshotRuntimeResponse errorRsp;
+                            errorRsp.set_code(Status::GetPosixErrorCode(status.StatusCode()));
+                            errorRsp.set_message(status.RawMessage());
+                            return errorRsp;
+                        }
+                        // 4. 通过 functionAgentMgr_ 发送 SnapshotRuntime 请求到 function_agent
+                        return functionAgentMgr->SnapshotRuntime(requestID, instanceInfo, ttl);
+                    });
         })
         .Then([aid(GetAID()), localSchedSrv(localSchedSrv_), requestID, instanceInfo,
                functionType](const messages::SnapshotRuntimeResponse &runtimeRsp) -> litebus::Future<SnapshotResult> {
@@ -161,6 +188,9 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
                 // snapshot failed: the instance keeps running (or died for real), drop
                 // the park mark so later exit events take the legacy teardown path.
                 if (markParked) {
+                    // park abandoned before the delete: roll the drain back (no-op if
+                    // the instance actually died — the FATAL path then governs)
+                    function_proxy::ParkedInstanceRegistry::Instance().ReleaseDrain(instanceID);
                     function_proxy::ParkedInstanceRegistry::Instance().Clear(instanceID);
                 }
                 return result;

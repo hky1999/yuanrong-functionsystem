@@ -52,6 +52,10 @@ public:
 
     litebus::Future<std::string> GetTenantID();
 
+    // Outstanding invokes already delivered to this instance's runtime; used by the
+    // park drain phase to wait for the data plane to quiesce before the sandbox kill.
+    litebus::Future<size_t> GetInFlightCount();
+
     litebus::Future<SharedStreamMsg> Call(const CallerInfo &callerInfo, const std::string &instanceID,
                                           const SharedStreamMsg &request, const std::shared_ptr<TimePoint> &time);
 
