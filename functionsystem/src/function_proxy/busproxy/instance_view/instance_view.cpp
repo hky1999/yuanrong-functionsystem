@@ -641,10 +641,11 @@ void InstanceView::ReleaseDrainInFlight(const std::string &instanceID)
                                               static_cast<InstanceState>(infoIter->second.instancestatus().code()))) {
                                           return;
                                       }
-                                      auto routeInfo = TransferInstanceInfo(infoIter->second, nodeID_);
-                                      routeInfo->isReady = true;
-                                      litebus::Async(iter->second->GetAID(), &InstanceProxy::NotifyChanged, instanceID,
-                                                     routeInfo);
+                                      // Resume WITHOUT the UpdateInfo(ready) replay path: already-delivered
+                                      // invokes are still executing on the live sandbox and must not be
+                                      // re-sent (park11: rollback via NotifyChanged re-delivered the running
+                                      // exec — double execution and a wedged in-flight count).
+                                      litebus::Async(iter->second->GetAID(), &InstanceProxy::ResumeAfterAbandonedDrain);
                                       YRLOG_INFO("instance view released drain for instance ({}): dispatcher back to ready",
                                                  instanceID);
                                   }));

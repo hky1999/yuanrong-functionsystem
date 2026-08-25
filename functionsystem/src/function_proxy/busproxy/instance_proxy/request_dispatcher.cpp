@@ -472,6 +472,18 @@ void RequestDispatcher::ReportCallLatency(const std::string &requestID, common::
     localStartCallTimeMap_.erase(requestID);
 }
 
+void RequestDispatcher::ResumeAfterAbandonedDrain()
+{
+    // Abandoned park drain rollback: the sandbox was never killed, so already-delivered
+    // invokes (OnResp/InProgress) keep their original channels and must NOT be resent.
+    // Only flush the New set — invokes that arrived while the dispatcher was drained.
+    isReady_ = true;
+    auto reqNew = callCache_->GetNewReqs();
+    for (auto &req : reqNew) {
+        TriggerCall(req);
+    }
+}
+
 void RequestDispatcher::Reject(const std::string &message, const StatusCode &code)
 {
     fatalMsg_ = message;
