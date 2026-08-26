@@ -26,6 +26,7 @@
 #include "async/option.hpp"
 #include "common/constants/constants.h"
 #include "common/constants/signal.h"
+#include "function_proxy/common/parked_instance_registry/parked_instance_registry.h"
 #include "common/create_agent_decision/create_agent_decision.h"
 #include "common/logs/logging.h"
 #include "common/metadata/metadata.h"
@@ -3569,9 +3570,19 @@ litebus::Future<Status> InstanceCtrlActor::UpdateInstanceStatus(const std::share
                    fmt::underlying(state));
         return Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "invalid instance state to change");
     }
-    if (concernedInstance_.find(info->instanceID) == concernedInstance_.end()) {
+    // W7-P2 #1 (consecutive park): a park (snapshot leaveRunning=false) kills the
+    // sandbox deliberately; that exit must drive the normal FATAL cleanup chain
+    // even when the instance is not in concernedInstance_. Restored instances are
+    // NOT re-registered there (resume path skips the running callback that inserts),
+    // so the second park's exit was dropped and the stale state machine then blocked
+    // the wake's ToScheduling with a duplicate-id error (1004).
+    const bool parkedExit = function_proxy::ParkedInstanceRegistry::Instance().IsParked(info->instanceID);
+    if (!parkedExit && concernedInstance_.find(info->instanceID) == concernedInstance_.end()) {
         YRLOG_WARN("instance {} status is not concerned", info->instanceID);
         return UpdateInstanceStatusPromise(info->instanceID, info->statusMsg);
+    }
+    if (parkedExit) {
+        YRLOG_INFO("instance {} exit is a park kill (marked parked), running FATAL cleanup", info->instanceID);
     }
     auto instanceInfo = stateMachine->GetInstanceInfo();
     if (stateMachine->GetOwner() != nodeID_) {
@@ -6203,9 +6214,22 @@ litebus::Future<Status> InstanceCtrlActor::ToScheduling(const std::shared_ptr<me
         auto stateMachine = instanceControlView_->GetInstance(scheduleReq->instance().instanceid());
         if (scheduleReq->instance().instancestatus().code() == static_cast<uint32_t>(InstanceState::NEW) &&
             stateMachine != nullptr) {
-            return Status(StatusCode::ERR_INSTANCE_DUPLICATED,
-                          "you are not allowed to create instance with the same instance id, please kill first " +
-                              scheduleReq->instance().instanceid());
+            // W7-P2 #1 (consecutive park): a wake restores under the ORIGINAL
+            // instance id (resume semantics: sandboxd C/R restores the runtime
+            // verbatim and it reconnects under the old identity). A state machine
+            // left over from the parked life is stale, not a genuine duplicate —
+            // supersede it instead of failing 1004.
+            if (function_proxy::ParkedInstanceRegistry::Instance().IsParked(
+                    scheduleReq->instance().instanceid())) {
+                YRLOG_WARN("superseding stale state machine of parked instance({}) for wake restore",
+                           scheduleReq->instance().instanceid());
+                instanceControlView_->Delete(scheduleReq->instance().instanceid(),
+                                             stateMachine->GetVersion());
+            } else {
+                return Status(StatusCode::ERR_INSTANCE_DUPLICATED,
+                              "you are not allowed to create instance with the same instance id, please kill first " +
+                                  scheduleReq->instance().instanceid());
+            }
         }
     }
     ASSERT_IF_NULL(observer_);
