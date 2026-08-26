@@ -264,6 +264,18 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleWake(const std::string &reque
         rsp.set_message("instance is not parked on this node: " + instanceID);
         return rsp;
     }
+    if (it->second.waking) {
+        // W9: a previous wake for this entry is still in flight (its restore
+        // chain can outlive the monitor's wake cooldown); a second concurrent
+        // wake restores a DUPLICATE instance and the first then fails with a
+        // replay conflict (W8 v7, second green line in the envelope plot).
+        YRLOG_WARN("{}|wake rejected: instance({}) already has a wake in flight", requestID, instanceID);
+        KillResponse rsp;
+        rsp.set_code(static_cast<common::ErrorCode>(StatusCode::ERR_INSTANCE_EXITED));
+        rsp.set_message("wake already in flight for parked instance: " + instanceID);
+        return rsp;
+    }
+    it->second.waking = true;
     const auto checkpointID = it->second.checkpointID;
     YRLOG_INFO("{}|wake parked instance({}) from checkpoint({})", requestID, instanceID, checkpointID);
     return HandleSnapStart(requestID, checkpointID, "")
@@ -296,11 +308,14 @@ KillResponse SnapCtrlActor::OnWakeComplete(const std::string &instanceID, const 
     // kWakeGiveUpAfter consecutive failures; the checkpoint itself stays on
     // disk (park TTL) and signal-19 by checkpointID still works.
     auto it = parkedInstances_.find(instanceID);
-    if (it != parkedInstances_.end() && ++it->second.wakeFails >= kWakeGiveUpAfter) {
-        YRLOG_WARN("wake of instance({}) failed {} times (last: {}), dropping parked entry; "
-                   "signal-19 restore by checkpointID({}) remains available",
-                   instanceID, it->second.wakeFails, msg, it->second.checkpointID);
-        ForgetParked(instanceID);
+    if (it != parkedInstances_.end()) {
+        it->second.waking = false;  // settled: pickable again on the next retry
+        if (++it->second.wakeFails >= kWakeGiveUpAfter) {
+            YRLOG_WARN("wake of instance({}) failed {} times (last: {}), dropping parked entry; "
+                       "signal-19 restore by checkpointID({}) remains available",
+                       instanceID, it->second.wakeFails, msg, it->second.checkpointID);
+            ForgetParked(instanceID);
+        }
     }
     return rsp;
 }
@@ -330,6 +345,10 @@ std::vector<std::pair<std::string, SnapCtrlActor::ParkedEntry>> SnapCtrlActor::G
     std::vector<std::pair<std::string, ParkedEntry>> out;
     out.reserve(parkedInstances_.size());
     for (const auto &entry : parkedInstances_) {
+        if (entry.second.waking) {
+            // a wake is in flight for this entry: invisible to the FIFO picker
+            continue;
+        }
         out.emplace_back(entry.first, entry.second);
     }
     return out;

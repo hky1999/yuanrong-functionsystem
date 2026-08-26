@@ -409,6 +409,14 @@ public:
         return usageAwareSafety_;
     }
 
+    // G3b A/B one-off (scratch-only builds): floor the admission safety when the
+    // image's deploy env bakes a leftover experiment value (0.2). Canonical keeps
+    // the plain getter only; this setter exists solely for the scratch clamp.
+    void SetUsageAwareSafetyForTest(double v)
+    {
+        usageAwareSafety_ = v;
+    }
+
     double GetOvercommitRatio() const
     {
         return overcommitRatio_;

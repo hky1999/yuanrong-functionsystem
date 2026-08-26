@@ -111,6 +111,13 @@ public:
         // restore keeps timing out (e.g. RPC deadline < 24G restore) must not
         // be retried forever; kWakeGiveUpAfter drops the entry
         uint32_t wakeFails = 0;
+        // W9: a wake for this entry is IN FLIGHT. The restore chain can take
+        // minutes and its response may time out and retry at the localSchedSrv
+        // layer (W8 v7 log: the monitor re-picked the same entry after its
+        // 300s cooldown while the first wake's deploy chain was still retrying,
+        // producing a duplicate restore and a replay-conflict failure). Entries
+        // with a live wake are skipped by the picker; reset only when it settles.
+        bool waking = false;
     };
 
     /**
