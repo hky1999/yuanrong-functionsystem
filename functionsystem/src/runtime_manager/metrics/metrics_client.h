@@ -38,6 +38,10 @@ public:
     void DeleteInstanceMetrics(const std::string &deployDir,
                                const std::string &instanceID) const;
 
+    // D-7: feed per-instance sandbox memory (MB) into the reported resource
+    // view (runsc reports no pid, so the pid-based collector cannot)
+    void UpdateInstanceMemoryUsage(const std::string &instanceID, double memoryMb) const;
+
     resources::ResourceUnit GetResourceUnit() const;
 
     litebus::Future<Status> InitializeSandboxRuntimeCapabilities(const std::set<std::string> &runtimes) const;

@@ -34,49 +34,16 @@
 #include "common/rpc/client/grpc_client.h"
 #include "common/status/status.h"
 #include "healthcheck/health_check.h"
+#include "runtime_manager/ckpt/ckpt_file_manager.h"
+#include "runtime_manager/ckpt/ckpt_file_manager_actor.h"
 #include "runtime_manager/config/command_builder.h"
 #include "runtime_manager/executor/executor.h"
 #include "runtime_manager/executor/sandboxd/runtime_state_manager.h"
-#include "runtime_manager/port/port_manager.h"
 #include "sandboxd_checkpoint_orchestrator.h"
 #include "sandboxd_request_builder.h"
 
-namespace functionsystem {
-class ActorWorker;
-}
-
 namespace functionsystem::runtime_manager {
 
-struct SandboxdRestoreResult {
-    SandboxdRestoreResult() = default;
-
-    explicit SandboxdRestoreResult(Status statusValue, std::string sandboxIDValue = {},
-                                   std::vector<std::string> portsValue = {}, std::string sandboxIPValue = {})
-        : status(statusValue), sandboxID(std::move(sandboxIDValue)), ports(std::move(portsValue)),
-          sandboxIP(std::move(sandboxIPValue))
-    {
-    }
-
-    Status status;
-    std::string sandboxID;
-    std::vector<std::string> ports;
-    std::string sandboxIP;
-};
-
-struct SandboxdListResult {
-    Status status;
-    runtime::v1::ListSandboxesResponse response;
-};
-
-struct SandboxdResumeIdentity {
-    bool trusted{false};
-    bool reusable{false};
-    bool rejected{false};
-    std::string logicalRequestID;
-    std::string tenantID;
-    std::string snapshotID;
-    std::map<std::string, std::string> labels;
-};
 
 /**
  * SandboxdStartGuard — RAII guard for the in-progress start lifecycle.
@@ -84,8 +51,7 @@ struct SandboxdResumeIdentity {
  * On construction:  registers an in-progress Future in RuntimeStateManager.
  * On destruction:   if Commit() was never called, calls Unregister() to roll
  *                   back all state — ensuring no map entries leak on failure.
- * On Commit():      records physical success. The lifecycle owner clears the
- *                   in-progress fence only after finalization/cleanup.
+ * On Commit():      transitions state to "active" (MarkStartDone).
  *
  * The guard keeps failed starts from leaking state into actor-owned maps.
  */
@@ -101,7 +67,8 @@ public:
     ~SandboxdStartGuard()
     {
         if (!committed_) {
-            mgr_.RollbackUncommittedStart(runtimeID_);
+            // Start path did not complete successfully — remove all residual state.
+            mgr_.Unregister(runtimeID_);
         }
     }
 
@@ -109,6 +76,7 @@ public:
     void Commit()
     {
         committed_ = true;
+        mgr_.MarkStartDone(runtimeID_);
     }
 
     SandboxdStartGuard(const SandboxdStartGuard &) = delete;
@@ -154,6 +122,15 @@ public:
         healthCheckClient_ = healthCheck;
     }
 
+    // D-7: wire per-instance sandbox memory (MB) from the sandboxd Stats poll
+    // into the resource view. Under runsc the pid-based collector reports
+    // nothing (MakeSuccessStartResponse sets pid=0), so this feed is the only
+    // source of per-instance actualuse.
+    void SetInstanceMemoryUsageReporter(std::function<void(const std::string &, double)> reporter)
+    {
+        instanceMemoryUsageReporter_ = std::move(reporter);
+    }
+
     // ── Executor interface ────────────────────────────────────────────────────
 
     litebus::Future<messages::StartInstanceResponse> StartInstance(
@@ -178,9 +155,6 @@ public:
 
     litebus::Future<messages::UpdateCredResponse> UpdateCredForRuntime(
         const std::shared_ptr<messages::UpdateCredRequest> &request) override;
-    litebus::Future<messages::UpdateNetworkPolicyResponse> UpdateNetworkPolicyForRuntime(
-        const std::shared_ptr<messages::UpdateNetworkPolicyRequest> &request) override;
-
 
     litebus::Future<Status> NotifyInstancesDiskUsageExceedLimit(const std::string &description,
                                                                 const int limit) override;
@@ -201,16 +175,7 @@ public:
     static std::vector<PortForwardConfig> ParseForwardPorts(const std::string &networkJson);
     static bool IsRetryableWaitError(const Status &status);
     static uint32_t SandboxReclaimBackoffMs(uint32_t failedAttempts);
-    static bool IsResultUnknownRpcError(const Status &status);
-    static std::vector<::messages::SandboxPhysicalFact> ProjectPhysicalFacts(
-        const runtime::v1::ListSandboxesResponse &listResponse);
-    static Status BuildPortReservationsFromPhysicalFacts(
-        const runtime::v1::ListSandboxesResponse &listResponse,
-        PortManager::ReservationMap &reservations);
-    static Status ResolveLocalSnapshotDirectory(
-        const std::string &checkpointRoot, const std::string &snapshotID,
-        std::string &checkpointDirectory);
-    static std::string RestoreSandboxID(const std::string &runtimeID);
+
 protected:
     void Init() override;
     void Finalize() override;
@@ -222,16 +187,7 @@ protected:
     }
 
 private:
-    Status ResolveAndRegisterRuntime(const std::shared_ptr<messages::StartInstanceRequest> &request);
-    void ApplyRuntimeControlEnvironment(runtime::v1::StartRequest &request) const;
-    void ApplyRuntimeControlEnvironment(
-        const std::string &runtimeClass,
-        google::protobuf::Map<std::string, std::string> *envs) const;
-    static SandboxdResumeIdentity ConsumeRestoreIdentity(messages::StartInstanceRequest &request);
-    static bool IsRestoreRequest(const messages::RuntimeInstanceInfo &info);
-    static Status BuildSnapshotCheckpointPlan(
-        const messages::SnapshotRuntimeRequest &request, const std::string &sandboxID,
-        CheckpointPlan &plan);
+
     // ── Start paths: normal / warm-up (Register) / restore (Restore) ───────────
 
     struct SandboxdStartContext {
@@ -241,7 +197,6 @@ private:
         Envs envs;
         std::vector<int> cardIDs;
         std::shared_ptr<SandboxdStartGuard> guard;
-        SandboxdResumeIdentity resumeIdentity;
     };
 
     struct SandboxdRestoreContext {
@@ -265,10 +220,8 @@ private:
         const runtime::v1::StartResponse &response, const std::shared_ptr<messages::StartInstanceRequest> &request,
         std::shared_ptr<SandboxdStartGuard> guard);
 
-    litebus::Future<messages::StartInstanceResponse> OnStartCompleted(
-        const std::string &runtimeID, const messages::StartInstanceResponse &response);
-    void OnPendingDeleteCompleted(const std::string &runtimeID,
-                                  const litebus::Future<Status> &future);
+    litebus::Future<messages::StartInstanceResponse> OnStartCompleted(const std::string &runtimeID,
+                                                                      const messages::StartInstanceResponse &response);
 
     // Warm-up: register a reusable SandboxTemplate via the Register RPC.
     litebus::Future<messages::StartInstanceResponse> StartWarmUp(
@@ -278,33 +231,19 @@ private:
         const runtime::v1::NormalResponse &response, const std::shared_ptr<messages::StartInstanceRequest> &request,
         std::shared_ptr<SandboxdStartGuard> guard);
 
-    // Restore uses the flat checkpoint-root/snapshotID directory materialized
-    // by FunctionAgent.
+    // Restore: download checkpoint -> add ref -> Restore RPC.
     litebus::Future<messages::StartInstanceResponse> StartBySnapshot(const SandboxdStartContext &context);
-    litebus::Future<messages::StartInstanceResponse> StartFromMaterializedCheckpoint(
+    litebus::Future<messages::StartInstanceResponse> OnCheckpointDownloaded(const std::string &checkpointPath,
+                                                                            const SandboxdStartContext &context);
+    litebus::Future<messages::StartInstanceResponse> OnCheckpointRefAdded(const Status &refStatus,
         const SandboxdRestoreContext &context);
-    litebus::Future<messages::StartInstanceResponse> ReconcileBeforeResumeRestore(
-        const SandboxdRestoreContext &context);
-    litebus::Future<messages::StartInstanceResponse> RestoreAfterExactAbsence(
-        const SandboxdRestoreContext &context);
-    litebus::Future<messages::StartInstanceResponse> OnResumeRestoreUncertain(
-        const SandboxdRestoreResult &result, const SandboxdRestoreContext &context,
-        const std::shared_ptr<runtime::v1::StartRequest> &startReq, bool retried);
     litebus::Future<messages::StartInstanceResponse> OnRestoreDone(
-        const SandboxdRestoreResult &result, const std::shared_ptr<messages::StartInstanceRequest> &request,
-        std::shared_ptr<SandboxdStartGuard> guard, bool trustedResume, bool exactExisting = false);
+        const runtime::v1::RestoreResponse &response, const std::shared_ptr<messages::StartInstanceRequest> &request,
+        std::shared_ptr<SandboxdStartGuard> guard);
 
     // ── Stop helpers ──────────────────────────────────────────────────────────
 
-    litebus::Future<Status> StopSandbox(
-        const std::shared_ptr<messages::StopInstanceRequest> &request, bool oomKilled);
-    litebus::Future<Status> StopExactResumeSandboxAfterAgentRestart(
-        const std::string &runtimeID, const std::string &requestID,
-        const std::string &logicalInstanceID, const std::string &targetAttemptID);
-    litebus::Future<Status> OnExactResumeCleanupListed(
-        const std::string &runtimeID, const std::string &requestID,
-        const std::string &logicalInstanceID, const std::string &targetAttemptID,
-        const SandboxdListResult &listed);
+    litebus::Future<Status> StopSandbox(const std::string &runtimeID, const std::string &requestID, bool oomKilled);
     litebus::Future<Status> TerminateSandbox(const std::string &runtimeID, const std::string &requestID,
                                              const std::string &sandboxID, bool force);
     litebus::Future<Status> OnDeleteDone(const std::string &runtimeID, const std::string &requestID,
@@ -317,22 +256,20 @@ private:
     // ── gRPC call wrappers (thin, no business logic) ──────────────────────────
 
     litebus::Future<runtime::v1::ListSandboxesResponse> DoList();
-    litebus::Future<SandboxdListResult> DoListForOperation(
-        const std::string &sandboxID, const std::map<std::string, std::string> &selector = {});
     litebus::Future<runtime::v1::StartResponse> DoStart(const std::shared_ptr<messages::StartInstanceRequest> &request,
                                                         const std::shared_ptr<runtime::v1::StartRequest> &startReq);
 
-    litebus::Future<Status> DoDelete(const std::string &instanceID, const std::string &runtimeID,
-                                     const std::string &requestID,
-                                     const std::shared_ptr<runtime::v1::DeleteRequest> &req);
+    litebus::Future<runtime::v1::DeleteResponse> DoDelete(const std::string &instanceID, const std::string &runtimeID,
+                                                          const std::string &requestID,
+        const std::shared_ptr<runtime::v1::DeleteRequest> &req);
 
     litebus::Future<runtime::v1::NormalResponse> DoRegister(const std::shared_ptr<runtime::v1::RegisterRequest> &req);
     litebus::Future<runtime::v1::NormalResponse> DoUnregister(
         const std::shared_ptr<runtime::v1::UnregisterRequest> &req);
     litebus::Future<runtime::v1::GetRegisteredResponse> DoGetRegistered();
-    litebus::Future<SandboxdRestoreResult> DoStartFromCheckpoint(
+    litebus::Future<runtime::v1::RestoreResponse> DoRestore(
         const std::shared_ptr<messages::StartInstanceRequest> &request,
-        const std::shared_ptr<runtime::v1::StartRequest> &startReq);
+        const std::shared_ptr<runtime::v1::RestoreRequest> &req);
 
     void DoWait(const std::string &sandboxID, const std::string &runtimeID);
     void RestoreWait(const std::string &sandboxID);
@@ -357,8 +294,7 @@ private:
                                                  const std::string &requestID,
                                                  litebus::Try<runtime::v1::DeleteResponse> response);
 
-    litebus::Future<Status> OnWaitDone(const std::string &runtimeID, const std::string &sandboxID,
-                                      const runtime::v1::WaitResponse &response);
+    litebus::Future<Status> OnWaitDone(const std::string &runtimeID, const runtime::v1::WaitResponse &response);
 
     static void StartSandboxCreateSpan(const std::shared_ptr<messages::StartInstanceRequest> &request);
     static void StopSandboxCreateSpan(const std::shared_ptr<messages::StartInstanceRequest> &request,
@@ -375,9 +311,6 @@ private:
     // ── Connectivity ──────────────────────────────────────────────────────────
 
     void Sync();
-    Status OnStartupPhysicalFacts(const SandboxdListResult &listed);
-    void RetryStartupPhysicalFacts();
-    void ScheduleStartupPhysicalFactsRetry();
     void ReconnectContainerd();
     void OnReconnectContainerd();
     void CheckConnectivity();
@@ -423,18 +356,6 @@ private:
                                  const std::string &port, CommandArgs *cmdArgs);
     Status ApplyPortForwardMappings(SandboxdStartParams *params,
         const std::shared_ptr<messages::StartInstanceRequest> &request);
-    Status ApplySandboxPhysicalPortMappings(
-        const std::string &runtimeID,
-        const std::shared_ptr<messages::StartInstanceRequest> &request,
-        const std::vector<std::string> &physicalPorts);
-    Status ApplyExistingSandboxPhysicalPortMappings(
-        const std::string &runtimeID,
-        const std::shared_ptr<messages::StartInstanceRequest> &request,
-        const std::vector<std::string> &physicalPorts);
-    Status DecodeSandboxPhysicalPortMappings(
-        const std::shared_ptr<messages::StartInstanceRequest> &request,
-        const std::vector<std::string> &physicalPorts,
-        std::vector<int> &hostPorts, std::string &portMappingsJson) const;
 
     // ── State ─────────────────────────────────────────────────────────────────
 
@@ -442,23 +363,21 @@ private:
     CommandBuilder cmdBuilder_{false};
     std::shared_ptr<GrpcClient<runtime::v1::SandboxService>> sandboxd_{nullptr};
     std::shared_ptr<HealthCheck> healthCheckClient_;
+    // D-7: invoked on every sandboxd Stats poll with (instanceID, memory MB)
+    std::function<void(const std::string &, double)> instanceMemoryUsageReporter_;
+    std::shared_ptr<CkptFileManager> ckptFileManager_;
     std::shared_ptr<SandboxdCheckpointOrchestrator> ckptOrch_;
-    std::string checkpointRoot_;
     // runtimeIDs registered as warm-up templates (route StopInstance -> Unregister)
     std::unordered_set<std::string> warmupRuntimes_;
     std::unordered_set<std::string> registeredTemplateIDs_;
-    std::unordered_map<std::string,
-                       std::vector<std::shared_ptr<litebus::Promise<Status>>>> pendingDeleteWaiters_;
     litebus::AID functionAgentAID_;
+    std::string checkpointDir_;  // resolved base dir for checkpoint artifacts
     AvailableRuntimesCallback availableRuntimesCallback_;
     bool reconnecting_ = false;
     bool synced_       = false;
     bool fetchingAvailableRuntimes_ = false;
     bool availableRuntimesInitialized_ = false;
     bool availableRuntimesRetryScheduled_ = false;
-    bool startupPhysicalFactsReady_ = false;
-    bool startupPhysicalFactsRetryScheduled_ = false;
-    std::unordered_map<std::string, runtime::v1::RuntimeInfo> runtimeCapabilities_;
 
     // ── Reconciliation state ─────────────────────────────────────────────────
     uint32_t orphanGracePeriodSec_ = kDefaultOrphanGracePeriodSec;
@@ -474,6 +393,7 @@ private:
     std::unordered_map<std::string, SandboxLifecycleStatus> sandboxLifecycleStates_;
     std::unordered_set<std::string> userInitiatedTerminateRuntimes_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> sandboxRunningStartTimes_;
+
     struct SandboxReclaimState {
         std::string sandboxID;
         uint32_t failedAttempts = 0;

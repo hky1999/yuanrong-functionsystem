@@ -74,6 +74,8 @@ public:
                 (const function_proxy::UpdateFuncMetasFunc &updateFuncMetasFunc), (override));
     MOCK_METHOD(void, SetTrafficReportCbFunc,
                 (const function_proxy::TrafficReportCbFunc &trafficReportCbFunc), (override));
+    MOCK_METHOD(void, SetInstanceUsedCbFunc,
+                (const function_proxy::InstanceUsedCbFunc &instanceUsedCbFunc), (override));
 
     MOCK_METHOD(void, Attach, (const std::shared_ptr<InstanceListener> &listener), (const, override));
 

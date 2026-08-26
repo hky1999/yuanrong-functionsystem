@@ -107,7 +107,8 @@ litebus::Future<messages::UpdateNetworkPolicyResponse> FunctionAgentMgr::UpdateN
 litebus::Future<messages::SnapshotRuntimeResponse> FunctionAgentMgr::SnapshotRuntime(
     const std::string &requestID,
     const resource_view::InstanceInfo &instanceInfo,
-    int32_t ttl)
+    int32_t ttl,
+    bool leaveRunning)
 {
     ASSERT_IF_NULL(actor_);
     return litebus::Async(actor_->GetAID(),
@@ -177,6 +178,8 @@ litebus::Future<std::optional<messages::LocalSnapshotMetadata>> FunctionAgentMgr
     ASSERT_IF_NULL(actor_);
     return litebus::Async(actor_->GetAID(), &FunctionAgentMgrActor::LatestAnonymousSnapshot,
                           instanceID);
+    return litebus::Async(actor_->GetAID(), &FunctionAgentMgrActor::SnapshotRuntime, requestID, instanceInfo, ttl,
+                          leaveRunning);
 }
 
 litebus::Future<messages::ReconcileRuntimesResponse> FunctionAgentMgr::ReconcileRuntimes(

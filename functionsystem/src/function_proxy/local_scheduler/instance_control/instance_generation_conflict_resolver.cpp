@@ -93,23 +93,6 @@ bool InstanceGenerationConflictResolver::IsExactPersistenceFailure(const Transit
            previousInfo.tenantid() == contenderSnapshot_.tenantid();
 }
 
-bool InstanceGenerationConflictResolver::IsExactRemoteOwnerPersistenceConflict(
-    const TransitionResult &result) const
-{
-    const auto &previousInfo = result.previousInfo;
-    const auto &savedInfo = result.savedInfo;
-    return !arbitrationEnabled_ && result.preState.IsNone() &&
-           result.status.StatusCode() == StatusCode::INSTANCE_TRANSACTION_WRONG_VERSION &&
-           previousInfo.instancestatus().code() == static_cast<int32_t>(InstanceState::CREATING) &&
-           previousInfo.version() == contenderSnapshot_.version() &&
-           MatchesContenderGenerationView(previousInfo) &&
-           savedInfo.instanceid() == contenderSnapshot_.instanceid() &&
-           savedInfo.function() == contenderSnapshot_.function() &&
-           savedInfo.tenantid() == contenderSnapshot_.tenantid() &&
-           !savedInfo.functionproxyid().empty() &&
-           savedInfo.functionproxyid() != contenderSnapshot_.functionproxyid();
-}
-
 bool InstanceGenerationConflictResolver::IsReusableWinner(
     const InstanceInfo &winnerInfo, const std::string &localProxyID) const
 {

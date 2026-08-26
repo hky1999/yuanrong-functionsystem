@@ -20,11 +20,11 @@
 #include <actor/actor.hpp>
 #include <async/future.hpp>
 #include <chrono>
-#include <cstdint>
-#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "common/logs/logging.h"
@@ -34,35 +34,34 @@
 #include "common/state_machine/instance_control_view.h"
 #include "common/state_machine/instance_state_machine.h"
 #include "common/status/status.h"
-#include "common/utils/actor_worker.h"
 #include "function_proxy/common/posix_client/control_plane_client/control_interface_client_manager_proxy.h"
 #include "local_scheduler/function_agent_manager/function_agent_mgr_actor.h"
 #include "local_scheduler/instance_control/instance_ctrl.h"
 #include "local_scheduler/local_scheduler_service/local_sched_srv.h"
-#include "local_scheduler/snap_ctrl/instance_lifecycle.h"
-#include "local_scheduler/snap_ctrl/resume_attempt_registry.h"
 
 namespace functionsystem::local_scheduler {
 
 class FunctionAgentMgr;
 class LocalSchedSrv;
 class InstanceCtrlActor;
-
-struct PauseRetryPolicy {
-    uint64_t initialDelayMs{ 10 };
-    uint64_t maximumDelayMs{ 1'000 };
-    uint64_t operationTimeoutMs{ 60'000 };
-};
+class IdleMgr;
 
 class SnapCtrlActor : public BasisActor {
 public:
-    SnapCtrlActor(const std::string &name, const std::string &nodeID,
-                  PauseRetryPolicy pauseRetryPolicy = {});
+    SnapCtrlActor(const std::string &name, const std::string &nodeID);
     ~SnapCtrlActor() override = default;
 
     void Init() override;
 
-    void Finalize() override;
+    // consecutive non-terminal wake failures after which the parked entry is
+    // dropped (D-5 F4); the checkpoint stays restorable via signal 19
+    static constexpr uint32_t kWakeGiveUpAfter = 3;
+    // W16: stale-state-machine transients re-wake immediately (self-healing
+    // class — the emitting branch already superseded the machine); bounded
+    // separately from the F4 budget. 1.5s lets the domain layer's own in-
+    // flight re-dispatch settle before the retry reads the machine table.
+    static constexpr uint32_t kWakeStaleRetryMax = 4;
+    static constexpr uint64_t kWakeStaleRetryDelayMs = 1500;
 
     /**
      * Handle INSTANCE_SNAPSHOT_SIGNAL
@@ -76,16 +75,16 @@ public:
                                                   const std::string &instanceID,
                                                   const std::string &payload);
 
-    litebus::Future<KillResponse> HandleAnonymousCheckpoint(
-        const std::string &requestID, const std::string &instanceID,
-        uint64_t checkpointTimeoutMs = 0);
-
     /**
-     * Callback to convert SnapshotResult to KillResponse
+     * Callback to convert SnapshotResult to KillResponse. Also maintains the
+     * parked registry: a successful leaveRunning=false snapshot parks the
+     * instance (checkpoint + delete), so it is recorded for wake/FIFO unpark.
+     * @param instanceID: ID of the snapshotted instance (registry key)
+     * @param leaveRunning: false = the instance was parked by this snapshot
      * @param result: The snapshot result
      * @return KillResponse with appropriate code and payload
      */
-    KillResponse OnHandleSnapshot(const SnapshotResult &result);
+    KillResponse OnHandleSnapshot(const std::string &instanceID, bool leaveRunning, const SnapshotResult &result);
 
     /**
      * Handle INSTANCE_SNAPSTART_SIGNAL
@@ -99,11 +98,46 @@ public:
                                                    const std::string &checkpointID,
                                                    const std::string &payload);
 
-    litebus::Future<DeletePreparation> PrepareForAuthorizedDelete(const std::string &instanceID);
+    /**
+     * Handle INSTANCE_WAKE_SNAPSHOT_SIGNAL: wake one parked instance by its
+     * ORIGINAL instanceID. Looks the instance up in the parked registry and
+     * SnapStarts it from the recorded checkpoint; the registry entry is
+     * dropped once the restore succeeds (the restored instance re-uses the
+     * original instanceID, see SnapshotScheduler::BuildScheduleRequest).
+     * @param requestID: Request ID for tracing
+     * @param instanceID: ORIGINAL instanceID of the parked instance
+     * @return KillResponse with restore result
+     */
+    litebus::Future<KillResponse> HandleWake(const std::string &requestID, const std::string &instanceID);
 
-    litebus::Future<Status> FinishAuthorizedDelete(const std::string &instanceID, uint64_t generation);
+    /** Registry entry for one parked instance. */
+    struct ParkedEntry {
+        std::string checkpointID;
+        std::chrono::steady_clock::time_point parkedAt;
+        // consecutive non-terminal wake failures (D-5 F4): a checkpoint whose
+        // restore keeps timing out (e.g. RPC deadline < 24G restore) must not
+        // be retried forever; kWakeGiveUpAfter drops the entry
+        uint32_t wakeFails = 0;
+        // W9: a wake for this entry is IN FLIGHT. The restore chain can take
+        // minutes and its response may time out and retry at the localSchedSrv
+        // layer (W8 v7 log: the monitor re-picked the same entry after its
+        // 300s cooldown while the first wake's deploy chain was still retrying,
+        // producing a duplicate restore and a replay-conflict failure). Entries
+        // with a live wake are skipped by the picker; reset only when it settles.
+        bool waking = false;
+        // W16: consecutive stale-state-machine transients superseded by this
+        // wake chain. Self-healing class: the supersede clears the blocker, so
+        // the next attempt succeeds — re-wake immediately instead of riding
+        // the monitor cooldown (21s -> ~3s observed), and never burn the
+        // D-5 F4 give-up budget on it.
+        uint32_t staleRetries = 0;
+    };
 
-    litebus::Future<Status> DeletePauseSnapshot(const resources::InstanceInfo &instanceInfo);
+    /**
+     * Copy of the parked registry (actor-executed) for the pressure
+     * monitor's FIFO fallback unpark.
+     */
+    std::vector<std::pair<std::string, ParkedEntry>> GetParkedInstances();
 
     /**
      * Handle snapstart instance initialization after state transition to CREATING
@@ -119,8 +153,7 @@ public:
         const std::shared_ptr<litebus::Promise<messages::ScheduleResponse>> scheduleResp,
         const std::shared_ptr<messages::ScheduleRequest> &scheduleReq,
         const schedule_decision::ScheduleResult &result,
-        const TransitionResult &transResult,
-        const std::shared_ptr<const resume_identity::TrustedResumeIdentity> &trustedResumeIdentity = nullptr);
+        const TransitionResult &transResult);
 
     /**
      * Bind the FunctionAgentMgr for sending snapshot requests to agents
@@ -168,306 +201,16 @@ public:
     }
 
     /**
-     * Bind the per-instance reverse-tunnel admission gate.  The acquire
-     * callback returns false when a tunnel is active; a successful acquire is
-     * paired with exactly one release after the reusable Snapshot operation
-     * reaches a terminal response.
+     * Bind the IdleMgr so a successful park can clear the instance's idle
+     * bookkeeping before its ID is reused by the restore (D-5 F1).
+     * @param idleMgr: The idle subsystem interface
      */
-    void BindReusableSnapshotTunnelGate(
-        std::function<bool(const std::string &)> acquire,
-        std::function<void(const std::string &)> release)
+    void BindIdleMgr(const std::shared_ptr<IdleMgr> &idleMgr)
     {
-        reusableSnapshotTunnelGateAcquire_ = std::move(acquire);
-        reusableSnapshotTunnelGateRelease_ = std::move(release);
+        idleMgr_ = idleMgr;
     }
 
-    /** Replay exact RESUME_COMMITTED cleanup for an already RUNNING winner. */
-    void ReplayCommittedResumeFinalize(
-        const std::shared_ptr<messages::ScheduleRequest> &sourceRequest,
-        const resources::InstanceInfo &authoritative,
-        const resume_identity::TrustedResumeIdentity &identity);
-
 private:
-    struct AnonymousCheckpointContext {
-        std::string requestID;
-        std::string instanceID;
-        std::string snapshotID;
-        resources::InstanceInfo instanceInfo;
-        messages::SnapshotRuntimeResponse snapshotResponse;
-        std::shared_ptr<litebus::Promise<KillResponse>> completion;
-        std::chrono::steady_clock::time_point snapStartedDeadline;
-    };
-
-    void OnAnonymousCheckpointPrepared(
-        const std::shared_ptr<AnonymousCheckpointContext> &context,
-        const litebus::Future<Status> &future);
-    void OnAnonymousCheckpointCreated(
-        const std::shared_ptr<AnonymousCheckpointContext> &context,
-        const litebus::Future<messages::SnapshotRuntimeResponse> &future);
-    void RetryAnonymousCheckpointClient(
-        const std::shared_ptr<AnonymousCheckpointContext> &context);
-    void OnAnonymousCheckpointClient(
-        const std::shared_ptr<AnonymousCheckpointContext> &context,
-        const litebus::Future<std::shared_ptr<ControlInterfacePosixClient>> &future);
-    void OnAnonymousCheckpointStarted(
-        const std::shared_ptr<AnonymousCheckpointContext> &context,
-        const litebus::Future<runtime::SnapStartedResponse> &future);
-    static void CompleteAnonymousCheckpoint(
-        const std::shared_ptr<AnonymousCheckpointContext> &context,
-        common::ErrorCode code, const std::string &message);
-
-    struct ReusableSnapshotContext {
-        std::string requestID;
-        std::string instanceID;
-        std::string snapshotID;
-        std::string name;
-        resources::InstanceInfo sourceInstanceInfo;
-        ::messages::SnapshotArtifact artifact;
-        ::core_service::SnapshotInfo publicInfo;
-        std::shared_ptr<litebus::Promise<KillResponse>> completion;
-        bool tunnelGateHeld{ false };
-        bool completed{ false };
-    };
-
-    litebus::Future<KillResponse> HandleReusableSnapshot(
-        const std::string &requestID, const std::string &instanceID,
-        const resources::InstanceInfo &instanceInfo, const SnapOptions &options);
-    void OnReusableSnapshotBegun(
-        const std::shared_ptr<ReusableSnapshotContext> &context,
-        const litebus::Future<::messages::BeginReusableSnapshotResponse> &future);
-    void OnReusableSnapshotResolvedForCleanup(
-        const std::shared_ptr<ReusableSnapshotContext> &context,
-        const litebus::Future<::messages::ResolveReusableSnapshotForCreateResponse> &future);
-    void OnReusableSnapshotPrepared(
-        const std::shared_ptr<ReusableSnapshotContext> &context,
-        const litebus::Future<Status> &future);
-    void OnReusableSnapshotCheckpointed(
-        const std::shared_ptr<ReusableSnapshotContext> &context,
-        const litebus::Future<::messages::SnapshotRuntimeResponse> &future);
-    void OnReusableSnapshotPublished(
-        const std::shared_ptr<ReusableSnapshotContext> &context,
-        const litebus::Future<::messages::SnapshotRuntimeResponse> &future);
-    void OnReusableSnapshotClient(
-        const std::shared_ptr<ReusableSnapshotContext> &context,
-        const litebus::Future<std::shared_ptr<ControlInterfacePosixClient>> &future);
-    void OnReusableSnapshotStarted(
-        const std::shared_ptr<ReusableSnapshotContext> &context,
-        const litebus::Future<runtime::SnapStartedResponse> &future);
-    void OnReusableSnapshotCommitted(
-        const std::shared_ptr<ReusableSnapshotContext> &context,
-        const litebus::Future<::messages::CommitReusableSnapshotResponse> &future);
-    void OnReusableSnapshotFinalized(
-        const std::shared_ptr<ReusableSnapshotContext> &context,
-        ::messages::SnapshotAttemptFinalizeOperation operation,
-        common::ErrorCode terminalCode, const std::string &terminalMessage,
-        const litebus::Future<::messages::SnapshotAttemptFinalizeResponse> &future);
-    void OnReusableSnapshotFailedRecord(
-        const std::shared_ptr<ReusableSnapshotContext> &context,
-        common::ErrorCode terminalCode, const std::string &terminalMessage,
-        const litebus::Future<::messages::FailReusableSnapshotResponse> &future);
-    void FailReusableSnapshot(
-        const std::shared_ptr<ReusableSnapshotContext> &context,
-        common::ErrorCode code, const std::string &message);
-    void FinalizeReusableSnapshot(
-        const std::shared_ptr<ReusableSnapshotContext> &context,
-        ::messages::SnapshotAttemptFinalizeOperation operation,
-        common::ErrorCode terminalCode, const std::string &terminalMessage);
-    void CompleteReusableSnapshotRequest(
-        const std::shared_ptr<ReusableSnapshotContext> &context,
-        const KillResponse &response);
-    KillResponse BuildReusableSnapshotResponse(
-        common::ErrorCode code, const std::string &message,
-        const ::core_service::SnapshotInfo *snapshotInfo = nullptr) const;
-    void ReleaseReusableSnapshotTunnelGate(
-        const std::shared_ptr<ReusableSnapshotContext> &context);
-
-    enum class PausePhase {
-        GATE,
-        PREPARE,
-        CHECKPOINT,
-        CONVERGING,
-    };
-
-    enum class ConvergenceResult {
-        COMMITTED,
-        SOURCE_RUNNING,
-        RESULT_UNKNOWN,
-        IDENTITY_CHANGED,
-        TERMINAL_FAILURE,
-    };
-
-    struct PauseContext {
-        std::string operationRequestID;
-        resources::InstanceInfo sourceInstanceInfo;
-        int32_t ttlSeconds{ 90'000 };
-        std::string snapshotCreateTime;
-        std::string storageBackend;
-        uint64_t publishedSize{ 0 };
-        std::string publishedSha256;
-        bool published{ false };
-        std::shared_ptr<litebus::Promise<KillResponse>> completion;
-        std::chrono::steady_clock::time_point prepareDeadline;
-        uint64_t prepareRetryDelayMs{ 0 };
-        PausePhase phase{ PausePhase::GATE };
-    };
-
-    enum class InstanceLifecyclePhase {
-        PAUSING,
-        PREPARING_DELETE,
-    };
-
-    struct InstanceLifecycleState {
-        InstanceLifecyclePhase phase{ InstanceLifecyclePhase::PAUSING };
-        uint64_t generation{ 0 };
-        std::shared_ptr<PauseContext> pauseContext;
-        std::shared_ptr<litebus::Promise<DeletePreparation>> deletePreparation;
-    };
-
-    bool IsCurrentPauseContext(const std::string &instanceID,
-                               const std::shared_ptr<PauseContext> &context) const;
-
-    bool DeleteOwnsLifecycle(const std::string &instanceID,
-                             const std::shared_ptr<PauseContext> &context) const;
-
-    litebus::Future<KillResponse> HandlePauseResumeSnapshot(
-        const std::string &requestID, const std::string &instanceID,
-        const std::shared_ptr<InstanceStateMachine> &stateMachine, int32_t ttlSeconds,
-        uint64_t checkpointTimeoutMs);
-
-    void OnPauseGateComplete(const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-                             const litebus::Future<Status> &gateFuture);
-
-    void PreparePauseSource(const std::string &instanceID, const std::shared_ptr<PauseContext> &context);
-
-    void RetryPausePrepare(const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-                           const std::string &failedOperation);
-
-    void OnPausePrepareComplete(const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-                                const litebus::Future<Status> &prepareFuture);
-
-    litebus::Future<KillResponse> ContinuePauseCheckpoint(const std::string &instanceID,
-                                                          const std::shared_ptr<PauseContext> &context);
-
-    void RetryPauseCheckpoint(const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-                              const std::shared_ptr<litebus::Promise<KillResponse>> &promise);
-
-    litebus::Future<KillResponse> HandlePauseCheckpointResponse(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-        const messages::SnapshotRuntimeResponse &response);
-
-    ConvergenceResult ClassifyPauseCheckpointResponse(
-        const messages::SnapshotRuntimeResponse &response,
-        const Status &continuationStatus) const;
-
-    ConvergenceResult ClassifyPausedCommit(
-        const std::shared_ptr<PauseContext> &context,
-        const resources::InstanceInfo &latest) const;
-
-    litebus::Future<KillResponse> RecoverRunningPauseSource(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-        const KillResponse &originalError);
-
-    void RetryRunningPauseClient(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-        const KillResponse &originalError, const std::shared_ptr<litebus::Promise<KillResponse>> &result);
-
-    void OnRunningPauseClient(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-        const KillResponse &originalError, const std::shared_ptr<litebus::Promise<KillResponse>> &result,
-        const litebus::Future<std::shared_ptr<ControlInterfacePosixClient>> &clientFuture);
-
-    void OnRunningPauseStarted(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-        const KillResponse &originalError, const std::shared_ptr<litebus::Promise<KillResponse>> &result,
-        const litebus::Future<runtime::SnapStartedResponse> &startedFuture);
-
-    void RetryRunningPauseGate(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-        const KillResponse &originalError, const std::shared_ptr<litebus::Promise<KillResponse>> &result);
-
-    void OnRunningPauseGateRecovered(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-        const KillResponse &originalError, const std::shared_ptr<litebus::Promise<KillResponse>> &result,
-        const litebus::Future<Status> &recoverFuture);
-
-    void RetryPreparePauseGate(const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-                               const KillResponse &originalError);
-
-    void OnPreparePauseGateRecovered(const std::string &instanceID,
-                                     const std::shared_ptr<PauseContext> &context,
-                                     const KillResponse &originalError,
-                                     const litebus::Future<Status> &recoverFuture);
-
-    litebus::Future<KillResponse> CleanupPauseAttemptRemoteArtifacts(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-        const KillResponse &originalError);
-
-    litebus::Future<KillResponse> ReconcilePausedCommit(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-        const KillResponse &commitError);
-
-    litebus::Future<KillResponse> FinalizeSuccessfulPause(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context);
-
-    litebus::Future<KillResponse> FinalizePauseAfterResourceRelease(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context);
-
-    void RetryPausedResourceRelease(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-        const std::shared_ptr<litebus::Promise<KillResponse>> &result);
-
-    void OnPausedResourceReleased(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-        const std::shared_ptr<litebus::Promise<KillResponse>> &result,
-        const litebus::Future<Status> &releaseFuture);
-
-    litebus::Future<KillResponse> FinalizePauseAttempt(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-        ::messages::SnapshotAttemptFinalizeOperation operation, const KillResponse &terminalResponse);
-
-    void RetryPauseAttemptFinalization(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-        ::messages::SnapshotAttemptFinalizeOperation operation, const KillResponse &terminalResponse,
-        const std::shared_ptr<litebus::Promise<KillResponse>> &result);
-
-    void OnPauseAttemptFinalized(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-        ::messages::SnapshotAttemptFinalizeOperation operation, const KillResponse &terminalResponse,
-        const std::shared_ptr<litebus::Promise<KillResponse>> &result,
-        const litebus::Future<::messages::SnapshotAttemptFinalizeResponse> &finalizeFuture);
-
-    void RetryPausedCommitReconcile(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-        const KillResponse &commitError, const std::shared_ptr<litebus::Promise<KillResponse>> &result);
-
-    void OnPausedCommitSynced(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-        const KillResponse &commitError, const std::shared_ptr<litebus::Promise<KillResponse>> &result,
-        const litebus::Future<resources::InstanceInfo> &syncFuture);
-
-    litebus::Future<KillResponse> ReleasePauseSourceRuntime(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context);
-
-    void RetryReleasePauseSourceRuntime(const std::string &instanceID,
-                                        const std::shared_ptr<PauseContext> &context,
-                                        const std::shared_ptr<litebus::Promise<KillResponse>> &promise);
-
-    litebus::Future<KillResponse> CommitPausedState(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context);
-
-    litebus::Future<KillResponse> FailPauseAndCleanupTemporary(
-        const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-        const Status &status);
-
-    Status ValidatePauseContinuation(const std::string &instanceID,
-                                     const std::shared_ptr<PauseContext> &context) const;
-
-    void OnPauseCheckpointComplete(const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-                                   const litebus::Future<KillResponse> &checkpointFuture);
-
-    void CompletePauseContext(const std::string &instanceID, const std::shared_ptr<PauseContext> &context,
-                              const KillResponse &response);
-
     /**
      * Prepare snapshot by calling runtime PrepareSnap interface
      * @param requestID: Request ID for tracing
@@ -485,60 +228,7 @@ private:
     void OnDeploySnapStartInstanceComplete(
         const std::shared_ptr<litebus::Promise<messages::ScheduleResponse>> scheduleResp,
         const std::shared_ptr<messages::ScheduleRequest> &scheduleReq,
-        const std::shared_ptr<const resume_identity::TrustedResumeIdentity> &trustedResumeIdentity,
-        const std::shared_ptr<ResumeContext> &resumeContext,
         const litebus::Future<messages::DeployInstanceResponse> &deployFuture);
-
-    void RetryTrustedResumeAfterResultUnknown(const std::shared_ptr<ResumeContext> &context);
-
-    void OnTrustedResumeClientCreated(
-        const std::shared_ptr<ResumeContext> &context,
-        const litebus::Future<std::shared_ptr<ControlInterfacePosixClient>> &clientFuture);
-
-    void OnTrustedResumeSnapStarted(
-        const std::shared_ptr<ResumeContext> &context,
-        const litebus::Future<runtime::SnapStartedResponse> &startedFuture);
-
-    void CommitTrustedResume(const std::shared_ptr<ResumeContext> &context);
-
-    void OnTrustedResumeCommitted(
-        const std::shared_ptr<ResumeContext> &context,
-        const litebus::Future<TransitionResult> &transitionFuture);
-
-    void ReconcileTrustedResume(const std::shared_ptr<ResumeContext> &context, bool resultUnknown);
-
-    void OnTrustedResumeReconciled(
-        const std::shared_ptr<ResumeContext> &context, bool resultUnknown,
-        const litebus::Future<resources::InstanceInfo> &syncFuture);
-
-    void ConfirmTrustedResumeWinner(const std::shared_ptr<ResumeContext> &context,
-                                    const resources::InstanceInfo *authoritative = nullptr);
-
-    void BeginTrustedResumeWinnerCleanup(const std::shared_ptr<ResumeContext> &context);
-
-    void CleanupTrustedResumeWinner(const std::shared_ptr<ResumeContext> &context);
-
-    void OnTrustedResumeFinalized(
-        const std::shared_ptr<ResumeContext> &context, bool winner,
-        const litebus::Future<::messages::SnapshotAttemptFinalizeResponse> &finalizeFuture);
-
-    void ReleaseTrustedResumeLoserResources(const std::shared_ptr<ResumeContext> &context);
-
-    void OnTrustedResumeLoserResourcesReleased(
-        const std::shared_ptr<ResumeContext> &context,
-        const litebus::Future<Status> &releaseFuture);
-
-    void ClearCommittedResumeSnapshot(const std::shared_ptr<ResumeContext> &context);
-
-    void OnCommittedResumeSnapshotCleared(
-        const std::shared_ptr<ResumeContext> &context,
-        const litebus::Future<TransitionResult> &transitionFuture);
-
-    void CleanupTrustedResumeLoser(const std::shared_ptr<ResumeContext> &context, const Status &failure);
-
-    void FinalizeTrustedResumeAttempt(const std::shared_ptr<ResumeContext> &context, bool winner);
-
-    void CompleteTrustedResume(const std::shared_ptr<ResumeContext> &context, const Status &status);
 
     /**
      * Handle CreateInstanceClient completion
@@ -574,19 +264,42 @@ private:
         const litebus::Future<TransitionResult> &transResult);
 
     std::string nodeID_;
-    PauseRetryPolicy pauseRetryPolicy_;
 
     std::shared_ptr<FunctionAgentMgr> functionAgentMgr_;
     std::shared_ptr<LocalSchedSrv> localSchedSrv_;
     std::shared_ptr<InstanceControlView> instanceControlView_;
     std::shared_ptr<ControlInterfaceClientManagerProxy> clientManager_;
     std::shared_ptr<InstanceCtrl> instanceCtrl_;
-    std::shared_ptr<ActorWorker> snapshotWorker_;
-    std::function<bool(const std::string &)> reusableSnapshotTunnelGateAcquire_;
-    std::function<void(const std::string &)> reusableSnapshotTunnelGateRelease_;
-    std::unordered_map<std::string, InstanceLifecycleState> instanceLifecycles_;
-    uint64_t nextLifecycleGeneration_{ 1 };
-    ResumeAttemptRegistry resumeAttempts_;
+    std::shared_ptr<IdleMgr> idleMgr_;
+
+    // Instances parked on this node via leaveRunning=false snapshots:
+    // original instanceID -> checkpoint. Enables wake-by-instanceID and
+    // FIFO unpark without external bookkeeping. Entries are dropped when
+    // the checkpoint is restored (HandleWake / direct SnapStart) or when
+    // the instance re-appears in the control view.
+    std::unordered_map<std::string, ParkedEntry> parkedInstances_;
+
+    /** Drop a registry entry after a successful wake/restore. */
+    void ForgetParked(const std::string &instanceID);
+
+    /** Drop registry entries whose checkpoint matches a direct SnapStart. */
+    void ForgetParkedByCheckpoint(const std::string &checkpointID);
+
+    /** OnWakeComplete: registry bookkeeping, returns rsp unchanged. */
+    KillResponse OnWakeComplete(const std::string &instanceID, const KillResponse &rsp);
+
+    // W10-2: checkpoints whose restore (SnapStart chain) is currently in
+    // flight; a concurrent SnapStart for the same checkpoint is rejected so
+    // duplicate restores cannot mint two sandboxes from one checkpoint.
+    std::unordered_set<std::string> restoringCheckpoints_;
+
+    /** Settle the in-flight marker when a SnapStart settles (any outcome). */
+    void FinishSnapStart(const std::string &checkpointID);
+
+    /** W16: immediate re-wake after a stale-state-machine transient. */
+    void RetryWake(const std::string &instanceID);
+
+    uint64_t retrySeq_ = 0;  // requestID sequence for stale retries
 };
 
 }  // namespace functionsystem::local_scheduler

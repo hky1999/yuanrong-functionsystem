@@ -90,6 +90,18 @@ public:
     Status DeleteInstance(const std::string &deployDir, const std::string &instanceID);
 
     /**
+     * D-7: feed per-instance memory usage (MB) from the sandboxd Stats poll.
+     * Under runsc the pid-based InstanceMemoryCollector is a no-op (the
+     * executor reports pid=0), so without this feed the resource view's
+     * per-instance actualuse stayed 0 and the pressure-park victim's
+     * "reclaim the most" tiebreak was dead.
+     *
+     * @param instanceID the ID of the running instance
+     * @param memoryMb sandbox memory usage in MB
+     */
+    void UpdateInstanceMemoryUsage(const std::string &instanceID, double memoryMb);
+
+    /**
      * Start update system resources and function resources to function agent.
      */
     void StartUpdateMetrics();
@@ -171,6 +183,9 @@ private:
     std::shared_ptr<XPUCollectorParams> npuCollectorParams_{ nullptr };
     std::shared_ptr<BaseMetricsCollector> runtimeMemoryLimitCollector_{ nullptr };
     std::unordered_map<std::string, messages::RuntimeInstanceInfo> instanceInfos_;
+    // D-7: instanceID -> sandbox memory usage (MB), fed by the sandboxd Stats
+    // poll; overlaid onto the reported per-instance actualuse
+    std::unordered_map<std::string, double> instanceMemoryUsageMb_;
     std::shared_ptr<ProcFSTools> procFSTools_{ nullptr };
     litebus::Timer updateMetricsTimer_;
     litebus::Timer pushMetricsTimer_;

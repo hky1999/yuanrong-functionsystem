@@ -827,6 +827,7 @@ bool FrontendProxyService::ValidateCreateRequest(const ::frontend_proxy::CreateI
                                    : "";
     const bool requiresFinalOwner = IsForceLowReliabilityInstanceEnabled() || response.has_callresult();
     if (createRsp.code() == common::ERR_NONE && requiresFinalOwner && owningProxyID.empty()) {
+    if (createRsp.code() == common::ERR_NONE && owningProxyID.empty()) {
         SetStatus(response.mutable_status(), common::ERR_INNER_SYSTEM_ERROR,
                   "frontend proxy create response missing final owner proxy node id");
         return ::grpc::Status::OK;
@@ -834,6 +835,7 @@ bool FrontendProxyService::ValidateCreateRequest(const ::frontend_proxy::CreateI
     if (createRsp.code() == common::ERR_NONE) {
         // Schedule-only responses use the entry proxy for subsequent lifecycle requests.
         response.set_routeaddress(owningProxyID.empty() ? param_.nodeID : owningProxyID);
+        response.set_routeaddress(owningProxyID);
     }
     SetStatus(response.mutable_status(), createRsp.code(), createRsp.message());
     const auto routeAddress = response.routeaddress();

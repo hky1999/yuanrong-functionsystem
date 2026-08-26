@@ -16,6 +16,8 @@
 
 #include "runtime_manager_driver.h"
 
+#include "ckpt/ckpt_file_manager_actor.h"
+
 #include "async/async.hpp"
 #include "common/constants/actor_name.h"
 #include "common/register/register_helper.h"
@@ -28,6 +30,8 @@ const std::string RUNTIME_MANAGER = "runtime-manager";
 RuntimeManagerDriver::RuntimeManagerDriver(const Flags &flags, const std::string &componentName)
     : flags_(flags), componentName_(componentName)
 {
+    // W2 P0.4: flag-driven default checkpoint TTL (0 keeps the compiled-in default)
+    CkptFileManagerActor::SetDefaultTtlOverride(flags_.GetCkptDefaultTtlSec());
     actor_ = std::make_shared<RuntimeManager>(flags_.GetNodeID() + RUNTIME_MANAGER_SRV_ACTOR_NAME,
                                               flags.GetLogReuseEnable());
     litebus::Spawn(actor_);

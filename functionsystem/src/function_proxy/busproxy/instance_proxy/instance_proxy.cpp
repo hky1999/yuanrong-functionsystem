@@ -72,6 +72,18 @@ litebus::Future<SharedStreamMsg> InstanceProxy::Call(const CallerInfo &callerInf
     YRLOG_INFO("{}|{}|received call request from {} to {}", callReq.traceid(), callReq.requestid(),
                callerInfo.instanceID, dstInstanceID);
     perf_->Record(callReq, dstInstanceID, time);
+    // P2 #8 (idle session-count gap): SDK exec/invoke rides the Invoke channel
+    // and never reaches ExecStreamService, so SessionCountDelta never fires and
+    // DataPlaneObserver::MarkInstanceUsed had NO caller at all — a sandbox
+    // driven purely by sparse frontend invokes (or with only detached
+    // background processes inside, e.g. the G3a2 allocators) stayed
+    // "never-used", fell out of the orphan grace window and was reclaimed by
+    // the idle sweeper. Mark the DESTINATION as ever-used on every real
+    // client invoke; the fire-and-forget observer hop re-arms its idle timer
+    // at the full timeout.
+    if (observer_ != nullptr && dstInstanceID == instanceID_) {
+        observer_->MarkInstanceUsed(dstInstanceID);
+    }
     // which means the invocation is happening without cross node
     // else it should be transferred by remote dispatcher
     if (dstInstanceID == instanceID_) {
@@ -246,6 +258,13 @@ void InstanceProxy::OnLocalCall(const litebus::Future<SharedStreamMsg> &callRspF
 
 void InstanceProxy::ForwardCall(const litebus::AID &from, std::string &&, std::string &&msg)
 {
+    // P2 #8: an invoke forwarded INTO this actor's instance is real client use
+    // (SDK exec rides this channel, never ExecStreamService) — claim it for
+    // the idle bookkeeping so the instance cannot be reclaimed as an orphan
+    // while background work keeps running (see InstanceProxy::Call note).
+    if (observer_ != nullptr) {
+        observer_->MarkInstanceUsed(instanceID_);
+    }
     auto request = std::make_shared<runtime_rpc::StreamingMessage>();
     (void)request->ParseFromString(msg);
     (void)DoForwardCall(from, request);

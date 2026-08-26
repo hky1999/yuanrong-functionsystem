@@ -29,6 +29,7 @@
 #include "common/types/instance_state.h"
 #include "resource_tool.h"
 #include "scala_resource_tool.h"
+#include "usage_trend_tracker.h"
 #include "utils/string_utils.hpp"
 
 namespace functionsystem::resource_view {
@@ -1438,6 +1439,33 @@ void ResourceViewActor::UpdateResourceUnitActual(const std::shared_ptr<ResourceU
 
     // update fragment
     *unit->second.mutable_actualuse() = std::move(*value->mutable_actualuse());
+
+    // D-7: merge the reported per-instance actualuse into the view. The
+    // collectors already report it (BuildResourceUnitWithInstance), but
+    // dropping it here left every view instance at useMb=0, which disabled
+    // the pressure-park victim's "reclaim the most" tiebreak. Only instances
+    // already tracked by the view are refreshed -- a lagging report must not
+    // resurrect a deleted instance. Both stores are updated: the unit fragment
+    // and the view-level instance index (consumers like the pressure monitor
+    // read the latter).
+    for (const auto &reportedIt : value->instances()) {
+        auto viewInst = unit->second.mutable_instances()->find(reportedIt.first);
+        if (viewInst == unit->second.mutable_instances()->end()) {
+            continue;
+        }
+        (*viewInst->second.mutable_actualuse()) = reportedIt.second.actualuse();
+        auto topInst = view_->mutable_instances()->find(reportedIt.first);
+        if (topInst != view_->mutable_instances()->end() && topInst->second.unitid() == value->id()) {
+            (*topInst->second.mutable_actualuse()) = reportedIt.second.actualuse();
+        }
+    }
+
+    // D-form admission input: feed the per-unit memory trend so the
+    // usage-aware filter can predict bursts instead of chasing last sample
+    auto memIt = value->actualuse().resources().find(MEMORY_RESOURCE_NAME);
+    if (memIt != value->actualuse().resources().end()) {
+        UsageTrendTracker::Record(value->id(), memIt->second.scalar().value());
+    }
 }
 
 void ResourceViewActor::PrintResourceView()

@@ -24,4 +24,4 @@ target_sources(usage_aware_filter PRIVATE ${SRCS})
 
 target_compile_options(usage_aware_filter PRIVATE "-fvisibility=hidden")
 
-target_link_libraries(usage_aware_filter PUBLIC schedule_plugin_common ${protobuf_LIB})
+target_link_libraries(usage_aware_filter PUBLIC schedule_plugin_common resource_view ${protobuf_LIB})

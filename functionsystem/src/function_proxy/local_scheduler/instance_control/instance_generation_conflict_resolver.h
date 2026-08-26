@@ -57,7 +57,6 @@ public:
     CleanupStatePtr GetCleanupState() const;
 
     bool IsExactPersistenceFailure(const TransitionResult &result) const;
-    bool IsExactRemoteOwnerPersistenceConflict(const TransitionResult &result) const;
     bool IsReusableWinner(const InstanceInfo &winnerInfo, const std::string &localProxyID) const;
     bool MatchesContenderGenerationView(const InstanceInfo &currentInfo) const;
 

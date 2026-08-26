@@ -38,6 +38,7 @@ public:
     virtual void SetInstanceInfoSyncerCbFunc(const InstanceInfoSyncerCbFunc &instanceInfoSyncerCbFunc);
     virtual void SetUpdateFuncMetasFunc(const UpdateFuncMetasFunc &updateFuncMetasFunc);
     virtual void SetTrafficReportCbFunc(const TrafficReportCbFunc &trafficReportCbFunc);
+    virtual void SetInstanceUsedCbFunc(const InstanceUsedCbFunc &instanceUsedCbFunc);
 
     /**
      * register callback to meta store accessor

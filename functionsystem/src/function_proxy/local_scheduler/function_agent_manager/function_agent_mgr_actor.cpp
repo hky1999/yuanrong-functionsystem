@@ -1750,7 +1750,8 @@ void FunctionAgentMgrActor::UpdateNetworkPolicyResponse(
 litebus::Future<messages::SnapshotRuntimeResponse> FunctionAgentMgrActor::SnapshotRuntime(
     const std::string &requestID,
     const resource_view::InstanceInfo &instanceInfo,
-    int32_t ttl)
+    int32_t ttl,
+    bool leaveRunning)
 {
     return SnapshotRuntime(requestID, instanceInfo, ttl, common::DUMPSTATE, {}, {});
 }
@@ -1839,6 +1840,9 @@ litebus::Future<messages::SnapshotRuntimeResponse> FunctionAgentMgrActor::Snapsh
         requestID, static_cast<uint32_t>(timeoutMs));
     const auto targetAgent = funcAgentTable_[funcAgentID].aid;
     snapshotRuntimeExpectedAgent_[requestID] = targetAgent;
+    request->set_ttl(ttl);  // Set TTL from parameter
+    request->set_leaverunning(leaveRunning);  // sandboxd PR#16 physical mode
+    auto future = snapshotRuntimeSync_.AddSynchronizer(requestID);
 
     YRLOG_INFO("{}|send SnapshotRuntime request to agent({}) for instance({}), ttl: {}",
                requestID, funcAgentID, instanceID, ttl);

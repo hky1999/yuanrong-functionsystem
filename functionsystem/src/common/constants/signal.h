@@ -72,11 +72,18 @@ const int32_t DELETE_CHECKPOINT_SIGNAL = 22;
 // See docs/features/sandbox-rrt-idle-report.md.
 const int32_t RRT_IDLE_REPORT_SIGNAL = 23;
 // RRT requests a local anonymous checkpoint for its own sandbox.
-const int32_t INSTANCE_ANONYMOUS_CHECKPOINT_SIGNAL = 24;
+// Renumbered from upstream's 24 during the 2026-09-11 scheduler-line rebase:
+// the scheduler line's deployed contract (transducer, sandboxd, smoke tooling)
+// pins 24 to the directed wake below.
+const int32_t INSTANCE_ANONYMOUS_CHECKPOINT_SIGNAL = 27;
 // User explicitly reloads a sandbox from its latest local anonymous checkpoint.
 const int32_t INSTANCE_RELOAD_SIGNAL = 25;
 // Replace the network policy of one running sandbox.
 const int32_t INSTANCE_UPDATE_NETWORK_POLICY_SIGNAL = 26;
+// Signal to wake one parked instance by its ORIGINAL instanceID: the proxy
+// looks the instance up in SnapCtrl's parked registry and SnapStarts it from
+// the recorded checkpoint (response-ready wake / FIFO fallback entry point).
+const int32_t INSTANCE_WAKE_SNAPSHOT_SIGNAL = 24;
 
 inline std::string SignalToString(int32_t signal)
 {
@@ -106,7 +113,8 @@ inline std::string SignalToString(int32_t signal)
         { RRT_IDLE_REPORT_SIGNAL, "RRT_IDLE_REPORT_SIGNAL" },
         { INSTANCE_ANONYMOUS_CHECKPOINT_SIGNAL, "INSTANCE_ANONYMOUS_CHECKPOINT_SIGNAL" },
         { INSTANCE_RELOAD_SIGNAL, "INSTANCE_RELOAD_SIGNAL" },
-        { INSTANCE_UPDATE_NETWORK_POLICY_SIGNAL, "INSTANCE_UPDATE_NETWORK_POLICY_SIGNAL" }
+        { INSTANCE_UPDATE_NETWORK_POLICY_SIGNAL, "INSTANCE_UPDATE_NETWORK_POLICY_SIGNAL" },
+        { INSTANCE_WAKE_SNAPSHOT_SIGNAL, "INSTANCE_WAKE_SNAPSHOT_SIGNAL" }
     };
     return signalMap.find(signal) != signalMap.end() ? signalMap.at(signal) : "UnknownSignal";
 }

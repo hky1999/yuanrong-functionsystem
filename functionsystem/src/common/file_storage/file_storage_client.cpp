@@ -16,6 +16,7 @@
 
 #include "file_storage_client.h"
 
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 
@@ -25,26 +26,29 @@
 
 namespace functionsystem::file_storage {
 
+namespace {
+constexpr int64_t FILE_TRANSFER_CHUNK_SIZE = 4 * 1024 * 1024;  // 4MiB
+}
+
 Status FileStorageClient::UploadFile(const std::string &key, const std::string &filePath)
 {
     YRLOG_INFO("uploading file: {} with key: {}", filePath, key);
 
-    // Read file content
-    std::string content;
-    Status status = ReadFileContent(filePath, content);
-    if (!status.IsOk()) {
-        YRLOG_ERROR("failed to read file content from: {}", filePath);
-        return status;
+    std::error_code ec;
+    const auto size = static_cast<uint64_t>(std::filesystem::file_size(filePath, ec));
+    if (ec) {
+        YRLOG_ERROR("failed to stat file for upload: {}, error: {}", filePath, ec.message());
+        return Status(StatusCode::FAILED, "failed to stat file: " + filePath);
     }
 
-    // Upload to KV storage
-    status = KVClient::GetInstance().Put(key, content);
+    // 流式上传：旧实现整文件读进内存，600MB+ ckpt 会整份常驻堆上
+    Status status = KVClient::GetInstance().PutFile(key, filePath, size);
     if (!status.IsOk()) {
         YRLOG_ERROR("failed to upload file to KV storage with key: {}, error: {}", key, status.GetMessage());
         return status;
     }
 
-    YRLOG_INFO("successfully uploaded file: {} with key: {}, size: {} bytes", filePath, key, content.size());
+    YRLOG_INFO("successfully uploaded file: {} with key: {}, size: {} bytes", filePath, key, size);
     return Status::OK();
 }
 
@@ -59,13 +63,24 @@ Status FileStorageClient::DownloadFile(const std::string &key, const std::string
         return status;
     }
 
-    // Write to file
-    std::string content(static_cast<const char *>(buffer.ImmutableData()), buffer.GetSize());
-    status = WriteFileContent(filePath, content);
-    if (!status.IsOk()) {
-        YRLOG_ERROR("failed to write file content to: {}", filePath);
-        return status;
+    // Write to file, chunked: avoid materializing a second full-size std::string copy of the buffer
+    const auto *data = static_cast<const char *>(buffer.ImmutableData());
+    const int64_t totalSize = buffer.GetSize();
+    std::ofstream file(filePath, std::ios::binary | std::ios::trunc);
+    if (!file.is_open()) {
+        YRLOG_ERROR("failed to open file for writing: {}", filePath);
+        return Status(StatusCode::FAILED, "failed to open file for writing: " + filePath);
     }
+    for (int64_t offset = 0; offset < totalSize; offset += FILE_TRANSFER_CHUNK_SIZE) {
+        const auto chunkSize =
+            static_cast<std::streamsize>(std::min<int64_t>(FILE_TRANSFER_CHUNK_SIZE, totalSize - offset));
+        if (!file.write(data + offset, chunkSize)) {
+            file.close();
+            YRLOG_ERROR("failed to write downloaded content to: {}", filePath);
+            return Status(StatusCode::FAILED, "failed to write content to file: " + filePath);
+        }
+    }
+    file.close();
 
     YRLOG_INFO("successfully downloaded file with key: {} to: {}, size: {} bytes", key, filePath, buffer.GetSize());
     return Status::OK();
@@ -82,41 +97,6 @@ Status FileStorageClient::DeleteFile(const std::string &key)
     }
 
     YRLOG_INFO("successfully deleted file with key: {}", key);
-    return Status::OK();
-}
-
-Status FileStorageClient::ReadFileContent(const std::string &filePath, std::string &content)
-{
-    std::ifstream file(filePath, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
-        return Status(StatusCode::FAILED, "failed to open file: " + filePath);
-    }
-
-    std::streamsize size = file.tellg();
-    file.seekg(0, std::ios::beg);
-
-    content.resize(size);
-    if (!file.read(content.data(), size)) {
-        return Status(StatusCode::FAILED, "failed to read file content: " + filePath);
-    }
-
-    file.close();
-    return Status::OK();
-}
-
-Status FileStorageClient::WriteFileContent(const std::string &filePath, const std::string &content)
-{
-    std::ofstream file(filePath, std::ios::binary | std::ios::trunc);
-    if (!file.is_open()) {
-        return Status(StatusCode::FAILED, "failed to open file for writing: " + filePath);
-    }
-
-    if (!file.write(content.data(), content.size())) {
-        file.close();
-        return Status(StatusCode::FAILED, "failed to write file content: " + filePath);
-    }
-
-    file.close();
     return Status::OK();
 }
 

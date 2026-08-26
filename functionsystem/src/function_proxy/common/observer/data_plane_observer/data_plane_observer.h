@@ -42,6 +42,12 @@ public:
     virtual void NotifyMigratingRequest(const std::string &instanceID);
 
     virtual void ReportTraffic(const std::string &instanceID, const size_t &size);
+
+    /**
+     * A client-originated data-plane action (exec/fs/pty) was dispatched to
+     * the instance; routed to the idle manager to claim ownership.
+     */
+    virtual void MarkInstanceUsed(const std::string &instanceID);
 private:
     std::shared_ptr<ObserverActor> observerActor_;
 };

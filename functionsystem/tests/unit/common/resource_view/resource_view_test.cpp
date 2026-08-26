@@ -1004,6 +1004,62 @@ TEST_F(ResourceViewTest, UpdateResourceUnit)
     EXPECT_TRUE(fragInst.alias() == "unit2");
 }
 
+// D-7: UPDATE_ACTUAL must merge the reported per-instance actualuse into the
+// view -- dropping it left every view instance at useMb=0 and disabled the
+// pressure-park victim's "reclaim the most" tiebreak. A lagging report for
+// an instance the view no longer tracks must not resurrect anything.
+TEST_F(ResourceViewTest, UpdateActualMergesPerInstanceActualuse)
+{
+    auto viewPtr = resource_view::ResourceView::CreateResourceView(
+        "update-actual-instances", CHILD_PARAM);
+    auto &resourceView = *viewPtr;
+
+    auto unit = Get1DResourceUnitWithInstances();
+    // production stamps the owning unit on every instance (see
+    // IsInstanceInResourceView); the fixture helper does not
+    for (auto &inst : *unit.mutable_instances()) {
+        inst.second.set_unitid(unit.id());
+    }
+    auto ret = resourceView.AddResourceUnit(unit);
+    ASSERT_AWAIT_READY(ret);
+
+    const auto knownKey = unit.instances().begin()->first;
+    resource_view::Resources used;
+    resource_view::Resource mem;
+    mem.mutable_scalar()->set_value(1536.0);
+    (*used.mutable_resources())[RESOURCE_MEM_NAME] = mem;
+
+    auto report = std::make_shared<resource_view::ResourceUnit>(Get1DResourceUnit(unit.id()));
+    auto knownInst = Get1DInstance();
+    knownInst.set_instanceid(knownKey);
+    (*knownInst.mutable_actualuse()) = used;
+    (*report->mutable_instances())[knownKey] = knownInst;
+    auto ghostInst = Get1DInstance();
+    ghostInst.set_instanceid("instance-not-in-view");
+    (*ghostInst.mutable_actualuse()) = used;
+    (*report->mutable_instances())["instance-not-in-view"] = ghostInst;
+
+    ret = resourceView.UpdateResourceUnit(report, resource_view::UpdateType::UPDATE_ACTUAL);
+    ASSERT_AWAIT_READY(ret);
+
+    auto rUnit = resourceView.GetResourceUnit(unit.id());
+    ASSERT_TRUE(rUnit.Get().IsSome());
+    const auto &fragInstances = rUnit.Get().Get().instances();
+    ASSERT_TRUE(fragInstances.contains(knownKey));
+    EXPECT_DOUBLE_EQ(fragInstances.at(knownKey).actualuse().resources().at(RESOURCE_MEM_NAME).scalar()
+                         .value(), 1536.0);
+    EXPECT_FALSE(fragInstances.contains("instance-not-in-view"));
+
+    // the view-level instance index (what e.g. the pressure monitor reads)
+    // must carry the same refreshed actualuse, not the stale AddResourceUnit
+    // snapshot
+    auto view = resourceView.GetResourceView();
+    const auto &viewInstances = view.Get()->instances();
+    ASSERT_TRUE(viewInstances.contains(knownKey));
+    EXPECT_DOUBLE_EQ(viewInstances.at(knownKey).actualuse().resources().at(RESOURCE_MEM_NAME).scalar()
+                         .value(), 1536.0);
+}
+
 TEST_F(ResourceViewTest, DynamicUpdateRemovesMissingVectorResourceWithoutAffectingOtherUnitsOrInstances)
 {
     auto viewPtr = resource_view::ResourceView::CreateResourceView(

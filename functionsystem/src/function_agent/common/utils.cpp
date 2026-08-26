@@ -462,8 +462,12 @@ void SetResourceLimits(const std::shared_ptr<messages::DeployInstanceRequest> &r
         cpuLimitIter != extension.end() && resources.find(CPU_RESOURCE_NAME) != resources.end()) {
         resources[CPU_RESOURCE_NAME].mutable_scalar()->set_limit(std::stod(cpuLimitIter->second));
     }
-    if (auto memLimitIter = extension.find("Memory_LIMIT");
-        memLimitIter != extension.end() && resources.find(MEMORY_RESOURCE_NAME) != resources.end()) {
+    // Go sandbox raw-create writes the all-caps variant; accept both spellings
+    auto memLimitIter = extension.find("Memory_LIMIT");
+    if (memLimitIter == extension.end()) {
+        memLimitIter = extension.find("MEMORY_LIMIT");
+    }
+    if (memLimitIter != extension.end() && resources.find(MEMORY_RESOURCE_NAME) != resources.end()) {
         resources[MEMORY_RESOURCE_NAME].mutable_scalar()->set_limit(std::stod(memLimitIter->second));
     }
     if (auto storageLimitIter = extension.find(STORAGE_LIMIT_EXTENSION);

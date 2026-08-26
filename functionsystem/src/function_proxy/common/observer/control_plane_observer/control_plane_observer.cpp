@@ -64,6 +64,12 @@ void ControlPlaneObserver::SetTrafficReportCbFunc(const TrafficReportCbFunc &tra
     litebus::Async(observerActor_->GetAID(), &ObserverActor::SetTrafficReportCbFunc, trafficReportCbFunc);
 }
 
+void ControlPlaneObserver::SetInstanceUsedCbFunc(const InstanceUsedCbFunc &instanceUsedCbFunc)
+{
+    ASSERT_IF_NULL(observerActor_);
+    litebus::Async(observerActor_->GetAID(), &ObserverActor::SetInstanceUsedCbFunc, instanceUsedCbFunc);
+}
+
 void ControlPlaneObserver::Register() const
 {
     ASSERT_IF_NULL(observerActor_);

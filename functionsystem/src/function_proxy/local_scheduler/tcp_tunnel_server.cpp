@@ -669,12 +669,7 @@ bool TcpTunnelServer::ServeClient(ClientSession &session)
         }
         backendPort = hostPort;
     }
-    if (!TryBeginTunnelSession(session.instanceID)) {
-        (void)SendResponse(session.ssl, session.clientFd, false,
-                           "instance Snapshot is in progress");
-        return false;
-    }
-    session.tunnelCounted = true;
+
     session.backendFd = ConnectLocalPort(connectHost, backendPort);
     if (session.backendFd < 0) {
         (void)SendResponse(session.ssl, session.clientFd, false, "failed to connect instance target port");

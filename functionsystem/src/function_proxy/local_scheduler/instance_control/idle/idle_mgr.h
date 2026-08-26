@@ -19,6 +19,9 @@
 
 #include <memory>
 #include <string>
+#include <vector>
+
+#include <async/future.hpp>
 
 #include "function_proxy/local_scheduler/instance_control/idle/idle_actor.h"
 
@@ -54,6 +57,24 @@ public:
     void OnInstanceRunning(const resources::InstanceInfo &identity);
 
     litebus::Future<Status> SetPauseGated(const resources::InstanceInfo &identity, uint64_t token, bool gated);
+
+    /**
+     * Client data-plane action (exec/fs/pty via the Invoke channel) claimed
+     * the instance: promote it out of the orphan grace window.
+     */
+    void MarkInstanceUsed(const std::string &instanceID);
+
+    /**
+     * Pressure park completed (SnapCtrlActor, leaveRunning=false): drop all
+     * per-ID idle bookkeeping before the instanceID is reused by the restore.
+     */
+    void OnInstanceParked(const std::string &instanceID);
+
+    /**
+     * Query the currently fully-idle instance set (traffic idle AND no
+     * active exec sessions); pressure-monitor park victim filter.
+     */
+    litebus::Future<std::vector<std::string>> GetIdleInstances();
 
 private:
     std::shared_ptr<IdleActor> idleActor_;

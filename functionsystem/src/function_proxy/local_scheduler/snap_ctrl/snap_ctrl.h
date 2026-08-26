@@ -18,7 +18,6 @@
 #define LOCAL_SCHEDULER_SNAP_CTRL_H
 
 #include <async/future.hpp>
-#include <functional>
 #include <memory>
 
 #include "common/utils/actor_driver.h"
@@ -30,6 +29,7 @@ namespace functionsystem::local_scheduler {
 class FunctionAgentMgr;
 class LocalSchedSrv;
 class InstanceCtrl;
+class IdleMgr;
 
 /**
  * SnapCtrl is the interface class that wraps async calls to SnapCtrlActor.
@@ -74,16 +74,14 @@ public:
      */
     void BindInstanceCtrl(const std::shared_ptr<InstanceCtrl> &instanceCtrl);
 
+    /** Bind the IdleMgr (park hook, D-5 F1). */
+    void BindIdleMgr(const std::shared_ptr<IdleMgr> &idleMgr);
+
     /**
      * Bind the ControlInterfaceClientManagerProxy for accessing instance clients
      * @param clientManager: The client manager
      */
     void BindClientManager(const std::shared_ptr<ControlInterfaceClientManagerProxy> &clientManager);
-
-    /** Bind the per-instance active reverse-tunnel admission gate. */
-    void BindReusableSnapshotTunnelGate(
-        std::function<bool(const std::string &)> acquire,
-        std::function<void(const std::string &)> release);
 
     /**
      * Handle INSTANCE_SNAPSHOT_SIGNAL
@@ -97,10 +95,6 @@ public:
                                                          const std::string &instanceID,
                                                          const std::string &payload);
 
-    virtual litebus::Future<KillResponse> HandleAnonymousCheckpoint(
-        const std::string &requestID, const std::string &instanceID,
-        uint64_t checkpointTimeoutMs = 0);
-
     /**
      * Handle INSTANCE_SNAPSTART_SIGNAL
      * Wrap async call to SnapCtrlActor::HandleSnapStart
@@ -113,22 +107,27 @@ public:
                                                           const std::string &checkpointID,
                                                           const std::string &payload);
 
-    virtual litebus::Future<DeletePreparation> PrepareForAuthorizedDelete(const std::string &instanceID);
+    /**
+     * Handle INSTANCE_WAKE_SNAPSHOT_SIGNAL
+     * Wrap async call to SnapCtrlActor::HandleWake: restore a parked instance
+     * looked up by its ORIGINAL instanceID.
+     * @param requestID: Request ID for tracing
+     * @param instanceID: ORIGINAL instanceID of the parked instance
+     * @return Future of KillResponse
+     */
+    virtual litebus::Future<KillResponse> HandleWake(const std::string &requestID,
+                                                     const std::string &instanceID);
 
-    virtual litebus::Future<Status> FinishAuthorizedDelete(const std::string &instanceID, uint64_t generation);
-
-    virtual litebus::Future<Status> DeletePauseSnapshot(const resources::InstanceInfo &instanceInfo);
-
-    virtual void ReplayCommittedResumeFinalize(
-        const std::shared_ptr<messages::ScheduleRequest> &sourceRequest,
-        const resources::InstanceInfo &authoritative,
-        const resume_identity::TrustedResumeIdentity &identity);
+    /**
+     * Copy of the actor's parked registry, for the pressure monitor's FIFO
+     * fallback unpark.
+     */
+    litebus::Future<std::vector<std::pair<std::string, SnapCtrlActor::ParkedEntry>>> GetParkedInstances();
 
     void SnapStart(
         const std::shared_ptr<litebus::Promise<messages::ScheduleResponse>> scheduleResp,
         const std::shared_ptr<messages::ScheduleRequest> &scheduleReq, const schedule_decision::ScheduleResult &result,
-        const TransitionResult &transResult,
-        const std::shared_ptr<const resume_identity::TrustedResumeIdentity> &trustedResumeIdentity = nullptr);
+        const TransitionResult &transResult);
 
     /**
      * Get the AID of the underlying actor

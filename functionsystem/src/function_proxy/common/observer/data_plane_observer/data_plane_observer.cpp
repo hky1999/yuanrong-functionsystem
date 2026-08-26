@@ -57,4 +57,10 @@ void DataPlaneObserver::ReportTraffic(const std::string &instanceID, const size_
     RETURN_IF_NULL(observerActor_);
     return litebus::Async(observerActor_->GetAID(), &ObserverActor::ReportTraffic, instanceID, size);
 }
+
+void DataPlaneObserver::MarkInstanceUsed(const std::string &instanceID)
+{
+    RETURN_IF_NULL(observerActor_);
+    return litebus::Async(observerActor_->GetAID(), &ObserverActor::MarkInstanceUsed, instanceID);
+}
 }  // namespace functionsystem::function_proxy

@@ -17,7 +17,6 @@
 #include "snap_ctrl.h"
 
 #include <async/async.hpp>
-#include <utility>
 
 #include "common/constants/actor_name.h"
 #include "common/logs/logging.h"
@@ -83,19 +82,16 @@ void SnapCtrl::BindInstanceCtrl(const std::shared_ptr<InstanceCtrl> &instanceCtr
     litebus::Async(aid_, &SnapCtrlActor::BindInstanceCtrl, instanceCtrl);
 }
 
+void SnapCtrl::BindIdleMgr(const std::shared_ptr<IdleMgr> &idleMgr)
+{
+    ASSERT_IF_NULL(snapCtrlActor_);
+    litebus::Async(aid_, &SnapCtrlActor::BindIdleMgr, idleMgr);
+}
+
 void SnapCtrl::BindClientManager(const std::shared_ptr<ControlInterfaceClientManagerProxy> &clientManager)
 {
     ASSERT_IF_NULL(snapCtrlActor_);
     litebus::Async(aid_, &SnapCtrlActor::BindClientManager, clientManager);
-}
-
-void SnapCtrl::BindReusableSnapshotTunnelGate(
-    std::function<bool(const std::string &)> acquire,
-    std::function<void(const std::string &)> release)
-{
-    ASSERT_IF_NULL(snapCtrlActor_);
-    litebus::Async(aid_, &SnapCtrlActor::BindReusableSnapshotTunnelGate,
-                   std::move(acquire), std::move(release));
 }
 
 litebus::Future<KillResponse> SnapCtrl::HandleSnapshot(const std::string &requestID,
@@ -106,15 +102,6 @@ litebus::Future<KillResponse> SnapCtrl::HandleSnapshot(const std::string &reques
     return litebus::Async(aid_, &SnapCtrlActor::HandleSnapshot, requestID, instanceID, payload);
 }
 
-litebus::Future<KillResponse> SnapCtrl::HandleAnonymousCheckpoint(
-    const std::string &requestID, const std::string &instanceID,
-    uint64_t checkpointTimeoutMs)
-{
-    ASSERT_IF_NULL(snapCtrlActor_);
-    return litebus::Async(aid_, &SnapCtrlActor::HandleAnonymousCheckpoint,
-                          requestID, instanceID, checkpointTimeoutMs);
-}
-
 litebus::Future<KillResponse> SnapCtrl::HandleSnapStart(
     const std::string &requestID, const std::string &checkpointID, const std::string &payload)
 {
@@ -122,43 +109,25 @@ litebus::Future<KillResponse> SnapCtrl::HandleSnapStart(
     return litebus::Async(aid_, &SnapCtrlActor::HandleSnapStart, requestID, checkpointID, payload);
 }
 
-litebus::Future<DeletePreparation> SnapCtrl::PrepareForAuthorizedDelete(const std::string &instanceID)
+litebus::Future<KillResponse> SnapCtrl::HandleWake(const std::string &requestID, const std::string &instanceID)
 {
     ASSERT_IF_NULL(snapCtrlActor_);
-    return litebus::Async(aid_, &SnapCtrlActor::PrepareForAuthorizedDelete, instanceID);
+    return litebus::Async(aid_, &SnapCtrlActor::HandleWake, requestID, instanceID);
 }
 
-litebus::Future<Status> SnapCtrl::FinishAuthorizedDelete(const std::string &instanceID, uint64_t generation)
+litebus::Future<std::vector<std::pair<std::string, SnapCtrlActor::ParkedEntry>>> SnapCtrl::GetParkedInstances()
 {
     ASSERT_IF_NULL(snapCtrlActor_);
-    return litebus::Async(aid_, &SnapCtrlActor::FinishAuthorizedDelete, instanceID, generation);
-}
-
-litebus::Future<Status> SnapCtrl::DeletePauseSnapshot(const resources::InstanceInfo &instanceInfo)
-{
-    ASSERT_IF_NULL(snapCtrlActor_);
-    return litebus::Async(aid_, &SnapCtrlActor::DeletePauseSnapshot, instanceInfo);
-}
-
-void SnapCtrl::ReplayCommittedResumeFinalize(
-    const std::shared_ptr<messages::ScheduleRequest> &sourceRequest,
-    const resources::InstanceInfo &authoritative,
-    const resume_identity::TrustedResumeIdentity &identity)
-{
-    ASSERT_IF_NULL(snapCtrlActor_);
-    litebus::Async(aid_, &SnapCtrlActor::ReplayCommittedResumeFinalize,
-                   sourceRequest, authoritative, identity);
+    return litebus::Async(aid_, &SnapCtrlActor::GetParkedInstances);
 }
 
 void SnapCtrl::SnapStart(
     const std::shared_ptr<litebus::Promise<messages::ScheduleResponse>> scheduleResp,
     const std::shared_ptr<messages::ScheduleRequest> &scheduleReq, const schedule_decision::ScheduleResult &result,
-    const TransitionResult &transResult,
-    const std::shared_ptr<const resume_identity::TrustedResumeIdentity> &trustedResumeIdentity)
+    const TransitionResult &transResult)
 {
     ASSERT_IF_NULL(snapCtrlActor_);
-    litebus::Async(aid_, &SnapCtrlActor::SnapStart, scheduleResp, scheduleReq, result, transResult,
-                   trustedResumeIdentity);
+    litebus::Async(aid_, &SnapCtrlActor::SnapStart, scheduleResp, scheduleReq, result, transResult);
 }
 
 }  // namespace functionsystem::local_scheduler

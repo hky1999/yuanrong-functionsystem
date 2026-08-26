@@ -82,4 +82,19 @@ litebus::Future<Status> IdleMgr::SetPauseGated(const resources::InstanceInfo &id
     return litebus::Async(idleActor_->GetAID(), &IdleActor::SetPauseGated, identity, token, gated);
 }
 
+void IdleMgr::MarkInstanceUsed(const std::string &instanceID)
+{
+    litebus::Async(idleActor_->GetAID(), &IdleActor::MarkInstanceUsed, instanceID);
+}
+
+void IdleMgr::OnInstanceParked(const std::string &instanceID)
+{
+    litebus::Async(idleActor_->GetAID(), &IdleActor::OnInstanceParked, instanceID);
+}
+
+litebus::Future<std::vector<std::string>> IdleMgr::GetIdleInstances()
+{
+    return litebus::Async(idleActor_->GetAID(), &IdleActor::GetIdleInstances);
+}
+
 }  // namespace functionsystem::local_scheduler

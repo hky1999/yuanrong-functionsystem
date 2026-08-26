@@ -174,7 +174,6 @@ TEST(FrontendProxyServiceTest, AwaitInvokeResultTimesOutAtExpiredDeadline)
     EXPECT_EQ(response.status().code(), common::ERR_INNER_SYSTEM_ERROR);
     EXPECT_EQ(response.status().retryreason(), "post-dispatch-unknown");
 }
-
 TEST(FrontendProxyServiceTest, InvokeUsesFunctionProxyAsRuntimeSender)
 {
     std::string capturedCaller;
