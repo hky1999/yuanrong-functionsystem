@@ -29,7 +29,15 @@ public:
     Status Init(const std::string &host, int32_t port);
     std::pair<Status, datasystem::ReadOnlyBuffer> Get(const std::string &key);
     Status Put(const std::string &key, const std::string &value);
+    // 流式上传：Buffer Create + 分块写入 + Set，避免大文件整体读进内存
+    Status PutFile(const std::string &key, const std::string &filePath, uint64_t size);
     Status Delete(const std::string &key);
+
+    // data_system_enable=false 时未 Init，调用方据此跳过远端上传/下载
+    bool IsInitialized() const
+    {
+        return dsKvClient_ != nullptr;
+    }
 
 private:
     std::unique_ptr<datasystem::KVClient> dsKvClient_;

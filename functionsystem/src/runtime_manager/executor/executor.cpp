@@ -108,6 +108,26 @@ std::string Executor::ShellQuote(const std::string &token)
     return escaped;
 }
 
+bool Executor::IsSafeBindSource(const std::string &path)
+{
+    // Reject host paths that would let the container/sandbox escape or hijack the daemon.
+    if (path.empty() || path == "/") {
+        return false;
+    }
+    static const std::vector<std::string> blocked = {
+        "/etc", "/proc", "/sys", "/dev", "/boot", "/var/run/docker.sock", "/run/docker.sock"
+    };
+    for (const auto &b : blocked) {
+        if (path == b || path.rfind(b + "/", 0) == 0) {
+            return false;
+        }
+    }
+    if (path.find("..") != std::string::npos) {
+        return false;
+    }
+    return true;
+}
+
 double Executor::GetEffectiveScalarLimit(const resource_view::Resource &resource, double defaultValue)
 {
     if (resource.type() != resource_view::ValueType::Value_Type_SCALAR) {

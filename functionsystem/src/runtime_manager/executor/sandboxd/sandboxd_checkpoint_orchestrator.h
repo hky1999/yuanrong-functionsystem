@@ -26,6 +26,7 @@
 #include "common/rpc/client/grpc_client.h"
 #include "common/status/status.h"
 #include "runtime_manager/ckpt/ckpt_file_manager.h"
+#include "runtime_manager/ckpt/ckpt_file_manager_actor.h"
 #include "runtime_manager/executor/sandboxd/runtime_state_manager.h"
 
 namespace functionsystem::runtime_manager {
@@ -43,7 +44,8 @@ class SandboxdCheckpointOrchestrator : public std::enable_shared_from_this<Sandb
 public:
     SandboxdCheckpointOrchestrator(litebus::AID ownerAID,
                                    std::shared_ptr<GrpcClient<runtime::v1::SandboxService>> sandboxd,
-                                   std::shared_ptr<CkptFileManager> ckptFileManager, RuntimeStateManager &stateManager);
+                                   std::shared_ptr<CkptFileManager> ckptFileManager, RuntimeStateManager &stateManager,
+                                   std::string checkpointDir = DEFAULT_CHECKPOINT_DIR);
     ~SandboxdCheckpointOrchestrator() = default;
 
     // ── Snapshot ──────────────────────────────────────────────────────────────
@@ -60,10 +62,14 @@ public:
 
     /**
      * Download a checkpoint and return its local path.
+     * expectedSha256/expectedSize come from SnapshotInfo and are verified
+     * against the downloaded archive (mismatch = explicit error).
      * Caller follows up with AddRef() + the executor's Restore RPC.
      */
     litebus::Future<std::string> DownloadForRestore(const std::string &checkpointID, const std::string &storageUrl,
-                                                    const std::string &requestID);
+                                                    const std::string &requestID,
+                                                    const std::string &expectedSha256 = "",
+                                                    int64_t expectedSize = 0);
 
     /**
      * Add a reference for checkpointID. On success: records runtimeID->checkpointID
@@ -90,13 +96,16 @@ private:
         std::string runtimeID;
         std::string checkpointID;
         std::string checkpointPath;
+        // 源沙箱 id：park 后 stateManager 会注销该映射，strict restore 需要
+        // 它时只能从 SnapshotInfo 读，故随快照持久化
+        std::string sandboxID;
         int32_t ttl = 0;
     };
 
     litebus::Future<messages::SnapshotRuntimeResponse> OnCheckpointDone(
         const runtime::v1::CheckpointResponse &ckptResponse, const SnapshotContext &context);
 
-    litebus::Future<messages::SnapshotRuntimeResponse> OnRegisterDone(const std::string &storageUrl,
+    litebus::Future<messages::SnapshotRuntimeResponse> OnRegisterDone(const CheckpointUploadResult &upload,
         messages::SnapshotRuntimeResponse response,
         const SnapshotContext &context);
 
@@ -104,6 +113,7 @@ private:
     std::shared_ptr<GrpcClient<runtime::v1::SandboxService>> sandboxd_;
     std::shared_ptr<CkptFileManager> ckptFileManager_;
     RuntimeStateManager &stateManager_;
+    std::string checkpointDir_;
 };
 
 }  // namespace functionsystem::runtime_manager

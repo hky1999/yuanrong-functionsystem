@@ -294,6 +294,106 @@ public:
         return enablePrintResourceView_;
     }
 
+    bool GetEnablePressurePark() const
+    {
+        return enablePressurePark_;
+    }
+
+    double GetPressureHighWatermark() const
+    {
+        return pressureHighWatermark_;
+    }
+
+    double GetPressureLowWatermark() const
+    {
+        return pressureLowWatermark_;
+    }
+
+    uint32_t GetPressureCheckIntervalMs() const
+    {
+        return pressureCheckIntervalMs_;
+    }
+
+    uint32_t GetPressureSustainSamples() const
+    {
+        return pressureSustainSamples_;
+    }
+
+    uint32_t GetPressureParkTtlSec() const
+    {
+        return pressureParkTtlSec_;
+    }
+
+    uint32_t GetPressureMaxParked() const
+    {
+        return pressureMaxParked_;
+    }
+
+    bool GetEnablePressureEvent() const
+    {
+        return enablePressureEvent_;
+    }
+
+    std::string GetPressureEventCgroupRoot() const
+    {
+        return pressureEventCgroupRoot_;
+    }
+
+    uint32_t GetPressureEventMinGapMs() const
+    {
+        return pressureEventMinGapMs_;
+    }
+
+    bool GetEnableUpgradeLadder() const
+    {
+        return enableUpgradeLadder_;
+    }
+
+    uint64_t GetUpgradeStepMb() const
+    {
+        return upgradeStepMb_;
+    }
+
+    uint64_t GetUpgradeCapMb() const
+    {
+        return upgradeCapMb_;
+    }
+
+    double GetUpgradeSafetyRatio() const
+    {
+        return upgradeSafetyRatio_;
+    }
+
+    double GetUpgradeHighRatio() const
+    {
+        return upgradeHighRatio_;
+    }
+
+    bool GetEnableCpuUpgradeLadder() const
+    {
+        return enableCpuUpgradeLadder_;
+    }
+
+    double GetCpuUpgradeStepRatio() const
+    {
+        return cpuUpgradeStepRatio_;
+    }
+
+    double GetCpuUpgradeCapCpus() const
+    {
+        return cpuUpgradeCapCpus_;
+    }
+
+    double GetCpuUpgradeSafetyRatio() const
+    {
+        return cpuUpgradeSafetyRatio_;
+    }
+
+    double GetCpuUpgradeNodeCpus() const
+    {
+        return cpuUpgradeNodeCpus_;
+    }
+
     int32_t GetServiceTTL() const
     {
         return serviceTTL_;
@@ -309,9 +409,39 @@ public:
         return usageAwareSafety_;
     }
 
+    double GetOvercommitRatio() const
+    {
+        return overcommitRatio_;
+    }
+
     double GetUsageAwareFloorMb() const
     {
         return usageAwareFloorMb_;
+    }
+
+    int64_t GetUsageAwareTrendWindowMs() const
+    {
+        return usageAwareTrendWindowMs_;
+    }
+
+    int64_t GetUsageAwareTrendHorizonMs() const
+    {
+        return usageAwareTrendHorizonMs_;
+    }
+
+    int32_t GetMaxInstancesPerNode() const
+    {
+        return maxInstancesPerNode_;
+    }
+
+    bool GetEnableCommitmentAdmission() const
+    {
+        return enableCommitmentAdmission_;
+    }
+
+    int64_t GetOrphanGraceSec() const
+    {
+        return orphanGraceSec_;
     }
 
     bool GetParkedInvokeDeferEnable() const
@@ -395,11 +525,6 @@ public:
     bool GetForceLowReliabilityInstance() const
     {
         return forceLowReliabilityInstance_;
-    }
-
-    bool GetEnableFrontendProxyService() const
-    {
-        return enableFrontendProxyService_;
     }
 
     const std::string &GetK8sBasePath() const
@@ -581,13 +706,45 @@ protected:
     bool enablePrintResourceView_;
     int32_t serviceTTL_;
     std::string schedulePlugins_;
-    double usageAwareSafety_ = 0.9;
+    double overcommitRatio_ = 1.0;
+    double usageAwareSafety_ = 0.95;
     double usageAwareFloorMb_ = 2048.0;
     bool parkedInvokeDeferEnable_ = true;
     uint32_t parkedInvokeHoldSeconds_ = 300;
     bool parkDrainEnable_ = true;
     uint32_t parkDrainTimeoutMs_ = 10000;
     bool parkDrainForceOnTimeout_ = false;
+    // D-form: burst prediction window/horizon + per-node instance cap
+    int64_t usageAwareTrendWindowMs_ = 60000;
+    int64_t usageAwareTrendHorizonMs_ = 30000;
+    int32_t maxInstancesPerNode_ = 0;
+    // P2.0: count promised-but-unrealized ladder headroom in admission
+    bool enableCommitmentAdmission_ = true;
+    // Ph0.2: create-race orphan grace window (never-used instances)
+    int64_t orphanGraceSec_ = 0;
+    // W2 step-5: watermark-driven pressure monitor
+    bool enablePressurePark_ = false;
+    double pressureHighWatermark_ = 0.85;
+    double pressureLowWatermark_ = 0.70;
+    uint32_t pressureCheckIntervalMs_ = 5000;
+    uint32_t pressureSustainSamples_ = 2;
+    uint32_t pressureParkTtlSec_ = 86400;
+    uint32_t pressureMaxParked_ = 8;
+    // D-2 event-driven watermarks: memory.events "high" increments wake the
+    // pressure monitor immediately instead of waiting for the polling tick
+    bool enablePressureEvent_ = false;
+    std::string pressureEventCgroupRoot_ = "/sys/fs/cgroup/sandbox";  // sandboxd cgroup pool root
+    uint32_t pressureEventMinGapMs_ = 1000;                           // callback debounce window
+    bool enableUpgradeLadder_{ false };                               // D-3 upgrade-as-signal ladder
+    uint64_t upgradeStepMb_ = 8192;                                   // ladder rung size (MB)
+    uint64_t upgradeCapMb_ = 32768;                                   // per-sandbox ladder ceiling (MB)
+    double upgradeSafetyRatio_ = 0.9;                                 // (use + step) <= safety * capacity
+    double upgradeHighRatio_ = 0.9;                                   // memory.high = ratio * new max
+    bool enableCpuUpgradeLadder_{ false };                            // W-CPUL cpu quota upgrade ladder
+    double cpuUpgradeStepRatio_ = 1.5;                                // quota *= ratio per rung
+    double cpuUpgradeCapCpus_ = 8.0;                                  // per-sandbox quota ceiling (cpus)
+    double cpuUpgradeSafetyRatio_ = 0.9;                              // same safety line as memory
+    double cpuUpgradeNodeCpus_ = 0.0;                                 // node CPU domain (cpus); 0 = fail closed
     bool enableIpv4TenantIsolation_;
     bool runtimeDsAuthEnable_;
     bool runtimeDsEncryptEnable_;
@@ -615,7 +772,6 @@ protected:
     bool enableMergeProcess_{ false };
     bool enableDirectRouting_{ false };
     bool forceLowReliabilityInstance_{ false };
-    bool enableFrontendProxyService_{ false };
     std::string dPosixUdsPath_;
     bool enableTraefikRegistry_{ false };
     std::string traefikEtcdPrefix_ = "traefik";

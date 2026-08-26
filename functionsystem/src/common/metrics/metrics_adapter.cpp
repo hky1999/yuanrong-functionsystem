@@ -48,6 +48,7 @@ namespace MetricsPlugin = observability::plugin::metrics;
 
 const std::unordered_set<std::string> SYSTEM_FUNCTION_NAME = { "0-system-faasscheduler", "0-system-faasfrontend",
                                                                "0-system-faascontroller", "0-system-faasmanager" };
+const std::string STORAGE_RESOURCE_NAME = "storage";
 const std::string IMMEDIATELY_EXPORT = "immediatelyExport";
 const std::string BATCH_EXPORT = "batchExport";
 const std::unordered_set<std::string> SENSITIVE_CONFIG_KEYS = {
@@ -100,6 +101,16 @@ static std::string GetLibraryPath(const std::string &exporterType)
         YRLOG_INFO("exporter {} get library path: {}", exporterType, filePath);
     }
     return filePath;
+}
+
+static const resources::Resource *FindScalarResource(const resource_view::Resources &resourceSet,
+                                                     const std::string &resourceName)
+{
+    const auto iter = resourceSet.resources().find(resourceName);
+    if (iter == resourceSet.resources().end() || iter->second.type() != resources::Value_Type_SCALAR) {
+        return nullptr;
+    }
+    return &iter->second;
 }
 
 static void SetOtelDefaultConfig(nlohmann::json &initConfigJson, const std::string &componentName)
@@ -1589,7 +1600,15 @@ void MetricsAdapter::ReportClusterSourceState(const std::shared_ptr<resource_vie
         TransformGaugeParam("yr_cluster_memory_allocatable", "", "mb", allocatableMemory);
     }
 
-    // 遍历 fragment 中的每个 resourceUnit，只上报 CPU 和 Memory
+    if (const auto *storage = FindScalarResource(unit->capacity(), STORAGE_RESOURCE_NAME); storage != nullptr) {
+        TransformGaugeParam("yr_cluster_storage_capacity", "", "bytes", storage->scalar().value());
+    }
+
+    if (const auto *storage = FindScalarResource(unit->allocatable(), STORAGE_RESOURCE_NAME); storage != nullptr) {
+        TransformGaugeParam("yr_cluster_storage_allocatable", "", "bytes", storage->scalar().value());
+    }
+
+    // 遍历 fragment 中的每个 resourceUnit，上报 CPU、Memory 和 Storage。
     for (const auto &[nodeID, resourceUnit] : unit->fragment()) {
         // 上报 CPU capacity
         if (functionsystem::resource_view::HasValidCPU(resourceUnit.capacity())) {
@@ -1624,6 +1643,20 @@ void MetricsAdapter::ReportClusterSourceState(const std::shared_ptr<resource_vie
                 functionsystem::resource_view::MEMORY_RESOURCE_NAME).scalar().value();
             MeterTitle meterTitle{ "yr_nodes_memory_allocatable", "", "mb" };
             MeterData meterData{ value, { { "node_id", nodeID } } };
+            ReportDoubleGauge(meterTitle, meterData, {});
+        }
+
+        if (const auto *storage = FindScalarResource(resourceUnit.capacity(), STORAGE_RESOURCE_NAME);
+            storage != nullptr) {
+            MeterTitle meterTitle{ "yr_nodes_storage_capacity", "", "bytes" };
+            MeterData meterData{ storage->scalar().value(), { { "node_id", nodeID } } };
+            ReportDoubleGauge(meterTitle, meterData, {});
+        }
+
+        if (const auto *storage = FindScalarResource(resourceUnit.allocatable(), STORAGE_RESOURCE_NAME);
+            storage != nullptr) {
+            MeterTitle meterTitle{ "yr_nodes_storage_allocatable", "", "bytes" };
+            MeterData meterData{ storage->scalar().value(), { { "node_id", nodeID } } };
             ReportDoubleGauge(meterTitle, meterData, {});
         }
     }

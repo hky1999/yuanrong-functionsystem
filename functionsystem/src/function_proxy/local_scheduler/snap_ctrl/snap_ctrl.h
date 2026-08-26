@@ -29,6 +29,7 @@ namespace functionsystem::local_scheduler {
 class FunctionAgentMgr;
 class LocalSchedSrv;
 class InstanceCtrl;
+class IdleMgr;
 
 /**
  * SnapCtrl is the interface class that wraps async calls to SnapCtrlActor.
@@ -73,6 +74,9 @@ public:
      */
     void BindInstanceCtrl(const std::shared_ptr<InstanceCtrl> &instanceCtrl);
 
+    /** Bind the IdleMgr (park hook, D-5 F1). */
+    void BindIdleMgr(const std::shared_ptr<IdleMgr> &idleMgr);
+
     /**
      * Bind the ControlInterfaceClientManagerProxy for accessing instance clients
      * @param clientManager: The client manager
@@ -102,6 +106,23 @@ public:
     virtual litebus::Future<KillResponse> HandleSnapStart(const std::string &requestID,
                                                           const std::string &checkpointID,
                                                           const std::string &payload);
+
+    /**
+     * Handle INSTANCE_WAKE_SNAPSHOT_SIGNAL
+     * Wrap async call to SnapCtrlActor::HandleWake: restore a parked instance
+     * looked up by its ORIGINAL instanceID.
+     * @param requestID: Request ID for tracing
+     * @param instanceID: ORIGINAL instanceID of the parked instance
+     * @return Future of KillResponse
+     */
+    virtual litebus::Future<KillResponse> HandleWake(const std::string &requestID,
+                                                     const std::string &instanceID);
+
+    /**
+     * Copy of the actor's parked registry, for the pressure monitor's FIFO
+     * fallback unpark.
+     */
+    litebus::Future<std::vector<std::pair<std::string, SnapCtrlActor::ParkedEntry>>> GetParkedInstances();
 
     void SnapStart(
         const std::shared_ptr<litebus::Promise<messages::ScheduleResponse>> scheduleResp,

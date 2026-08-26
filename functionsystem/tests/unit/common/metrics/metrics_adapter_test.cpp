@@ -407,6 +407,15 @@ TEST_F(MetricsAdapterTest, ReportClusterSourceState)
     (*unit->mutable_allocatable()->mutable_resources())[functionsystem::resource_view::CPU_RESOURCE_NAME] = res;
     (*unit->mutable_capacity()->mutable_resources())[functionsystem::resource_view::MEMORY_RESOURCE_NAME] = res;
     (*unit->mutable_allocatable()->mutable_resources())[functionsystem::resource_view::MEMORY_RESOURCE_NAME] = res;
+    resources::Resource storage;
+    storage.set_type(resources::Value_Type_SCALAR);
+    storage.mutable_scalar()->set_value(104857600.0);
+    (*unit->mutable_capacity()->mutable_resources())["storage"] = storage;
+    storage.mutable_scalar()->set_value(52428800.0);
+    (*unit->mutable_allocatable()->mutable_resources())["storage"] = storage;
+    auto &node = (*unit->mutable_fragment())["node-1"];
+    (*node.mutable_capacity()->mutable_resources())["storage"] = storage;
+    (*node.mutable_allocatable()->mutable_resources())["storage"] = storage;
     MetricsAdapter::GetInstance().ReportClusterSourceState(unit);
 
     MetricsAdapter::GetInstance().CleanMetrics();

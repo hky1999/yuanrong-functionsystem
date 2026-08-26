@@ -45,6 +45,7 @@ public:
                  std::shared_ptr<StoreInfo> debugInstPutInfo, const int64_t version,
                  bool isLowReliability),
                 (override));
+    MOCK_METHOD(litebus::Future<OperateResult>, GetInstance, (const std::string &key), (override));
     MOCK_METHOD(litebus::Future<OperateResult>, ForceDelete,
                 (std::shared_ptr<StoreInfo> instanceInfo, std::shared_ptr<StoreInfo> routeInfo,
                  std::shared_ptr<StoreInfo> debugInstPutInfo, bool isLowReliability),

@@ -147,6 +147,21 @@ TEST_F(FunctionAgentUtilsTest, SetDeployRequestConfigSuccess)
     EXPECT_EQ(deployRequest->deploymentconfig().bucketurl(), "https://**.cn:***");
 }
 
+TEST_F(FunctionAgentUtilsTest, SetRuntimeConfigCarriesStorageLimit)
+{
+    auto request = std::make_shared<functionsystem::messages::DeployInstanceRequest>();
+    auto *storage = &(*request->mutable_resources()->mutable_resources())["storage"];
+    storage->set_type(resources::Value_Type_SCALAR);
+    storage->mutable_scalar()->set_value(104857600);
+    (*request->mutable_scheduleoption()->mutable_extension())["STORAGE_LIMIT"] = "209715200";
+
+    auto runtimeConfig = function_agent::SetRuntimeConfig(request);
+
+    const auto &runtimeStorage = runtimeConfig.resources().resources().at("storage");
+    EXPECT_DOUBLE_EQ(runtimeStorage.scalar().value(), 104857600);
+    EXPECT_DOUBLE_EQ(runtimeStorage.scalar().limit(), 209715200);
+}
+
 TEST_F(FunctionAgentUtilsTest, SetRuntimeConfigSuccess)
 {
     auto resourcePath = FunctionAgentUtilsTest::LoadRootKey(K1_HEX_STR, K2_HEX_STR, SALT_HEX_STR, K3_HEX_STR);

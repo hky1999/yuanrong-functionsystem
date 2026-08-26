@@ -34,6 +34,7 @@ const std::string SUBSCRIPTION_MGR_ACTOR_NAME_POSTFIX = "-SubscriptionMgrActor";
 const std::string SNAP_CTRL_ACTOR_NAME = "SnapCtrlActor";
 const std::string LOCAL_GC_ACTOR_NAME = "LocalGcActor";
 const std::string RUNTIME_RECONCILE_ACTOR_NAME = "RuntimeReconcileActor";
+const std::string PRESSURE_MONITOR_ACTOR_NAME = "PressureMonitorActor";
 
 // GlobalScheduler
 const std::string GLOBAL_SCHED_ACTOR_NAME = "GlobalSchedActor";

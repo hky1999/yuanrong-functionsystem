@@ -30,7 +30,14 @@ std::shared_ptr<messages::ScheduleRequest> SnapshotScheduler::BuildScheduleReque
     auto scheduleReq = std::make_shared<messages::ScheduleRequest>();
 
     const auto &snapshotID = meta.snapshotinfo().checkpointid();
-    std::string newID = GenerateInstanceID(snapshotID);
+    // W2 resume semantics: sandboxd state C/R restores the sandbox processes
+    // verbatim, so the in-memory libruntime session reconnects under the
+    // ORIGINAL instance identity. Re-admitting under a fresh ID makes the
+    // proxy reject that reconnect ("instance may be deleted or invalid").
+    // Keep the original instanceID when the snapshot metadata carries one;
+    // fall back to a generated ID otherwise.
+    const std::string &origID = meta.instanceinfo().instanceid();
+    std::string newID = origID.empty() ? GenerateInstanceID(snapshotID) : origID;
 
     scheduleReq->set_requestid(newID);
     scheduleReq->set_traceid(newID);

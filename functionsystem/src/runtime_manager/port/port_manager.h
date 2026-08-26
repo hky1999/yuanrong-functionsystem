@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <map>
 #include <vector>
+#include "common/status/status.h"
 #include "common/utils/singleton.h"
 
 namespace functionsystem::runtime_manager {
@@ -72,6 +73,19 @@ public:
      * @return Allocated port numbers, or empty vector if insufficient ports.
      */
     std::vector<int> RequestPorts(const std::string &runtimeID, int count);
+
+    /**
+     * Reserve persisted ports for a runtime during proxy reconciliation.
+     *
+     * The operation is atomic across all supplied ports and idempotent when
+     * the same runtime already owns them. A port outside the configured pool
+     * or owned by another runtime fails the whole operation.
+     *
+     * @param runtimeID Runtime that owns the persisted reservations.
+     * @param ports Host ports to restore.
+     * @return success when every port is reserved by runtimeID.
+     */
+    Status ReservePorts(const std::string &runtimeID, const std::vector<int> &ports);
 
     /**
      * Release all port resources associated with a runtimeID.

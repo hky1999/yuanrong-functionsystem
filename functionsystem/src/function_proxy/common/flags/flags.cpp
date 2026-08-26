@@ -100,6 +100,14 @@ const uint64_t MIN_MAX_DS_HEALTH_CHECK_TIMES = 3;
 const uint64_t MAX_MAX_DS_HEALTH_CHECK_TIMES = 30;
 const uint32_t DEFAULT_SERVICE_TTL = 300000;
 
+// W2 step-5 pressure monitor defaults
+const uint32_t PRESSURE_CHECK_INTERVAL_MS = 5000;
+const uint32_t PRESSURE_SUSTAIN_SAMPLES = 2;
+const uint32_t PRESSURE_PARK_TTL_SEC = 86400;
+const uint32_t PRESSURE_MAX_PARKED = 8;
+// D-2 event-driven watermarks
+const uint32_t PRESSURE_EVENT_MIN_GAP_MS = 1000;
+
 const std::string DEFAULT_LOCAL_SCHEDULE_PLUGINS =
     R"("["Default", "ResourceSelector", "Label", "Heterogeneous"]")";
 
@@ -155,11 +163,89 @@ Flags::Flags()
     AddFlag(&Flags::schedulePlugins_, "schedule_plugins", "schedule plugins need to be registered",
             DEFAULT_LOCAL_SCHEDULE_PLUGINS);
     AddFlag(&Flags::usageAwareSafety_, "usage_aware_safety",
-            "usage-aware admission safety fraction of node memory capacity, used by UsageAwareFilter", 0.9,
+            "usage-aware admission safety fraction of node memory capacity, used by UsageAwareFilter", 0.95,
             NumCheck(0.1, 1.0));
+    AddFlag(&Flags::overcommitRatio_, "overcommit_ratio",
+            "ceiling multiplier on node capacity for the sum of per-instance scalar limits, used by OvercommitFilter",
+            1.0, NumCheck(0.1, 16.0));
     AddFlag(&Flags::usageAwareFloorMb_, "usage_aware_floor_mb",
             "per-instance real memory reserve (MB) for usage-aware admission, capped by the instance request", 2048.0,
             NumCheck(0.0, 1048576.0));
+    AddFlag(&Flags::usageAwareTrendWindowMs_, "usage_aware_trend_window_ms",
+            "rolling window (ms) of node memory actualuse samples kept for usage-aware burst prediction",
+            int64_t(60000), NumCheck(int64_t(1000), int64_t(600000)));
+    AddFlag(&Flags::usageAwareTrendHorizonMs_, "usage_aware_trend_horizon_ms",
+            "look-ahead horizon (ms) for the usage-aware burst predictor; 0 disables prediction",
+            int64_t(30000), NumCheck(int64_t(0), int64_t(600000)));
+    AddFlag(&Flags::maxInstancesPerNode_, "max_instances_per_node",
+            "hard cap on concurrent instances per node enforced by UsageAwareFilter; 0 = unlimited", int32_t(0),
+            NumCheck(0, 4096));
+    AddFlag(&Flags::enableCommitmentAdmission_, "enable_commitment_admission",
+            "count upgrade-ladder promised-but-unrealized headroom (commitment ledger) in usage-aware admission",
+            true);
+    AddFlag(&Flags::orphanGraceSec_, "orphan_grace_sec",
+            "create-race orphan grace: a never-used (no exec/busy traffic) instance is evicted after this many"
+            " seconds instead of its idle timeout; 0 = disabled", int64_t(0), NumCheck(int64_t(0), int64_t(86400)));
+    AddFlag(&Flags::enablePressurePark_, "enable_pressure_park",
+            "enable the watermark-driven pressure monitor (park idle instances when node memory actualuse is high,"
+            " FIFO unpark when low)", false);
+    AddFlag(&Flags::pressureHighWatermark_, "pressure_high_watermark",
+            "node memory actualuse/capacity ratio at/above which the pressure monitor parks victims", 0.85,
+            NumCheck(0.1, 1.0));
+    AddFlag(&Flags::pressureLowWatermark_, "pressure_low_watermark",
+            "node memory actualuse/capacity ratio at/below which the pressure monitor FIFO-unparks", 0.70,
+            NumCheck(0.05, 1.0));
+    AddFlag(&Flags::pressureCheckIntervalMs_, "pressure_check_interval_ms",
+            "pressure monitor sampling interval in milliseconds", PRESSURE_CHECK_INTERVAL_MS);
+    AddFlag(&Flags::pressureSustainSamples_, "pressure_sustain_samples",
+            "consecutive high-watermark samples required before the pressure monitor parks",
+            PRESSURE_SUSTAIN_SAMPLES);
+    AddFlag(&Flags::pressureParkTtlSec_, "pressure_park_ttl_sec",
+            "checkpoint TTL (seconds) for pressure-parked instances, overriding the ckpt manager default",
+            PRESSURE_PARK_TTL_SEC);
+    AddFlag(&Flags::pressureMaxParked_, "pressure_max_parked",
+            "maximum simultaneously parked instances kept by the pressure monitor", PRESSURE_MAX_PARKED);
+    AddFlag(&Flags::enablePressureEvent_, "enable_pressure_event",
+            "wake the pressure monitor immediately when a sandbox cgroup crosses memory.high"
+            " (memory.events high increment) instead of waiting for the polling tick", false);
+    AddFlag(&Flags::pressureEventCgroupRoot_, "pressure_event_cgroup_root",
+            "sandboxd sandbox cgroup pool root watched for memory.events high increments"
+            " (e.g. /sys/fs/cgroup/sandbox upstream, /sys/fs/cgroup/akernel on the w2 standalone)",
+            std::string("/sys/fs/cgroup/sandbox"));
+    AddFlag(&Flags::pressureEventMinGapMs_, "pressure_event_min_gap_ms",
+            "debounce window in milliseconds for pressure event wakeups (throttle storms)",
+            PRESSURE_EVENT_MIN_GAP_MS, NumCheck(uint32_t(0), uint32_t(60000)));
+    AddFlag(&Flags::enableUpgradeLadder_, "enable_upgrade_ladder",
+            "D-3 upgrade-as-signal: a sandbox throttled at memory.high asks for one ladder rung "
+            "(memory.max += step, memory.high = ratio * new max), admitted only when the node "
+            "usage prediction fits; denied rungs stay deferred and throttled", false);
+    AddFlag(&Flags::upgradeStepMb_, "upgrade_step_mb",
+            "upgrade ladder rung size in MB", uint64_t(8192), NumCheck(uint64_t(256), uint64_t(65536)));
+    AddFlag(&Flags::upgradeCapMb_, "upgrade_cap_mb",
+            "per-sandbox memory.max ceiling the upgrade ladder will not exceed, in MB", uint64_t(32768),
+            NumCheck(uint64_t(1024), uint64_t(262144)));
+    AddFlag(&Flags::upgradeSafetyRatio_, "upgrade_safety_ratio",
+            "a rung is admitted only when actualuse + step <= safety * node memory capacity", 0.9,
+            NumCheck(0.5, 1.0));
+    AddFlag(&Flags::upgradeHighRatio_, "upgrade_high_ratio",
+            "after a raise, memory.high is set to this fraction of the new memory.max", 0.9,
+            NumCheck(0.5, 1.0));
+    AddFlag(&Flags::enableCpuUpgradeLadder_, "enable_cpu_upgrade_ladder",
+            "W-CPUL: a sandbox whose cpu.stat nr_throttled grows asks for one cpu.max quota rung "
+            "(quota *= step ratio, period untouched), admitted only when the node CPU domain "
+            "(scope-aggregate usage rate) fits under the safety line; CPU promises are not booked "
+            "in the commitment ledger", false);
+    AddFlag(&Flags::cpuUpgradeStepRatio_, "cpu_upgrade_step_ratio",
+            "cpu.max quota multiplier per ladder rung", 1.5, NumCheck(1.1, 4.0));
+    AddFlag(&Flags::cpuUpgradeCapCpus_, "cpu_upgrade_cap_cpus",
+            "per-sandbox cpu.max quota ceiling in cpus (period stays at the kernel default)", 8.0,
+            NumCheck(0.5, 64.0));
+    AddFlag(&Flags::cpuUpgradeSafetyRatio_, "cpu_upgrade_safety_ratio",
+            "a cpu rung is admitted only when measured usage + step <= safety * node cpus", 0.9,
+            NumCheck(0.5, 1.0));
+    AddFlag(&Flags::cpuUpgradeNodeCpus_, "cpu_upgrade_node_cpus",
+            "node CPU domain capacity in cpus used for cpu ladder admission; 0 = fail closed "
+            "(set to the node's core count per deployment)", 0.0, NumCheck(0.0, 1024.0));
     AddFlag(&Flags::parkedInvokeDeferEnable_, "parked_invoke_defer_enable",
             "hold data-plane invokes of parked instances until restore or hold TTL instead of failing them", true);
     AddFlag(&Flags::parkedInvokeHoldSeconds_, "parked_invoke_hold_seconds",
@@ -193,8 +279,6 @@ Flags::Flags()
     AddFlag(&Flags::tcpTunnelMaxConnections_, "tcp_tunnel_max_connections",
             "maximum concurrent TCP tunnel connections", DEFAULT_TCP_TUNNEL_MAX_CONNECTIONS,
             NumCheck(MIN_TCP_TUNNEL_MAX_CONNECTIONS, MAX_TCP_TUNNEL_MAX_CONNECTIONS));
-    AddFlag(&Flags::enableFrontendProxyService_, "enable_frontend_proxy_service",
-            "enable faasfrontend gRPC service on the existing proxy POSIX port", false);
     AddElectionFlags();
     AddDSFlags();
     AddRuntimeFlags();

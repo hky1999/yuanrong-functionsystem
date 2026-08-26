@@ -33,13 +33,15 @@ CkptFileManager::~CkptFileManager()
 
 litebus::Future<std::string> CkptFileManager::DownloadCheckpoint(
     const std::string &checkpointID,
-    const std::string &storageUrl) const
+    const std::string &storageUrl,
+    const std::string &expectedSha256,
+    int64_t expectedSize) const
 {
     return litebus::Async(actor_->GetAID(), &CkptFileManagerActor::DownloadCheckpoint,
-                          checkpointID, storageUrl);
+                          checkpointID, storageUrl, expectedSha256, expectedSize);
 }
 
-litebus::Future<std::string> CkptFileManager::RegisterCheckpoint(
+litebus::Future<CheckpointUploadResult> CkptFileManager::RegisterCheckpoint(
     const std::string &checkpointID,
     const std::string &localPath,
     const std::string &storageUrl,

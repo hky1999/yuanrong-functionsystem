@@ -50,6 +50,7 @@ using UpdateFuncMetasFunc =
     std::function<void(bool isAdd, const std::unordered_map<std::string, FunctionMeta> &funcMetas)>;
 
 using TrafficReportCbFunc = std::function<void(const std::string &instanceID, const size_t &size)>;
+using InstanceUsedCbFunc = std::function<void(const std::string &instanceID)>;
 using SelfProxyDeleteCbFunc = std::function<Status()>;
 
 const int SERVICE_TTL = 300000;  // ms
@@ -165,6 +166,11 @@ public:
     virtual void SetTrafficReportCbFunc(const TrafficReportCbFunc &trafficReportCbFunc)
     {
         trafficReportCbFunc_ = trafficReportCbFunc;
+    }
+
+    virtual void SetInstanceUsedCbFunc(const InstanceUsedCbFunc &instanceUsedCbFunc)
+    {
+        instanceUsedCbFunc_ = instanceUsedCbFunc;
     }
 
     virtual void SetSelfProxyDeleteCbFunc(const SelfProxyDeleteCbFunc &selfProxyDeleteCbFunc)
@@ -302,6 +308,8 @@ public:
 
     void ReportTraffic(const std::string &instanceID, const size_t &size);
 
+    void MarkInstanceUsed(const std::string &instanceID);
+
     void InstanceRouteUpdate(const std::string &instanceID, const resources::InstanceInfo &instanceInfo);
 
     void AttachTenantListener(const std::shared_ptr<TenantListener> &listener);
@@ -404,6 +412,7 @@ private:
     InstanceInfoSyncerCbFunc instanceInfoSyncerCbFunc_;
     UpdateFuncMetasFunc updateFuncMetasFunc_;
     TrafficReportCbFunc trafficReportCbFunc_;
+    InstanceUsedCbFunc instanceUsedCbFunc_;
     SelfProxyDeleteCbFunc selfProxyDeleteCbFunc_;
 
     // for busproxy

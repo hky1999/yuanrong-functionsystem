@@ -10,6 +10,24 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
+# Keep the port recovery unit test independent from the full runtime manager.
+cc_library(
+    name = "port_manager_test_lib",
+    testonly = True,
+    srcs = ["port/port_manager.cpp"],
+    hdrs = ["port/port_manager.h"],
+    copts = COPTS + ["-fPIC"],
+    deps = [
+        ":runtime_manager_inc",
+        "//functionsystem/src/common:status",
+        "//functionsystem/src/common:utils_base",
+        "@logs_sdk//:logs_sdk",
+    ],
+    visibility = [
+        "//functionsystem/tests/unit:__pkg__",
+    ],
+)
+
 # runtime_manager_lib — mirrors CMake's runtime_manager_lib STATIC library
 cc_library(
     name = "runtime_manager_lib",
@@ -35,6 +53,7 @@ cc_library(
         "//functionsystem/src/common:utils",
         "//functionsystem/src/common:metrics_adapter",
         "//functionsystem/src/common:resource_view",
+        "//functionsystem/src/common:status",
         "@litebus//:litebus",
         "@logs_sdk//:logs_sdk",
         "@securec//:securec",

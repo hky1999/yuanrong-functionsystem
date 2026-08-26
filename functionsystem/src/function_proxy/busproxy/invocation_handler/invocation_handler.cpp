@@ -28,6 +28,7 @@ const uint32_t MSG_ESTIMATED_FACTOR = 2;
 
 REGISTER_FUNCTION_SYS_POSIX_CONTROL_HANDLER(StreamingMessage::kInvokeReq, &InvocationHandler::Invoke);
 REGISTER_FUNCTION_SYS_POSIX_CONTROL_HANDLER(StreamingMessage::kCallResultReq, &InvocationHandler::CallResultAdapter);
+REGISTER_FUNCTION_SYS_POSIX_CONTROL_HANDLER(StreamingMessage::kEventReq, &InvocationHandler::EventAdapter);
 
 std::shared_ptr<StreamingMessage> InvokeRequestToCallRequest(const std::string &from,
                                                              const std::shared_ptr<InvokeRequest> &request)
@@ -65,7 +66,6 @@ litebus::Future<std::shared_ptr<StreamingMessage>> InvocationHandler::Invoke(
     ASSERT_FS(request->has_invokereq());
     auto invokeRequest = std::make_shared<InvokeRequest>(std::move(*request->mutable_invokereq()));
     auto instanceID = invokeRequest->instanceid();
-
     auto recevied =
         isPerf_ ? std::make_shared<busproxy::TimePoint>(std::chrono::high_resolution_clock::now()) : nullptr;
     litebus::AID id(instanceID, localUrl_);
@@ -135,7 +135,9 @@ litebus::Future<std::shared_ptr<StreamingMessage>> InvocationHandler::CallResult
         if (result.first) {
             YRLOG_INFO("{}|CallResult from {} is consumed by frontend proxy service.",
                        request->callresultreq().requestid(), from);
-            return litebus::Future<std::shared_ptr<StreamingMessage>>(result.second);
+            ASSERT_IF_NULL(instanceProxy_);
+            litebus::AID id(from, localUrl_);
+            return instanceProxy_->CompleteFrontendCall(id, request, result.second);
         }
     }
     if (createCallResultReceiver_) {
@@ -150,6 +152,7 @@ litebus::Future<std::shared_ptr<StreamingMessage>> InvocationHandler::CallResult
                           -> litebus::Future<std::shared_ptr<StreamingMessage>> {
                     if (result.first) {
                         YRLOG_INFO("{}|request from {} is create request.", callResult->requestid(), from);
+                        ASSERT_IF_NULL(result.second);
                         return result.second;
                     }
                     // initcall must be verified by local scheduler
@@ -163,6 +166,25 @@ litebus::Future<std::shared_ptr<StreamingMessage>> InvocationHandler::CallResult
         }
     }
     return CallResult(from, request);
+}
+
+litebus::Future<std::shared_ptr<StreamingMessage>> InvocationHandler::EventAdapter(
+    const std::string &from, const std::shared_ptr<StreamingMessage> &request)
+{
+    ASSERT_IF_NULL(request);
+    ASSERT_FS(request->has_eventreq());
+    if (frontendEventReceiver_ && frontendEventReceiver_(from, request)) {
+        YRLOG_DEBUG("{}|Event from {} is consumed by frontend proxy service.",
+                    request->eventreq().requestid(), from);
+    } else {
+        YRLOG_WARN("{}|No frontend stream is waiting for event from {}.",
+                   request->eventreq().requestid(), from);
+    }
+    auto response = std::make_shared<StreamingMessage>();
+    auto ack = response->mutable_callresultack();
+    ack->set_code(common::ERR_NONE);
+    ack->set_message("success");
+    return response;
 }
 
 litebus::Future<std::shared_ptr<StreamingMessage>> InvocationHandler::CallResult(

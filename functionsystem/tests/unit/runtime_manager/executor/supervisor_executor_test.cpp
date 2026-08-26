@@ -71,12 +71,14 @@ public:
     }
 
     messages::StartInstanceResponse TestGenSuccessStartInstanceResponse(
-        const std::shared_ptr<messages::StartInstanceRequest> &request, const std::string &sandboxID)
+        const std::shared_ptr<messages::StartInstanceRequest> &request, const std::string &sandboxID,
+        const std::string &sandboxIP = "")
     {
-        return GenSuccessStartInstanceResponse(request, sandboxID);
+        return GenSuccessStartInstanceResponse(request, sandboxID, sandboxIP);
     }
 
-    litebus::Future<std::string> TestCreateSandbox(const std::string &runtimeID, const std::string &hostUser = "")
+    litebus::Future<runtime::v1::StartResponse> TestCreateSandbox(const std::string &runtimeID,
+                                                                   const std::string &hostUser = "")
     {
         // CreateSandbox takes a StartInstanceRequest; build a minimal one carrying the
         // runtimeID and (optionally) HOST_USER deploy option the caller asked for.
@@ -872,9 +874,12 @@ TEST_F(SupervisorExecutorTest, CreateSandbox_FailsWhenSupervisorUnavailable)
     std::string runtimeID = "test_cs_runtime_id";
     auto future = executor_->TestCreateSandbox(runtimeID, "host_user");
 
-    ASSERT_AWAIT_SET_FOR(future, TEST_AWAIT_TIMEOUT);
-    EXPECT_TRUE(future.IsError());
-    EXPECT_EQ(future.GetErrorCode(), static_cast<int>(StatusCode::ERR_INNER_COMMUNICATION));
+    ASSERT_AWAIT_READY_FOR(future, TEST_AWAIT_TIMEOUT);
+    auto rsp = future.Get();
+    // CreateSandbox resolves failures as a value (code != SUCCESS), not SetFailed — mirrors ExecInSandbox
+    EXPECT_EQ(rsp.code(), static_cast<int32_t>(StatusCode::ERR_INNER_COMMUNICATION));
+    // transport failure (no supervisor): generic message, error_message unavailable
+    EXPECT_EQ(rsp.message(), "Failed to create sandbox");
     // No sandbox should be registered on failure
     EXPECT_FALSE(executor_->TestIsRuntimeActive(runtimeID));
 }
@@ -884,9 +889,9 @@ TEST_F(SupervisorExecutorTest, CreateSandbox_FailsWithEmptyHostUser)
     std::string runtimeID = "test_cs_empty_host";
     auto future = executor_->TestCreateSandbox(runtimeID, "");
 
-    ASSERT_AWAIT_SET_FOR(future, TEST_AWAIT_TIMEOUT);
-    EXPECT_TRUE(future.IsError());
-    EXPECT_EQ(future.GetErrorCode(), static_cast<int>(StatusCode::ERR_INNER_COMMUNICATION));
+    ASSERT_AWAIT_READY_FOR(future, TEST_AWAIT_TIMEOUT);
+    auto rsp = future.Get();
+    EXPECT_EQ(rsp.code(), static_cast<int32_t>(StatusCode::ERR_INNER_COMMUNICATION));
 }
 
 /**
@@ -975,7 +980,8 @@ TEST_F(SupervisorExecutorTest, StartByRuntimeID_ReturnsFailureResponseWhenCreate
 
     ASSERT_AWAIT_READY_FOR(future, TEST_AWAIT_TIMEOUT);
     auto rsp = future.Get();
-    // CreateSandbox fails (no supervisor) -> OnComplete IsError branch -> SetValue failure StartResponse
+    // CreateSandbox fails (no supervisor) -> returns failure StartResponse (code != SUCCESS),
+    // StartByRuntimeID propagates message into its own failure StartResponse
     EXPECT_EQ(rsp.code(), static_cast<int32_t>(StatusCode::ERR_INNER_COMMUNICATION));
     EXPECT_EQ(rsp.message(), "Failed to create sandbox");
 }

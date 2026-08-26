@@ -42,6 +42,7 @@
 #include "function_proxy/common/posix_client/control_plane_client/control_interface_client_manager_proxy.h"
 #include "function_proxy/common/rate_limiter/token_bucket_rate_limiter.h"
 #include "local_scheduler/instance_control/frontend_kill_cleanup_snapshot.h"
+#include "local_scheduler/instance_control/instance_generation_conflict_resolver.h"
 // for remove rgroup, easy for facilitates authentication, which should be extracted in the future
 #include "local_scheduler/instance_control/idle/idle_mgr.h"
 #include "local_scheduler/resource_group_controller/resource_group_ctrl.h"
@@ -614,6 +615,19 @@ public:
     litebus::Future<messages::DeployInstanceResponse> DeploySnapStartInstance(
         const std::shared_ptr<messages::ScheduleRequest> &scheduleReq);
 
+    /**
+     * Remove the state machine left behind by a failed snapstart(restore)
+     * deploy. D-6 F3: without this, the CREATING machine outlives the failed
+     * attempt, and the next wake's schedule request hits it
+     * (CheckExistInstanceState -> "wait state change") while nothing will ever
+     * deploy -- the phantom restore (exec stuck at 4005 until LocalGcActor
+     * reclaims the ghost 660s later).
+     * @param scheduleReq: the schedule request of the failed restore
+     * @param reason: short failure description for the log
+     */
+    void CleanupFailedSnapStart(const std::shared_ptr<messages::ScheduleRequest> &scheduleReq,
+                                const std::string &reason);
+
     void SessionCountDelta(const std::string &instanceID, int delta);
 
     /**
@@ -785,6 +799,10 @@ private:
     litebus::Future<internal::ForwardCallResultResponse> SendForwardCallResultRequest(
         const litebus::AID &proxyAID,
         const std::shared_ptr<internal::ForwardCallResultRequest> &forwardCallResultRequest);
+    std::shared_ptr<internal::ForwardCallResultRequest> BuildForwardCallResultRequest(
+        const std::string &srcInstance, const std::string &dstInstance,
+        const std::string &dstProxyID,
+        const std::shared_ptr<functionsystem::CallResult> &callResult);
 
     litebus::Future<Status> SendForwardCallResultResponse(const CallResultAck &ack, const litebus::AID &from,
                                                           const std::string &requestID, const std::string &instanceID);
@@ -980,6 +998,67 @@ private:
 
     CreateCallResultCallBack RegisterCreateCallResultCallback(
         const std::shared_ptr<messages::ScheduleRequest> &request);
+    litebus::Future<CallResultAck> HandleCreateCallResult(
+        const std::shared_ptr<messages::ScheduleRequest> &request,
+        const std::shared_ptr<InstanceGenerationConflictResolver> &resolver,
+        const std::shared_ptr<functionsystem::CallResult> &callResult);
+    litebus::Future<CallResultAck> HandleCreateCallResultForStateMachine(
+        const std::shared_ptr<messages::ScheduleRequest> &request,
+        const std::shared_ptr<InstanceGenerationConflictResolver> &resolver,
+        const std::shared_ptr<InstanceStateMachine> &stateMachine,
+        const std::shared_ptr<functionsystem::CallResult> &callResult);
+    litebus::Future<CallResultAck> HandleCreateTransitionResult(
+        const std::shared_ptr<InstanceGenerationConflictResolver> &resolver,
+        const std::shared_ptr<functionsystem::CallResult> &callResult,
+        const TransitionResult &result);
+
+    litebus::Future<CallResultAck> HandleCreateGenerationChange(
+        const InstanceInfo &contenderSnapshot, const InstanceInfo &currentInfo,
+        const std::shared_ptr<functionsystem::CallResult> &callResult,
+        const std::shared_ptr<InstanceGenerationConflictResolver> &resolver);
+    litebus::Future<Status> StartCreateContenderCleanup(
+        const InstanceInfo &contenderSnapshot,
+        const std::shared_ptr<InstanceGenerationConflictResolver> &resolver);
+    litebus::Future<Status> ContinueCreateContenderCleanupAfterResource(
+        const litebus::Future<Status> &resourceFuture, const InstanceInfo &contenderSnapshot,
+        const std::shared_ptr<InstanceGenerationConflictResolver> &resolver);
+    Status FinishCreateContenderRuntimeCleanup(
+        const litebus::Future<messages::KillInstanceResponse> &runtimeFuture,
+        const InstanceInfo &contenderSnapshot,
+        const std::shared_ptr<InstanceGenerationConflictResolver> &resolver);
+    litebus::Future<CallResultAck> HandleCreateRouteConflict(
+        const InstanceInfo &contenderSnapshot, const TransitionResult &result,
+        const std::shared_ptr<functionsystem::CallResult> &callResult,
+        const std::shared_ptr<InstanceGenerationConflictResolver> &resolver);
+    litebus::Future<CallResultAck> HandleCreateRouteWinner(
+        const InstanceInfo &contenderSnapshot, const InstanceInfo &winnerInfo,
+        const std::shared_ptr<functionsystem::CallResult> &callResult,
+        const std::shared_ptr<InstanceGenerationConflictResolver> &resolver);
+    litebus::Future<CallResultAck> SendCreateConflictError(
+        const InstanceInfo &contenderInfo, const std::shared_ptr<functionsystem::CallResult> &callResult,
+        const std::string &message, bool recordTombstone = false);
+    litebus::Future<CallResultAck> ReclaimCreateContenderAndSendError(
+        const InstanceInfo &contenderSnapshot, const std::shared_ptr<functionsystem::CallResult> &callResult,
+        const std::shared_ptr<InstanceGenerationConflictResolver> &resolver,
+        const std::string &message);
+    litebus::Future<CallResultAck> ReclaimCreateContenderAndSendWinner(
+        const InstanceInfo &contenderSnapshot, const InstanceInfo &winnerInfo,
+        const std::shared_ptr<functionsystem::CallResult> &callResult,
+        const std::shared_ptr<InstanceGenerationConflictResolver> &resolver);
+    litebus::Future<CallResultAck> ResolveAndSendCreateRouteWinner(
+        const InstanceInfo &contenderInfo, const InstanceInfo &winnerInfo,
+        const std::shared_ptr<functionsystem::CallResult> &callResult);
+    litebus::Future<CallResultAck> SendCreateRouteWinnerCallResult(
+        const InstanceInfo &contenderInfo,
+        const std::shared_ptr<functionsystem::CallResult> &callResult);
+    litebus::Future<CallResultAck> SendCreateArbitratedCallResult(
+        const InstanceInfo &contenderInfo,
+        const std::shared_ptr<functionsystem::CallResult> &callResult,
+        bool recordTombstone);
+    CallResultAck RecordCreateRouteWinnerCallResult(
+        const CallResultAck &ack, const std::string &instanceID, const std::string &contenderRequestID);
+    void ClearCreateConflictCallResultTombstone(
+        const std::string &instanceID, const std::string &contenderRequestID);
 
     bool CheckExistInstanceState(const InstanceState &state,
                                  const std::shared_ptr<litebus::Promise<messages::ScheduleResponse>> &runtimePromise,
@@ -1042,6 +1121,10 @@ private:
 
     using ForwardCallResultPromise = litebus::Promise<internal::ForwardCallResultResponse>;
     std::unordered_map<std::string, std::shared_ptr<ForwardCallResultPromise>> forwardCallResultPromise_;
+    // request ID -> exact losing contender instance ID.  Prevent a stale forward-notify
+    // response from applying generic cleanup to the state machine already
+    // overwritten with the remote winner.
+    std::unordered_map<std::string, std::string> createConflictForwardContenders_;
 
     using SyncPromise = std::shared_ptr<litebus::Promise<Status>>;
 
@@ -1060,6 +1143,12 @@ private:
     std::unordered_map<std::string, std::string> instanceReadyCallResultRequestIDByInstanceID_;
 
     std::unordered_map<std::string, CreateCallResultCallBack> createCallResultCallback_;
+    // Only these callbacks are allowed to consume the RUNNING fast-path.  Other
+    // lifecycle callbacks retain the legacy direct-forward behavior.
+    std::unordered_set<std::string> routeConflictCreateCallbackInstances_;
+    // instance ID -> completed contender request ID.  A delayed duplicate init
+    // CallResult must be ACKed rather than forwarded using the winner's parent.
+    std::unordered_map<std::string, std::string> createConflictCallResultTombstones_;
 
     // key: tenant id
     std::unordered_map<std::string, std::shared_ptr<TokenBucketRateLimiter>> rateLimiterMap_;

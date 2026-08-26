@@ -17,6 +17,7 @@
 #ifndef COMMON_UTILS_STRUCT_TRANSFER_H
 #define COMMON_UTILS_STRUCT_TRANSFER_H
 
+#include <algorithm>
 #include <exception>
 #include <map>
 #include <regex>
@@ -285,9 +286,19 @@ static void SetInstanceInfoResources(::resources::InstanceInfo *instanceInfo, co
         resource.set_name(r.first);
         resource.set_type(resource_view::ValueType::Value_Type_SCALAR);
         resource.mutable_scalar()->set_value(r.second);
-        // Set resource limit from extension if present (e.g. CPU_LIMIT, MEMORY_LIMIT)
+        // Set resource limit from extension if present. Two key spellings
+        // exist in the wild: "<Name>_LIMIT" (libruntime invoke_spec, agent
+        // utils) and the all-caps "<NAME>_LIMIT" (Go sandbox raw-create
+        // writes CPU_LIMIT/MEMORY_LIMIT); accept both.
         std::string limitKey = r.first + "_LIMIT";
-        if (auto it = extensions.find(limitKey); it != extensions.end()) {
+        auto it = extensions.find(limitKey);
+        if (it == extensions.end()) {
+            std::string upperKey = limitKey;
+            std::transform(upperKey.begin(), upperKey.end(), upperKey.begin(),
+                           [](unsigned char c) { return std::toupper(c); });
+            it = extensions.find(upperKey);
+        }
+        if (it != extensions.end()) {
             resource.mutable_scalar()->set_limit(std::stod(it->second));
         }
         (*resources)[r.first] = std::move(resource);
@@ -865,10 +876,21 @@ static int GetRuntimeRecoverTimes(const resources::InstanceInfo &instanceInfo)
 
 [[maybe_unused]] static bool IsCreateByFrontend(const std::shared_ptr<InstanceInfo> &info)
 {
+    if (info == nullptr) {
+        return false;
+    }
     if (info->extensions().find(CREATE_SOURCE) == info->extensions().end()) {
         return false;
     }
     return info->extensions().at(CREATE_SOURCE) == FRONTEND_STR;
+}
+
+[[maybe_unused]] static bool IsCreateByFrontend(const InstanceInfo &info)
+{
+    if (info.extensions().find(CREATE_SOURCE) == info.extensions().end()) {
+        return false;
+    }
+    return info.extensions().at(CREATE_SOURCE) == FRONTEND_STR;
 }
 
 [[maybe_unused]] static bool IsDriver(const InstanceInfo &info)
@@ -885,6 +907,9 @@ static int GetRuntimeRecoverTimes(const resources::InstanceInfo &instanceInfo)
 
 [[maybe_unused]] static bool IsDriver(const std::shared_ptr<InstanceInfo> &info)
 {
+    if (info == nullptr) {
+        return false;
+    }
     return IsDriver(*info);
 }
 

@@ -17,21 +17,28 @@
 #ifndef FUNCTIONSYSTEM_USAGE_AWARE_FILTER_H
 #define FUNCTIONSYSTEM_USAGE_AWARE_FILTER_H
 
+#include <cstdint>
 #include <mutex>
 
 #include "common/proto/pb/posix/resource.pb.h"
 #include "common/resource_view/resource_type.h"
+#include "common/resource_view/usage_trend_tracker.h"
 #include "common/schedule_plugin/common/preallocated_context.h"
 #include "common/scheduler_framework/framework/policy.h"
 #include "common/status/status.h"
 
 namespace functionsystem::schedule_plugin::filter {
 
-// Usage-aware admission (gVisor overcommit): pass when the node's real usage
-// plus a per-instance reserve fits inside a safety fraction of the node
-// capacity, i.e.  actualuse(Memory) + reserve <= capacity(Memory) * safety.
-// The booked/allocatable check stays in DefaultFilter as the guaranteed
-// fallback; this filter only ever adds constraints on top of it.
+// Usage-aware admission (gVisor overcommit, D-form): pass when the node's
+// real usage (burst-predicted over a short horizon by UsageTrendTracker)
+// plus a per-instance reserve plus a floor-style reserve for same-window
+// in-flight (admitted but still cold) instances fits inside a safety
+// fraction of the node capacity, i.e.
+//   predicted(actualuse(Memory)) + reserve + pendingReserve <= capacity(Memory) * safety,
+// and the node's concurrent instance count stays under a hard cap
+// (cross-window cold-start backstop). The booked/allocatable check stays
+// in DefaultFilter as the guaranteed fallback; this filter only ever adds
+// constraints on top of it.
 class UsageAwareFilter : public schedule_framework::FilterPlugin {
 public:
     UsageAwareFilter() = default;
@@ -44,15 +51,17 @@ public:
 
     // set once by the local/domain scheduler driver before plugin creation
     // (creators take no arguments); defaults keep the filter self-contained.
-    static void SetConfig(double safety, double floorMb);
+    static void SetConfig(double safety, double floorMb, int32_t maxInstances);
 
     static double GetSafety();
     static double GetFloorMb();
+    static int32_t GetMaxInstances();
 
 private:
     static std::mutex configMutex_;
     static double safety_;
     static double floorMb_;
+    static int32_t maxInstances_;
 };
 }  // namespace functionsystem::schedule_plugin::filter
 

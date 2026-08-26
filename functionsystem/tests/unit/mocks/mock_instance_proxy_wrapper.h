@@ -41,6 +41,9 @@ public:
                 (const litebus::AID &to, const std::string &srcInstanceID, const std::string &dstInstanceID,
                  const SharedStreamMsg &request, const std::shared_ptr<busproxy::TimePoint> &time),
                 (override));
+    MOCK_METHOD(litebus::Future<SharedStreamMsg>, CompleteFrontendCall,
+                (const litebus::AID &to, const SharedStreamMsg &callResult, const SharedStreamMsg &callResultAck),
+                (override));
     MOCK_METHOD(litebus::Future<std::string>, GetTenantID, (const litebus::AID &to),(override));
 };
 }  // namespace functionsystem::test

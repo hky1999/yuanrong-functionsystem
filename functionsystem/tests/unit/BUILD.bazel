@@ -123,6 +123,30 @@ cc_test(
 )
 
 cc_test(
+    name = "port_manager_test",
+    linkstatic = True,
+    srcs = [
+        "runtime_manager/port/port_manager_test.cpp",
+        "utils/port_helper.h",
+    ],
+    copts = COPTS + [
+        "-Wno-error",
+        "-Ifunctionsystem/src",
+        "-Ifunctionsystem/src/runtime_manager",
+        "-Ifunctionsystem/tests/unit",
+    ],
+    linkopts = [
+        "-pthread",
+        "-lcap",
+        "-ldl",
+    ],
+    deps = [
+        "//functionsystem/src/runtime_manager:port_manager_test_lib",
+        "@gtest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "sandboxd_request_builder_test",
     linkstatic = True,
     srcs = ["runtime_manager/executor/sandboxd/sandboxd_request_builder_test.cpp"],
@@ -153,6 +177,7 @@ cc_test(
         "function_proxy/local_scheduler/grpc_server/frontend_proxy_service_test.cpp",
         "gtest_sleep_compat.h",
         "main.cpp",
+        "mocks/mock_instance_proxy_wrapper.h",
         "utils/port_helper.h",
     ],
     copts = COPTS + [
@@ -268,6 +293,13 @@ cc_test(
     name = "instance_ctrl_unit_test",
     linkstatic = True,
     srcs = [
+        "common/resource_view/view_utils.cpp",
+        "common/resource_view/view_utils.h",
+        "common/etcd_service/etcd_lease_service.cpp",
+        "common/etcd_service/etcd_kv_service.cpp",
+        "common/etcd_service/etcd_service_driver.cpp",
+        "common/etcd_service/etcd_watch_service.cpp",
+        "common/etcd_service/etcd_watch_srv_actor.cpp",
         "function_proxy/local_scheduler/instance_control/instance_ctrl_test.cpp",
         "gtest_sleep_compat.h",
         "main.cpp",

@@ -935,6 +935,14 @@ void ObserverActor::ReportTraffic(const std::string &instanceID, const size_t &s
     trafficReportCbFunc_(instanceID, size);
 }
 
+void ObserverActor::MarkInstanceUsed(const std::string &instanceID)
+{
+    if (instanceUsedCbFunc_ == nullptr) {
+        return;
+    }
+    instanceUsedCbFunc_(instanceID);
+}
+
 void ObserverActor::SetInstanceBillingContext(const resource_view::InstanceInfo &instanceInfo, bool synced)
 {
     if (synced && instanceInfo.functionproxyid() == nodeID_) {

@@ -77,6 +77,7 @@ private:
 
     static OperateResult OnDelete(const OperateInfo &operateInfo);
     static OperateResult OnCreate(const OperateInfo &operateInfo);
+    static OperateResult ResolveCreateConflict(const OperateInfo &operateInfo);
     static OperateResult OnModify(const OperateInfo &operateInfo);
     static OperateResult OnForceDelete(const OperateInfo &operateInfo);
     static bool CheckGetResponse(const TxnOperationResponse &resp, const std::string &key, const std::string &value,

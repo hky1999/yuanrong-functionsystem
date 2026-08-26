@@ -26,11 +26,12 @@
 #include "common/proto/pb/message_pb.h"
 #include "common/proto/pb/posix_pb.h"
 #include "common/resource_view/resource_type.h"
+#include "common/utils/struct_transfer.h"
 #include "local_scheduler/function_agent_manager/function_agent_mgr.h"
+#include "local_scheduler/instance_control/idle/idle_mgr.h"
+#include "function_proxy/common/parked_instance_registry/parked_instance_registry.h"
 #include "local_scheduler/instance_control/instance_ctrl_message.h"
 #include "local_scheduler/local_scheduler_service/local_sched_srv.h"
-
-#include "function_proxy/common/parked_instance_registry/parked_instance_registry.h"
 
 namespace functionsystem::local_scheduler {
 
@@ -138,8 +139,8 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
     //    超时默认放弃本次 park（实例继续运行，上层可重试）；force 策略仅实验用。
     const bool forceOnDrainTimeout = markParked && parkedRegistry.DrainForceOnTimeout();
     return parkedRegistry.DrainInstance(instanceID)
-        .Then([this, aid(GetAID()), requestID, instanceID, instanceInfo, ttl, markParked, forceOnDrainTimeout,
-               functionAgentMgr(functionAgentMgr_)](const Status &drainStatus)
+        .Then([this, aid(GetAID()), requestID, instanceID, instanceInfo, ttl, leaveRunning, markParked,
+               forceOnDrainTimeout, functionAgentMgr(functionAgentMgr_)](const Status &drainStatus)
                    -> litebus::Future<messages::SnapshotRuntimeResponse> {
             if (drainStatus.IsError()) {
                 YRLOG_ERROR("{}|{}|park drain failed: {}", requestID, instanceID, drainStatus.GetMessage());
@@ -160,7 +161,7 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
             }
             // 3. 调用 PrepareSnap 验证实例状态并准备快照
             return PrepareSnap(requestID, instanceID)
-                .Then([aid, requestID, instanceID, instanceInfo, ttl, markParked,
+                .Then([aid, requestID, instanceID, instanceInfo, ttl, leaveRunning, markParked,
                        functionAgentMgr](const Status &status) -> litebus::Future<messages::SnapshotRuntimeResponse> {
                         if (status.IsError()) {
                             YRLOG_ERROR("{}|{}|PrepareSnap failed: {}", requestID, instanceID, status.GetMessage());
@@ -175,7 +176,7 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
                             return errorRsp;
                         }
                         // 4. 通过 functionAgentMgr_ 发送 SnapshotRuntime 请求到 function_agent
-                        return functionAgentMgr->SnapshotRuntime(requestID, instanceInfo, ttl);
+                        return functionAgentMgr->SnapshotRuntime(requestID, instanceInfo, ttl, leaveRunning);
                     });
         })
         .Then([aid(GetAID()), localSchedSrv(localSchedSrv_), requestID, instanceInfo,
@@ -214,10 +215,12 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
 
             return result;
         })
-        .Then(litebus::Defer(GetAID(), &SnapCtrlActor::OnHandleSnapshot, std::placeholders::_1));
+        .Then(litebus::Defer(GetAID(), &SnapCtrlActor::OnHandleSnapshot, instanceID, leaveRunning,
+                             std::placeholders::_1));
 }
 
-KillResponse SnapCtrlActor::OnHandleSnapshot(const SnapshotResult &result)
+KillResponse SnapCtrlActor::OnHandleSnapshot(const std::string &instanceID, bool leaveRunning,
+                                             const SnapshotResult &result)
 {
     KillResponse rsp;
     rsp.set_code(static_cast<common::ErrorCode>(result.code));
@@ -231,8 +234,105 @@ KillResponse SnapCtrlActor::OnHandleSnapshot(const SnapshotResult &result)
         rsp.set_payload(info.SerializeAsString());
         YRLOG_INFO("snapshot completed, checkpointID: {}, size: {}", result.snapshotInfo.checkpointid(),
                    result.snapshotInfo.size());
+        if (!leaveRunning) {
+            // park: the instance is deleted right after this response, so the
+            // checkpoint is the only handle left. Record it for wake/FIFO unpark.
+            ParkedEntry entry;
+            entry.checkpointID = result.snapshotInfo.checkpointid();
+            entry.parkedAt = std::chrono::steady_clock::now();
+            parkedInstances_[instanceID] = entry;
+            YRLOG_INFO("instance({}) parked, registered checkpoint({}), parked total: {}", instanceID,
+                       entry.checkpointID, parkedInstances_.size());
+            // D-5 F1: clear the idle bookkeeping for the ID before the
+            // restore reuses it, or the pre-park idle timer evicts the
+            // restored instance on its old deadline.
+            if (idleMgr_ != nullptr) {
+                idleMgr_->OnInstanceParked(instanceID);
+            }
+        }
     }
     return rsp;
+}
+
+litebus::Future<KillResponse> SnapCtrlActor::HandleWake(const std::string &requestID, const std::string &instanceID)
+{
+    auto it = parkedInstances_.find(instanceID);
+    if (it == parkedInstances_.end()) {
+        YRLOG_WARN("{}|wake rejected: instance({}) is not parked on this node", requestID, instanceID);
+        KillResponse rsp;
+        rsp.set_code(static_cast<common::ErrorCode>(StatusCode::ERR_INSTANCE_NOT_FOUND));
+        rsp.set_message("instance is not parked on this node: " + instanceID);
+        return rsp;
+    }
+    const auto checkpointID = it->second.checkpointID;
+    YRLOG_INFO("{}|wake parked instance({}) from checkpoint({})", requestID, instanceID, checkpointID);
+    return HandleSnapStart(requestID, checkpointID, "")
+        .Then(litebus::Defer(GetAID(), &SnapCtrlActor::OnWakeComplete, instanceID, std::placeholders::_1));
+}
+
+KillResponse SnapCtrlActor::OnWakeComplete(const std::string &instanceID, const KillResponse &rsp)
+{
+    if (rsp.code() == common::ERR_NONE) {
+        ForgetParked(instanceID);
+        return rsp;
+    }
+    // 步6 正规化：终态失败（checkpoint 工件不存在/过期、同 ID 实例已重建）
+    // 时丢弃注册表项，否则水位 FIFO unpark 会每周期无限重试。工件若仍在，
+    // 外部 signal 19（按 checkpointID）恢复不受影响；瞬时错误保留条目重试。
+    const auto &msg = rsp.message();
+    const bool terminal = msg.find("not found") != std::string::npos
+        || msg.find("has expired") != std::string::npos
+        || msg.find("same instance id") != std::string::npos;
+    if (terminal) {
+        YRLOG_WARN("wake of instance({}) failed terminally ({}), dropping parked entry; "
+                   "signal-19 restore by checkpointID remains available",
+                   instanceID, msg);
+        ForgetParked(instanceID);
+        return rsp;
+    }
+    // D-5 F4: non-terminal failures (e.g. a 24G checkpoint restore exceeding
+    // the RPC deadline, code 1017) must not retry forever -- the monitor's
+    // wake cooldown re-picks the same oldest entry every 300s. Give up after
+    // kWakeGiveUpAfter consecutive failures; the checkpoint itself stays on
+    // disk (park TTL) and signal-19 by checkpointID still works.
+    auto it = parkedInstances_.find(instanceID);
+    if (it != parkedInstances_.end() && ++it->second.wakeFails >= kWakeGiveUpAfter) {
+        YRLOG_WARN("wake of instance({}) failed {} times (last: {}), dropping parked entry; "
+                   "signal-19 restore by checkpointID({}) remains available",
+                   instanceID, it->second.wakeFails, msg, it->second.checkpointID);
+        ForgetParked(instanceID);
+    }
+    return rsp;
+}
+
+void SnapCtrlActor::ForgetParked(const std::string &instanceID)
+{
+    if (parkedInstances_.erase(instanceID) > 0) {
+        YRLOG_INFO("parked instance({}) restored, registry size: {}", instanceID, parkedInstances_.size());
+    }
+}
+
+void SnapCtrlActor::ForgetParkedByCheckpoint(const std::string &checkpointID)
+{
+    for (auto it = parkedInstances_.begin(); it != parkedInstances_.end();) {
+        if (it->second.checkpointID == checkpointID) {
+            YRLOG_INFO("parked instance({}) restored by direct snapstart, registry size before: {}", it->first,
+                       parkedInstances_.size());
+            it = parkedInstances_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+std::vector<std::pair<std::string, SnapCtrlActor::ParkedEntry>> SnapCtrlActor::GetParkedInstances()
+{
+    std::vector<std::pair<std::string, ParkedEntry>> out;
+    out.reserve(parkedInstances_.size());
+    for (const auto &entry : parkedInstances_) {
+        out.emplace_back(entry.first, entry.second);
+    }
+    return out;
 }
 
 litebus::Future<KillResponse> SnapCtrlActor::HandleSnapStart(const std::string &requestID,
@@ -269,7 +369,7 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapStart(const std::string &
     // 4. 通过 localSchedSrv_ 转发到 function_master 的 ckpt_manager
     ASSERT_IF_NULL(localSchedSrv_);
     return localSchedSrv_->SnapStartCheckpoint(req).Then(
-        [requestID, checkpointID](const messages::RestoreSnapshotResponse &rsp) -> KillResponse {
+        [aid(GetAID()), requestID, checkpointID](const messages::RestoreSnapshotResponse &rsp) -> KillResponse {
             KillResponse killRsp;
             killRsp.set_code(static_cast<common::ErrorCode>(rsp.code()));
             killRsp.set_message(rsp.message());
@@ -277,6 +377,10 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapStart(const std::string &
             if (rsp.code() == common::ERR_NONE) {
                 YRLOG_INFO("{}|snapstart checkpoint {} succeeded, new instanceID: {}", requestID, checkpointID,
                            rsp.instanceid());
+                // direct restore (signal 19): drop any parked-registry entry
+                // pointing at this checkpoint so the instance cannot be
+                // double-woken afterwards.
+                litebus::Async(aid, &SnapCtrlActor::ForgetParkedByCheckpoint, checkpointID);
                 SnapStartedInfo info;
                 info.set_instanceid(rsp.instanceid());
                 if (rsp.has_snapstartinfo()) {
@@ -326,6 +430,7 @@ void SnapCtrlActor::OnDeploySnapStartInstanceComplete(
     if (deployFuture.IsError()) {
         YRLOG_ERROR("{}|{}|DeploySnapStartInstance future failed, error code: {}", requestID, instanceID,
                     deployFuture.GetErrorCode());
+        instanceCtrl_->CleanupFailedSnapStart(scheduleReq, "DeploySnapStartInstance future failed");
         scheduleResp->SetValue(GenScheduleResponse(StatusCode::FAILED, "DeploySnapStartInstance failed", *scheduleReq));
         return;
     }
@@ -334,6 +439,8 @@ void SnapCtrlActor::OnDeploySnapStartInstanceComplete(
     if (deployResponse.code() != 0) {
         YRLOG_ERROR("{}|{}|deploy snapstart instance failed, code: {}, message: {}", requestID, instanceID,
                     deployResponse.code(), deployResponse.message());
+        instanceCtrl_->CleanupFailedSnapStart(scheduleReq,
+                                              "deploy failed: " + std::to_string(deployResponse.code()));
         scheduleResp->SetValue(GenScheduleResponse(static_cast<StatusCode>(deployResponse.code()),
                                                    deployResponse.message(), *scheduleReq));
         return;
@@ -349,6 +456,17 @@ void SnapCtrlActor::OnDeploySnapStartInstanceComplete(
     scheduleReq->mutable_instance()->set_runtimeaddress(address);
     scheduleReq->mutable_instance()->set_starttime(deployResponse.timeinfo());
     (*scheduleReq->mutable_instance()->mutable_extensions())["PID"] = std::to_string(deployResponse.pid());
+    // 步6 正规化：restore 产生新 sandbox ID，必须同步进 control view（经
+    // RUNNING 转换的 instanceInfo = scheduleReq->instance()）。否则实例信息
+    // 仍带 park 前的旧 containerID，RuntimeReconcileActor 会把它判成 ghost
+    // （expected 容器缺失）强制删除，同时新 sandbox 被当 orphan 候选——
+    // 实测 wake 后 ≤60s 被 reconcile 清扫（fp18 run1）。
+    scheduleReq->mutable_instance()->set_containerid(deployResponse.containerid());
+    scheduleReq->mutable_instance()->set_containerip(deployResponse.containerip());
+    scheduleReq->mutable_instance()->set_executortype(deployResponse.executortype());
+    if (!deployResponse.portmappings().empty()) {
+        (*scheduleReq->mutable_instance()->mutable_extensions())[PORT_FORWARD_KEY] = deployResponse.portmappings();
+    }
 
     // 2. CreateInstanceClient
     ASSERT_IF_NULL(instanceCtrl_);
@@ -370,6 +488,7 @@ void SnapCtrlActor::OnCreateInstanceClientComplete(
     if (clientResult.IsError() || clientResult.Get() == nullptr) {
         YRLOG_ERROR("{}|{}|failed to create instance client, error code: {}", requestID, instanceID,
                     clientResult.GetErrorCode());
+        instanceCtrl_->CleanupFailedSnapStart(scheduleReq, "failed to create instance client");
         scheduleResp->SetValue(
             GenScheduleResponse(StatusCode::FAILED, "failed to create instance client", *scheduleReq));
         return;
@@ -402,6 +521,7 @@ void SnapCtrlActor::OnSnapStartedRpcComplete(
     if (snapStartedResult.IsError()) {
         YRLOG_ERROR("{}|{}|SnapStarted RPC failed, error code: {}", requestID, instanceID,
                     snapStartedResult.GetErrorCode());
+        instanceCtrl_->CleanupFailedSnapStart(scheduleReq, "SnapStarted RPC failed");
         scheduleResp->SetValue(GenScheduleResponse(StatusCode::FAILED, "SnapStarted RPC failed", *scheduleReq));
         return;
     }
@@ -410,6 +530,8 @@ void SnapCtrlActor::OnSnapStartedRpcComplete(
     if (response.code() != common::ERR_NONE) {
         YRLOG_ERROR("{}|{}|SnapStarted RPC returned error: code={}, message={}", requestID, instanceID, response.code(),
                     response.message());
+        instanceCtrl_->CleanupFailedSnapStart(scheduleReq,
+                                              "SnapStarted RPC error: " + std::to_string(response.code()));
         scheduleResp->SetValue(
             GenScheduleResponse(static_cast<StatusCode>(response.code()), response.message(), *scheduleReq));
         return;
@@ -447,6 +569,7 @@ void SnapCtrlActor::OnTransInstanceStateComplete(
     if (transResult.IsError()) {
         YRLOG_ERROR("{}|{}|failed to transition instance to RUNNING state, error code: {}", requestID, instanceID,
                     transResult.GetErrorCode());
+        instanceCtrl_->CleanupFailedSnapStart(scheduleReq, "RUNNING transition future failed");
         scheduleResp->SetValue(
             GenScheduleResponse(StatusCode::ERR_ETCD_OPERATION_ERROR, "failed to update instance state", *scheduleReq));
         return;
@@ -456,6 +579,7 @@ void SnapCtrlActor::OnTransInstanceStateComplete(
     if (result.status.IsError()) {
         YRLOG_ERROR("{}|{}|failed to transition instance to RUNNING state: {}", requestID, instanceID,
                     result.status.GetMessage());
+        instanceCtrl_->CleanupFailedSnapStart(scheduleReq, "RUNNING transition failed");
         scheduleResp->SetValue(
             GenScheduleResponse(result.status.StatusCode(), result.status.GetMessage(), *scheduleReq));
         return;

@@ -30,6 +30,12 @@
 
 namespace functionsystem::resource_view {
 
+// 合并的 revision 范围，左开右闭：start < revision <= end
+struct RevisionRange {
+    int64_t start;
+    int64_t end;
+};
+
 struct InstanceAllocatedInfo {
     const InstanceInfo instanceInfo;
     std::shared_ptr<litebus::Promise<Status>> allocatedPromise;
@@ -256,7 +262,7 @@ public:
     }
 
     // for test
-    [[maybe_unused]]static void SetEnableTenantAffinity(bool enable)
+    [[maybe_unused]] void SetEnableTenantAffinity(bool enable)
     {
         enableTenantAffinity_ = enable;
     }
@@ -292,7 +298,8 @@ private:
     static void AddBucketIndexBySubUnit(ResourceUnit &view, const ResourceUnit &fragmentUnit);
     static void DeleteBucketIndexBySubUnit(ResourceUnit &view, const ResourceUnit &fragmentUnit);
 
-    static Resources AddInstanceToAgentView(const InstanceInfo &instance, resources::ResourceUnit &unit);
+    static Resources AddInstanceToAgentView(const InstanceInfo &instance, resources::ResourceUnit &unit,
+                                            bool enableTenantAffinity);
     void AddInstanceToView(const InstanceInfo &instance);
     void DeleteInstanceFromView(const InstanceInfo &instance);
 
@@ -320,7 +327,9 @@ private:
     void DeleteLabels(const InstanceInfo &instInfo);
     void AddLabels(const InstanceInfo &instance);
 
-    static void AddLabel(const InstanceInfo &instance, ::google::protobuf::Map<std::string, ValueCounter> &nodeLabels);
+    static void AddLabel(const InstanceInfo &instance,
+                         ::google::protobuf::Map<std::string, ValueCounter> &nodeLabels,
+                         bool enableTenantAffinity);
 
     /**
      * @brief local scheduler merge of changes from multiple revisions, the range is: (startRevision, endRevision]
@@ -331,8 +340,8 @@ private:
      * @brief Static version for async merge
      */
     static void MergeResourceViewChanges(const std::map<int64_t, ResourceUnitChange> &changes,
-                                         int64_t startRevision, int64_t endRevision,
-                                         const std::string &localId, ResourceUnitChanges &result);
+                                         const RevisionRange &range, const std::string &localId,
+                                         ResourceUnitChanges &result, bool enableTenantAffinity);
 
     /**
      * @brief Async version: copy changes and merge in background, then send result via callback
@@ -343,8 +352,10 @@ private:
 
     void StoreChange(int64_t revision, const ResourceUnitChange& change);
     void DelChanges(int64_t newStartRevision);
-    static ResourceUnitChange MergeResourceUnitChanges(ResourceUnitChange &previous, const ResourceUnitChange &current);
-    static ResourceUnitChange MergeAddAndModify(ResourceUnitChange &previous, const ResourceUnitChange &current);
+    static ResourceUnitChange MergeResourceUnitChanges(ResourceUnitChange &previous, const ResourceUnitChange &current,
+                                                       bool enableTenantAffinity);
+    static ResourceUnitChange MergeAddAndModify(ResourceUnitChange &previous, const ResourceUnitChange &current,
+                                                bool enableTenantAffinity);
     static ResourceUnitChange MergeTwoModifies(ResourceUnitChange &previous, const ResourceUnitChange &current);
     static void MergeCapacityChange(ResourceUnitChange &previous, const ResourceUnitChange &current);
     static void MergeInstanceChanges(Modification &previous, const Modification &current);
@@ -393,7 +404,7 @@ private:
 
     bool isLocal_;
     bool isHeader_ = false;
-    static bool enableTenantAffinity_;
+    bool enableTenantAffinity_ = true;
     int32_t tenantPodReuseTimeWindow_;
     bool hasResourceUpdated_ = false;
 

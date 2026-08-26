@@ -16,12 +16,19 @@
 
 #include "ckpt_file_manager_actor.h"
 
+#include <atomic>
 #include <filesystem>
+#include <fstream>
+#include <vector>
+
+#include <openssl/evp.h>
+
 #include "async/asyncafter.hpp"
 #include "common/logs/logging.h"
 #include "common/utils/files.h"
 #include "common/utils/actor_worker.h"
 #include "common/file_storage/file_storage_client.h"
+#include "common/kv_client/kv_client.h"
 
 namespace functionsystem::runtime_manager {
 
@@ -29,9 +36,18 @@ static const int32_t DEFAULT_TTL_SECONDS = 1800;  // 30 minutes
 static const int32_t DEFAULT_CLEANUP_INTERVAL_SECONDS = 300;  // 5 minutes
 static constexpr int32_t MILLISECONDS_PER_SECOND = 1000;
 
+// W2 P0.4: flag-driven default TTL (0 = compiled-in default above)
+static std::atomic<int32_t> g_defaultTtlOverride{0};
+
+namespace {
+// 分块读 4MiB：sha256 与 KV 流式传输共用的内存上界
+constexpr std::streamsize DIGEST_CHUNK_SIZE = 4 * 1024 * 1024;
+}  // namespace
+
 CkptFileManagerActor::CkptFileManagerActor(const std::string &name)
     : ActorBase(name),
-      defaultTTLSeconds_(DEFAULT_TTL_SECONDS),
+      defaultTTLSeconds_(CkptFileManagerActor::GetDefaultTtlOverride() > 0 ? CkptFileManagerActor::GetDefaultTtlOverride()
+                                                                          : DEFAULT_TTL_SECONDS),
       cleanupIntervalSeconds_(DEFAULT_CLEANUP_INTERVAL_SECONDS),
       checkpointBaseDir_(DEFAULT_CHECKPOINT_DIR),
       cleanupEnabled_(true)
@@ -40,7 +56,8 @@ CkptFileManagerActor::CkptFileManagerActor(const std::string &name)
 
 CkptFileManagerActor::CkptFileManagerActor(const std::string &name, const std::string &checkpointDir)
     : ActorBase(name),
-      defaultTTLSeconds_(DEFAULT_TTL_SECONDS),
+      defaultTTLSeconds_(CkptFileManagerActor::GetDefaultTtlOverride() > 0 ? CkptFileManagerActor::GetDefaultTtlOverride()
+                                                                          : DEFAULT_TTL_SECONDS),
       cleanupIntervalSeconds_(DEFAULT_CLEANUP_INTERVAL_SECONDS),
       checkpointBaseDir_(checkpointDir),
       cleanupEnabled_(true)
@@ -70,16 +87,25 @@ void CkptFileManagerActor::Finalize()
 
 litebus::Future<std::string> CkptFileManagerActor::DownloadCheckpoint(
     const std::string &checkpointID,
-    const std::string &storageUrl)
+    const std::string &storageUrl,
+    const std::string &expectedSha256,
+    int64_t expectedSize)
 {
     YRLOG_INFO("downloading checkpoint: {}, storageUrl: {}", checkpointID, storageUrl);
 
-    // Check if checkpoint already exists locally
+    // Check if checkpoint already exists locally. The in-memory map alone is not
+    // enough: entries restored from a previous run can point at deleted files,
+    // so only short-circuit when the artifact is actually on disk.
     auto iter = checkpointFiles_.find(checkpointID);
     if (iter != checkpointFiles_.end()) {
-        YRLOG_INFO("checkpoint {} already exists locally at {}", checkpointID, iter->second.localPath);
-        iter->second.lastAccessTime = std::chrono::steady_clock::now();
-        return iter->second.localPath;
+        if (std::filesystem::exists(iter->second.localPath)) {
+            YRLOG_INFO("checkpoint {} already exists locally at {}", checkpointID, iter->second.localPath);
+            iter->second.lastAccessTime = std::chrono::steady_clock::now();
+            return iter->second.localPath;
+        }
+        // 跨节点/清场后等价场景：map 有记录但工件已不在本地，必须走 KV 重新拉取
+        YRLOG_WARN("checkpoint {} is mapped to {} but the file is gone, re-downloading",
+                   checkpointID, iter->second.localPath);
     }
 
     // Check if download is already in progress
@@ -111,37 +137,73 @@ litebus::Future<std::string> CkptFileManagerActor::DownloadCheckpoint(
     info.localPath = extractedPath;
     info.ttlSeconds = defaultTTLSeconds_;
 
+    // ActorWorker::AsyncWork takes std::function<void()> and the worker's
+    // Future<Status> is always OK, so outcome is relayed through shared state.
+    auto workStatus = std::make_shared<Status>(Status::OK());
+    auto downloadedDigest = std::make_shared<std::string>();
     // Use local AsyncWorker for concurrent downloads
     auto worker = std::make_shared<ActorWorker>();
     worker->AsyncWork([parentPath, zipLocalPath, extractedPath, checkpointID,
-                       baseDir = checkpointBaseDir_]() {
+                       baseDir = checkpointBaseDir_, expectedSha256, expectedSize,
+                       workStatus, downloadedDigest]() {
         // Download the zip file using parentPath as key
         YRLOG_DEBUG("worker thread downloading checkpoint zip: {} with key: {}", zipLocalPath, parentPath);
         file_storage::FileStorageClient client;
         Status status = client.DownloadFile(parentPath, zipLocalPath);
         if (!status.IsOk()) {
-            return status;
+            *workStatus = status;
+            return;
         }
 
-        // Extract zip to basedir_
+        // Extract zip to basedir_ first: SnapshotInfo 的 sha/size 描述的是
+        // 解压后的 checkpoint.img（sandboxd 校验口径），不是 zip 归档本身
         YRLOG_DEBUG("extracting checkpoint zip {} to {}", zipLocalPath, baseDir);
         status = CkptFileManagerActor::UnzipFile(zipLocalPath, baseDir);
 
         // Clean up the zip file after extraction
         std::filesystem::remove(zipLocalPath);
 
-        return status;
-    }).OnComplete([worker, checkpointID, info, aid(GetAID())](
+        if (!status.IsOk()) {
+            *workStatus = status;
+            return;
+        }
+
+        // 校验解压出的 checkpoint.img 与 SnapshotInfo 一致；expected 缺失
+        // （旧元数据）时跳过校验
+        std::string sha256Hex;
+        int64_t sizeBytes = 0;
+        status = ComputeFileSha256(extractedPath + "/" + CHECKPOINT_IMAGE_NAME, sha256Hex, sizeBytes);
+        if (!status.IsOk()) {
+            *workStatus = status;
+            std::filesystem::remove_all(extractedPath);
+            return;
+        }
+        if (!expectedSha256.empty() && sha256Hex != expectedSha256) {
+            *workStatus = Status(StatusCode::FAILED, "checkpoint " + checkpointID +
+                " sha256 mismatch: expected " + expectedSha256 + ", got " + sha256Hex);
+            std::filesystem::remove_all(extractedPath);
+            return;
+        }
+        if (expectedSize > 0 && sizeBytes != expectedSize) {
+            *workStatus = Status(StatusCode::FAILED, "checkpoint " + checkpointID +
+                " size mismatch: expected " + std::to_string(expectedSize) +
+                ", got " + std::to_string(sizeBytes));
+            std::filesystem::remove_all(extractedPath);
+            return;
+        }
+        *downloadedDigest = sha256Hex;
+    }).OnComplete([worker, checkpointID, info, aid(GetAID()), workStatus, downloadedDigest](
         const litebus::Future<Status> &result) mutable {
         worker->Terminate();
-        if (result.IsError() || result.Get().IsError()) {
-            auto code = result.IsError() ? result.GetErrorCode() : result.Get().StatusCode();
-            YRLOG_ERROR("async download checkpoint {} failed with error code: {}",
-                checkpointID, code);
+        if (result.IsError() || workStatus->IsError()) {
+            auto code = result.IsError() ? result.GetErrorCode() : workStatus->StatusCode();
+            YRLOG_ERROR("async download checkpoint {} failed: {}",
+                checkpointID, result.IsError() ? "worker actor failed" : workStatus->RawMessage());
             litebus::Async(aid, &CkptFileManagerActor::OnDownloadFailed,
                 checkpointID, code);
             return;
         }
+        info.sha256 = *downloadedDigest;
         YRLOG_INFO("checkpoint {} downloaded and extracted to {}", checkpointID, info.localPath);
         litebus::Async(aid, &CkptFileManagerActor::OnDownloadSuccess, checkpointID, info);
     });
@@ -202,7 +264,7 @@ litebus::Future<Status> CkptFileManagerActor::RemoveReference(const std::string 
     return Status::OK();
 }
 
-litebus::Future<std::string> CkptFileManagerActor::RegisterCheckpoint(
+litebus::Future<CheckpointUploadResult> CkptFileManagerActor::RegisterCheckpoint(
     const std::string &checkpointID,
     const std::string &localPath,
     const std::string & /* storageUrl */,
@@ -222,49 +284,93 @@ litebus::Future<std::string> CkptFileManagerActor::RegisterCheckpoint(
     auto iter = checkpointFiles_.find(checkpointID);
     if (iter != checkpointFiles_.end()) {
         YRLOG_WARN("checkpoint {} already registered", checkpointID);
-        litebus::Promise<std::string> p;
+        litebus::Promise<CheckpointUploadResult> p;
         p.SetFailed(static_cast<int32_t>(StatusCode::ERR_CHECKPOINT_ALREADY_EXISTS));
         return p.GetFuture();
     }
 
     // Zip the localPath directory and upload the zip to remote storage
     auto worker = std::make_shared<ActorWorker>();
-    litebus::Promise<std::string> uploadPromise;
+    litebus::Promise<CheckpointUploadResult> uploadPromise;
     auto uploadFuture = uploadPromise.GetFuture();
 
-    worker->AsyncWork([localPath, parentPath, derivedStorageUrl, checkpointID]() {
-        // Zip the checkpoint directory: localPath → localPath.zip
+    // ActorWorker::AsyncWork 丢弃 handler 返回值（其 Future<Status> 恒为 worker
+    // 自身的 OK），结果经共享状态带出
+    auto result = std::make_shared<CheckpointUploadResult>();
+    worker->AsyncWork([localPath, parentPath, derivedStorageUrl, checkpointID, result]() {
+        // 与旧路径一致：storageUrl 只由 localPath 推导，不依赖归档/上传成败
+        result->storageUrl = derivedStorageUrl;
+
+        // 摘要口径 = sandboxd restore 校验的对象（checkpoint_dir/checkpoint.img），
+        // 不是 KV 传输用的 zip 归档；必须先于归档/上传成败独立成立
+        const std::string imagePath = localPath + "/" + CHECKPOINT_IMAGE_NAME;
+        Status digestStatus = ComputeFileSha256(imagePath, result->sha256, result->size);
+        if (!digestStatus.IsOk()) {
+            // 无摘要的快照无法通过 identity-checked restore（sandboxd 要求
+            // checkpoint_id/sha/size 三元组全非空），静默降级只会造出必死的
+            // wake 路径——显式失败，让 park 侧立刻看到
+            YRLOG_ERROR("failed to digest checkpoint image {} ({}), failing registration",
+                       imagePath, digestStatus.RawMessage());
+            result->failed = true;
+            result->failMessage = "failed to digest checkpoint image: " + digestStatus.RawMessage();
+            return;
+        }
+        result->createTime = std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+
+        if (!KVClient::GetInstance().IsInitialized()) {
+            // data_system_enable=false：与旧路径一致，只留本地工件（无需归档）
+            YRLOG_INFO("kv client not initialized, checkpoint {} stays local-only", checkpointID);
+            return;
+        }
+
+        // KV 可用才归档上传：zip 只是跨节点传输载体，失败降级为本地保留
         std::string zipPath = localPath + ".zip";
         Status zipStatus = ZipDirectory(localPath, zipPath);
         if (!zipStatus.IsOk()) {
-            YRLOG_ERROR("failed to zip checkpoint directory {}: {}", localPath, zipStatus.RawMessage());
-            return zipStatus;
+            YRLOG_ERROR("failed to zip checkpoint {} ({}) for KV upload, keeping local-only: {}",
+                        checkpointID, localPath, zipStatus.RawMessage());
+            return;
         }
 
-        // Upload the zip file with key = parentPath
-        YRLOG_DEBUG("worker thread uploading checkpoint zip: {} with key: {}", zipPath, parentPath);
+        // Upload the zip file with key = parentPath (== checkpointID for sandboxd snapshots)
+        YRLOG_DEBUG("worker thread uploading checkpoint zip: {} ({} bytes) with key: {}",
+                    zipPath, result->size, parentPath);
         file_storage::FileStorageClient client;
         Status status = client.UploadFile(parentPath, zipPath);
 
         // Clean up the temporary zip file after upload
         std::filesystem::remove(zipPath);
 
-        return status;
-    }).OnComplete([worker, checkpointID, localPath, derivedStorageUrl, effectiveTTL, uploadPromise, aid(GetAID())](
-        const litebus::Future<Status> &result) mutable {
-        worker->Terminate();
-        if (result.IsError() || result.Get().IsError()) {
-            auto code = result.IsError() ? result.GetErrorCode() : result.Get().StatusCode();
-            YRLOG_ERROR("async upload checkpoint {} failed with error code: {}",
-                checkpointID, code);
-            uploadPromise.SetFailed(code);
+        if (!status.IsOk()) {
+            // 上传失败降级：本地盘保留，单节点语义不回退
+            YRLOG_ERROR("failed to upload checkpoint {} ({}), keeping local copy only",
+                        checkpointID, status.RawMessage());
             return;
         }
-        YRLOG_INFO("checkpoint {} uploaded successfully, storageUrl: {}", checkpointID, derivedStorageUrl);
+    }).OnComplete([worker, checkpointID, localPath, effectiveTTL, uploadPromise, result, aid(GetAID())](
+        const litebus::Future<Status> &asyncResult) mutable {
+        worker->Terminate();
+        if (asyncResult.IsError()) {
+            // Only the async machinery itself can fail here; storage problems
+            // were already degraded to ERROR inside the worker.
+            YRLOG_ERROR("async upload checkpoint {} failed with error code: {}",
+                checkpointID, asyncResult.GetErrorCode());
+            uploadPromise.SetFailed(asyncResult.GetErrorCode());
+            return;
+        }
+        if (result->failed) {
+            YRLOG_ERROR("registration of checkpoint {} failed: {}",
+                checkpointID, result->failMessage);
+            uploadPromise.SetFailed(static_cast<int32_t>(StatusCode::FAILED));
+            return;
+        }
+        YRLOG_INFO("checkpoint {} upload phase done, storageUrl: {}, size: {}, sha256: {}",
+                   checkpointID, result->storageUrl, result->size, result->sha256);
 
         // Register checkpoint info after successful upload with TTL
         litebus::Async(aid, &CkptFileManagerActor::OnUploadSuccess,
-                       checkpointID, localPath, derivedStorageUrl, effectiveTTL, uploadPromise);
+                       checkpointID, localPath, *result, effectiveTTL, uploadPromise);
     });
 
     return uploadFuture;
@@ -273,15 +379,17 @@ litebus::Future<std::string> CkptFileManagerActor::RegisterCheckpoint(
 void CkptFileManagerActor::OnUploadSuccess(
     const std::string &checkpointID,
     const std::string &localPath,
-    const std::string &storageUrl,
+    const CheckpointUploadResult &result,
     int32_t ttl,
-    litebus::Promise<std::string> uploadPromise)
+    litebus::Promise<CheckpointUploadResult> uploadPromise)
 {
     // Create checkpoint info with initial reference count = 0
     CheckpointFileInfo info;
     info.checkpointID = checkpointID;
     info.localPath = localPath;
-    info.storageUrl = storageUrl;
+    info.storageUrl = result.storageUrl;
+    info.sha256 = result.sha256;
+    info.size = result.size;
     info.refCount = 0;  // Start with 0, will be incremented when used for restore
     info.ttlSeconds = ttl;  // Set TTL from parameter
     info.ttlActive = true;  // Start TTL immediately since refCount is 0
@@ -292,14 +400,24 @@ void CkptFileManagerActor::OnUploadSuccess(
     checkpointFiles_[checkpointID] = info;
 
     YRLOG_INFO("checkpoint {} registered successfully with initial refCount=0, TTL: {} seconds, storageUrl: {}",
-               checkpointID, ttl, storageUrl);
-    uploadPromise.SetValue(storageUrl);
+               checkpointID, ttl, result.storageUrl);
+    uploadPromise.SetValue(result);
 }
 
 void CkptFileManagerActor::SetDefaultTTL(int32_t ttlSeconds)
 {
     defaultTTLSeconds_ = ttlSeconds;
     YRLOG_INFO("set default checkpoint TTL to {} seconds", ttlSeconds);
+}
+
+void CkptFileManagerActor::SetDefaultTtlOverride(int32_t ttlSeconds)
+{
+    g_defaultTtlOverride.store(ttlSeconds, std::memory_order_relaxed);
+}
+
+int32_t CkptFileManagerActor::GetDefaultTtlOverride()
+{
+    return g_defaultTtlOverride.load(std::memory_order_relaxed);
 }
 
 void CkptFileManagerActor::StartCleanupTimer()
@@ -513,6 +631,65 @@ Status CkptFileManagerActor::ZipDirectory(const std::string &dirPath, const std:
                       "zip command failed with exit code " + std::to_string(ret));
     }
 
+    return Status::OK();
+}
+
+Status CkptFileManagerActor::ComputeFileSha256(const std::string &filePath, std::string &sha256Hex,
+                                               int64_t &sizeBytes)
+{
+    sha256Hex.clear();
+    sizeBytes = 0;
+
+    std::ifstream file(filePath, std::ios::binary);
+    if (!file.is_open()) {
+        return Status(StatusCode::FAILED, "failed to open file: " + filePath);
+    }
+
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (ctx == nullptr) {
+        return Status(StatusCode::FAILED, "failed to create EVP digest context for: " + filePath);
+    }
+    if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return Status(StatusCode::FAILED, "failed to init sha256 digest for: " + filePath);
+    }
+
+    std::vector<char> chunk(DIGEST_CHUNK_SIZE);
+    int64_t total = 0;
+    for (;;) {
+        file.read(chunk.data(), DIGEST_CHUNK_SIZE);
+        const std::streamsize got = file.gcount();
+        if (got > 0) {
+            if (EVP_DigestUpdate(ctx, chunk.data(), static_cast<size_t>(got)) != 1) {
+                EVP_MD_CTX_free(ctx);
+                return Status(StatusCode::FAILED, "sha256 update failed for: " + filePath);
+            }
+            total += got;
+        }
+        if (got < DIGEST_CHUNK_SIZE) {
+            break;
+        }
+    }
+    if (file.bad()) {
+        EVP_MD_CTX_free(ctx);
+        return Status(StatusCode::FAILED, "io error while reading: " + filePath);
+    }
+
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int mdLen = 0;
+    if (EVP_DigestFinal_ex(ctx, md, &mdLen) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return Status(StatusCode::FAILED, "sha256 finalize failed for: " + filePath);
+    }
+    EVP_MD_CTX_free(ctx);
+
+    static constexpr char hexDigits[] = "0123456789abcdef";
+    sha256Hex.reserve(mdLen * 2);
+    for (unsigned int i = 0; i < mdLen; i++) {
+        sha256Hex.push_back(hexDigits[md[i] >> 4]);
+        sha256Hex.push_back(hexDigits[md[i] & 0xf]);
+    }
+    sizeBytes = total;
     return Status::OK();
 }
 

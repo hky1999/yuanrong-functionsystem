@@ -71,6 +71,10 @@ const int32_t DELETE_CHECKPOINT_SIGNAL = 22;
 // busy/>0 => TrafficReport>0. It follows core signals 1..22 and is not POSIX.
 // See docs/features/sandbox-rrt-idle-report.md.
 const int32_t RRT_IDLE_REPORT_SIGNAL = 23;
+// signal to wake one parked instance by its ORIGINAL instanceID: the proxy
+// looks the instance up in SnapCtrl's parked registry and SnapStarts it from
+// the recorded checkpoint (response-ready wake / FIFO fallback entry point).
+const int32_t INSTANCE_WAKE_SNAPSHOT_SIGNAL = 24;
 
 inline std::string SignalToString(int32_t signal)
 {
@@ -97,7 +101,8 @@ inline std::string SignalToString(int32_t signal)
         { LIST_CHECKPOINTS_BY_FUNCTION_KEY_SIGNAL, "LIST_CHECKPOINTS_BY_FUNCTION_KEY_SIGNAL" },
         { LIST_CHECKPOINTS_BY_TENANT_SIGNAL, "LIST_CHECKPOINTS_BY_TENANT_SIGNAL" },
         { DELETE_CHECKPOINT_SIGNAL, "DELETE_CHECKPOINT_SIGNAL" },
-        { RRT_IDLE_REPORT_SIGNAL, "RRT_IDLE_REPORT_SIGNAL" }
+        { RRT_IDLE_REPORT_SIGNAL, "RRT_IDLE_REPORT_SIGNAL" },
+        { INSTANCE_WAKE_SNAPSHOT_SIGNAL, "INSTANCE_WAKE_SNAPSHOT_SIGNAL" }
     };
     return signalMap.find(signal) != signalMap.end() ? signalMap.at(signal) : "UnknownSignal";
 }

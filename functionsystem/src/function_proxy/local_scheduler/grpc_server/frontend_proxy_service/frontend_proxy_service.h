@@ -95,6 +95,11 @@ public:
                                   const ::frontend_proxy::InvokeInstanceRequest *request,
                                   ::frontend_proxy::InvokeInstanceResponse *response) override;
 
+    ::grpc::Status InvokeInstanceStream(
+        ::grpc::ServerContext *context,
+        const ::frontend_proxy::InvokeInstanceRequest *request,
+        ::grpc::ServerWriter<::frontend_proxy::InvokeInstanceStreamResponse> *writer) override;
+
     ::grpc::Status CreateInstance(::grpc::ServerContext *context,
                                   const ::frontend_proxy::CreateInstanceRequest *request,
                                   ::frontend_proxy::CreateInstanceResponse *response) override;
@@ -102,14 +107,6 @@ public:
     ::grpc::Status KillInstance(::grpc::ServerContext *context,
                                 const ::frontend_proxy::KillInstanceRequest *request,
                                 ::frontend_proxy::KillInstanceResponse *response) override;
-
-    ::grpc::Status UploadFile(::grpc::ServerContext *context,
-                              ::grpc::ServerReader<::frontend_proxy::FileChunk> *reader,
-                              ::frontend_proxy::FileTransferResponse *response) override;
-
-    ::grpc::Status DownloadFile(::grpc::ServerContext *context,
-                                const ::frontend_proxy::FileTransferRequest *request,
-                                ::grpc::ServerWriter<::frontend_proxy::FileChunk> *writer) override;
 
 private:
     bool ValidateInvokeRequest(const ::frontend_proxy::InvokeInstanceRequest &request,
@@ -139,20 +136,6 @@ private:
     static void SetStatus(::frontend_proxy::FrontendProxyStatus *status, common::ErrorCode code,
                           const std::string &message, bool retryable = false,
                           const std::string &retryReason = "");
-    bool ValidateFileChunkContext(const ::frontend_proxy::FrontendRequestContext &context,
-        const std::string &instanceID) const;
-    bool ValidateFileTransferRequest(const ::frontend_proxy::FileTransferRequest &request,
-        ::frontend_proxy::FileTransferResponse &response) const;
-    SharedStreamMsg CreateFileInvokeRequest(const std::string &instanceID,
-                                            const std::string &path,
-                                            const std::string &fileOp,
-                                            const std::string &mode,
-                                            const std::string &data,
-                                            int64_t offset = 0,
-                                            int64_t length = 0,
-                                            const std::string &uploadId = "",
-                                            bool isLast = false);
-
     FrontendProxyServiceParam param_;
 };
 

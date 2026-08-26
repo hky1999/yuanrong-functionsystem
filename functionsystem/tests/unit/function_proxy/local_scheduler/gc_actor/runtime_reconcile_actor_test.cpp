@@ -26,6 +26,7 @@
 #include "async/async.hpp"
 #include "common/constants/actor_name.h"
 #include "common/types/instance_state.h"
+#include "common/utils/struct_transfer.h"
 #include "mocks/mock_function_agent_mgr.h"
 #include "mocks/mock_instance_control_view.h"
 #include "mocks/mock_instance_ctrl.h"
@@ -169,6 +170,41 @@ TEST_F(RuntimeReconcileActorTest, SendsCorrectEntriesToAgent)
             EXPECT_TRUE(containerIDs.count(TEST_CONTAINER_ID_1) > 0);
             EXPECT_TRUE(containerIDs.count(TEST_CONTAINER_ID_2) > 0);
 
+            called = true;
+            return MakeSuccessReconcileResponse(request);
+        }));
+
+    CreateAndSpawnActor();
+    reconcileActor_->TriggerOnce(TEST_AGENT_ID);
+    ASSERT_AWAIT_TRUE([&called]() { return called.load(); });
+}
+
+TEST_F(RuntimeReconcileActorTest, SendsPersistedPortMappingsToAgent)
+{
+    const std::string portMappings =
+        R"(["public+http:21006:18080","direct+http:21007:50090"])";
+    auto stateMachine = std::make_shared<MockInstanceStateMachine>(TEST_NODE_ID);
+    auto info = MakeInstanceInfo(TEST_AGENT_ID, TEST_RUNTIME_ID_1, TEST_CONTAINER_ID_1);
+    (*info.mutable_extensions())[PORT_FORWARD_KEY] = portMappings;
+    ON_CALL(*stateMachine, GetInstanceInfo()).WillByDefault(Return(info));
+    ON_CALL(*stateMachine, GetInstanceState()).WillByDefault(Return(InstanceState::RUNNING));
+
+    std::unordered_map<std::string, std::shared_ptr<InstanceStateMachine>> instances{
+        {TEST_INSTANCE_ID_1, stateMachine},
+    };
+    EXPECT_CALL(*mockInstanceControlView_, GetInstances())
+        .WillRepeatedly(Return(instances));
+
+    std::atomic<bool> called{false};
+    EXPECT_CALL(*mockFunctionAgentMgr_, ReconcileRuntimes(TEST_AGENT_ID, _))
+        .WillRepeatedly(Invoke([&called, &portMappings](
+                                   const std::string &,
+                                   const std::shared_ptr<messages::ReconcileRuntimesRequest> &request) {
+            EXPECT_EQ(request->entries_size(), 1);
+            if (request->entries_size() == 1) {
+                EXPECT_EQ(request->entries(0).runtimeid(), TEST_RUNTIME_ID_1);
+                EXPECT_EQ(request->entries(0).portmappings(), portMappings);
+            }
             called = true;
             return MakeSuccessReconcileResponse(request);
         }));

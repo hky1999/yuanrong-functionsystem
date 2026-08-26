@@ -18,6 +18,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <unordered_set>
 
 #include "common/logs/logging.h"
 
@@ -166,6 +167,44 @@ std::vector<int> PortManager::RequestPorts(const std::string &runtimeID, int cou
         return {};
     }
     return allocated;
+}
+
+Status PortManager::ReservePorts(const std::string &runtimeID, const std::vector<int> &ports)
+{
+    if (runtimeID.empty()) {
+        return Status(StatusCode::RUNTIME_MANAGER_PORT_UNAVAILABLE,
+                      "cannot restore port reservations for an empty runtime ID");
+    }
+
+    std::unordered_set<int> uniquePorts;
+    for (const int port : ports) {
+        if (!uniquePorts.insert(port).second) {
+            return Status(StatusCode::RUNTIME_MANAGER_PORT_UNAVAILABLE,
+                          "duplicate persisted port " + std::to_string(port) + " for runtime " + runtimeID);
+        }
+        const auto iter = portMap_.find(port);
+        if (iter == portMap_.end()) {
+            return Status(StatusCode::RUNTIME_MANAGER_PORT_UNAVAILABLE,
+                          "persisted port " + std::to_string(port) + " for runtime " + runtimeID +
+                              " is outside the configured port pool");
+        }
+        if (iter->second.used && iter->second.runtimeID != runtimeID) {
+            return Status(StatusCode::RUNTIME_MANAGER_PORT_UNAVAILABLE,
+                          "persisted port " + std::to_string(port) + " for runtime " + runtimeID +
+                              " conflicts with owner " + iter->second.runtimeID);
+        }
+    }
+
+    for (const int port : ports) {
+        auto &info = portMap_.at(port);
+        info.used = true;
+        info.runtimeID = runtimeID;
+        info.port = port;
+    }
+    if (!ports.empty()) {
+        YRLOG_INFO("restored {} port reservations for runtimeID: {}", ports.size(), runtimeID);
+    }
+    return Status::OK();
 }
 
 void PortManager::ReleasePorts(const std::string &runtimeID)

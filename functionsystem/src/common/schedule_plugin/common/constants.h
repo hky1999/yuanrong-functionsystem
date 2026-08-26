@@ -36,6 +36,7 @@ const std::string STRICT_NON_ROOT_LABEL_AFFINITY_FILTER_NAME = "StrictNonRootLab
 const std::string DISK_FILTER_NAME = "DiskFilter";
 const std::string NUMA_AFFINITY_FILTER_NAME = "NUMAAffinityFilter";
 const std::string USAGE_AWARE_FILTER_NAME = "UsageAwareFilter";
+const std::string OVERCOMMIT_FILTER_NAME = "OvercommitFilter";
 
 // scorer name
 const std::string DEFAULT_SCORER_NAME = "DefaultScorer";

@@ -77,6 +77,7 @@ private:
     void CloseClient(ClientSession &session);
     bool ConfigureTLS();
     int ResolveHostPort(const std::string &instanceID, int targetPort, std::string &error) const;
+    std::string ResolveContainerIP(const std::string &instanceID, std::string &error) const;
     bool Relay(SSL *ssl, int clientFd, int backendFd) const;
 
     TcpTunnelServerConfig config_;

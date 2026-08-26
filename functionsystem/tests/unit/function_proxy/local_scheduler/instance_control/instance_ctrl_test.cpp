@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <atomic>
+
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
@@ -417,6 +419,86 @@ TEST(InstanceCtrlReadyCallResultTest, FrontendReadyCallResultCallbackFallsBackTo
     EXPECT_EQ(observedResult->instanceid(), "frontend-created-instance");
 }
 
+TEST(InstanceCtrlReadyCallResultTest, NestedCreateResultDoesNotConsumeParentFrontendCallback)
+{
+    auto actor = std::make_shared<InstanceCtrlActor>("InstanceCtrlActor", "nodeID", instanceCtrlConfig);
+    auto scheduleReq = GenScheduleReq(actor);
+    scheduleReq->set_requestid("parent-frontend-create-request");
+    scheduleReq->mutable_instance()->set_instanceid("parent-frontend-instance");
+
+    bool callbackCalled = false;
+    actor->RegisterReadyCallResultCallback(
+        scheduleReq->instance().instanceid(), scheduleReq,
+        [&callbackCalled](const std::shared_ptr<functionsystem::CallResult> &) {
+            callbackCalled = true;
+            return litebus::Future<CallResultAck>(CallResultAck());
+        });
+
+    auto nestedReadyResult = std::make_shared<functionsystem::CallResult>();
+    nestedReadyResult->set_requestid("nested-create-request");
+    nestedReadyResult->set_instanceid(scheduleReq->instance().instanceid());
+    nestedReadyResult->set_code(common::ERR_NONE);
+
+    auto callback = actor->TakeFrontendReadyCallback("nested-created-instance", nestedReadyResult);
+    EXPECT_EQ(callback, nullptr);
+    EXPECT_FALSE(callbackCalled);
+    EXPECT_EQ(actor->instanceRegisteredReadyCallResultCallback_.count(scheduleReq->requestid()), 1);
+    EXPECT_EQ(actor->instanceReadyCallResultCallbackByInstanceID_.count(scheduleReq->instance().instanceid()), 1);
+}
+
+TEST(InstanceCtrlReadyCallResultTest, FrontendReadyResultUsesTicketAsRemoteDestination)
+{
+    auto source = std::make_shared<InstanceCtrlActor>("FrontendReadySourceProxy", "source-node", instanceCtrlConfig);
+    auto target = std::make_shared<InstanceCtrlActor>("FrontendReadyTargetProxy", "target-node", instanceCtrlConfig);
+    auto sourceView = std::make_shared<MockInstanceControlView>("source-node");
+    source->BindInstanceControlView(sourceView);
+    source->BindObserver(std::make_shared<NiceMock<MockObserver>>());
+
+    const std::string requestID = "remote-frontend-create-request";
+    const std::string instanceID = "remote-frontend-created-instance";
+    auto scheduleReq = GenScheduleReq(source);
+    scheduleReq->set_requestid(requestID);
+    scheduleReq->mutable_instance()->set_instanceid(instanceID);
+    scheduleReq->mutable_instance()->clear_parentid();
+    scheduleReq->mutable_instance()->set_parentfunctionproxyaid(target->GetAID());
+    (*scheduleReq->mutable_instance()->mutable_extensions())[CREATE_SOURCE] = FRONTEND_STR;
+
+    auto stateMachine = std::make_shared<MockInstanceStateMachine>("source-node");
+    EXPECT_CALL(*sourceView, GetInstance(instanceID))
+        .WillOnce(Return(stateMachine))
+        .WillOnce(Return(nullptr));
+    EXPECT_CALL(*stateMachine, GetInstanceState).WillOnce(Return(InstanceState::RUNNING));
+
+    std::atomic<bool> targetCallbackCalled = false;
+    target->RegisterReadyCallResultCallback(
+        instanceID, scheduleReq,
+        [&targetCallbackCalled](const std::shared_ptr<functionsystem::CallResult> &) {
+            targetCallbackCalled = true;
+            return litebus::Future<CallResultAck>(CallResultAck());
+        });
+
+    litebus::Spawn(source);
+    litebus::Spawn(target);
+
+    auto ready = std::make_shared<functionsystem::CallResult>();
+    ready->set_requestid(requestID);
+    ready->set_instanceid(instanceID);
+    ready->set_code(common::ERR_NONE);
+    auto sourceReadyCallback = source->RegisterCreateCallResultCallback(scheduleReq);
+    auto ack = sourceReadyCallback(ready);
+    EXPECT_AWAIT_READY(ack);
+    EXPECT_TRUE(targetCallbackCalled);
+    EXPECT_TRUE(scheduleReq->instance().parentid().empty());
+    if (ack.IsOK()) {
+        EXPECT_EQ(ack.Get().code(), common::ERR_NONE);
+    }
+
+    litebus::Terminate(source->GetAID());
+    litebus::Terminate(target->GetAID());
+    litebus::Await(source);
+    litebus::Await(target);
+}
+
 TEST(InstanceCtrlReadyCallResultTest, FrontendTicketBindsBeforeReadyAndCompletesExactlyOnce)
 {
     auto actor = std::make_shared<InstanceCtrlActor>("InstanceCtrlActor", "nodeID", instanceCtrlConfig);
@@ -555,6 +637,48 @@ TEST(InstanceCtrlReadyCallResultTest, LowReliabilitySuccessKeepsStaleInstancePro
 
     EXPECT_FALSE(callbackCalled);
     actor->UnregisterFrontendReadyWait(requestID, "test cleanup");
+}
+
+TEST(InstanceCtrlReadyCallResultTest, ResolvedWinnerRelayMarkerBypassesStaleProtection)
+{
+    auto actor = std::make_shared<InstanceCtrlActor>("InstanceCtrlActor", "nodeID", instanceCtrlConfig);
+    actor->BindInstanceControlView(std::make_shared<InstanceControlView>("nodeID", false));
+
+    const std::string requestID = "resolved-winner-request";
+    const std::string instanceID = "resolved-winner-instance";
+    auto scheduleReq = GenScheduleReq(actor);
+    scheduleReq->set_requestid(requestID);
+    scheduleReq->mutable_instance()->set_instanceid(instanceID);
+
+    bool callbackCalled = false;
+    std::shared_ptr<functionsystem::CallResult> observedResult;
+    actor->RegisterReadyCallResultCallback(
+        instanceID, scheduleReq,
+        [&callbackCalled, &observedResult](const std::shared_ptr<functionsystem::CallResult> &callResult) {
+            callbackCalled = true;
+            observedResult = callResult;
+            return litebus::Future<CallResultAck>(CallResultAck());
+        });
+
+    ::internal::ForwardCallResultRequest request;
+    request.set_instanceid(instanceID);
+    request.mutable_req()->set_requestid(requestID);
+    request.mutable_req()->set_instanceid(instanceID);
+    request.mutable_req()->set_code(common::ERR_NONE);
+    request.mutable_req()->mutable_runtimeinfo()->set_route("tcp://winner-route");
+    request.mutable_req()->mutable_runtimeinfo()->set_proxyid("winner-proxy");
+    auto readyInstance = request.mutable_readyinstance();
+    readyInstance->set_instanceid(instanceID);
+    (*readyInstance->mutable_extensions())["createConflictArbitratedContender"] = instanceID;
+
+    actor->ForwardCallResultRequest(litebus::AID(), "", request.SerializeAsString());
+
+    EXPECT_TRUE(callbackCalled);
+    ASSERT_NE(observedResult, nullptr);
+    EXPECT_EQ(observedResult->runtimeinfo().route(), "tcp://winner-route");
+    EXPECT_EQ(observedResult->runtimeinfo().proxyid(), "winner-proxy");
+    EXPECT_TRUE(actor->instanceRegisteredReadyCallResultCallback_.empty());
+    EXPECT_TRUE(actor->instanceReadyCallResultCallbackByInstanceID_.empty());
 }
 
 TEST_F(InstanceCtrlTest, ScheduleUpdateInstanceInfoFailed)
@@ -777,8 +901,16 @@ TEST_F(InstanceCtrlTest, ScheduleExistInstance)
         .WillOnce(Return(InstanceState::CREATING))
         .WillOnce(Return(InstanceState::CREATING))
         .WillOnce(Return(InstanceState::CREATING));
+    // D-6 F3: a schedule for a CREATING machine now rides the machine's own
+    // pending request future (no more unconditional code:0 "already been
+    // scheduling" which produced phantom restores); inject one and complete
+    // it with SUCCESS.
+    EXPECT_CALL(mockStateMachine, GetRequestID()).WillRepeatedly(Return("creating-req"));
+    auto creatingPromise = std::make_shared<litebus::Promise<messages::ScheduleResponse>>();
+    instanceControlView->InsertRequestFuture("creating-req", creatingPromise->GetFuture(), creatingPromise);
     runtimePromise = std::make_shared<litebus::Promise<messages::ScheduleResponse>>();
     result = instanceCtrl.Schedule(scheduleReq, runtimePromise);
+    creatingPromise->SetValue(GenScheduleResponse(StatusCode::SUCCESS, "creating", *scheduleReq));
     ASSERT_AWAIT_READY(result);
     EXPECT_EQ(result.Get().code(), static_cast<int32_t>(StatusCode::SUCCESS));
 
@@ -3725,7 +3857,7 @@ TEST_F(InstanceCtrlTest, CreateLocalNotEnoughAndRemoteNotEnough)
 }
 
 /**
- * Test schedule instance, local resource not enough, but remote resource enough
+ * Test frontend create, local resource not enough, but remote resource enough
  * Steps:
  * 1. MockObserver (GetFuncMeta() => defaultMeta / IsSystemFunction() => False)
  * 2. MockResourceView (DeleteInstances => OK)
@@ -3735,14 +3867,14 @@ TEST_F(InstanceCtrlTest, CreateLocalNotEnoughAndRemoteNotEnough)
  * 6. MockInstanceCtrlView (NewInstance => return instanceID / GetInstance => return mockStateMachine in step 5)
  * 7. MockScheduler (ScheduleDecision => return RESOURCE_NOT_ENOUGH)
  * 8. start instanceCtrl with above mockers
- * 9. send schedule request
+ * 9. send frontend schedule request and report the remote instance ready
  *
  * Expectations:
- * 1. get ScheduleResponse with code SUCCESS
+ * 1. frontend gets the accepted ScheduleResponse with code SUCCESS
  * 2. mockStateMachine state == Scheduling
- * 3. sendCallResult is called, and callResult code is SUCCESS
+ * 3. frontend ready callback remains registered and receives the remote ready CallResult
  */
-TEST_F(InstanceCtrlTest, CreateLocalNotEnoughAndRemoteEnough)
+TEST_F(InstanceCtrlTest, FrontendCreateLocalNotEnoughAndRemoteEnoughWaitsForReady)
 {
     auto observer = std::make_shared<MockObserver>();
     ASSERT_IF_NULL(observer);
@@ -3755,8 +3887,7 @@ TEST_F(InstanceCtrlTest, CreateLocalNotEnoughAndRemoteEnough)
     resourceViewMgr->virtual_ = MockResourceView::CreateMockResourceView();
     EXPECT_CALL(*primary, DeleteInstances).WillRepeatedly(Return(Status::OK()));
 
-    auto actor = std::make_shared<MockInstanceCtrlActor>("InstanceCtrlActor", "nodeID", instanceCtrlConfig);
-    EXPECT_CALL(*actor, MockSendCallResult).Times(0);
+    auto actor = std::make_shared<InstanceCtrlActor>("InstanceCtrlActor", "nodeID", instanceCtrlConfig);
 
     auto localSchedSrv = std::make_shared<MockLocalSchedSrv>();
     messages::ScheduleResponse scheduleResponse;
@@ -3803,16 +3934,35 @@ TEST_F(InstanceCtrlTest, CreateLocalNotEnoughAndRemoteEnough)
     EXPECT_CALL(mockStateMachine, GetScheduleRequest).WillRepeatedly(Return(scheduleReq));
 
     auto runtimePromise = std::make_shared<litebus::Promise<messages::ScheduleResponse>>();
-    auto result = instanceCtrl->Schedule(scheduleReq, runtimePromise);
+    int readyCallbackCount = 0;
+    std::shared_ptr<functionsystem::CallResult> observedReadyResult;
+    auto result = instanceCtrl->ScheduleFrontendAndWaitReady(
+        scheduleReq, runtimePromise,
+        [&readyCallbackCount, &observedReadyResult](
+            const std::shared_ptr<functionsystem::CallResult> &callResult) {
+            ++readyCallbackCount;
+            observedReadyResult = callResult;
+            return litebus::Future<CallResultAck>(CallResultAck());
+        });
     ASSERT_AWAIT_READY(result);
     auto runtimeFuture = runtimePromise->GetFuture();
     ASSERT_AWAIT_READY(runtimeFuture);
     YRLOG_INFO("Result: {}", result.Get().SerializeAsString());
-    EXPECT_EQ(result.Get().code(), (int32_t)StatusCode::RESOURCE_NOT_ENOUGH);
+    EXPECT_EQ(result.Get().code(), static_cast<int32_t>(StatusCode::SUCCESS));
     EXPECT_EQ(runtimeFuture.Get().code(), 0);
     EXPECT_EQ(runtimeFuture.Get().instanceid(), "instance-id-CreateLocalNotEnoughAndRemoteEnough");
     EXPECT_EQ(mockStateMachineState, InstanceState::SCHEDULING);
     ASSERT_AWAIT_READY(request);
+
+    auto readyResult = std::make_shared<functionsystem::CallResult>();
+    readyResult->set_requestid(scheduleReq->requestid());
+    readyResult->set_instanceid(scheduleReq->instance().instanceid());
+    readyResult->set_code(common::ERR_NONE);
+    auto readyAck = litebus::Async(actor->GetAID(), &InstanceCtrlActor::SendCallResult,
+                                   scheduleReq->instance().instanceid(), "", "", readyResult);
+    ASSERT_AWAIT_READY(readyAck);
+    EXPECT_EQ(readyCallbackCount, 1);
+    EXPECT_EQ(observedReadyResult, readyResult);
 }
 
 /**
@@ -4164,6 +4314,113 @@ TEST_F(InstanceCtrlTest, CheckGeneratedInstanceIDFailed)
     auto res2 = actor->CheckGeneratedInstanceID(GeneratedInstanceStates{ "111" }, scheduleReq,
                                                 std::make_shared<litebus::Promise<messages::ScheduleResponse>>());
     EXPECT_EQ(res2.Get().code(), StatusCode::ERR_INSTANCE_EXITED);
+}
+
+/**
+ * Feature: instance ctrl (D-6 F3 phantom restore).
+ * Description: RegisterStateChangeCallback against a stale CREATING machine
+ *              (leftover of a failed restore) without a pending schedule
+ *              future must fail the promise instead of faking a code:0
+ *              SUCCESS ("instance has already been scheduling") that made
+ *              the wake caller drop the parked entry while nothing deploys.
+ * Expectation: promise resolves with FAILED and a "stale" message.
+ */
+TEST_F(InstanceCtrlTest, RegisterStateChangeCallbackStaleCreatingMachineFailsPromise)
+{
+    auto actor = std::make_shared<InstanceCtrlActor>("InstanceCtrlActor", "nodeID", instanceCtrlConfig);
+    auto view = std::make_shared<MockInstanceControlView>("nodeID");
+    actor->instanceControlView_ = view;
+    auto stateMachine = std::make_shared<MockInstanceStateMachine>("nodeID");
+    EXPECT_CALL(*stateMachine, GetInstanceState()).WillRepeatedly(Return(InstanceState::CREATING));
+    EXPECT_CALL(*stateMachine, GetRequestID()).WillRepeatedly(Return("rq-stale"));
+    EXPECT_CALL(*view, GetInstance("phantom-iid")).WillRepeatedly(Return(stateMachine));
+    auto scheduleReq = std::make_shared<messages::ScheduleRequest>();
+    scheduleReq->set_requestid("rq-new");
+    scheduleReq->mutable_instance()->set_instanceid("phantom-iid");
+    auto runtimePromise = std::make_shared<litebus::Promise<messages::ScheduleResponse>>();
+    actor->RegisterStateChangeCallback(scheduleReq, runtimePromise);
+    auto rsp = runtimePromise->GetFuture().Get();
+    EXPECT_EQ(rsp.code(), static_cast<int32_t>(StatusCode::FAILED));
+    EXPECT_NE(rsp.message().find("stale"), std::string::npos);
+}
+
+/**
+ * Feature: instance ctrl (D-6 F3 phantom restore).
+ * Description: RegisterStateChangeCallback against a CREATING machine that
+ *              still has a pending schedule future must ride that future
+ *              (same as SCHEDULING), so a duplicate/concurrent schedule
+ *              observes the real deployment outcome.
+ * Expectation: promise resolves exactly when the pending future completes.
+ */
+TEST_F(InstanceCtrlTest, RegisterStateChangeCallbackCreatingMachineRidesPendingFuture)
+{
+    auto actor = std::make_shared<InstanceCtrlActor>("InstanceCtrlActor", "nodeID", instanceCtrlConfig);
+    auto view = std::make_shared<MockInstanceControlView>("nodeID");
+    actor->instanceControlView_ = view;
+    auto sourcePromise = std::make_shared<litebus::Promise<messages::ScheduleResponse>>();
+    view->InsertRequestFuture("rq-live", sourcePromise->GetFuture(), sourcePromise);
+    auto stateMachine = std::make_shared<MockInstanceStateMachine>("nodeID");
+    EXPECT_CALL(*stateMachine, GetInstanceState()).WillRepeatedly(Return(InstanceState::CREATING));
+    EXPECT_CALL(*stateMachine, GetRequestID()).WillRepeatedly(Return("rq-live"));
+    EXPECT_CALL(*view, GetInstance("live-iid")).WillRepeatedly(Return(stateMachine));
+    auto scheduleReq = std::make_shared<messages::ScheduleRequest>();
+    scheduleReq->set_requestid("rq-dup");
+    scheduleReq->mutable_instance()->set_instanceid("live-iid");
+    auto runtimePromise = std::make_shared<litebus::Promise<messages::ScheduleResponse>>();
+    actor->RegisterStateChangeCallback(scheduleReq, runtimePromise);
+    auto future = runtimePromise->GetFuture();
+    EXPECT_TRUE(future.IsInit());  // rides the pending future, not completed yet
+    auto expected = GenScheduleResponse(StatusCode::SUCCESS, "restore done", *scheduleReq);
+    sourcePromise->SetValue(expected);
+    auto rsp = future.Get();
+    EXPECT_EQ(rsp.code(), static_cast<int32_t>(StatusCode::SUCCESS));
+    EXPECT_EQ(rsp.message(), "restore done");
+}
+
+/**
+ * Feature: instance ctrl (D-6 F3 phantom restore).
+ * Description: CleanupFailedSnapStart removes the CREATING state machine of
+ *              a failed restore deploy (so the next wake schedules a fresh
+ *              restore instead of hitting a stale machine), and refuses to
+ *              touch machines it does not own (other request / advanced
+ *              state).
+ * Expectation: DelInstance invoked only for the owned CREATING machine.
+ */
+TEST_F(InstanceCtrlTest, CleanupFailedSnapStartRemovesOwnedCreatingMachineOnly)
+{
+    auto actor = std::make_shared<InstanceCtrlActor>("InstanceCtrlActor", "nodeID", instanceCtrlConfig);
+    auto view = std::make_shared<MockInstanceControlView>("nodeID");
+    actor->instanceControlView_ = view;
+    EXPECT_CALL(*view, DelInstance).WillRepeatedly(Return(Status::OK()));
+
+    auto creatingSm = std::make_shared<MockInstanceStateMachine>("nodeID");
+    EXPECT_CALL(*creatingSm, GetInstanceState()).WillRepeatedly(Return(InstanceState::CREATING));
+    EXPECT_CALL(*creatingSm, GetRequestID()).WillRepeatedly(Return("rq-1"));
+    auto runningSm = std::make_shared<MockInstanceStateMachine>("nodeID");
+    EXPECT_CALL(*runningSm, GetInstanceState()).WillRepeatedly(Return(InstanceState::RUNNING));
+    EXPECT_CALL(*runningSm, GetRequestID()).WillRepeatedly(Return("rq-1"));
+    auto foreignSm = std::make_shared<MockInstanceStateMachine>("nodeID");
+    EXPECT_CALL(*foreignSm, GetInstanceState()).WillRepeatedly(Return(InstanceState::CREATING));
+    EXPECT_CALL(*foreignSm, GetRequestID()).WillRepeatedly(Return("rq-other"));
+
+    auto scheduleReq = std::make_shared<messages::ScheduleRequest>();
+    scheduleReq->set_requestid("rq-1");
+    scheduleReq->mutable_instance()->set_instanceid("iid");
+
+    // owned CREATING machine: full removal executed
+    EXPECT_CALL(*view, GetInstance("iid"))
+        .WillOnce(Return(creatingSm))
+        .WillOnce(Return(runningSm))
+        .WillOnce(Return(foreignSm))
+        .WillRepeatedly(Return(nullptr));
+    EXPECT_CALL(*view, DelInstance("iid")).Times(1).WillOnce(Return(Status::OK()));
+    actor->CleanupFailedSnapStart(scheduleReq, "deploy failed: 80004");
+    // advanced state (e.g. restore finished concurrently): untouched
+    actor->CleanupFailedSnapStart(scheduleReq, "deploy failed: 80004");
+    // machine owned by another request: untouched
+    actor->CleanupFailedSnapStart(scheduleReq, "deploy failed: 80004");
+    // machine already gone: no-op
+    actor->CleanupFailedSnapStart(scheduleReq, "deploy failed: 80004");
 }
 
 /**
@@ -6666,6 +6923,845 @@ TEST_F(InstanceCtrlTest, KillDriverInstance)
     auto killRsp = instanceCtrl_->Kill(srcInstance, killReq);
     ASSERT_AWAIT_READY(killRsp);
     EXPECT_EQ(static_cast<int>(killRsp.Get().code()), static_cast<int>(common::ErrorCode::ERR_NONE));
+}
+
+class InitialLowReliabilityRouteConflictActorTest : public ::testing::Test {
+protected:
+    void SetUp() override
+    {
+        previousDirectRoutingEnabled_ = DirectRoutingConfig::IsEnabled();
+        previousForceLowReliabilityEnabled_ = IsForceLowReliabilityInstanceEnabled();
+        DirectRoutingConfig::SetEnabled(false);
+        SetForceLowReliabilityInstance(false);
+
+        auto suffix = litebus::uuid_generator::UUID::GetRandomUUID().ToString();
+        actor_ = std::make_shared<MockInstanceCtrlActor>(
+            "InitialLowReliabilityRouteConflictActor-" + suffix, LOSER_PROXY_ID, instanceCtrlConfig);
+        instanceControlView_ = std::make_shared<MockInstanceControlView>(LOSER_PROXY_ID);
+        clientManager_ = std::make_shared<MockSharedClientManagerProxy>();
+        functionAgentMgr_ = std::make_shared<MockFunctionAgentMgr>("RouteConflictFunctionAgentMgr-" + suffix, nullptr);
+        resourceViewMgr_ = std::make_shared<resource_view::ResourceViewMgr>();
+        primary_ = MockResourceView::CreateMockResourceView();
+        virtual_ = MockResourceView::CreateMockResourceView();
+        resourceViewMgr_->primary_ = primary_;
+        resourceViewMgr_->virtual_ = virtual_;
+        observer_ = std::make_shared<MockObserver>();
+        InternalIAM::Param internalIAMParam;
+        internalIAMParam.isEnableIAM = false;
+        internalIAM_ = std::make_shared<MockInternalIAM>(internalIAMParam);
+        ON_CALL(*internalIAM_, IsIAMEnabled()).WillByDefault(Return(false));
+
+        actor_->BindInstanceControlView(instanceControlView_);
+        actor_->BindControlInterfaceClientManager(clientManager_);
+        actor_->BindFunctionAgentMgr(functionAgentMgr_);
+        actor_->BindResourceView(resourceViewMgr_);
+        actor_->BindInternalIAM(internalIAM_);
+        // Binding a MockObserver registers several unrelated callbacks. The lightweight
+        // conflict helper only needs winner proxy resolution, so set it directly.
+        actor_->observer_ = observer_;
+        litebus::Spawn(actor_);
+
+        auto &metricsContext = metrics::MetricsAdapter::GetInstance().GetMetricsContext();
+        previousEnabledInstruments_ = metricsContext.GetEnabledInstruments();
+        metricsContext.SetEnabledInstruments({ metrics::YRInstrument::YR_INSTANCE_RUNNING_DURATION });
+    }
+
+    void TearDown() override
+    {
+        if (actor_ != nullptr) {
+            litebus::Terminate(actor_->GetAID());
+            litebus::Await(actor_);
+        }
+        auto &metricsContext = metrics::MetricsAdapter::GetInstance().GetMetricsContext();
+        metricsContext.EraseBillingInstanceItem(INSTANCE_ID);
+        metricsContext.SetEnabledInstruments(previousEnabledInstruments_);
+        DirectRoutingConfig::SetEnabled(previousDirectRoutingEnabled_);
+        SetForceLowReliabilityInstance(previousForceLowReliabilityEnabled_);
+    }
+
+    InstanceInfo MakeLoserInfo() const
+    {
+        InstanceInfo loser;
+        loser.set_instanceid(INSTANCE_ID);
+        loser.set_requestid(LOSER_REQUEST_ID);
+        loser.set_runtimeid(LOSER_RUNTIME_ID);
+        loser.set_functionagentid(LOSER_AGENT_ID);
+        loser.set_functionproxyid(LOSER_PROXY_ID);
+        loser.set_function(FUNCTION_KEY);
+        loser.set_tenantid(TENANT_ID);
+        loser.set_jobid(JOB_ID);
+        loser.set_parentid(PARENT_INSTANCE_ID);
+        loser.set_parentfunctionproxyaid(PARENT_PROXY_AID);
+        loser.set_version(0);
+        loser.set_lowreliability(true);
+        loser.mutable_instancestatus()->set_code(static_cast<int32_t>(InstanceState::CREATING));
+        (*loser.mutable_createoptions())[RELIABILITY_TYPE] = "low";
+        return loser;
+    }
+
+    InstanceInfo MakeWinnerInfo() const
+    {
+        auto winner = MakeLoserInfo();
+        winner.set_requestid(WINNER_REQUEST_ID);
+        winner.set_runtimeid("winner-runtime");
+        winner.set_functionagentid("winner-agent");
+        winner.set_functionproxyid(WINNER_PROXY_ID);
+        winner.set_version(1);
+        winner.mutable_instancestatus()->set_code(static_cast<int32_t>(InstanceState::RUNNING));
+        return winner;
+    }
+
+    std::shared_ptr<functionsystem::CallResult> MakeCallResult() const
+    {
+        auto callResult = std::make_shared<functionsystem::CallResult>();
+        callResult->set_code(common::ErrorCode::ERR_NONE);
+        callResult->set_requestid(ORIGINAL_CALL_RESULT_REQUEST_ID);
+        callResult->set_instanceid(INSTANCE_ID);
+        callResult->set_message("loser runtime payload");
+        callResult->add_smallobjects()->set_value("loser result");
+        callResult->add_stacktraceinfos();
+        callResult->mutable_runtimeinfo()->set_serveripaddr("192.0.2.10");
+        callResult->mutable_runtimeinfo()->set_serverport(18080);
+        callResult->mutable_runtimeinfo()->set_route("tcp://192.0.2.10:18081");
+        callResult->mutable_runtimeinfo()->set_proxyid(LOSER_PROXY_ID);
+        return callResult;
+    }
+
+    TransitionResult MakeConflictResult(const InstanceInfo &loser, const InstanceInfo &winner) const
+    {
+        return TransitionResult{ litebus::None(), winner, loser, 0,
+                                 Status(StatusCode::INSTANCE_TRANSACTION_WRONG_VERSION, "route already exists") };
+    }
+
+    void PrimeLoserLifecycle(const InstanceInfo &loser)
+    {
+        actor_->AddHeartbeatTimer(loser.instanceid());
+        actor_->instanceStatusPromises_[loser.instanceid()] = litebus::Promise<Status>();
+        auto &metricsContext = metrics::MetricsAdapter::GetInstance().GetMetricsContext();
+        metricsContext.InitBillingInstance(loser, {});
+        EXPECT_EQ(metricsContext.GetBillingInstance(loser.instanceid()).endTimeMillis, 0);
+    }
+
+    void ExpectExactLoserCleanup(
+        const InstanceInfo &loser,
+        litebus::Future<std::shared_ptr<messages::KillInstanceRequest>> &killRequestFuture,
+        litebus::Future<std::vector<std::string>> &deletedInstancesFuture)
+    {
+        EXPECT_CALL(*clientManager_, DeleteClient(loser.instanceid())).WillOnce(Return(Status::OK()));
+
+        messages::KillInstanceResponse killResponse;
+        killResponse.set_code(static_cast<int32_t>(StatusCode::SUCCESS));
+        killResponse.set_requestid(loser.requestid());
+        EXPECT_CALL(*functionAgentMgr_, KillInstance(_, loser.functionagentid(), false))
+            .WillOnce(DoAll(FutureArg<0>(&killRequestFuture), Return(killResponse)));
+
+        EXPECT_CALL(*primary_, DeleteInstances(ElementsAre(loser.instanceid()), false))
+            .WillOnce(DoAll(FutureArg<0>(&deletedInstancesFuture), Return(Status::OK())));
+        EXPECT_CALL(*virtual_, DeleteInstances).Times(0);
+        // The shared instance ID now represents the winner; cleanup must never delete its state machine.
+        EXPECT_CALL(*instanceControlView_, DelInstance).Times(0);
+    }
+
+    void AssertExactLoserCleanup(
+        const InstanceInfo &loser,
+        const litebus::Future<std::shared_ptr<messages::KillInstanceRequest>> &killRequestFuture,
+        const litebus::Future<std::vector<std::string>> &deletedInstancesFuture)
+    {
+        ASSERT_AWAIT_READY(killRequestFuture);
+        ASSERT_AWAIT_READY(deletedInstancesFuture);
+        ASSERT_NE(killRequestFuture.Get(), nullptr);
+        EXPECT_EQ(killRequestFuture.Get()->instanceid(), loser.instanceid());
+        EXPECT_EQ(killRequestFuture.Get()->requestid(), loser.requestid());
+        EXPECT_EQ(killRequestFuture.Get()->runtimeid(), loser.runtimeid());
+        ASSERT_THAT(deletedInstancesFuture.Get(), ElementsAre(loser.instanceid()));
+        EXPECT_EQ(actor_->GetHeartbeatTimers().count(loser.instanceid()), 0);
+        EXPECT_EQ(actor_->instanceStatusPromises_.count(loser.instanceid()), 0);
+        EXPECT_GT(metrics::MetricsAdapter::GetInstance()
+                      .GetMetricsContext()
+                      .GetBillingInstance(loser.instanceid())
+                      .endTimeMillis,
+                  0);
+    }
+
+    inline static const std::string INSTANCE_ID = "initial-low-route-conflict-instance";
+    inline static const std::string LOSER_REQUEST_ID = "loser-create-request";
+    inline static const std::string ORIGINAL_CALL_RESULT_REQUEST_ID = "runtime-call-result-request";
+    inline static const std::string WINNER_REQUEST_ID = "winner-create-request";
+    inline static const std::string LOSER_RUNTIME_ID = "loser-runtime-exact";
+    inline static const std::string LOSER_AGENT_ID = "loser-agent-exact";
+    inline static const std::string LOSER_PROXY_ID = "loser-proxy";
+    inline static const std::string WINNER_PROXY_ID = "winner-proxy";
+    inline static const std::string PARENT_INSTANCE_ID = "original-parent-instance";
+    inline static const std::string PARENT_PROXY_AID = "original-parent-proxy-aid";
+    inline static const std::string FUNCTION_KEY = "default/0-test-helloWorld/$latest";
+    inline static const std::string TENANT_ID = "tenant-a";
+    inline static const std::string JOB_ID = "job-a";
+    inline static const std::string ARBITRATED_CONTENDER_MARKER =
+        "createConflictArbitratedContender";
+
+    bool previousDirectRoutingEnabled_ = false;
+    bool previousForceLowReliabilityEnabled_ = false;
+    std::unordered_set<metrics::YRInstrument> previousEnabledInstruments_;
+    std::shared_ptr<MockInstanceCtrlActor> actor_;
+    std::shared_ptr<MockInstanceControlView> instanceControlView_;
+    std::shared_ptr<MockSharedClientManagerProxy> clientManager_;
+    std::shared_ptr<MockFunctionAgentMgr> functionAgentMgr_;
+    std::shared_ptr<resource_view::ResourceViewMgr> resourceViewMgr_;
+    std::shared_ptr<MockResourceView> primary_;
+    std::shared_ptr<MockResourceView> virtual_;
+    std::shared_ptr<MockObserver> observer_;
+    std::shared_ptr<MockInternalIAM> internalIAM_;
+};
+
+TEST_F(InitialLowReliabilityRouteConflictActorTest, ReturnsWinnerAndReclaimsExactLoser)
+{
+    const auto loser = MakeLoserInfo();
+    const auto winner = MakeWinnerInfo();
+    const auto winnerAID = litebus::AID("winner-local-scheduler", "tcp://127.0.0.1:39091");
+    auto callResult = MakeCallResult();
+    auto resolver = std::make_shared<InstanceGenerationConflictResolver>(loser, true);
+    auto cleanupState = resolver->GetCleanupState();
+
+    PrimeLoserLifecycle(loser);
+    litebus::Future<std::shared_ptr<messages::KillInstanceRequest>> killRequestFuture;
+    litebus::Future<std::vector<std::string>> deletedInstancesFuture;
+    ExpectExactLoserCleanup(loser, killRequestFuture, deletedInstancesFuture);
+
+    EXPECT_CALL(*observer_, GetLocalSchedulerAID(winner.functionproxyid()))
+        .WillOnce(Return(litebus::Option<litebus::AID>(winnerAID)));
+    CallResultAck ack;
+    ack.set_code(common::ErrorCode::ERR_NONE);
+    litebus::Future<std::shared_ptr<functionsystem::CallResult>> sentCallResultFuture;
+    EXPECT_CALL(*actor_, MockSendCallResult(loser.instanceid(), loser.parentid(),
+                                            loser.parentfunctionproxyaid(), _))
+        .WillOnce(DoAll(FutureArg<3>(&sentCallResultFuture), Return(ack)));
+
+    auto result = actor_->HandleCreateRouteConflict(
+        loser, MakeConflictResult(loser, winner), callResult, resolver);
+
+    ASSERT_AWAIT_READY(result);
+    ASSERT_AWAIT_READY(sentCallResultFuture);
+    AssertExactLoserCleanup(loser, killRequestFuture, deletedInstancesFuture);
+    EXPECT_EQ(result.Get().code(), common::ErrorCode::ERR_NONE);
+    ASSERT_NE(sentCallResultFuture.Get(), nullptr);
+    EXPECT_EQ(sentCallResultFuture.Get(), callResult);
+    const auto &sent = *sentCallResultFuture.Get();
+    EXPECT_EQ(sent.requestid(), ORIGINAL_CALL_RESULT_REQUEST_ID);
+    EXPECT_EQ(sent.instanceid(), loser.instanceid());
+    EXPECT_EQ(sent.code(), common::ErrorCode::ERR_NONE);
+    EXPECT_TRUE(sent.message().empty());
+    EXPECT_EQ(sent.smallobjects_size(), 0);
+    EXPECT_EQ(sent.stacktraceinfos_size(), 0);
+    ASSERT_TRUE(sent.has_runtimeinfo());
+    EXPECT_TRUE(sent.runtimeinfo().serveripaddr().empty());
+    EXPECT_EQ(sent.runtimeinfo().serverport(), 0);
+    EXPECT_EQ(sent.runtimeinfo().route(), winnerAID.Url());
+    EXPECT_EQ(sent.runtimeinfo().proxyid(), winner.functionproxyid());
+    EXPECT_EQ(resolver->ResolvedWinner().requestid(), winner.requestid());
+    EXPECT_TRUE(cleanupState->localCleanupPrepared);
+    ASSERT_NE(cleanupState->attempt, nullptr);
+    ASSERT_AWAIT_READY(*cleanupState->attempt);
+    EXPECT_TRUE(cleanupState->attempt->Get().IsOk());
+}
+
+TEST_F(InitialLowReliabilityRouteConflictActorTest, IncompleteLocalRuntimeViewStillMatchesContender)
+{
+    const auto contender = MakeLoserInfo();
+    auto localView = contender;
+    localView.clear_runtimeid();
+    auto resolver = std::make_shared<InstanceGenerationConflictResolver>(contender, true);
+
+    EXPECT_TRUE(resolver->MatchesContenderGenerationView(localView));
+
+    localView.set_runtimeid("replacement-runtime");
+    EXPECT_FALSE(resolver->MatchesContenderGenerationView(localView));
+
+    localView = contender;
+    localView.clear_runtimeid();
+    localView.set_requestid("replacement-request");
+    EXPECT_FALSE(resolver->MatchesContenderGenerationView(localView));
+}
+
+TEST_F(InitialLowReliabilityRouteConflictActorTest, RegisteredCallbackRejectsChangedLocalGenerationWithoutCleanup)
+{
+    const auto loser = MakeLoserInfo();
+    const auto winner = MakeWinnerInfo();
+    auto replacement = loser;
+    replacement.set_runtimeid("replacement-runtime");
+    replacement.set_functionagentid("replacement-agent");
+    replacement.mutable_instancestatus()->set_code(static_cast<int32_t>(InstanceState::RUNNING));
+    auto scheduleRequest = std::make_shared<messages::ScheduleRequest>();
+    scheduleRequest->set_requestid(loser.requestid());
+    scheduleRequest->mutable_instance()->CopyFrom(loser);
+    auto callResult = MakeCallResult();
+    auto stateMachine = std::make_shared<MockInstanceStateMachine>(LOSER_PROXY_ID);
+
+    EXPECT_CALL(*instanceControlView_, GetInstance(loser.instanceid()))
+        .Times(2)
+        .WillRepeatedly(Return(stateMachine));
+    EXPECT_CALL(*stateMachine, GetInstanceState()).WillOnce(Return(InstanceState::CREATING));
+    EXPECT_CALL(*stateMachine, GetVersion()).WillOnce(Return(0)).WillOnce(Return(1));
+    EXPECT_CALL(*stateMachine, IsSaving()).WillOnce(Return(false));
+    EXPECT_CALL(*stateMachine, GetInstanceInfo())
+        .WillOnce(Return(loser))
+        .WillOnce(Return(loser))
+        .WillRepeatedly(Return(replacement));
+    auto conflictResult = MakeConflictResult(loser, winner);
+    conflictResult.currentModRevision = 23;
+    EXPECT_CALL(*stateMachine,
+                TransitionToImpl(InstanceState::RUNNING, 0, "running", true, 0))
+        .WillOnce(Return(conflictResult));
+    {
+        InSequence sequence;
+        EXPECT_CALL(*stateMachine, UpdateInstanceInfo(Truly([loser](const InstanceInfo &actual) {
+            return actual.SerializeAsString() == loser.SerializeAsString();
+        })));
+        EXPECT_CALL(*stateMachine, UpdateInstanceInfo(Truly([winner](const InstanceInfo &actual) {
+            return actual.SerializeAsString() == winner.SerializeAsString();
+        })));
+        EXPECT_CALL(*stateMachine, SetVersion(0));
+        EXPECT_CALL(*stateMachine, SetModRevision(23));
+    }
+    PrimeLoserLifecycle(loser);
+    EXPECT_CALL(*clientManager_, DeleteClient).Times(0);
+    EXPECT_CALL(*functionAgentMgr_, KillInstance).Times(0);
+    EXPECT_CALL(*primary_, DeleteInstances).Times(0);
+    EXPECT_CALL(*virtual_, DeleteInstances).Times(0);
+    EXPECT_CALL(*instanceControlView_, DelInstance).Times(0);
+    EXPECT_CALL(*observer_, GetLocalSchedulerAID).Times(0);
+    CallResultAck ack;
+    ack.set_code(common::ErrorCode::ERR_NONE);
+    litebus::Future<std::shared_ptr<functionsystem::CallResult>> sentCallResultFuture;
+    EXPECT_CALL(*actor_, MockSendCallResult(loser.instanceid(), loser.parentid(),
+                                            loser.parentfunctionproxyaid(), _))
+        .WillOnce(DoAll(FutureArg<3>(&sentCallResultFuture), Return(ack)));
+
+    auto callback = actor_->RegisterCreateCallResultCallback(scheduleRequest);
+    auto result = callback(callResult);
+
+    ASSERT_AWAIT_READY(result);
+    ASSERT_AWAIT_READY(sentCallResultFuture);
+    EXPECT_EQ(result.Get().code(), common::ErrorCode::ERR_NONE);
+    EXPECT_EQ(sentCallResultFuture.Get()->code(), common::ErrorCode::ERR_ETCD_OPERATION_ERROR);
+    EXPECT_THAT(sentCallResultFuture.Get()->message(), HasSubstr("generation changed"));
+    EXPECT_FALSE(sentCallResultFuture.Get()->has_runtimeinfo());
+    EXPECT_EQ(actor_->GetHeartbeatTimers().count(loser.instanceid()), 1);
+    EXPECT_EQ(metrics::MetricsAdapter::GetInstance()
+                  .GetMetricsContext()
+                  .GetBillingInstance(loser.instanceid())
+                  .endTimeMillis,
+              0);
+}
+
+TEST_F(InitialLowReliabilityRouteConflictActorTest, PostTransitionRuntimeGenerationChangeSkipsExactCleanup)
+{
+    const auto loser = MakeLoserInfo();
+    auto replacement = loser;
+    replacement.set_runtimeid("replacement-runtime");
+    replacement.mutable_instancestatus()->set_code(static_cast<int32_t>(InstanceState::RUNNING));
+    auto scheduleRequest = std::make_shared<messages::ScheduleRequest>();
+    scheduleRequest->set_requestid(loser.requestid());
+    scheduleRequest->mutable_instance()->CopyFrom(loser);
+    auto callResult = MakeCallResult();
+    auto stateMachine = std::make_shared<MockInstanceStateMachine>(LOSER_PROXY_ID);
+
+    EXPECT_CALL(*instanceControlView_, GetInstance(loser.instanceid()))
+        .Times(2)
+        .WillRepeatedly(Return(stateMachine));
+    EXPECT_CALL(*stateMachine, GetInstanceState()).WillOnce(Return(InstanceState::CREATING));
+    EXPECT_CALL(*stateMachine, GetVersion()).WillOnce(Return(0)).WillOnce(Return(1));
+    EXPECT_CALL(*stateMachine, IsSaving()).WillOnce(Return(false));
+    EXPECT_CALL(*stateMachine, GetInstanceInfo())
+        .WillOnce(Return(loser))
+        .WillOnce(Return(loser))
+        .WillOnce(Return(replacement));
+    TransitionResult persistenceFailure{
+        litebus::None(), {}, loser, 0,
+        Status(StatusCode::INSTANCE_TRANSACTION_GET_INFO_FAILED, "route is missing")
+    };
+    EXPECT_CALL(*stateMachine,
+                TransitionToImpl(InstanceState::RUNNING, 0, "running", true, 0))
+        .WillOnce(Return(persistenceFailure));
+    EXPECT_CALL(*stateMachine, UpdateInstanceInfo(Truly([loser](const InstanceInfo &actual) {
+        return actual.SerializeAsString() == loser.SerializeAsString();
+    })));
+    EXPECT_CALL(*clientManager_, DeleteClient).Times(0);
+    EXPECT_CALL(*functionAgentMgr_, KillInstance).Times(0);
+    EXPECT_CALL(*primary_, DeleteInstances).Times(0);
+    EXPECT_CALL(*virtual_, DeleteInstances).Times(0);
+    EXPECT_CALL(*instanceControlView_, DelInstance).Times(0);
+    EXPECT_CALL(*observer_, GetLocalSchedulerAID).Times(0);
+
+    CallResultAck ack;
+    ack.set_code(common::ErrorCode::ERR_NONE);
+    litebus::Future<std::shared_ptr<functionsystem::CallResult>> sentCallResultFuture;
+    EXPECT_CALL(*actor_, MockSendCallResult(loser.instanceid(), loser.parentid(),
+                                            loser.parentfunctionproxyaid(), _))
+        .WillOnce(DoAll(FutureArg<3>(&sentCallResultFuture), Return(ack)));
+
+    auto callback = actor_->RegisterCreateCallResultCallback(scheduleRequest);
+    auto result = callback(callResult);
+
+    ASSERT_AWAIT_READY(result);
+    ASSERT_AWAIT_READY(sentCallResultFuture);
+    EXPECT_EQ(result.Get().code(), common::ErrorCode::ERR_NONE);
+    EXPECT_EQ(sentCallResultFuture.Get()->code(), common::ErrorCode::ERR_ETCD_OPERATION_ERROR);
+    EXPECT_THAT(sentCallResultFuture.Get()->message(), HasSubstr("generation changed"));
+    EXPECT_FALSE(sentCallResultFuture.Get()->has_runtimeinfo());
+}
+
+TEST_F(InitialLowReliabilityRouteConflictActorTest, FailedRuntimeCleanupIsReportedAndRetried)
+{
+    const auto loser = MakeLoserInfo();
+    const auto winner = MakeWinnerInfo();
+    const auto winnerAID = litebus::AID("winner-local-scheduler", "tcp://127.0.0.1:39091");
+    auto callResult = MakeCallResult();
+    auto resolver = std::make_shared<InstanceGenerationConflictResolver>(loser, true);
+    auto cleanupState = resolver->GetCleanupState();
+    PrimeLoserLifecycle(loser);
+
+    EXPECT_CALL(*clientManager_, DeleteClient(loser.instanceid()))
+        .Times(2)
+        .WillRepeatedly(Return(Status::OK()));
+    messages::KillInstanceResponse failedKill;
+    failedKill.set_code(static_cast<int32_t>(StatusCode::FAILED));
+    messages::KillInstanceResponse successfulKill;
+    successfulKill.set_code(static_cast<int32_t>(StatusCode::SUCCESS));
+    EXPECT_CALL(*functionAgentMgr_, KillInstance(_, loser.functionagentid(), false))
+        .WillOnce(Return(failedKill))
+        .WillOnce(Return(successfulKill));
+    EXPECT_CALL(*primary_, DeleteInstances(ElementsAre(loser.instanceid()), false))
+        .WillOnce(Return(Status::OK()));
+    EXPECT_CALL(*virtual_, DeleteInstances).Times(0);
+    EXPECT_CALL(*instanceControlView_, DelInstance).Times(0);
+
+    CallResultAck ack;
+    ack.set_code(common::ErrorCode::ERR_NONE);
+    litebus::Future<std::shared_ptr<functionsystem::CallResult>> secondSent;
+    EXPECT_CALL(*actor_, MockSendCallResult(loser.instanceid(), loser.parentid(),
+                                            loser.parentfunctionproxyaid(), _))
+        .WillOnce(DoAll(FutureArg<3>(&secondSent), Return(ack)));
+    EXPECT_CALL(*observer_, GetLocalSchedulerAID(winner.functionproxyid()))
+        .WillOnce(Return(litebus::Option<litebus::AID>(winnerAID)));
+
+    auto first = actor_->HandleCreateRouteConflict(
+        loser, MakeConflictResult(loser, winner), callResult, resolver);
+    ASSERT_AWAIT_READY(first);
+    ASSERT_NE(cleanupState->attempt, nullptr);
+    ASSERT_AWAIT_READY(*cleanupState->attempt);
+    EXPECT_TRUE(cleanupState->attempt->Get().IsError());
+    EXPECT_NE(first.Get().code(), common::ErrorCode::ERR_NONE);
+    EXPECT_THAT(first.Get().message(), HasSubstr("failed to reclaim"));
+
+    auto second = actor_->ReclaimCreateContenderAndSendWinner(
+        loser, winner, callResult, resolver);
+    ASSERT_AWAIT_READY(second);
+    ASSERT_AWAIT_READY(secondSent);
+    ASSERT_NE(cleanupState->attempt, nullptr);
+    ASSERT_AWAIT_READY(*cleanupState->attempt);
+    EXPECT_TRUE(cleanupState->attempt->Get().IsOk());
+    EXPECT_EQ(secondSent.Get()->code(), common::ErrorCode::ERR_NONE);
+    EXPECT_EQ(secondSent.Get()->runtimeinfo().route(), winnerAID.Url());
+    EXPECT_EQ(secondSent.Get()->runtimeinfo().proxyid(), winner.functionproxyid());
+}
+
+TEST_F(InitialLowReliabilityRouteConflictActorTest, CallResultKeepsCallbackAndRetriesFailedCleanup)
+{
+    const auto loser = MakeLoserInfo();
+    const auto winner = MakeWinnerInfo();
+    const auto winnerAID = litebus::AID("winner-local-scheduler", "tcp://127.0.0.1:39091");
+    auto scheduleRequest = std::make_shared<messages::ScheduleRequest>();
+    scheduleRequest->set_requestid(loser.requestid());
+    scheduleRequest->mutable_instance()->CopyFrom(loser);
+    auto stateMachine = std::make_shared<MockInstanceStateMachine>(LOSER_PROXY_ID);
+
+    EXPECT_CALL(*instanceControlView_, GetInstance(loser.instanceid()))
+        .Times(5)
+        .WillRepeatedly(Return(stateMachine));
+    EXPECT_CALL(*stateMachine, GetInstanceState())
+        .Times(7)
+        .WillRepeatedly(Return(InstanceState::CREATING));
+    EXPECT_CALL(*stateMachine, GetVersion()).WillOnce(Return(0)).WillOnce(Return(1));
+    EXPECT_CALL(*stateMachine, IsSaving()).WillOnce(Return(false));
+    EXPECT_CALL(*stateMachine, GetInstanceInfo())
+        .WillOnce(Return(loser))
+        .WillOnce(Return(loser))
+        .WillOnce(Return(winner))
+        .WillOnce(Return(winner));
+    auto conflictResult = MakeConflictResult(loser, winner);
+    conflictResult.currentModRevision = 31;
+    EXPECT_CALL(*stateMachine,
+                TransitionToImpl(InstanceState::RUNNING, 0, "running", true, 0))
+        .WillOnce(Return(conflictResult));
+    {
+        InSequence sequence;
+        EXPECT_CALL(*stateMachine, UpdateInstanceInfo(Truly([loser](const InstanceInfo &actual) {
+            return actual.SerializeAsString() == loser.SerializeAsString();
+        })));
+        EXPECT_CALL(*stateMachine, UpdateInstanceInfo(Truly([winner](const InstanceInfo &actual) {
+            return actual.SerializeAsString() == winner.SerializeAsString();
+        })));
+        EXPECT_CALL(*stateMachine, SetVersion(0));
+        EXPECT_CALL(*stateMachine, SetModRevision(31));
+    }
+
+    PrimeLoserLifecycle(loser);
+    EXPECT_CALL(*clientManager_, DeleteClient(loser.instanceid()))
+        .Times(2)
+        .WillRepeatedly(Return(Status::OK()));
+    messages::KillInstanceResponse failedKill;
+    failedKill.set_code(static_cast<int32_t>(StatusCode::FAILED));
+    messages::KillInstanceResponse successfulKill;
+    successfulKill.set_code(static_cast<int32_t>(StatusCode::SUCCESS));
+    EXPECT_CALL(*functionAgentMgr_, KillInstance(_, loser.functionagentid(), false))
+        .WillOnce(Return(failedKill))
+        .WillOnce(Return(successfulKill));
+    EXPECT_CALL(*primary_, DeleteInstances(ElementsAre(loser.instanceid()), false))
+        .WillOnce(Return(Status::OK()));
+    EXPECT_CALL(*virtual_, DeleteInstances).Times(0);
+    EXPECT_CALL(*instanceControlView_, DelInstance).Times(0);
+    EXPECT_CALL(*observer_, GetLocalSchedulerAID(winner.functionproxyid()))
+        .WillOnce(Return(litebus::Option<litebus::AID>(winnerAID)));
+
+    CallResultAck delivered;
+    delivered.set_code(common::ErrorCode::ERR_NONE);
+    litebus::Future<std::shared_ptr<functionsystem::CallResult>> sentCallResultFuture;
+    EXPECT_CALL(*actor_, MockSendCallResult(loser.instanceid(), loser.parentid(),
+                                            loser.parentfunctionproxyaid(), _))
+        .WillOnce(DoAll(FutureArg<3>(&sentCallResultFuture), Return(delivered)));
+
+    actor_->RegisterCreateCallResultCallback(scheduleRequest);
+    actor_->syncCreateCallResultPromises_[loser.instanceid()] =
+        std::make_shared<litebus::Promise<std::shared_ptr<functionsystem::CallResult>>>();
+
+    auto firstCallResult = MakeCallResult();
+    auto first = actor_->CallResult(loser.instanceid(), firstCallResult);
+    ASSERT_AWAIT_READY(first);
+    EXPECT_NE(first.Get().code(), common::ErrorCode::ERR_NONE);
+    EXPECT_EQ(actor_->createCallResultCallback_.count(loser.instanceid()), 1);
+
+    auto retryCallResult = MakeCallResult();
+    auto second = actor_->CallResult(loser.instanceid(), retryCallResult);
+    ASSERT_AWAIT_READY(second);
+    ASSERT_AWAIT_READY(sentCallResultFuture);
+    EXPECT_EQ(second.Get().code(), common::ErrorCode::ERR_NONE);
+    EXPECT_EQ(actor_->createCallResultCallback_.count(loser.instanceid()), 0);
+    EXPECT_EQ(sentCallResultFuture.Get()->runtimeinfo().route(), winnerAID.Url());
+    EXPECT_EQ(sentCallResultFuture.Get()->runtimeinfo().proxyid(), winner.functionproxyid());
+}
+
+TEST_F(InitialLowReliabilityRouteConflictActorTest, DuplicateLoserCallResultIsAcknowledgedWithoutWinnerForward)
+{
+    auto callResult = MakeCallResult();
+    actor_->createConflictCallResultTombstones_[INSTANCE_ID] = callResult->requestid();
+    EXPECT_CALL(*instanceControlView_, GetInstance(INSTANCE_ID)).WillOnce(Return(nullptr));
+    EXPECT_CALL(*actor_, MockSendCallResult).Times(0);
+
+    auto result = actor_->CallResult(INSTANCE_ID, callResult);
+    ASSERT_AWAIT_READY(result);
+    EXPECT_EQ(result.Get().code(), common::ErrorCode::ERR_NONE);
+}
+
+TEST_F(InitialLowReliabilityRouteConflictActorTest, StaleForwardAckDoesNotApplyGenericCleanupToWinner)
+{
+    const std::string requestID = "loser-forward-request";
+    auto promise = std::make_shared<InstanceCtrlActor::ForwardCallResultPromise>();
+    actor_->forwardCallResultPromise_[requestID] = promise;
+    actor_->createConflictForwardContenders_[requestID] = INSTANCE_ID;
+    EXPECT_CALL(*instanceControlView_, GetInstance).Times(0);
+
+    ::internal::ForwardCallResultResponse response;
+    response.set_requestid(requestID);
+    response.set_instanceid(INSTANCE_ID);
+    response.set_code(static_cast<common::ErrorCode>(StatusCode::ERR_INSTANCE_EXITED));
+    auto message = response.SerializeAsString();
+    actor_->ForwardCallResultResponse(litebus::AID("remote-parent"), std::string(), std::move(message));
+
+    ASSERT_AWAIT_READY(promise->GetFuture());
+    EXPECT_EQ(actor_->createConflictForwardContenders_.count(requestID), 0);
+}
+
+TEST_F(InitialLowReliabilityRouteConflictActorTest, ResolvedWinnerForwardCarriesOnlyRelayMarker)
+{
+    auto callResult = MakeCallResult();
+    actor_->createConflictForwardContenders_[callResult->requestid()] = INSTANCE_ID;
+
+    EXPECT_CALL(*instanceControlView_, GetInstance).Times(0);
+    auto request = actor_->BuildForwardCallResultRequest(
+        INSTANCE_ID, PARENT_INSTANCE_ID, PARENT_PROXY_AID, callResult);
+
+    ASSERT_NE(request, nullptr);
+    ASSERT_TRUE(request->has_readyinstance());
+    const auto &readyInstance = request->readyinstance();
+    EXPECT_EQ(readyInstance.instanceid(), INSTANCE_ID);
+    EXPECT_EQ(readyInstance.extensions_size(), 1);
+    ASSERT_NE(readyInstance.extensions().find(ARBITRATED_CONTENDER_MARKER),
+              readyInstance.extensions().end());
+    EXPECT_EQ(readyInstance.extensions().at(ARBITRATED_CONTENDER_MARKER), INSTANCE_ID);
+    EXPECT_TRUE(readyInstance.runtimeid().empty());
+    EXPECT_TRUE(readyInstance.functionagentid().empty());
+    EXPECT_TRUE(readyInstance.functionproxyid().empty());
+    EXPECT_FALSE(readyInstance.lowreliability());
+    EXPECT_EQ(request->instanceid(), PARENT_INSTANCE_ID);
+    EXPECT_EQ(request->functionproxyid(), PARENT_PROXY_AID);
+    EXPECT_EQ(request->req().runtimeinfo().route(), callResult->runtimeinfo().route());
+}
+
+TEST_F(InitialLowReliabilityRouteConflictActorTest, FrontendArbitratedResultUsesRequestTicketAsRemoteDestination)
+{
+    auto contender = MakeLoserInfo();
+    contender.clear_parentid();
+    contender.set_parentfunctionproxyaid(PARENT_PROXY_AID);
+    (*contender.mutable_extensions())[CREATE_SOURCE] = FRONTEND_STR;
+    auto callResult = MakeCallResult();
+
+    CallResultAck delivered;
+    delivered.set_code(common::ErrorCode::ERR_NONE);
+    EXPECT_CALL(*actor_, MockSendCallResult(contender.instanceid(), callResult->requestid(),
+                                            contender.parentfunctionproxyaid(), callResult))
+        .WillOnce(Return(delivered));
+
+    auto result = actor_->SendCreateArbitratedCallResult(contender, callResult, true);
+
+    ASSERT_AWAIT_READY(result);
+    EXPECT_EQ(result.Get().code(), common::ErrorCode::ERR_NONE);
+    EXPECT_EQ(actor_->createConflictForwardContenders_.at(callResult->requestid()), contender.instanceid());
+    EXPECT_EQ(actor_->createConflictCallResultTombstones_.at(contender.instanceid()), callResult->requestid());
+}
+
+TEST_F(InitialLowReliabilityRouteConflictActorTest, ArbitratedMarkerIsReestablishedForMultiHopRelay)
+{
+    auto callResult = MakeCallResult();
+    actor_->createConflictForwardContenders_[callResult->requestid()] = INSTANCE_ID;
+    EXPECT_CALL(*instanceControlView_, GetInstance).Times(0);
+
+    auto firstHop = actor_->BuildForwardCallResultRequest(
+        INSTANCE_ID, PARENT_INSTANCE_ID, PARENT_PROXY_AID, callResult);
+    ASSERT_NE(firstHop, nullptr);
+    ASSERT_TRUE(firstHop->has_readyinstance());
+    actor_->createConflictForwardContenders_.clear();
+
+    litebus::Promise<CallResultAck> downstreamPromise;
+    EXPECT_CALL(*actor_, MockSendCallResult(INSTANCE_ID, PARENT_INSTANCE_ID, PARENT_PROXY_AID, _))
+        .WillOnce(Return(downstreamPromise.GetFuture()));
+    auto firstHopMessage = firstHop->SerializeAsString();
+    actor_->ForwardCallResultRequest(
+        litebus::AID("upstream-proxy"), std::string(), std::move(firstHopMessage));
+
+    ASSERT_EQ(actor_->createConflictForwardContenders_.at(callResult->requestid()), INSTANCE_ID);
+    auto secondHop = actor_->BuildForwardCallResultRequest(
+        INSTANCE_ID, "next-parent-instance", "next-parent-proxy", callResult);
+    ASSERT_NE(secondHop, nullptr);
+    ASSERT_TRUE(secondHop->has_readyinstance());
+    const auto &relayedReadyInstance = secondHop->readyinstance();
+    EXPECT_EQ(relayedReadyInstance.instanceid(), INSTANCE_ID);
+    ASSERT_NE(relayedReadyInstance.extensions().find(ARBITRATED_CONTENDER_MARKER),
+              relayedReadyInstance.extensions().end());
+    EXPECT_EQ(relayedReadyInstance.extensions().at(ARBITRATED_CONTENDER_MARKER), INSTANCE_ID);
+    EXPECT_TRUE(relayedReadyInstance.runtimeid().empty());
+    EXPECT_TRUE(relayedReadyInstance.functionproxyid().empty());
+
+    CallResultAck delivered;
+    delivered.set_code(common::ErrorCode::ERR_NONE);
+    downstreamPromise.SetValue(delivered);
+}
+
+TEST_F(InitialLowReliabilityRouteConflictActorTest, UnresolvedRouteConflictReclaimsExactLoser)
+{
+    const auto loser = MakeLoserInfo();
+    auto scheduleRequest = std::make_shared<messages::ScheduleRequest>();
+    scheduleRequest->set_requestid(loser.requestid());
+    scheduleRequest->mutable_instance()->CopyFrom(loser);
+    auto callResult = MakeCallResult();
+    auto stateMachine = std::make_shared<MockInstanceStateMachine>(LOSER_PROXY_ID);
+
+    EXPECT_CALL(*instanceControlView_, GetInstance(loser.instanceid()))
+        .Times(2)
+        .WillRepeatedly(Return(stateMachine));
+    EXPECT_CALL(*stateMachine, GetInstanceState()).WillOnce(Return(InstanceState::CREATING));
+    EXPECT_CALL(*stateMachine, GetVersion()).WillOnce(Return(0)).WillOnce(Return(1));
+    EXPECT_CALL(*stateMachine, IsSaving()).WillOnce(Return(false));
+    EXPECT_CALL(*stateMachine, GetInstanceInfo())
+        .Times(3)
+        .WillRepeatedly(Return(loser));
+    TransitionResult persistenceFailure{
+        litebus::None(), {}, loser, 0,
+        Status(StatusCode::INSTANCE_TRANSACTION_WRONG_VERSION, "route conflict winner is unavailable")
+    };
+    EXPECT_CALL(*stateMachine,
+                TransitionToImpl(InstanceState::RUNNING, 0, "running", true, 0))
+        .WillOnce(Return(persistenceFailure));
+    EXPECT_CALL(*stateMachine, UpdateInstanceInfo(Truly([loser](const InstanceInfo &actual) {
+        return actual.SerializeAsString() == loser.SerializeAsString();
+    })));
+
+    PrimeLoserLifecycle(loser);
+    litebus::Future<std::shared_ptr<messages::KillInstanceRequest>> killRequestFuture;
+    litebus::Future<std::vector<std::string>> deletedInstancesFuture;
+    ExpectExactLoserCleanup(loser, killRequestFuture, deletedInstancesFuture);
+    EXPECT_CALL(*observer_, GetLocalSchedulerAID).Times(0);
+    CallResultAck ack;
+    ack.set_code(common::ErrorCode::ERR_NONE);
+    litebus::Future<std::shared_ptr<functionsystem::CallResult>> sentCallResultFuture;
+    EXPECT_CALL(*actor_, MockSendCallResult(loser.instanceid(), loser.parentid(),
+                                            loser.parentfunctionproxyaid(), _))
+        .WillOnce(DoAll(FutureArg<3>(&sentCallResultFuture), Return(ack)));
+
+    auto callback = actor_->RegisterCreateCallResultCallback(scheduleRequest);
+    auto result = callback(callResult);
+
+    ASSERT_AWAIT_READY(result);
+    ASSERT_AWAIT_READY(sentCallResultFuture);
+    AssertExactLoserCleanup(loser, killRequestFuture, deletedInstancesFuture);
+    EXPECT_EQ(result.Get().code(), common::ErrorCode::ERR_NONE);
+    EXPECT_EQ(sentCallResultFuture.Get()->code(), common::ErrorCode::ERR_ETCD_OPERATION_ERROR);
+    EXPECT_THAT(sentCallResultFuture.Get()->message(), HasSubstr("failed to resolve route conflict"));
+    EXPECT_FALSE(sentCallResultFuture.Get()->has_runtimeinfo());
+}
+
+TEST_F(InitialLowReliabilityRouteConflictActorTest, MissingRoutePersistenceFailureReclaimsExactLoser)
+{
+    const auto loser = MakeLoserInfo();
+    auto scheduleRequest = std::make_shared<messages::ScheduleRequest>();
+    scheduleRequest->set_requestid(loser.requestid());
+    scheduleRequest->mutable_instance()->CopyFrom(loser);
+    auto callResult = MakeCallResult();
+    auto stateMachine = std::make_shared<MockInstanceStateMachine>(LOSER_PROXY_ID);
+
+    EXPECT_CALL(*instanceControlView_, GetInstance(loser.instanceid()))
+        .Times(2)
+        .WillRepeatedly(Return(stateMachine));
+    EXPECT_CALL(*stateMachine, GetInstanceState()).WillOnce(Return(InstanceState::CREATING));
+    EXPECT_CALL(*stateMachine, GetVersion()).WillOnce(Return(0)).WillOnce(Return(1));
+    EXPECT_CALL(*stateMachine, IsSaving()).WillOnce(Return(false));
+    EXPECT_CALL(*stateMachine, GetInstanceInfo()).Times(3).WillRepeatedly(Return(loser));
+    TransitionResult persistenceFailure{
+        litebus::None(), {}, loser, 0,
+        Status(StatusCode::INSTANCE_TRANSACTION_GET_INFO_FAILED, "route key is missing")
+    };
+    EXPECT_CALL(*stateMachine, TransitionToImpl(InstanceState::RUNNING, 0, "running", true, 0))
+        .WillOnce(Return(persistenceFailure));
+    EXPECT_CALL(*stateMachine, UpdateInstanceInfo(Truly([loser](const InstanceInfo &actual) {
+        return actual.SerializeAsString() == loser.SerializeAsString();
+    })));
+
+    PrimeLoserLifecycle(loser);
+    litebus::Future<std::shared_ptr<messages::KillInstanceRequest>> killRequestFuture;
+    litebus::Future<std::vector<std::string>> deletedInstancesFuture;
+    ExpectExactLoserCleanup(loser, killRequestFuture, deletedInstancesFuture);
+    EXPECT_CALL(*observer_, GetLocalSchedulerAID).Times(0);
+    CallResultAck ack;
+    ack.set_code(common::ErrorCode::ERR_NONE);
+    litebus::Future<std::shared_ptr<functionsystem::CallResult>> sentCallResultFuture;
+    EXPECT_CALL(*actor_, MockSendCallResult(loser.instanceid(), loser.parentid(),
+                                            loser.parentfunctionproxyaid(), _))
+        .WillOnce(DoAll(FutureArg<3>(&sentCallResultFuture), Return(ack)));
+
+    auto callback = actor_->RegisterCreateCallResultCallback(scheduleRequest);
+    auto result = callback(callResult);
+
+    ASSERT_AWAIT_READY(result);
+    ASSERT_AWAIT_READY(sentCallResultFuture);
+    AssertExactLoserCleanup(loser, killRequestFuture, deletedInstancesFuture);
+    EXPECT_EQ(result.Get().code(), common::ErrorCode::ERR_NONE);
+    EXPECT_EQ(sentCallResultFuture.Get()->code(), common::ErrorCode::ERR_ETCD_OPERATION_ERROR);
+    EXPECT_THAT(sentCallResultFuture.Get()->message(), HasSubstr("route is missing"));
+    EXPECT_FALSE(sentCallResultFuture.Get()->has_runtimeinfo());
+}
+
+TEST_F(InitialLowReliabilityRouteConflictActorTest, InvalidWinnerReturnsEtcdErrorAndReclaimsExactLoser)
+{
+    const auto loser = MakeLoserInfo();
+    auto invalidWinner = MakeWinnerInfo();
+    invalidWinner.clear_functionproxyid();
+    auto callResult = MakeCallResult();
+    auto resolver = std::make_shared<InstanceGenerationConflictResolver>(loser, true);
+    auto cleanupState = resolver->GetCleanupState();
+
+    PrimeLoserLifecycle(loser);
+    litebus::Future<std::shared_ptr<messages::KillInstanceRequest>> killRequestFuture;
+    litebus::Future<std::vector<std::string>> deletedInstancesFuture;
+    ExpectExactLoserCleanup(loser, killRequestFuture, deletedInstancesFuture);
+
+    EXPECT_CALL(*observer_, GetLocalSchedulerAID).Times(0);
+    CallResultAck ack;
+    ack.set_code(common::ErrorCode::ERR_NONE);
+    litebus::Future<std::shared_ptr<functionsystem::CallResult>> sentCallResultFuture;
+    EXPECT_CALL(*actor_, MockSendCallResult(loser.instanceid(), loser.parentid(),
+                                            loser.parentfunctionproxyaid(), _))
+        .WillOnce(DoAll(FutureArg<3>(&sentCallResultFuture), Return(ack)));
+
+    auto result = actor_->HandleCreateRouteConflict(
+        loser, MakeConflictResult(loser, invalidWinner), callResult, resolver);
+
+    ASSERT_AWAIT_READY(result);
+    ASSERT_AWAIT_READY(sentCallResultFuture);
+    AssertExactLoserCleanup(loser, killRequestFuture, deletedInstancesFuture);
+    EXPECT_EQ(result.Get().code(), common::ErrorCode::ERR_NONE);
+    ASSERT_NE(sentCallResultFuture.Get(), nullptr);
+    EXPECT_EQ(sentCallResultFuture.Get(), callResult);
+    const auto &sent = *sentCallResultFuture.Get();
+    EXPECT_EQ(sent.requestid(), ORIGINAL_CALL_RESULT_REQUEST_ID);
+    EXPECT_EQ(sent.code(), common::ErrorCode::ERR_ETCD_OPERATION_ERROR);
+    EXPECT_THAT(sent.message(), HasSubstr("invalid winner instance"));
+    EXPECT_EQ(sent.smallobjects_size(), 0);
+    EXPECT_EQ(sent.stacktraceinfos_size(), 0);
+    EXPECT_FALSE(sent.has_runtimeinfo());
+    EXPECT_FALSE(resolver->HasResolvedWinner());
+    EXPECT_TRUE(cleanupState->localCleanupPrepared);
+    ASSERT_NE(cleanupState->attempt, nullptr);
+}
+
+TEST_F(InitialLowReliabilityRouteConflictActorTest, LocalWinnerReturnsErrorWithoutSharedCleanup)
+{
+    const auto loser = MakeLoserInfo();
+    auto localWinner = MakeWinnerInfo();
+    localWinner.set_functionproxyid(LOSER_PROXY_ID);
+    auto callResult = MakeCallResult();
+    auto resolver = std::make_shared<InstanceGenerationConflictResolver>(loser, true);
+    auto cleanupState = resolver->GetCleanupState();
+
+    PrimeLoserLifecycle(loser);
+    EXPECT_CALL(*clientManager_, DeleteClient).Times(0);
+    EXPECT_CALL(*functionAgentMgr_, KillInstance).Times(0);
+    EXPECT_CALL(*primary_, DeleteInstances).Times(0);
+    EXPECT_CALL(*virtual_, DeleteInstances).Times(0);
+    EXPECT_CALL(*instanceControlView_, DelInstance).Times(0);
+    EXPECT_CALL(*observer_, GetLocalSchedulerAID).Times(0);
+    CallResultAck ack;
+    ack.set_code(common::ErrorCode::ERR_NONE);
+    litebus::Future<std::shared_ptr<functionsystem::CallResult>> sentCallResultFuture;
+    EXPECT_CALL(*actor_, MockSendCallResult(loser.instanceid(), loser.parentid(),
+                                            loser.parentfunctionproxyaid(), _))
+        .WillOnce(DoAll(FutureArg<3>(&sentCallResultFuture), Return(ack)));
+
+    auto result = actor_->HandleCreateRouteConflict(
+        loser, MakeConflictResult(loser, localWinner), callResult, resolver);
+
+    ASSERT_AWAIT_READY(result);
+    ASSERT_AWAIT_READY(sentCallResultFuture);
+    EXPECT_EQ(sentCallResultFuture.Get()->code(), common::ErrorCode::ERR_ETCD_OPERATION_ERROR);
+    EXPECT_THAT(sentCallResultFuture.Get()->message(), HasSubstr("local winner"));
+    EXPECT_EQ(actor_->GetHeartbeatTimers().count(loser.instanceid()), 1);
+    EXPECT_FALSE(cleanupState->localCleanupPrepared);
+    EXPECT_EQ(cleanupState->attempt, nullptr);
+}
+
+TEST_F(InitialLowReliabilityRouteConflictActorTest, ResolverFreezesFirstResolvedWinner)
+{
+    const auto contender = MakeLoserInfo();
+    auto firstWinner = MakeWinnerInfo();
+    auto laterWinner = firstWinner;
+    laterWinner.set_requestid("later-winner-request");
+    laterWinner.set_functionproxyid("later-winner-proxy");
+
+    auto resolver = std::make_shared<InstanceGenerationConflictResolver>(contender, true);
+    resolver->RecordResolvedWinner(firstWinner);
+    resolver->RecordResolvedWinner(laterWinner);
+
+    ASSERT_TRUE(resolver->HasResolvedWinner());
+    EXPECT_EQ(resolver->ResolvedWinner().requestid(), firstWinner.requestid());
+    EXPECT_EQ(resolver->ResolvedWinner().functionproxyid(), firstWinner.functionproxyid());
 }
 
 }  // namespace functionsystem::test

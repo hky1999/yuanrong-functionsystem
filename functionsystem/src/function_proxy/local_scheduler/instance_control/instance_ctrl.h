@@ -285,6 +285,16 @@ public:
         return litebus::Async(aid_, &InstanceCtrlActor::DeploySnapStartInstance, scheduleReq);
     }
 
+    /**
+     * D-6 F3: forward to the actor to remove the state machine left behind
+     * by a failed snapstart(restore) deploy (phantom-restore fix).
+     */
+    virtual void CleanupFailedSnapStart(const std::shared_ptr<messages::ScheduleRequest> &scheduleReq,
+                                        const std::string &reason)
+    {
+        litebus::Async(aid_, &InstanceCtrlActor::CleanupFailedSnapStart, scheduleReq, reason);
+    }
+
     virtual void RegisterClearGroupInstanceCallBack(ClearGroupInstanceCallBack callback);
     // only for test
     void SetMaxForwardKillRetryTimes(uint32_t times);

@@ -189,7 +189,7 @@ bool ReadHeader(SSL *ssl, int fd, nlohmann::json &header, std::string &error)
     return true;
 }
 
-int ConnectLocalPort(int port)
+int ConnectLocalPort(const std::string &host, int port)
 {
     const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) {
@@ -201,7 +201,12 @@ int ConnectLocalPort(int port)
     } address{};
     address.ipv4.sin_family = AF_INET;
     address.ipv4.sin_port = htons(static_cast<uint16_t>(port));
-    address.ipv4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (host.empty()) {
+        address.ipv4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    } else if (inet_pton(AF_INET, host.c_str(), &address.ipv4.sin_addr) != 1) {
+        close(fd);
+        return -1;
+    }
     if (connect(fd, &address.generic, sizeof(address.ipv4)) != 0) {
         close(fd);
         return -1;
@@ -552,6 +557,22 @@ int TcpTunnelServer::ResolveHostPort(const std::string &instanceID, int targetPo
     return ResolvePublishedTCPPort(mapping->second, targetPort, error);
 }
 
+std::string TcpTunnelServer::ResolveContainerIP(const std::string &instanceID, std::string &error) const
+{
+    auto machine = instanceView_->GetInstance(instanceID);
+    if (machine == nullptr) {
+        error = "instance is not managed by this proxy";
+        return {};
+    }
+    const auto &instance = machine->GetInstanceInfo();
+    if (instance.functionproxyid() != config_.nodeID ||
+        instance.instancestatus().code() != static_cast<int32_t>(InstanceState::RUNNING)) {
+        error = "instance is not running on this proxy";
+        return {};
+    }
+    return instance.containerip();
+}
+
 void TcpTunnelServer::HandleClient(int clientFd)
 {
     ClientSession session;
@@ -574,12 +595,28 @@ bool TcpTunnelServer::ServeClient(ClientSession &session)
     }
     session.instanceID = request.instanceID;
     session.requestID = request.requestID;
-    const int hostPort = ResolveHostPort(request.instanceID, request.targetPort, error);
-    if (hostPort <= 0) {
+    std::string containerIP = ResolveContainerIP(request.instanceID, error);
+    int backendPort = 0;
+    std::string connectHost;
+    if (!containerIP.empty()) {
+        // Network isolation mode: sandbox has its own netns, loopback can't reach AgentServer.
+        // Connect directly to sandboxIP:containerPort (targetPort semantics == containerPort).
+        connectHost = containerIP;
+        backendPort = request.targetPort;
+    } else if (!error.empty()) {
+        // Instance not managed here / not RUNNING — fail fast.
         (void)SendResponse(session.ssl, session.clientFd, false, error);
         return false;
+    } else {
+        // Host network mode: no containerIP, fall back to loopback:hostPort.
+        const int hostPort = ResolveHostPort(request.instanceID, request.targetPort, error);
+        if (hostPort <= 0) {
+            (void)SendResponse(session.ssl, session.clientFd, false, error);
+            return false;
+        }
+        backendPort = hostPort;
     }
-    session.backendFd = ConnectLocalPort(hostPort);
+    session.backendFd = ConnectLocalPort(connectHost, backendPort);
     if (session.backendFd < 0) {
         (void)SendResponse(session.ssl, session.clientFd, false, "failed to connect instance target port");
         return false;

@@ -373,6 +373,11 @@ public:
         return checkpointDir_;
     }
 
+    int32_t GetCkptDefaultTtlSec() const
+    {
+        return ckptDefaultTtlSec_;
+    }
+
     const std::string &GetNodeJsEntryPath() const
     {
         return nodeJsEntryPath_;
@@ -493,6 +498,7 @@ protected:
     int oomConsecutiveDetectionCount_ = 3;
     std::string runtimeHomeDir_;
     std::string checkpointDir_;
+    int32_t ckptDefaultTtlSec_ = 1800;
     std::string nodeJsEntryPath_;
     std::string resourceLabelPath_;
     std::string npuDeviceInfoPath_;

@@ -19,8 +19,12 @@
 
 #include <actor/actor.hpp>
 #include <async/future.hpp>
+#include <chrono>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "common/logs/logging.h"
 #include "common/proto/pb/message_pb.h"
@@ -39,6 +43,7 @@ namespace functionsystem::local_scheduler {
 class FunctionAgentMgr;
 class LocalSchedSrv;
 class InstanceCtrlActor;
+class IdleMgr;
 
 class SnapCtrlActor : public BasisActor {
 public:
@@ -46,6 +51,10 @@ public:
     ~SnapCtrlActor() override = default;
 
     void Init() override;
+
+    // consecutive non-terminal wake failures after which the parked entry is
+    // dropped (D-5 F4); the checkpoint stays restorable via signal 19
+    static constexpr uint32_t kWakeGiveUpAfter = 3;
 
     /**
      * Handle INSTANCE_SNAPSHOT_SIGNAL
@@ -60,11 +69,15 @@ public:
                                                   const std::string &payload);
 
     /**
-     * Callback to convert SnapshotResult to KillResponse
+     * Callback to convert SnapshotResult to KillResponse. Also maintains the
+     * parked registry: a successful leaveRunning=false snapshot parks the
+     * instance (checkpoint + delete), so it is recorded for wake/FIFO unpark.
+     * @param instanceID: ID of the snapshotted instance (registry key)
+     * @param leaveRunning: false = the instance was parked by this snapshot
      * @param result: The snapshot result
      * @return KillResponse with appropriate code and payload
      */
-    KillResponse OnHandleSnapshot(const SnapshotResult &result);
+    KillResponse OnHandleSnapshot(const std::string &instanceID, bool leaveRunning, const SnapshotResult &result);
 
     /**
      * Handle INSTANCE_SNAPSTART_SIGNAL
@@ -77,6 +90,34 @@ public:
     litebus::Future<KillResponse> HandleSnapStart(const std::string &requestID,
                                                    const std::string &checkpointID,
                                                    const std::string &payload);
+
+    /**
+     * Handle INSTANCE_WAKE_SNAPSHOT_SIGNAL: wake one parked instance by its
+     * ORIGINAL instanceID. Looks the instance up in the parked registry and
+     * SnapStarts it from the recorded checkpoint; the registry entry is
+     * dropped once the restore succeeds (the restored instance re-uses the
+     * original instanceID, see SnapshotScheduler::BuildScheduleRequest).
+     * @param requestID: Request ID for tracing
+     * @param instanceID: ORIGINAL instanceID of the parked instance
+     * @return KillResponse with restore result
+     */
+    litebus::Future<KillResponse> HandleWake(const std::string &requestID, const std::string &instanceID);
+
+    /** Registry entry for one parked instance. */
+    struct ParkedEntry {
+        std::string checkpointID;
+        std::chrono::steady_clock::time_point parkedAt;
+        // consecutive non-terminal wake failures (D-5 F4): a checkpoint whose
+        // restore keeps timing out (e.g. RPC deadline < 24G restore) must not
+        // be retried forever; kWakeGiveUpAfter drops the entry
+        uint32_t wakeFails = 0;
+    };
+
+    /**
+     * Copy of the parked registry (actor-executed) for the pressure
+     * monitor's FIFO fallback unpark.
+     */
+    std::vector<std::pair<std::string, ParkedEntry>> GetParkedInstances();
 
     /**
      * Handle snapstart instance initialization after state transition to CREATING
@@ -139,6 +180,16 @@ public:
         instanceCtrl_ = instanceCtrl;
     }
 
+    /**
+     * Bind the IdleMgr so a successful park can clear the instance's idle
+     * bookkeeping before its ID is reused by the restore (D-5 F1).
+     * @param idleMgr: The idle subsystem interface
+     */
+    void BindIdleMgr(const std::shared_ptr<IdleMgr> &idleMgr)
+    {
+        idleMgr_ = idleMgr;
+    }
+
 private:
     /**
      * Prepare snapshot by calling runtime PrepareSnap interface
@@ -199,6 +250,23 @@ private:
     std::shared_ptr<InstanceControlView> instanceControlView_;
     std::shared_ptr<ControlInterfaceClientManagerProxy> clientManager_;
     std::shared_ptr<InstanceCtrl> instanceCtrl_;
+    std::shared_ptr<IdleMgr> idleMgr_;
+
+    // Instances parked on this node via leaveRunning=false snapshots:
+    // original instanceID -> checkpoint. Enables wake-by-instanceID and
+    // FIFO unpark without external bookkeeping. Entries are dropped when
+    // the checkpoint is restored (HandleWake / direct SnapStart) or when
+    // the instance re-appears in the control view.
+    std::unordered_map<std::string, ParkedEntry> parkedInstances_;
+
+    /** Drop a registry entry after a successful wake/restore. */
+    void ForgetParked(const std::string &instanceID);
+
+    /** Drop registry entries whose checkpoint matches a direct SnapStart. */
+    void ForgetParkedByCheckpoint(const std::string &checkpointID);
+
+    /** OnWakeComplete: registry bookkeeping, returns rsp unchanged. */
+    KillResponse OnWakeComplete(const std::string &instanceID, const KillResponse &rsp);
 };
 
 }  // namespace functionsystem::local_scheduler

@@ -100,6 +100,9 @@ void Flags::AddDiskUsageMonitorFlags()
 void Flags::AddConfigFlags()
 {
     AddFlag(&Flags::runtimeHomeDir_, "runtime_home_dir", "runtime home dir", litebus::os::GetEnv("HOME").Get());
+    AddFlag(&Flags::ckptDefaultTtlSec_, "ckpt_default_ttl_sec",
+            "default checkpoint TTL in seconds after ref count reaches 0 (per-snapshot TTL still overrides)",
+            int32_t(1800), NumCheck(60, 604800));
     AddFlag(&Flags::checkpointDir_, "checkpoint_dir", "base directory for checkpoint file storage",
             std::string("/home/yuanrong/checkpoints"));
     AddFlag(&Flags::nodeJsEntryPath_, "nodejs_entry", "node js entry path", "/home/snuser/runtime/nodejs/wrapper.js");

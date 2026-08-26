@@ -221,6 +221,9 @@ private:
                                                               const resources::InstanceInfo &prevInstanceInfo,
                                                               const InstanceState oldState,
                                                               const TransContext &context);
+    litebus::Future<TransitionResult> ResolveInitialLowReliabilityCreateConflict(
+        const resources::InstanceInfo &newInstanceInfo, const resources::InstanceInfo &prevInstanceInfo,
+        const Status &createStatus);
 
     TransitionResult VerifyTransitionState(const TransContext &context, std::string &requestID, InstanceState oldState);
 
@@ -262,6 +265,9 @@ private:
     inline static std::shared_ptr<function_proxy::ControlPlaneObserver> controlPlaneObserver_;
 
     friend class InstanceStateMachineTest;
+    bool IsInitialLowReliabilityRunningPersistence(const InstanceInfo &newInstanceInfo,
+                                                   const InstanceState &oldState,
+                                                   const int64_t version) const;
     bool IsFirstPersistence(const InstanceInfo &newInstanceInfo, const InstanceState &oldState,
                             const int64_t version) const;
 };

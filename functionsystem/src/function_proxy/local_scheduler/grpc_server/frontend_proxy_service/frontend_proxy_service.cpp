@@ -17,7 +17,10 @@
 #include "frontend_proxy_service.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -25,18 +28,13 @@
 #include <unordered_map>
 #include <utility>
 
-#include <nlohmann/json.hpp>
-
-#include "async/uuid_generator.hpp"
-#include "common/hex/hex.h"
 #include "common/logs/logging.h"
 #include "function_proxy/busproxy/invocation_handler/invocation_handler.h"
 
 namespace functionsystem::local_scheduler {
 namespace {
 constexpr const char *FRONTEND_PROXY_CONTROL_NOT_WIRED =
-    "frontend proxy create/kill control path is not wired; use libruntime fallback until control semantics "
-    "are reviewed";
+    "frontend proxy create/kill control path is not wired";
 constexpr const char *FRONTEND_PROXY_CREATE_READY_NOT_WIRED =
     "frontend proxy create requires ready create dispatcher; legacy stream create dispatcher is not allowed";
 constexpr const char *FRONTEND_PROXY_KILL_READY_NOT_WIRED =
@@ -46,13 +44,10 @@ constexpr const char *FRONTEND_CREATE_SOURCE_VALUE = "frontend";
 constexpr const char *FRONTEND_KILL_ROUTE_STALE_MESSAGE =
     "frontend proxy is not the owning proxy for this instance";
 constexpr uint64_t FRONTEND_WAIT_POLL_MS = 20;
-constexpr const char *FRONTEND_FILE_FUNCTION_URN = "default/0-system-faasExecutorPython3.11/$latest";
-constexpr int64_t FRONTEND_FILE_MAX_TOTAL_SIZE = 512LL * 1024 * 1024;  // 512MB
-// 2MB raw → ~2.7MB base64, stays under the 4MB gRPC max message size limit.
-constexpr int64_t FRONTEND_FILE_READ_CHUNK_SIZE = 2 * 1024 * 1024;      // 2MB
-constexpr int64_t FRONTEND_FILE_READ_EOF_MARKER = -1;
-constexpr const char *FRONTEND_FILE_FAAS_META_PREFIX = "0000000000000000";  // METALEN = 16
-
+constexpr const char *FUNCTION_PROXY_STREAM_CALLER_ID = "function-proxy";
+constexpr size_t FRONTEND_EVENT_QUEUE_CAPACITY = 100;
+constexpr size_t FRONTEND_EVENT_METADATA_SIZE = 16;
+constexpr const char *FRONTEND_EVENT_EOF = "yuanrong_event_EOF";
 struct LifecycleEvent {
     const char *operation;
     const char *dispatchPhase;
@@ -243,12 +238,14 @@ namespace frontend_call_result_registry {
             return { false, nullptr };
         }
         const auto &callResult = request->callresultreq();
-        const auto &instanceID = callResult.instanceid().empty() ? from : callResult.instanceid();
-        auto key = BuildPendingKey(instanceID, callResult.requestid());
         std::shared_ptr<litebus::Promise<SharedStreamMsg>> promise;
         {
             std::lock_guard<std::mutex> lock(Mutex());
-            auto iter = Pending().find(key);
+            // `from` is the authenticated runtime stream identity. For an SSE
+            // invoke the logical caller is function-proxy, so CallResult's
+            // instanceid may name that destination instead of the runtime that
+            // produced the result.
+            auto iter = Pending().find(BuildPendingKey(from, callResult.requestid()));
             if (iter == Pending().end()) {
                 return { false, nullptr };
             }
@@ -267,6 +264,136 @@ namespace frontend_call_result_registry {
     }
 
 }  // namespace frontend_call_result_registry
+
+namespace frontend_event_registry {
+    struct PendingStream {
+        std::mutex mutex;
+        std::condition_variable changed;
+        std::deque<std::string> events;
+        bool eventComplete { false };
+        bool closed { false };
+    };
+
+    std::mutex &Mutex()
+    {
+        static std::mutex mutex;
+        return mutex;
+    }
+
+    std::unordered_map<std::string, std::shared_ptr<PendingStream>> &Pending()
+    {
+        static std::unordered_map<std::string, std::shared_ptr<PendingStream>> pending;
+        return pending;
+    }
+
+    std::shared_ptr<PendingStream> Watch(const std::string &requestID)
+    {
+        auto stream = std::make_shared<PendingStream>();
+        std::lock_guard<std::mutex> lock(Mutex());
+        if (!Pending().emplace(requestID, stream).second) {
+            return nullptr;
+        }
+        return stream;
+    }
+
+    void Cancel(const std::string &requestID)
+    {
+        std::shared_ptr<PendingStream> stream;
+        {
+            std::lock_guard<std::mutex> lock(Mutex());
+            auto iter = Pending().find(requestID);
+            if (iter == Pending().end()) {
+                return;
+            }
+            stream = iter->second;
+            (void)Pending().erase(iter);
+        }
+        {
+            std::lock_guard<std::mutex> lock(stream->mutex);
+            stream->closed = true;
+        }
+        stream->changed.notify_all();
+    }
+
+    bool Receive(const std::string &, const SharedStreamMsg &request)
+    {
+        if (request == nullptr || !request->has_eventreq()) {
+            return false;
+        }
+        std::shared_ptr<PendingStream> stream;
+        {
+            std::lock_guard<std::mutex> lock(Mutex());
+            auto iter = Pending().find(request->eventreq().requestid());
+            if (iter == Pending().end()) {
+                return false;
+            }
+            stream = iter->second;
+        }
+        {
+            std::unique_lock<std::mutex> lock(stream->mutex);
+            if (stream->closed) {
+                return false;
+            }
+            const auto &framedMessage = request->eventreq().message();
+            if (framedMessage.size() < FRONTEND_EVENT_METADATA_SIZE) {
+                return false;
+            }
+            auto event = framedMessage.substr(FRONTEND_EVENT_METADATA_SIZE);
+            if (event == FRONTEND_EVENT_EOF) {
+                stream->eventComplete = true;
+            } else {
+                stream->changed.wait(lock, [&]() {
+                    return stream->events.size() < FRONTEND_EVENT_QUEUE_CAPACITY || stream->closed;
+                });
+                if (stream->closed) {
+                    return false;
+                }
+                stream->events.emplace_back(std::move(event));
+            }
+        }
+        stream->changed.notify_all();
+        return true;
+    }
+}  // namespace frontend_event_registry
+
+bool ForwardFrontendEvents(
+    ::grpc::ServerContext *context,
+    ::grpc::ServerWriter<::frontend_proxy::InvokeInstanceStreamResponse> *writer,
+    const std::shared_ptr<frontend_event_registry::PendingStream> &pending,
+    const std::atomic<bool> &dispatchComplete,
+    const ::frontend_proxy::InvokeInstanceResponse &finalResponse)
+{
+    bool writeOK = true;
+    bool observedEventComplete = false;
+    while (writeOK && !context->IsCancelled()) {
+        std::deque<std::string> events;
+        bool eventComplete = false;
+        {
+            std::unique_lock<std::mutex> lock(pending->mutex);
+            pending->changed.wait_for(lock, std::chrono::milliseconds(FRONTEND_WAIT_POLL_MS), [&]() {
+                return !pending->events.empty() || pending->eventComplete != observedEventComplete
+                       || context->IsCancelled();
+            });
+            events.swap(pending->events);
+            eventComplete = pending->eventComplete;
+            observedEventComplete = eventComplete;
+        }
+        pending->changed.notify_all();
+        for (auto &event : events) {
+            ::frontend_proxy::InvokeInstanceStreamResponse frame;
+            frame.set_event(std::move(event));
+            if (!writer->Write(frame)) {
+                writeOK = false;
+                break;
+            }
+        }
+        if (dispatchComplete.load(std::memory_order_acquire)
+            && (eventComplete || finalResponse.status().code() != common::ERR_NONE)) {
+            break;
+        }
+    }
+    return writeOK;
+}
 
 struct KillCleanupObservation {
     FrontendKillCleanupSnapshot snapshot;
@@ -350,155 +477,12 @@ std::optional<litebus::Future<::frontend_proxy::KillInstanceResponse>> DispatchR
     return param.killReadyDispatcher(CreateReadyKillRequest(request));
 }
 
-// BuildFileInvokeRequestJSON constructs the JSON payload carried by the second
-// common::Arg (args[1]) in the file-transfer InvokeRequest. The first arg
-// (args[0]) is a protobuf-serialized libruntime::MetaData built by
-// BuildFileInvokeMetadata so that runtime ParseMetaData succeeds. dataB64 is
-// standard base64 of the raw chunk bytes; for file_read it is empty because the
-// runtime returns data in the CallResult smallObjects instead of the request args.
-std::string BuildFileInvokeRequestJSON(const std::string &fileOp, const std::string &path,
-                                       const std::string &mode, const std::string &dataB64,
-                                       int64_t offset = 0, int64_t length = 0,
-                                       const std::string &uploadId = "",
-                                       bool isLast = false)
-{
-    nlohmann::json body = nlohmann::json::object();
-    body["file_op"] = fileOp;
-    body["path"] = path;
-    if (!mode.empty()) {
-        body["mode"] = mode;
-    }
-    if (!dataB64.empty()) {
-        body["data"] = dataB64;
-    }
-    if (offset != 0) {
-        body["offset"] = offset;
-    }
-    if (length != 0) {
-        body["length"] = length;
-    }
-    if (!uploadId.empty()) {
-        body["upload_id"] = uploadId;
-    }
-    if (isLast) {
-        body["is_last"] = true;
-    }
-    nlohmann::json argsJson = nlohmann::json::object();
-    argsJson["body"] = body;
-    return argsJson.dump();
-}
-
-// BuildFileInvokeMetadata constructs a minimal protobuf-serialized
-// libruntime::MetaData that the runtime ParseMetaData can successfully
-// deserialize. Sets invokeType=InvokeFunction and functionMeta.apiType=Faas
-// so the Python executor routes through __execute_faas → faas_call_handler
-// where the file_op routing lives.
-std::string BuildFileInvokeMetadata()
-{
-    // Wire format:
-    //   field 1 (varint): tag=0x08, value=0x01   → invokeType=InvokeFunction
-    //   field 2 (bytes):  tag=0x12, len=0x04      → functionMeta nested message
-    //     field 5 (varint): tag=0x28, value=0x01  → language=Python
-    //     field 8 (varint): tag=0x40, value=0x01  → apiType=Faas
-    return std::string({
-        static_cast<char>(0x08), static_cast<char>(0x01),  // invokeType = InvokeFunction
-        static_cast<char>(0x12), static_cast<char>(0x04),  // functionMeta (length=4)
-        static_cast<char>(0x28), static_cast<char>(0x01),  //   language = Python
-        static_cast<char>(0x40), static_cast<char>(0x01),  //   apiType = Faas
-    });
-}
-
-// BuildFileInvokeRequestPayload returns the args[1] value for file-transfer
-// InvokeRequest. The Python faas_executor expects a 16-byte META_PREFIX
-// ("0000000000000000") prepended to the JSON payload for FaaS API type.
-std::string BuildFileInvokeRequestPayload(const std::string &fileOp, const std::string &path,
-                                          const std::string &mode, const std::string &dataB64,
-                                          int64_t offset = 0, int64_t length = 0,
-                                          const std::string &uploadId = "",
-                                          bool isLast = false)
-{
-    const auto jsonBody = BuildFileInvokeRequestJSON(fileOp, path, mode, dataB64, offset, length,
-                                                     uploadId, isLast);
-    return FRONTEND_FILE_FAAS_META_PREFIX + jsonBody;
-}
-
-// ForwardFileInvokeRequest dispatches a file-transfer InvokeRequest and awaits
-// the runtime CallResult via frontend_call_result_registry, mirroring the
-// AwaitInvokeResult wait flow. Returns the StreamingMessage that carries the
-// callresultreq, or nullptr on dispatch/wait failure.
-SharedStreamMsg ForwardFileInvokeRequest(const FrontendProxyServiceParam &param,
-                                         ::grpc::ServerContext *context,
-                                         const SharedStreamMsg &invokeRequest,
-                                         const std::string &requestID,
-                                         const std::string &instanceID,
-                                         const std::string &fileOp,
-                                         bool &cancelled)
-{
-    cancelled = false;
-    auto watchResult = frontend_call_result_registry::Watch(requestID, instanceID);
-    if (!watchResult.registered) {
-        YRLOG_ERROR("{}|frontend proxy file {} requires a globally unique request id", requestID, fileOp);
-        return nullptr;
-    }
-    auto invokeFuture = DispatchInvoke(param, "", invokeRequest);
-    auto invokeResponse = WaitFrontendResult(invokeFuture, context, param.invokeResultTimeoutMs, cancelled);
-    if (!invokeResponse.IsSome()) {
-        frontend_call_result_registry::Cancel(requestID, instanceID);
-        YRLOG_ERROR("{}|frontend proxy file {} {} dispatch",
-            requestID, fileOp, cancelled ? "cancelled" : "timed out");
-        return nullptr;
-    }
-    if (!invokeResponse.Get()->has_invokersp()) {
-        frontend_call_result_registry::Cancel(requestID, instanceID);
-        YRLOG_ERROR("{}|frontend proxy file {} received invalid invoke response", requestID, fileOp);
-        return nullptr;
-    }
-    if (invokeResponse.Get()->invokersp().code() != common::ERR_NONE) {
-        frontend_call_result_registry::Cancel(requestID, instanceID);
-        YRLOG_ERROR("{}|frontend proxy file {} invoke failed: {}",
-            requestID, fileOp, invokeResponse.Get()->invokersp().message());
-        return nullptr;
-    }
-    auto callResult = WaitFrontendResult(watchResult.future, context, param.invokeResultTimeoutMs, cancelled);
-    if (!callResult.IsSome()) {
-        frontend_call_result_registry::Cancel(requestID, instanceID);
-        YRLOG_ERROR("{}|frontend proxy file {} result {}",
-            requestID, fileOp, cancelled ? "cancelled" : "timed out");
-        return nullptr;
-    }
-    if (!callResult.Get()->has_callresultreq()) {
-        YRLOG_ERROR("{}|frontend proxy file {} received invalid call result",
-            requestID, fileOp);
-        return nullptr;
-    }
-    return callResult.Get();
-}
-
-// ExtractDownloadChunkData parses the CallResult message JSON and returns the
-// base64-decoded chunk data. Returns empty string on missing data field or
-// parse failure, and sets parseError when JSON parsing itself fails.
-std::string ExtractDownloadChunkData(const std::string &resultMsg, std::string &parseError)
-{
-    parseError.clear();
-    if (resultMsg.empty()) {
-        return {};
-    }
-    try {
-        auto respJson = nlohmann::json::parse(resultMsg);
-        if (respJson.contains("body") && respJson["body"].contains("data")) {
-            return functionsystem::Base64Decode(respJson["body"]["data"].get<std::string>());
-        }
-    } catch (const std::exception &e) {
-        parseError = std::string("frontend proxy file download failed to parse result: ") + e.what();
-    }
-    return {};
-}
-
 }  // namespace
 
 FrontendProxyService::FrontendProxyService(FrontendProxyServiceParam &&param) : param_(std::move(param))
 {
     InvocationHandler::RegisterFrontendCallResultReceiver(frontend_call_result_registry::Receive);
+    InvocationHandler::RegisterFrontendEventReceiver(frontend_event_registry::Receive);
 }
 
 bool FrontendProxyService::HasAuthenticatedPeer(const ::grpc::ServerContext *context) const
@@ -528,6 +512,59 @@ bool FrontendProxyService::HasAuthenticatedPeer(const ::grpc::ServerContext *con
         return ::grpc::Status::OK;
     }
     return DispatchInvokeRequest(context, *request, *response);
+}
+
+::grpc::Status FrontendProxyService::InvokeInstanceStream(
+    ::grpc::ServerContext *context, const ::frontend_proxy::InvokeInstanceRequest *request,
+    ::grpc::ServerWriter<::frontend_proxy::InvokeInstanceStreamResponse> *writer)
+{
+    if (!HasAuthenticatedPeer(context)) {
+        return { ::grpc::StatusCode::UNAUTHENTICATED,
+                 "frontend proxy invoke stream requires an authenticated component certificate" };
+    }
+    if (request == nullptr || writer == nullptr) {
+        return { ::grpc::StatusCode::INVALID_ARGUMENT, "invalid frontend proxy invoke stream args" };
+    }
+
+    ::frontend_proxy::InvokeInstanceResponse finalResponse;
+    if (!ValidateInvokeRequest(*request, finalResponse)) {
+        ::frontend_proxy::InvokeInstanceStreamResponse frame;
+        frame.mutable_final()->CopyFrom(finalResponse);
+        (void)writer->Write(frame);
+        return ::grpc::Status::OK;
+    }
+
+    const auto requestID = request->invoke().requestid().empty() ? request->context().requestid()
+                                                                : request->invoke().requestid();
+    auto pending = frontend_event_registry::Watch(requestID);
+    if (pending == nullptr) {
+        SetStatus(finalResponse.mutable_status(), common::ERR_PARAM_INVALID,
+                  "frontend proxy invoke stream requires a globally unique request id");
+        ::frontend_proxy::InvokeInstanceStreamResponse frame;
+        frame.mutable_final()->CopyFrom(finalResponse);
+        (void)writer->Write(frame);
+        return ::grpc::Status::OK;
+    }
+
+    std::atomic<bool> dispatchComplete { false };
+    std::thread dispatchThread([this, context, request, &finalResponse, &dispatchComplete, pending]() {
+        (void)DispatchInvokeRequest(context, *request, finalResponse);
+        dispatchComplete.store(true, std::memory_order_release);
+        pending->changed.notify_all();
+    });
+
+    const bool writeOK = ForwardFrontendEvents(context, writer, pending, dispatchComplete, finalResponse);
+
+    frontend_event_registry::Cancel(requestID);
+    if (dispatchThread.joinable()) {
+        dispatchThread.join();
+    }
+    if (writeOK && !context->IsCancelled()) {
+        ::frontend_proxy::InvokeInstanceStreamResponse frame;
+        frame.mutable_final()->CopyFrom(finalResponse);
+        (void)writer->Write(frame);
+    }
+    return ::grpc::Status::OK;
 }
 
 bool FrontendProxyService::ValidateInvokeRequest(const ::frontend_proxy::InvokeInstanceRequest &request,
@@ -575,7 +612,10 @@ bool FrontendProxyService::ValidateInvokeRequest(const ::frontend_proxy::InvokeI
                   "frontend proxy invoke requires a globally unique request id");
         return ::grpc::Status::OK;
     }
-    auto invokeFuture = DispatchInvoke(param_, "", CreateInvokeRequest(request));
+    // The Call sender is also the destination used by runtime EventAsync.
+    // Direct frontend invokes therefore use the local FunctionProxy's stream
+    // identity so SSE data and the legacy EOF event return to this service.
+    auto invokeFuture = DispatchInvoke(param_, FUNCTION_PROXY_STREAM_CALLER_ID, CreateInvokeRequest(request));
     bool invokeCancelled = false;
     auto invokeResponse = WaitFrontendResult(invokeFuture, context, param_.invokeResultTimeoutMs, invokeCancelled);
     if (!invokeResponse.IsSome()) {
@@ -641,8 +681,9 @@ bool FrontendProxyService::ValidateInvokeRequest(const ::frontend_proxy::InvokeI
         return ::grpc::Status::OK;
     }
     response.mutable_callresult()->CopyFrom(callResult.Get()->callresultreq());
-    SetStatus(response.mutable_status(), callResult.Get()->callresultreq().code(),
-              callResult.Get()->callresultreq().message());
+    // A valid CallResult means the frontend-to-proxy operation completed. Its
+    // code belongs to runtime/function execution and must remain in callResult.
+    SetStatus(response.mutable_status(), common::ERR_NONE, "");
     LogLifecycleEvent("invoke", "terminal", request.context(), param_.nodeID, request.invoke().instanceid(),
                       callResult.Get()->callresultreq().code() == common::ERR_NONE ? "success" : "failed", false,
                       "", "", param_.endpointAddress, param_.nodeID);
@@ -736,9 +777,8 @@ bool FrontendProxyService::ValidateCreateRequest(const ::frontend_proxy::CreateI
     // the raw libruntime create contract returns the final NotifyRequest, while
     // Posix create only returns the immediate scheduler CreateResponse and its
     // caller argument is also interpreted as parent/sender runtime identity.
-    // Keep the proto/API shape for future control-plane work, but force callers
-    // to use the reviewed libruntime fallback until ready-notify semantics and
-    // frontend caller identity are designed end-to-end.
+    // Keep this explicit failure for an incompletely wired proxy deployment.
+    // Frontend must not fall back to libruntime.
     SetStatus(response.mutable_status(), common::ERR_INNER_SYSTEM_ERROR,
               FRONTEND_PROXY_CONTROL_NOT_WIRED, false, "control-path-not-wired");
     return ::grpc::Status::OK;
@@ -753,14 +793,19 @@ bool FrontendProxyService::ValidateCreateRequest(const ::frontend_proxy::CreateI
                   "frontend proxy create response missing instance id");
         return ::grpc::Status::OK;
     }
-    if (createRsp.code() == common::ERR_NONE && response.routeaddress().empty()) {
-        response.set_routeaddress(param_.nodeID);
-    }
-    SetStatus(response.mutable_status(), createRsp.code(), createRsp.message());
     const auto owningProxyID = response.has_callresult() && response.callresult().has_runtimeinfo()
                                    ? response.callresult().runtimeinfo().proxyid()
-                                   : param_.nodeID;
-    const auto routeAddress = response.routeaddress().empty() ? param_.endpointAddress : response.routeaddress();
+                                   : "";
+    if (createRsp.code() == common::ERR_NONE && owningProxyID.empty()) {
+        SetStatus(response.mutable_status(), common::ERR_INNER_SYSTEM_ERROR,
+                  "frontend proxy create response missing final owner proxy node id");
+        return ::grpc::Status::OK;
+    }
+    if (createRsp.code() == common::ERR_NONE) {
+        response.set_routeaddress(owningProxyID);
+    }
+    SetStatus(response.mutable_status(), createRsp.code(), createRsp.message());
+    const auto routeAddress = response.routeaddress();
     LogLifecycleEvent("create", "terminal", request.context(), param_.nodeID, createRsp.instanceid(),
                       createRsp.code() == common::ERR_NONE ? "success" : "failed", false, "", "", routeAddress,
                       owningProxyID);
@@ -878,243 +923,6 @@ void FrontendProxyService::SetStatus(::frontend_proxy::FrontendProxyStatus *stat
     status->set_message(message);
     status->set_retryable(retryable);
     status->set_retryreason(retryReason);
-}
-
-bool FrontendProxyService::ValidateFileChunkContext(const ::frontend_proxy::FrontendRequestContext &context,
-    const std::string &instanceID) const
-{
-    if (!HasRequiredLifecycleContext(context) || instanceID.empty()) {
-        return false;
-    }
-    if (HasContextTenantMismatch(context)) {
-        return false;
-    }
-    if (param_.invokeTenantAuthorizer && !param_.invokeTenantAuthorizer(context.tenantid(), instanceID)) {
-        return false;
-    }
-    return true;
-}
-
-bool FrontendProxyService::ValidateFileTransferRequest(const ::frontend_proxy::FileTransferRequest &request,
-    ::frontend_proxy::FileTransferResponse &response) const
-{
-    if (!HasRequiredLifecycleContext(request.context()) || request.instanceid().empty() || request.path().empty()) {
-        SetStatus(response.mutable_status(), common::ERR_PARAM_INVALID,
-                  "frontend proxy file transfer requires context.frontendClientID, context.requestID, "
-                  "context.tenantID, instanceID and path");
-        return false;
-    }
-    if (HasContextTenantMismatch(request.context())) {
-        SetStatus(response.mutable_status(), common::ERR_AUTHORIZE_FAILED,
-                  "frontend proxy file transfer tenant does not match context labels");
-        return false;
-    }
-    if (param_.invokeTenantAuthorizer
-        && !param_.invokeTenantAuthorizer(request.context().tenantid(), request.instanceid())) {
-        SetStatus(response.mutable_status(), common::ERR_AUTHORIZE_FAILED,
-                  "frontend proxy file transfer tenant does not own target instance");
-        return false;
-    }
-    if (request.chunksize() < 0) {
-        SetStatus(response.mutable_status(), common::ERR_PARAM_INVALID,
-                  "frontend proxy file transfer chunkSize must be non-negative");
-        return false;
-    }
-    return true;
-}
-
-SharedStreamMsg FrontendProxyService::CreateFileInvokeRequest(const std::string &instanceID,
-                                                              const std::string &path,
-                                                              const std::string &fileOp,
-                                                              const std::string &mode,
-                                                              const std::string &data,
-                                                              int64_t offset, int64_t length,
-                                                              const std::string &uploadId,
-                                                              bool isLast)
-{
-    auto invoke = std::make_shared<runtime_rpc::StreamingMessage>();
-    auto invokeReq = invoke->mutable_invokereq();
-    invokeReq->set_function(FRONTEND_FILE_FUNCTION_URN);
-    invokeReq->set_instanceid(instanceID);
-    invokeReq->set_requestid(litebus::uuid_generator::UUID::GetRandomUUID().ToString());
-    // File chunk payload bypasses the data system for the whole round-trip.
-    invokeReq->mutable_invokeoptions()->set_bypass_datasystem(true);
-    // args[0] = protobuf-serialized libruntime::MetaData (invokeType=InvokeFunction,
-    // functionMeta.apiType=Faas). Required so runtime ParseMetaData succeeds in
-    // non-Posix mode and the Python executor routes to __execute_faas.
-    const auto metaData = BuildFileInvokeMetadata();
-    auto metaArg = invokeReq->add_args();
-    metaArg->set_type(::common::Arg_ArgType_VALUE);
-    metaArg->set_value(metaData);
-    // args[1] = placeholder for posix_args[_INDEX_META_DATA] (trace_id source).
-    // FaaS convention: every user arg gets a 16-byte META_PREFIX. faas_call_handler
-    // reads trace_id from posix_args[0] via get_trace_id_from_params.
-    auto traceArg = invokeReq->add_args();
-    traceArg->set_type(::common::Arg_ArgType_VALUE);
-    traceArg->set_value(FRONTEND_FILE_FAAS_META_PREFIX);  // empty meta, just the prefix
-    // args[2] = 16-byte META_PREFIX + JSON body for posix_args[_INDEX_CALL_USER_EVENT].
-    // ParseRequest skips args[0] (MetaData), so rawArgs = [args[1], args[2]].
-    // faas_call_handler reads event from posix_args[1] = rawArgs[1] = args[2].
-    const auto payload = BuildFileInvokeRequestPayload(fileOp, path, mode, data, offset, length,
-                                                       uploadId, isLast);
-    auto bodyArg = invokeReq->add_args();
-    bodyArg->set_type(::common::Arg_ArgType_VALUE);
-    bodyArg->set_value(payload);
-    return invoke;
-}
-
-::grpc::Status FrontendProxyService::UploadFile(::grpc::ServerContext *context,
-                                                ::grpc::ServerReader<::frontend_proxy::FileChunk> *reader,
-                                                ::frontend_proxy::FileTransferResponse *response)
-{
-    if (!HasAuthenticatedPeer(context)) {
-        return { ::grpc::StatusCode::UNAUTHENTICATED,
-                 "frontend proxy file upload requires an authenticated component certificate" };
-    }
-    if (reader == nullptr || response == nullptr) {
-        return { ::grpc::StatusCode::INVALID_ARGUMENT, "invalid frontend proxy file upload args" };
-    }
-
-    ::frontend_proxy::FileChunk chunk;
-    bool firstChunk = true;
-    int64_t totalSize = 0;
-    std::string path;
-    std::string instanceID;
-    const std::string uploadId = litebus::uuid_generator::UUID::GetRandomUUID().ToString();
-    while (reader->Read(&chunk)) {
-        if (firstChunk) {
-            instanceID = chunk.instanceid();
-            path = chunk.path();
-            if (!ValidateFileChunkContext(chunk.context(), instanceID)) {
-                SetStatus(response->mutable_status(), common::ERR_PARAM_INVALID,
-                          "frontend proxy file upload requires context.frontendClientID, context.requestID, "
-                          "context.tenantID, instanceID and valid tenant ownership");
-                return ::grpc::Status::OK;
-            }
-            firstChunk = false;
-        } else if (chunk.instanceid() != instanceID || chunk.path() != path
-                   || !ValidateFileChunkContext(chunk.context(), instanceID)) {
-            SetStatus(response->mutable_status(), common::ERR_PARAM_INVALID,
-                      "frontend proxy file upload chunk instanceID/path/context inconsistent with first chunk");
-            return ::grpc::Status::OK;
-        }
-        const auto dataSize = static_cast<int64_t>(chunk.data().size());
-        totalSize += dataSize;
-        if (totalSize > FRONTEND_FILE_MAX_TOTAL_SIZE) {
-            SetStatus(response->mutable_status(), common::ERR_PARAM_INVALID,
-                      "frontend proxy file upload exceeds the 512MB size limit");
-            return ::grpc::Status::OK;
-        }
-        const auto &dataB64 = functionsystem::Base64Encode(chunk.data());
-        const std::string effectiveMode = (totalSize == dataSize) ? "wb" : "ab";
-        const bool isLast = chunk.islast();
-        auto invokeRequest = CreateFileInvokeRequest(instanceID, path, "file_write", effectiveMode,
-                                                     dataB64, 0, 0, uploadId, isLast);
-        const auto requestID = invokeRequest->invokereq().requestid();
-        bool cancelled = false;
-        auto callResult = ForwardFileInvokeRequest(param_, context, invokeRequest, requestID, instanceID,
-                                                   "upload", cancelled);
-        if (callResult == nullptr) {
-            SetStatus(response->mutable_status(), common::ERR_INNER_SYSTEM_ERROR,
-                      cancelled ? "frontend proxy file upload cancelled while result outcome is unknown"
-                                : "frontend proxy file upload timed out while result outcome is unknown",
-                      false, "post-dispatch-unknown");
-            return ::grpc::Status::OK;
-        }
-        if (callResult->callresultreq().code() != common::ERR_NONE) {
-            SetStatus(response->mutable_status(), callResult->callresultreq().code(),
-                      callResult->callresultreq().message());
-            return ::grpc::Status::OK;
-        }
-        if (chunk.islast()) {
-            break;
-        }
-    }
-
-    if (firstChunk) {
-        SetStatus(response->mutable_status(), common::ERR_PARAM_INVALID,
-                  "frontend proxy file upload requires at least one chunk");
-        return ::grpc::Status::OK;
-    }
-    response->set_path(path);
-    response->set_size(totalSize);
-    SetStatus(response->mutable_status(), common::ERR_NONE, "success");
-    return ::grpc::Status::OK;
-}
-
-::grpc::Status FrontendProxyService::DownloadFile(::grpc::ServerContext *context,
-                                                  const ::frontend_proxy::FileTransferRequest *request,
-                                                  ::grpc::ServerWriter<::frontend_proxy::FileChunk> *writer)
-{
-    if (!HasAuthenticatedPeer(context)) {
-        return { ::grpc::StatusCode::UNAUTHENTICATED,
-                 "frontend proxy file download requires an authenticated component certificate" };
-    }
-    if (request == nullptr || writer == nullptr) {
-        return { ::grpc::StatusCode::INVALID_ARGUMENT, "invalid frontend proxy file download args" };
-    }
-    // DownloadFile is server-streaming and has no response message, so reuse the
-    // shared validator against a throwaway FileTransferResponse to keep the
-    // validation rules aligned with the proto-level contract.
-    ::frontend_proxy::FileTransferResponse validationResponse;
-    if (!ValidateFileTransferRequest(*request, validationResponse)) {
-        return { ::grpc::StatusCode::INVALID_ARGUMENT,
-                 validationResponse.status().message().empty() ? "invalid frontend proxy file download request"
-                                                                : validationResponse.status().message() };
-    }
-
-    int64_t offset = request->offset();
-    int64_t totalSize = 0;
-    while (true) {
-        const auto length = FRONTEND_FILE_READ_CHUNK_SIZE;
-        auto invokeRequest = CreateFileInvokeRequest(request->instanceid(), request->path(), "file_read", "",
-                                                     "", offset, length);
-        const auto requestID = invokeRequest->invokereq().requestid();
-        bool cancelled = false;
-        auto callResult = ForwardFileInvokeRequest(param_, context, invokeRequest, requestID,
-                                                   request->instanceid(), "download", cancelled);
-        if (callResult == nullptr) {
-            return { ::grpc::StatusCode::INTERNAL,
-                     cancelled ? "frontend proxy file download cancelled while result outcome is unknown"
-                               : "frontend proxy file download timed out while result outcome is unknown" };
-        }
-        if (callResult->callresultreq().code() != common::ERR_NONE) {
-            return { ::grpc::StatusCode::INTERNAL, callResult->callresultreq().message() };
-        }
-        // The file_read result is returned via returnByMsg path, so the JSON
-        // response (with base64-encoded data) is in CallResult.message, not
-        // smallobjects. Parse the JSON to extract the base64 data field.
-        std::string parseError;
-        auto chunkData = ExtractDownloadChunkData(callResult->callresultreq().message(), parseError);
-        if (!parseError.empty()) {
-            return { ::grpc::StatusCode::INTERNAL, parseError };
-        }
-        const auto chunkSize = static_cast<int64_t>(chunkData.size());
-        totalSize += chunkSize;
-        if (totalSize > FRONTEND_FILE_MAX_TOTAL_SIZE) {
-            return { ::grpc::StatusCode::INVALID_ARGUMENT,
-                     "frontend proxy file download exceeds the 512MB size limit" };
-        }
-        const bool isLast = chunkSize == 0 || chunkSize < FRONTEND_FILE_READ_CHUNK_SIZE;
-        ::frontend_proxy::FileChunk chunk;
-        chunk.mutable_context()->CopyFrom(request->context());
-        chunk.set_instanceid(request->instanceid());
-        chunk.set_path(request->path());
-        chunk.set_offset(offset);
-        chunk.set_data(chunkData);
-        chunk.set_islast(isLast);
-        if (!writer->Write(chunk)) {
-            return { ::grpc::StatusCode::INTERNAL, "frontend proxy file download client stream closed" };
-        }
-        if (isLast) {
-            break;
-        }
-        offset += chunkSize;
-        if (context != nullptr && context->IsCancelled()) {
-            return { ::grpc::StatusCode::CANCELLED, "frontend proxy file download cancelled by client" };
-        }
-    }
-    return ::grpc::Status::OK;
 }
 
 #undef LogLifecycleEvent

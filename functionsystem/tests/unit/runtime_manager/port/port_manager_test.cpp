@@ -157,4 +157,92 @@ TEST_F(DISABLED_PortManagerTest, ReleasePorts_ReAlloc)
     auto ports2 = PortManager::GetInstance().RequestPorts(runtimeID, 2);
     EXPECT_EQ(2u, ports2.size());
 }
+
+class PortManagerRecoveryTest : public ::testing::Test {
+public:
+    void SetUp() override
+    {
+        initialPort_ = FindAvailablePortRange(4);
+        ASSERT_GT(initialPort_, 0);
+        PortManager::GetInstance().InitPortResource(initialPort_, 4);
+    }
+
+    void TearDown() override
+    {
+        PortManager::GetInstance().Clear();
+    }
+
+protected:
+    static int FindAvailablePortRange(int count)
+    {
+        for (int first = 20000; first <= 65535 - count; ++first) {
+            bool available = true;
+            for (int offset = 0; offset < count; ++offset) {
+                if (PortManager::GetInstance().CheckPortInUse(first + offset)) {
+                    available = false;
+                    break;
+                }
+            }
+            if (available) {
+                return first;
+            }
+        }
+        return -1;
+    }
+
+    int initialPort_ = -1;
+};
+
+TEST_F(PortManagerRecoveryTest, RestoredPortsAreSkippedByNewAllocations)
+{
+    const auto status = PortManager::GetInstance().ReservePorts(
+        "runtime-a", {initialPort_, initialPort_ + 1});
+    ASSERT_TRUE(status.IsOk()) << status.ToString();
+
+    const auto ports = PortManager::GetInstance().RequestPorts("runtime-b", 2);
+    EXPECT_EQ(ports, (std::vector<int>{initialPort_ + 2, initialPort_ + 3}));
+}
+
+TEST_F(PortManagerRecoveryTest, RestoreIsIdempotentForSameOwner)
+{
+    ASSERT_TRUE(PortManager::GetInstance().ReservePorts("runtime-a", {initialPort_}).IsOk());
+    EXPECT_TRUE(PortManager::GetInstance().ReservePorts("runtime-a", {initialPort_}).IsOk());
+}
+
+TEST_F(PortManagerRecoveryTest, RestoreRejectsDifferentOwner)
+{
+    ASSERT_TRUE(PortManager::GetInstance().ReservePorts("runtime-a", {initialPort_}).IsOk());
+    const auto status = PortManager::GetInstance().ReservePorts("runtime-b", {initialPort_});
+    EXPECT_TRUE(status.IsError());
+    EXPECT_NE(status.RawMessage().find("runtime-a"), std::string::npos);
+}
+
+TEST_F(PortManagerRecoveryTest, RestoreRejectsPortsOutsidePoolAtomically)
+{
+    const auto status = PortManager::GetInstance().ReservePorts(
+        "runtime-a", {initialPort_, initialPort_ + 4});
+    EXPECT_TRUE(status.IsError());
+
+    const auto ports = PortManager::GetInstance().RequestPorts("runtime-b", 2);
+    EXPECT_EQ(ports, (std::vector<int>{initialPort_, initialPort_ + 1}));
+}
+
+TEST_F(PortManagerRecoveryTest, RestoreRejectsDuplicatePortsAtomically)
+{
+    const auto status = PortManager::GetInstance().ReservePorts(
+        "runtime-a", {initialPort_, initialPort_});
+    EXPECT_TRUE(status.IsError());
+
+    const auto ports = PortManager::GetInstance().RequestPorts("runtime-b", 1);
+    EXPECT_EQ(ports, (std::vector<int>{initialPort_}));
+}
+
+TEST_F(PortManagerRecoveryTest, RestoredPortsCanBeReleased)
+{
+    ASSERT_TRUE(PortManager::GetInstance().ReservePorts("runtime-a", {initialPort_}).IsOk());
+    PortManager::GetInstance().ReleasePorts("runtime-a");
+
+    const auto ports = PortManager::GetInstance().RequestPorts("runtime-b", 1);
+    EXPECT_EQ(ports, (std::vector<int>{initialPort_}));
+}
 }

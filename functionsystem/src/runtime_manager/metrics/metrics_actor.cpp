@@ -267,7 +267,17 @@ Status MetricsActor::DeleteInstance(const std::string &deployDir, const std::str
         }
     }
     (void)instanceInfos_.erase(instanceID);
+    (void)instanceMemoryUsageMb_.erase(instanceID);
     return Status(StatusCode::SUCCESS);
+}
+
+void MetricsActor::UpdateInstanceMemoryUsage(const std::string &instanceID, double memoryMb)
+{
+    if (instanceID.empty() || memoryMb < 0) {
+        return;
+    }
+    YRLOG_INFO("[D-7] metrics actor received instance({}) memory {} MB", instanceID, memoryMb);
+    instanceMemoryUsageMb_[instanceID] = memoryMb;
 }
 
 void MetricsActor::StartUpdateMetrics()
@@ -504,6 +514,18 @@ resources::ResourceUnit MetricsActor::BuildResourceUnitWithInstance(
         }
         BuildResource(metrics, resource, resourceValueType);
         (void)instanceInfo.mutable_actualuse()->mutable_resources()->insert({ resource.name(), resource });
+    }
+
+    // D-7: overlay the sandboxd-Stats-fed per-instance memory (MB). Under
+    // runsc the pid-based collectors report nothing (executor pid=0), so
+    // without this overlay the reported per-instance actualuse stayed 0.
+    for (const auto &usageIt : instanceMemoryUsageMb_) {
+        resources::Resource memResource;
+        memResource.mutable_scalar()->set_value(usageIt.second);
+        auto &instanceInfo = (*unit.mutable_instances())[usageIt.first];
+        instanceInfo.set_instanceid(usageIt.first);
+        (*instanceInfo.mutable_actualuse()->mutable_resources())[resource_view::MEMORY_RESOURCE_NAME] =
+            std::move(memResource);
     }
     return unit;
 }

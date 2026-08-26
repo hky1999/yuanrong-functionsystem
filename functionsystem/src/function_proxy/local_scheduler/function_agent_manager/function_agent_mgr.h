@@ -106,7 +106,8 @@ public:
     virtual litebus::Future<messages::SnapshotRuntimeResponse> SnapshotRuntime(
         const std::string &requestID,
         const resource_view::InstanceInfo &instanceInfo,
-        int32_t ttl = 0);
+        int32_t ttl = 0,
+        bool leaveRunning = false);
 
     virtual litebus::Future<messages::ReconcileRuntimesResponse> ReconcileRuntimes(
         const std::string &funcAgentID,

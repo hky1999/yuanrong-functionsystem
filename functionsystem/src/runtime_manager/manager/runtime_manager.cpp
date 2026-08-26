@@ -581,6 +581,15 @@ std::shared_ptr<ExecutorProxy> RuntimeManager::CreateSandboxdExecutor()
     auto executor = std::make_shared<SandboxdExecutor>(name, functionAgentAID_, checkpointDir_,
                                                        std::move(availableRuntimesCallback));
     executor->SetHealthCheckClient(healthCheckClient_);
+    if (metricsClient_ != nullptr) {
+        // D-7: bridge the sandboxd Stats poll into the resource view so
+        // per-instance actualuse is populated even though runsc reports pid=0
+        auto metricsClient = metricsClient_;
+        executor->SetInstanceMemoryUsageReporter(
+            [metricsClient](const std::string &instanceID, double memoryMb) {
+                metricsClient->UpdateInstanceMemoryUsage(instanceID, memoryMb);
+            });
+    }
     litebus::Spawn(executor, false);
     auto executorProxy = std::make_shared<SandboxdExecutorProxy>(executor);
     (void)executorMap_.insert(std::make_pair(EXECUTOR_TYPE::SANDBOXD, executorProxy));

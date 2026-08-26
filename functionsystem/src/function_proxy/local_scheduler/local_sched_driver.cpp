@@ -240,8 +240,68 @@ Status LocalSchedDriver::Start()
     snapCtrl_->BindFunctionAgentMgr(funcAgentMgr_);
     snapCtrl_->BindLocalSchedSrv(localSchedSrv_);
     snapCtrl_->BindInstanceCtrl(instanceCtrl_);
+    snapCtrl_->BindIdleMgr(instanceCtrl_->GetIdleMgr());
     snapCtrl_->BindClientManager(param_.controlInterfacePosixMgr);
     instanceCtrl_->BindSnapCtrl(snapCtrl_);
+
+    // W2 step-5: watermark-driven pressure monitor (opt-in via enable_pressure_park).
+    // Parks fully-idle instances at the high watermark (SnapCtrl signal-18 path,
+    // leaveRunning=false + explicit ttl) and FIFO-unparks at the low watermark;
+    // external response-ready wakes come in as INSTANCE_WAKE_SNAPSHOT_SIGNAL.
+    // W-CPUL: the monitor also hosts the memory/cpu upgrade ladders, so it
+    // starts when ANY pressure feature is on; park decisions themselves stay
+    // gated on enablePressurePark inside the actor.
+    if (param_.enablePressurePark || param_.enableUpgradeLadder || param_.enableCpuUpgradeLadder) {
+        PressureMonitorConfig pressureConfig;
+        pressureConfig.checkIntervalMs = param_.pressureCheckIntervalMs;
+        pressureConfig.highWatermark = param_.pressureHighWatermark;
+        pressureConfig.lowWatermark = param_.pressureLowWatermark;
+        pressureConfig.sustainSamples = param_.pressureSustainSamples;
+        pressureConfig.parkTtlSec = param_.pressureParkTtlSec;
+        pressureConfig.maxParked = param_.pressureMaxParked;
+        pressureConfig.enablePark = param_.enablePressurePark;
+        pressureConfig.upgradeLadder.enabled = param_.enableUpgradeLadder;
+        pressureConfig.upgradeLadder.stepBytes = param_.upgradeStepMb * 1024ULL * 1024ULL;
+        pressureConfig.upgradeLadder.capBytes = param_.upgradeCapMb * 1024ULL * 1024ULL;
+        pressureConfig.upgradeLadder.safetyRatio = param_.upgradeSafetyRatio;
+        pressureConfig.upgradeLadder.highRatio = param_.upgradeHighRatio;
+        pressureConfig.upgradeLadderCgroupRoot = param_.pressureEventCgroupRoot;
+        pressureConfig.cpuUpgradeLadder.enabled = param_.enableCpuUpgradeLadder;
+        pressureConfig.cpuUpgradeLadder.stepRatio = param_.cpuUpgradeStepRatio;
+        // cpu.max speaks quota usec per period; the period stays at the
+        // kernel default 100000, so the cap in cpus converts 1:100000
+        pressureConfig.cpuUpgradeLadder.capQuotaUsec =
+            static_cast<uint64_t>(param_.cpuUpgradeCapCpus * 100000.0);
+        pressureConfig.cpuUpgradeLadder.safetyRatio = param_.cpuUpgradeSafetyRatio;
+        pressureConfig.cpuUpgradeLadder.nodeCapacityMilli =
+            static_cast<uint64_t>(param_.cpuUpgradeNodeCpus * 1000.0);
+        pressureConfig.cpuUpgradeLadderCgroupRoot = param_.pressureEventCgroupRoot;
+        pressureMonitorActor_ = std::make_shared<PressureMonitorActor>(PRESSURE_MONITOR_ACTOR_NAME, param_.nodeID,
+                                                                       pressureConfig);
+        pressureMonitorActor_->BindInstanceControlView(instanceCtrl_->GetInstanceControlView());
+        pressureMonitorActor_->BindResourceView(resourceViewMgr_->GetInf(resource_view::ResourceType::PRIMARY));
+        pressureMonitorActor_->BindSnapCtrl(snapCtrl_);
+        pressureMonitorActor_->BindIdleMgr(instanceCtrl_->GetIdleMgr());
+        litebus::Spawn(pressureMonitorActor_);
+
+        // D-2 event-driven watermarks: wake the monitor as soon as a sandbox
+        // cgroup crosses memory.high instead of waiting for the polling tick.
+        // The watcher thread only enqueues onto the actor (litebus::Async).
+        if (param_.enablePressureEvent) {
+            pressureEventWatcher_ = std::make_unique<PressureEventWatcher>(
+                param_.pressureEventCgroupRoot, param_.pressureEventMinGapMs,
+                [monitor(pressureMonitorActor_)](const std::string &poolDir, uint64_t increment) {
+                    litebus::Async(monitor->GetAID(), &PressureMonitorActor::NotifyPressureEvent, poolDir, increment);
+                });
+            (void)pressureEventWatcher_->Start();  // logs + degrades to polling on failure
+        }
+
+        // W-CPUL: the CPU ladder does NOT get a watcher instance — cgroupfs
+        // cpu.stat emits no inotify (cgroup_file_notify covers memory.events
+        // & friends only), so an inotify watch would never fire. The ladder
+        // scans pool-dir cpu.stat for nr_throttled growth inside OnSample,
+        // making the monitor's sampling cadence the event source.
+    }
 
     gcActor_ = std::make_shared<LocalGcActor>(LOCAL_GC_ACTOR_NAME, param_.nodeID);
     gcActor_->BindInstanceControlView(instanceCtrl_->GetInstanceControlView());
@@ -367,6 +427,10 @@ void LocalSchedDriver::ToReady()
 
 Status LocalSchedDriver::Stop()
 {
+    if (pressureEventWatcher_) {
+        pressureEventWatcher_->Stop();
+        pressureEventWatcher_.reset();
+    }
     if (tcpTunnelServer_) {
         tcpTunnelServer_->Stop();
         tcpTunnelServer_.reset();
@@ -491,70 +555,68 @@ bool LocalSchedDriver::CreatePosixAndDriverServer()
                                   .hostIP = param_.ip };
     std::shared_ptr<BusService> busService = std::make_shared<BusService>(std::move(serviceParam));
     posixGrpcServer_->RegisterService(busService);
-    if (param_.enableFrontendProxyService) {
-        FrontendProxyServiceBindings bindings;
-        bindings.enableCreateDispatch = true;
-        bindings.scheduler =
-            [instanceCtrl(instanceCtrl_)](
-                const std::shared_ptr<messages::ScheduleRequest> &scheduleReq,
-                const std::shared_ptr<litebus::Promise<messages::ScheduleResponse>> &runtimePromise,
-                FrontendProxyReadyCallback callback) {
-                if (instanceCtrl == nullptr) {
-                    messages::ScheduleResponse response;
-                    response.set_code(common::ERR_LOCAL_SCHEDULER_ABNORMAL);
-                    response.set_message("instance control is nullptr in local scheduler");
-                    return litebus::Future<messages::ScheduleResponse>(response);
-                }
-                scheduleReq->mutable_instance()->set_parentfunctionproxyaid(instanceCtrl->GetActorAID());
-                return instanceCtrl->ScheduleFrontendAndWaitReady(scheduleReq, runtimePromise, std::move(callback));
-            };
-        bindings.readyUnregister =
-            [instanceCtrl(instanceCtrl_)](const std::string &requestID, const std::string &reason) {
-                if (instanceCtrl != nullptr) {
-                    instanceCtrl->UnregisterFrontendReadyWait(requestID, reason);
-                }
-            };
-        bindings.enableKillDispatch = true;
-        bindings.killInvoker =
-            [instanceCtrl(instanceCtrl_)](const std::string &caller, const std::string &tenantID,
-                                         const std::shared_ptr<KillRequest> &killReq) {
-                if (instanceCtrl == nullptr) {
-                    KillResponse response;
-                    response.set_code(common::ERR_LOCAL_SCHEDULER_ABNORMAL);
-                    response.set_message("instance control is nullptr in local scheduler");
-                    return litebus::Future<KillResponse>(response);
-                }
-                (void)caller;
-                return instanceCtrl->KillFrontend(tenantID, killReq);
-            };
-        bindings.killCleanupProbe =
-            [instanceCtrl(instanceCtrl_)](const std::string &requestID, const std::string &instanceID) {
-                if (instanceCtrl == nullptr) {
-                    FrontendKillCleanupSnapshot snapshot;
-                    return litebus::Future<FrontendKillCleanupSnapshot>(snapshot);
-                }
-                return instanceCtrl->ProbeFrontendKillCleanup(requestID, instanceID);
-            };
-        auto frontendServiceParam = BuildFrontendProxyServiceParam(param_.nodeID, bindings);
-        frontendServiceParam.endpointAddress = param_.ip + ":" + param_.posixPort;
-        frontendServiceParam.requireAuthenticatedPeer = param_.enableSSL;
-        frontendServiceParam.invokeTenantAuthorizer =
-            [instanceView(instanceCtrl_->GetInstanceControlView())](const std::string &tenantID,
-                                                                    const std::string &instanceID) {
-                if (tenantID.empty() || instanceView == nullptr) {
-                    return false;
-                }
-                auto stateMachine = instanceView->GetInstance(instanceID);
-                return stateMachine != nullptr && stateMachine->GetInstanceInfo().tenantid() == tenantID;
-            };
-        // Lifecycle create/kill use reviewed ready dispatcher seams when the single
-        // frontend-proxy service switch is enabled. Legacy stream dispatchers remain disallowed.
-        std::shared_ptr<FrontendProxyService> frontendProxyService =
-            std::make_shared<FrontendProxyService>(std::move(frontendServiceParam));
-        posixGrpcServer_->RegisterService(frontendProxyService);
-        frontendProxyServiceRegistered_ = true;
-        YRLOG_INFO("FrontendProxyService registered on existing posix port {}", param_.posixPort);
-    }
+    FrontendProxyServiceBindings bindings;
+    bindings.enableCreateDispatch = true;
+    bindings.scheduler =
+        [instanceCtrl(instanceCtrl_)](
+            const std::shared_ptr<messages::ScheduleRequest> &scheduleReq,
+            const std::shared_ptr<litebus::Promise<messages::ScheduleResponse>> &runtimePromise,
+            FrontendProxyReadyCallback callback) {
+            if (instanceCtrl == nullptr) {
+                messages::ScheduleResponse response;
+                response.set_code(common::ERR_LOCAL_SCHEDULER_ABNORMAL);
+                response.set_message("instance control is nullptr in local scheduler");
+                return litebus::Future<messages::ScheduleResponse>(response);
+            }
+            scheduleReq->mutable_instance()->set_parentfunctionproxyaid(instanceCtrl->GetActorAID());
+            return instanceCtrl->ScheduleFrontendAndWaitReady(scheduleReq, runtimePromise, std::move(callback));
+        };
+    bindings.readyUnregister =
+        [instanceCtrl(instanceCtrl_)](const std::string &requestID, const std::string &reason) {
+            if (instanceCtrl != nullptr) {
+                instanceCtrl->UnregisterFrontendReadyWait(requestID, reason);
+            }
+        };
+    bindings.enableKillDispatch = true;
+    bindings.killInvoker =
+        [instanceCtrl(instanceCtrl_)](const std::string &caller, const std::string &tenantID,
+                                     const std::shared_ptr<KillRequest> &killReq) {
+            if (instanceCtrl == nullptr) {
+                KillResponse response;
+                response.set_code(common::ERR_LOCAL_SCHEDULER_ABNORMAL);
+                response.set_message("instance control is nullptr in local scheduler");
+                return litebus::Future<KillResponse>(response);
+            }
+            (void)caller;
+            return instanceCtrl->KillFrontend(tenantID, killReq);
+        };
+    bindings.killCleanupProbe =
+        [instanceCtrl(instanceCtrl_)](const std::string &requestID, const std::string &instanceID) {
+            if (instanceCtrl == nullptr) {
+                FrontendKillCleanupSnapshot snapshot;
+                return litebus::Future<FrontendKillCleanupSnapshot>(snapshot);
+            }
+            return instanceCtrl->ProbeFrontendKillCleanup(requestID, instanceID);
+        };
+    auto frontendServiceParam = BuildFrontendProxyServiceParam(param_.nodeID, bindings);
+    frontendServiceParam.endpointAddress = param_.ip + ":" + param_.posixPort;
+    frontendServiceParam.requireAuthenticatedPeer = param_.enableSSL;
+    frontendServiceParam.invokeTenantAuthorizer =
+        [instanceView(instanceCtrl_->GetInstanceControlView())](const std::string &tenantID,
+                                                                const std::string &instanceID) {
+            if (tenantID.empty() || instanceView == nullptr) {
+                return false;
+            }
+            auto stateMachine = instanceView->GetInstance(instanceID);
+            return stateMachine != nullptr && stateMachine->GetInstanceInfo().tenantid() == tenantID;
+        };
+    // Lifecycle create/kill use reviewed ready dispatcher seams. Legacy stream dispatchers remain
+    // disallowed.
+    std::shared_ptr<FrontendProxyService> frontendProxyService =
+        std::make_shared<FrontendProxyService>(std::move(frontendServiceParam));
+    posixGrpcServer_->RegisterService(frontendProxyService);
+    frontendProxyServiceRegistered_ = true;
+    YRLOG_INFO("FrontendProxyService registered on existing posix port {}", param_.posixPort);
 
     // Create ExecStreamService instance
     execStreamService_ = std::make_shared<ExecStreamService>(instanceCtrl_->GetIdleMgr());

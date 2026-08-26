@@ -17,11 +17,13 @@
 #ifndef LOCAL_SCHEDULER_IDLE_ACTOR_H
 #define LOCAL_SCHEDULER_IDLE_ACTOR_H
 
+#include <atomic>
 #include <cstdint>
 #include <actor/actor.hpp>
 #include <async/future.hpp>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "common/state_machine/instance_control_view.h"
 #include "common/utils/actor_driver.h"
@@ -87,6 +89,47 @@ public:
      */
     void OnInstanceRunning(const std::string &instanceID);
 
+    /**
+     * Mark an instance as ever-used because a client-originated data-plane
+     * action (exec / filesystem / pty, as opposed to the create-flow's
+     * lifecycle probes ping/get_info) was dispatched to it. SDK exec rides
+     * the Invoke channel and never reaches ExecStreamService, so
+     * SessionCountDelta alone cannot claim ownership for it. If an orphan
+     * grace timer is currently armed, it is re-armed at the full idle
+     * timeout: a used instance must not be reclaimed on the short window.
+     *
+     * @param instanceID  Instance identifier
+     */
+    void MarkInstanceUsed(const std::string &instanceID);
+
+    /**
+     * Lifecycle hook from SnapCtrlActor when a leaveRunning=false snapshot
+     * (pressure park) completes. The instance is deleted but its ID will be
+     * REUSED by the restore (SnapshotScheduler::BuildScheduleRequest), so all
+     * per-ID bookkeeping must be dropped now: an idle timer armed before the
+     * park would otherwise fire against the restored instance on the old
+     * deadline (the parked/restore-in-flight kill, D-4 finding F1) or block
+     * the fresh timer from being armed at all (StartIdleTimer no-ops while a
+     * stale entry lingers in idleTimers_).
+     *
+     * @param instanceID  Instance identifier of the parked instance
+     */
+    void OnInstanceParked(const std::string &instanceID);
+
+    /**
+     * Copy of the currently fully-idle instance set: traffic idle AND no
+     * active exec sessions. Actor-executed so the two maps are read
+     * consistently; used by the pressure monitor as the park
+     * victim-eligibility filter (an instance with in-flight tunnel/exec
+     * traffic is never a victim).
+     */
+    std::vector<std::string> GetIdleInstances();
+
+    // set once by the local scheduler driver before the actor is spawned;
+    // 0 keeps the legacy behavior (no special orphan window).
+    static void SetOrphanGraceSec(int64_t graceSec);
+    static int64_t GetOrphanGraceSec();
+
 private:
     void SessionAlive(const std::string &instanceID, bool hasActiveSessions);
     void StartIdleTimer(const std::string &instanceID);
@@ -116,6 +159,15 @@ private:
 
     // Per-instance session counts for timer management decisions.
     std::unordered_map<std::string, size_t> instanceSessionCounts_;
+
+    // Instances that have ever shown real use (an exec session or busy
+    // traffic). A never-used instance is a create-race orphan candidate:
+    // the client gave up (or crashed) before the first exec landed, so the
+    // orphan grace window applies instead of the full idle timeout.
+    std::unordered_map<std::string, bool> instanceEverUsed_;
+
+    // Orphan grace window in seconds (0 = disabled); see SetOrphanGraceSec.
+    static std::atomic<int64_t> orphanGraceSec_;
 };
 
 }  // namespace functionsystem::local_scheduler

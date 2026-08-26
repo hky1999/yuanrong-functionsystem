@@ -35,6 +35,7 @@
 #include "common/kube_client/kube_client.h"
 #include "common/logs/logging.h"
 #include "common/metadata/metadata.h"
+#include "common/resource_view/commitment_ledger.h"
 #include "meta_store_client/meta_store_client.h"
 #include "common/proto/pb/posix_pb.h"
 #include "common/rpc/server/common_grpc_server.h"
@@ -61,7 +62,9 @@
 #include "function_proxy/config/direct_routing_config.h"
 #include "grpc/grpc_security_constants.h"
 #include "grpcpp/security/server_credentials.h"
+#include "common/schedule_plugin/filter/overcommit_filter/overcommit_filter.h"
 #include "common/schedule_plugin/filter/usage_aware_filter/usage_aware_filter.h"
+#include "local_scheduler/instance_control/idle/idle_actor.h"
 #include "local_scheduler/instance_control/posix_api_handler/posix_api_handler.h"
 #include "local_scheduler/local_sched_driver.h"
 #include "memory_monitor/memory_monitor.h"
@@ -244,10 +247,8 @@ std::shared_ptr<::grpc::ServerCredentials> InitPosixGrpcServerSecureOption(const
 ProxyServiceMeta BuildProxyServiceMeta(const function_proxy::Flags &flags)
 {
     ProxyServiceMeta proxyService;
-    if (flags.GetEnableFrontendProxyService()) {
-        proxyService.grpcAddress = flags.GetIP() + ":" + flags.GetGrpcListenPort();
-        proxyService.capabilities = { "faas.create", "faas.invoke", "faas.kill" };
-    }
+    proxyService.grpcAddress = flags.GetIP() + ":" + flags.GetGrpcListenPort();
+    proxyService.capabilities = { "faas.create", "faas.invoke", "faas.kill" };
     if (flags.GetEnableTcpTunnel()) {
         proxyService.tcpTunnelAddress = flags.GetIP() + ":" + flags.GetTcpTunnelPort();
         proxyService.capabilities.emplace_back("tcp.tunnel");
@@ -439,7 +440,17 @@ LocalSchedStartParam InitLocalSchedParam(const function_proxy::Flags &flags,
     // usage-aware admission knobs (consumed by the UsageAwareFilter plugin;
     // set before the scheduler registers any policy)
     ::functionsystem::schedule_plugin::filter::UsageAwareFilter::SetConfig(flags.GetUsageAwareSafety(),
-                                                                        flags.GetUsageAwareFloorMb());
+                                                                        flags.GetUsageAwareFloorMb(),
+                                                                        flags.GetMaxInstancesPerNode());
+    // burst-prediction window/horizon (consumed by UsageTrendTracker via the filter)
+    ::functionsystem::resource_view::UsageTrendTracker::SetParams(flags.GetUsageAwareTrendWindowMs(),
+                                                                 flags.GetUsageAwareTrendHorizonMs());
+    // P2.0 commitment ledger switch (consumed by UsageAwareFilter + UpgradeLadder)
+    ::functionsystem::resource_view::CommitmentLedger::SetEnabled(flags.GetEnableCommitmentAdmission());
+    // overcommit ceiling knob (consumed by the OvercommitFilter plugin)
+    ::functionsystem::schedule_plugin::filter::OvercommitFilter::SetConfig(flags.GetOvercommitRatio());
+    // Ph0.2 orphan grace (consumed by the IdleActor; set before it spawns)
+    ::functionsystem::local_scheduler::IdleActor::SetOrphanGraceSec(flags.GetOrphanGraceSec());
 
     return LocalSchedStartParam{
         .nodeID = flags.GetNodeID(),
@@ -509,6 +520,26 @@ LocalSchedStartParam InitLocalSchedParam(const function_proxy::Flags &flags,
         .runtimeInstanceDebugEnable = flags.IsRuntimeInstanceDebugEnable(),
         .unRegisterWhileStop = flags.UnRegisterWhileStop(),
         .enableFakeSuspendResume = flags.GetEnableFakeSuspendResume(),
+        .enablePressurePark = flags.GetEnablePressurePark(),
+        .pressureHighWatermark = flags.GetPressureHighWatermark(),
+        .pressureLowWatermark = flags.GetPressureLowWatermark(),
+        .pressureCheckIntervalMs = flags.GetPressureCheckIntervalMs(),
+        .pressureSustainSamples = flags.GetPressureSustainSamples(),
+        .pressureParkTtlSec = flags.GetPressureParkTtlSec(),
+        .pressureMaxParked = flags.GetPressureMaxParked(),
+        .enablePressureEvent = flags.GetEnablePressureEvent(),
+        .pressureEventCgroupRoot = flags.GetPressureEventCgroupRoot(),
+        .pressureEventMinGapMs = flags.GetPressureEventMinGapMs(),
+        .enableUpgradeLadder = flags.GetEnableUpgradeLadder(),
+        .upgradeStepMb = flags.GetUpgradeStepMb(),
+        .upgradeCapMb = flags.GetUpgradeCapMb(),
+        .upgradeSafetyRatio = flags.GetUpgradeSafetyRatio(),
+        .upgradeHighRatio = flags.GetUpgradeHighRatio(),
+        .enableCpuUpgradeLadder = flags.GetEnableCpuUpgradeLadder(),
+        .cpuUpgradeStepRatio = flags.GetCpuUpgradeStepRatio(),
+        .cpuUpgradeCapCpus = flags.GetCpuUpgradeCapCpus(),
+        .cpuUpgradeSafetyRatio = flags.GetCpuUpgradeSafetyRatio(),
+        .cpuUpgradeNodeCpus = flags.GetCpuUpgradeNodeCpus(),
         .udsPath = flags.GetDPosixUdsPath(),
         .sessionGrpcPort = flags.GetSessionGrpcPort(),
         .address = flags.GetAddress(),  // LiteBus address for extracting IP used by gRPC servers
@@ -525,8 +556,7 @@ LocalSchedStartParam InitLocalSchedParam(const function_proxy::Flags &flags,
         .tcpTunnelMaxConnections = flags.GetTcpTunnelMaxConnections(),
         .tcpTunnelRootCert = "",
         .tcpTunnelModuleCert = "",
-        .tcpTunnelModuleKey = "",
-        .enableFrontendProxyService = flags.GetEnableFrontendProxyService()
+        .tcpTunnelModuleKey = ""
     };
 }
 
@@ -796,8 +826,6 @@ int main(int argc, char **argv)
 
     YRLOG_INFO("DirectRouting feature flag: {}", flags.GetEnableDirectRouting());
     YRLOG_INFO("ForceLowReliabilityInstance feature flag: {}", flags.GetForceLowReliabilityInstance());
-    YRLOG_INFO("FrontendProxyService feature flag: {}", flags.GetEnableFrontendProxyService());
-
     if (!g_functionProxySwitcher->RegisterHandler(Stop, stopSignal)) {
         return EXIT_ABNORMAL;
     }

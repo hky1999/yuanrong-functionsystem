@@ -16,6 +16,11 @@
 
 #include "common/kv_client/kv_client.h"
 
+#include <algorithm>
+#include <cstring>
+#include <fstream>
+#include <vector>
+
 namespace functionsystem {
 
 Status KVClient::Init(const std::string &host, int32_t port)
@@ -78,6 +83,57 @@ Status KVClient::Delete(const std::string &key)
         return Status(StatusCode::BP_DATASYSTEM_ERROR, s.ToString());
     }
     YRLOG_DEBUG("successfully deleted key: {}", key);
+    return Status::OK();
+}
+
+namespace {
+constexpr uint64_t FILE_TRANSFER_CHUNK_SIZE = 4 * 1024 * 1024;  // 4MiB
+}
+
+Status KVClient::PutFile(const std::string &key, const std::string &filePath, uint64_t size)
+{
+    if (dsKvClient_ == nullptr) {
+        YRLOG_ERROR("kv client is not initialized");
+        return Status(StatusCode::BP_DATASYSTEM_ERROR, "kv client is not initialized");
+    }
+    if (size == 0) {
+        return Status(StatusCode::BP_DATASYSTEM_ERROR, "refuse to upload empty file: " + filePath);
+    }
+
+    // Buffer 路径：Create 拿共享内存缓冲后分块灌入，再 Set 发布，全程不持有整文件堆副本
+    std::shared_ptr<datasystem::Buffer> buffer;
+    datasystem::Status s = dsKvClient_->Create(key, size, datasystem::SetParam {}, buffer);
+    if (s.IsError()) {
+        YRLOG_ERROR("failed to create buffer for key: {}, size: {}, error: {}", key, size, s.ToString());
+        return Status(StatusCode::BP_DATASYSTEM_ERROR, s.ToString());
+    }
+
+    std::ifstream file(filePath, std::ios::binary);
+    if (!file.is_open()) {
+        YRLOG_ERROR("failed to open file for streaming upload: {}", filePath);
+        return Status(StatusCode::BP_DATASYSTEM_ERROR, "failed to open file: " + filePath);
+    }
+
+    auto *dst = static_cast<uint8_t *>(buffer->MutableData());
+    std::vector<char> chunk(FILE_TRANSFER_CHUNK_SIZE);
+    uint64_t copied = 0;
+    while (copied < size) {
+        const uint64_t bytes = std::min<uint64_t>(FILE_TRANSFER_CHUNK_SIZE, size - copied);
+        file.read(chunk.data(), static_cast<std::streamsize>(bytes));
+        if (static_cast<uint64_t>(file.gcount()) != bytes) {
+            YRLOG_ERROR("short read while uploading {}: expected {}, got {}", filePath, bytes, file.gcount());
+            return Status(StatusCode::BP_DATASYSTEM_ERROR, "short read on file: " + filePath);
+        }
+        std::memcpy(dst + copied, chunk.data(), bytes);
+        copied += bytes;
+    }
+
+    s = dsKvClient_->Set(buffer);
+    if (s.IsError()) {
+        YRLOG_ERROR("failed to publish buffer for key: {}, error: {}", key, s.ToString());
+        return Status(StatusCode::BP_DATASYSTEM_ERROR, s.ToString());
+    }
+    YRLOG_DEBUG("successfully streamed file {} ({} bytes) to key: {}", filePath, size, key);
     return Status::OK();
 }
 }  // namespace functionsystem

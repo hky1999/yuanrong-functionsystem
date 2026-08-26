@@ -75,6 +75,8 @@ public:
     litebus::Future<SharedStreamMsg> CallResult(const std::string &srcInstanceID, const std::string &dstInstanceID,
                                                 const SharedStreamMsg &request, const std::shared_ptr<TimePoint> &time);
 
+    SharedStreamMsg CompleteFrontendCall(const SharedStreamMsg &callResult, const SharedStreamMsg &callResultAck);
+
     void ForwardCallResult(const litebus::AID &from, std::string &&, std::string &&msg);
 
     void ResponseForwardCallResult(const litebus::AID &from, std::string &&, std::string &&msg);
@@ -197,6 +199,9 @@ public:
                                                         const std::string &dstInstanceID,
                                                         const SharedStreamMsg &request,
                                                         const std::shared_ptr<TimePoint> &time);
+    virtual litebus::Future<SharedStreamMsg> CompleteFrontendCall(const litebus::AID &to,
+                                                                  const SharedStreamMsg &callResult,
+                                                                  const SharedStreamMsg &callResultAck);
     virtual litebus::Future<std::string> GetTenantID(const litebus::AID &to);
 };
 }  // namespace functionsystem::busproxy

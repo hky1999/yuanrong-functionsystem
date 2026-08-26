@@ -131,6 +131,13 @@ public:
     // no instance state — kept here once so the quoting logic is correct in exactly one place.
     static std::string ShellQuote(const std::string &token);
 
+    // Reject host bind-mount source paths that would let the sandbox/container escape or hijack
+    // the daemon (/, /etc, /proc, /sys, /dev, /boot, docker.sock, .. traversal). Shared by docker
+    // and supervisor executors when binding the runtime log dir (and rootfs mounts) into the
+    // sandbox. Pure function, no instance state — kept here once so the blocklist is authoritative
+    // in exactly one place.
+    static bool IsSafeBindSource(const std::string &path);
+
     // Resolve a scalar Resource's effective value (CPU/memory). scalar.limit takes precedence;
     // scalar.value is the fallback when limit is unset; defaultValue is returned when neither is
     // set. Applies to both CPU and memory the same way. Shared by executors.

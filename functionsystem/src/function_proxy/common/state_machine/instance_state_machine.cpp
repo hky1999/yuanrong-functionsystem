@@ -407,9 +407,12 @@ litebus::Future<TransitionResult> InstanceStateMachine::SaveInstanceInfoToMetaSt
         context.version, fmt::underlying(persistenceType));
     ASSERT_IF_NULL(instanceOpt_);
     if (IsFirstPersistence(newInstanceInfo, oldState, context.version)) {
+        const bool resolveRouteConflict =
+            IsInitialLowReliabilityRunningPersistence(newInstanceInfo, oldState, context.version);
         return instanceOpt_->Create(instancePutInfo, routePutInfo, IsLowReliabilityInstance(newInstanceInfo))
             .Then([prevInstanceInfo, oldState, key(keyPath), newInstanceInfo,
                    instanceID(newInstanceInfo.instanceid()), context,
+                   resolveRouteConflict,
                    self(shared_from_this())](const OperateResult &result) -> litebus::Future<TransitionResult> {
                 if (result.status.IsOk()) {
                     YRLOG_DEBUG("success to create instance for key({}), preKeyVersion is {}", key,
@@ -427,6 +430,12 @@ litebus::Future<TransitionResult> InstanceStateMachine::SaveInstanceInfoToMetaSt
                                              Status::OK(),     result.currentModRevision };
                 }
                 YRLOG_ERROR("fail to create instance for key({}), err: {}", key, result.status.ToString());
+
+                if (resolveRouteConflict &&
+                    result.status.StatusCode() == StatusCode::INSTANCE_TRANSACTION_WRONG_VERSION) {
+                    return self->ResolveInitialLowReliabilityCreateConflict(
+                        newInstanceInfo, prevInstanceInfo, result.status);
+                }
 
                 InstanceInfo instanceInfoSaved;
                 if (!TransToInstanceInfoFromJson(instanceInfoSaved, result.value)) {
@@ -468,6 +477,60 @@ litebus::Future<TransitionResult> InstanceStateMachine::SaveInstanceInfoToMetaSt
             }
             return TransitionResult{ litebus::None(), instanceInfoSaved, prevInstanceInfo, 0, result.status };
         });
+}
+
+litebus::Future<TransitionResult> InstanceStateMachine::ResolveInitialLowReliabilityCreateConflict(
+    const resources::InstanceInfo &newInstanceInfo, const resources::InstanceInfo &prevInstanceInfo,
+    const Status &createStatus)
+{
+    auto promise = std::make_shared<litebus::Promise<TransitionResult>>();
+    auto conflictResult = TransitionResult{ litebus::None(), {}, prevInstanceInfo, 0, createStatus };
+    auto routeKey = GenInstanceRouteKey(newInstanceInfo.instanceid());
+    instanceOpt_->GetInstance(routeKey).OnComplete(
+        [promise, conflictResult, newInstanceInfo, routeKey](
+            const litebus::Future<OperateResult> &routeFuture) mutable {
+            if (routeFuture.IsError() || routeFuture.Get().status.IsError()) {
+                YRLOG_ERROR("{}|failed to read winner route({}) after initial RUNNING conflict",
+                            newInstanceInfo.requestid(), routeKey);
+                promise->SetValue(conflictResult);
+                return;
+            }
+
+            resources::RouteInfo routeInfo;
+            // A route conflict is reusable only when the shared route describes the same
+            // logical instance and has already reached RUNNING on a concrete proxy.  These
+            // identity checks prevent a stale/corrupt route (or a route from another
+            // tenant/function) from being exposed as the winner to the original caller.
+            if (!TransToRouteInfoFromJson(routeInfo, routeFuture.Get().value) ||
+                routeInfo.instanceid() != newInstanceInfo.instanceid() ||
+                routeInfo.function() != newInstanceInfo.function() ||
+                routeInfo.tenantid() != newInstanceInfo.tenantid() ||
+                routeInfo.issystemfunc() != newInstanceInfo.issystemfunc() ||
+                routeInfo.instancestatus().code() != static_cast<int32_t>(InstanceState::RUNNING) ||
+                routeInfo.requestid().empty() || routeInfo.functionproxyid().empty()) {
+                YRLOG_ERROR("{}|winner route({}) is missing, invalid, or not RUNNING",
+                            newInstanceInfo.requestid(), routeKey);
+                promise->SetValue(conflictResult);
+                return;
+            }
+
+            // RouteInfo is the shared, transaction-arbitrated ownership record.  Project it
+            // directly into InstanceInfo instead of reading the request-scoped full-instance
+            // key: the latter is not required to return the winning proxy and introduces an
+            // additional read whose generation may already differ from the route.
+            InstanceInfo winnerInfo;
+            TransToInstanceInfoFromRouteInfo(routeInfo, winnerInfo);
+            YRLOG_WARN(
+                "{}|initial RUNNING contender lost route arbitration for instance({}); "
+                "winner request({}) proxy({})",
+                newInstanceInfo.requestid(), newInstanceInfo.instanceid(), winnerInfo.requestid(),
+                winnerInfo.functionproxyid());
+            auto result = conflictResult;
+            result.savedInfo = std::move(winnerInfo);
+            result.currentModRevision = routeFuture.Get().currentModRevision;
+            promise->SetValue(std::move(result));
+        });
+    return promise->GetFuture();
 }
 
 Status InstanceStateMachine::TransToStoredKeys(const resources::InstanceInfo &instanceInfo,
@@ -1052,7 +1115,22 @@ bool InstanceStateMachine::IsFirstPersistence(const InstanceInfo &newInstanceInf
     }
     return oldState == InstanceState::NEW ||
            // for group schedule we only need to persist creating
-           (oldState == InstanceState::SCHEDULING && !newInstanceInfo.groupid().empty() && version == 0);
+           (oldState == InstanceState::SCHEDULING && !newInstanceInfo.groupid().empty() && version == 0) ||
+           IsInitialLowReliabilityRunningPersistence(newInstanceInfo, oldState, version);
+}
+
+bool InstanceStateMachine::IsInitialLowReliabilityRunningPersistence(
+    const InstanceInfo &newInstanceInfo, const InstanceState &oldState, const int64_t version) const
+{
+    // This policy is deliberately narrower than DR first persistence: only the
+    // non-DR low-reliability CREATING -> RUNNING gap enables winner propagation.
+    return !function_proxy::DirectRoutingConfig::IsEnabled() && IsLowReliabilityInstance(newInstanceInfo) &&
+           oldState == InstanceState::CREATING &&
+           newInstanceInfo.instancestatus().code() == static_cast<int32_t>(InstanceState::RUNNING) && version == 0 &&
+           newInstanceInfo.groupid().empty() && !IsAppDriver(newInstanceInfo.createoptions()) &&
+           !IsStaticFunctionInstance(newInstanceInfo) && !newInstanceInfo.has_snapshotinfo() &&
+           !newInstanceInfo.ischeckpointed() &&
+           !IsRuntimeRecoverEnable(newInstanceInfo);
 }
 
 void InstanceStateMachine::TagStop()

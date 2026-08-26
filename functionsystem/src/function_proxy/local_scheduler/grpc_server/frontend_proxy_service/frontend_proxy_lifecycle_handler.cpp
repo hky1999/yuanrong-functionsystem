@@ -127,7 +127,10 @@ FrontendProxyServiceParam::CreateReadyDispatcher BuildFrontendProxyCreateReadyDi
                          [readyPromise](const std::shared_ptr<functionsystem::CallResult> &readyResult)
                              -> litebus::Future<CallResultAck> {
             readyPromise->SetValue(readyResult);
-            return CallResultAck();
+            CallResultAck ack;
+            ack.set_code(common::ERR_NONE);
+            ack.set_message("success");
+            return ack;
                          })
             .Then([scheduleReq, readyFuture](const messages::ScheduleResponse &scheduleResponse) {
                 auto response = BuildCreateResponse(scheduleResponse);

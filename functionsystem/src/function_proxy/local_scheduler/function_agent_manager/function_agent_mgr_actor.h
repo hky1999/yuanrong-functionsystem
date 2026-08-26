@@ -256,7 +256,8 @@ public:
 
     litebus::Future<messages::SnapshotRuntimeResponse> SnapshotRuntime(const std::string &requestID,
                                                      const resource_view::InstanceInfo &instanceInfo,
-                                                     int32_t ttl);
+                                                     int32_t ttl,
+                                                     bool leaveRunning);
     void SnapshotRuntimeResponse(const litebus::AID &from, std::string &&name, std::string &&msg);
 
     litebus::Future<messages::ReconcileRuntimesResponse> ReconcileRuntimes(

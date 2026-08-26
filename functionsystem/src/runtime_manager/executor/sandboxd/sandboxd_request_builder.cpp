@@ -603,7 +603,11 @@ Status SandboxdRequestBuilder::ApplyWritableLayerSize(
         storage > static_cast<double>(std::numeric_limits<uint64_t>::max())) {
         return Status(StatusCode::ERR_PARAM_INVALID, "storage resource must be a positive integer number of bytes");
     }
-    start->mutable_rootfs()->set_writable_layer_size_bytes(static_cast<uint64_t>(storage));
+    const auto storageBytes = static_cast<uint64_t>(storage);
+    // Field 19 is sandboxd's canonical hard quota. Keep the rootfs field 6
+    // compatibility alias populated for older sandboxd deployments.
+    start->set_writable_layer_limit_bytes(storageBytes);
+    start->mutable_rootfs()->set_writable_layer_size_bytes(storageBytes);
     return Status::OK();
 }
 

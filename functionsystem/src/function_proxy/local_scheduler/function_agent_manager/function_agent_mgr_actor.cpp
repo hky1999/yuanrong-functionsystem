@@ -1569,7 +1569,8 @@ void FunctionAgentMgrActor::UpdateCredResponse(const litebus::AID &from, std::st
 litebus::Future<messages::SnapshotRuntimeResponse> FunctionAgentMgrActor::SnapshotRuntime(
     const std::string &requestID,
     const resource_view::InstanceInfo &instanceInfo,
-    int32_t ttl)
+    int32_t ttl,
+    bool leaveRunning)
 {
     // 1. 从 instanceInfo 获取 funcAgentID
     std::string funcAgentID = instanceInfo.functionagentid();
@@ -1599,6 +1600,7 @@ litebus::Future<messages::SnapshotRuntimeResponse> FunctionAgentMgrActor::Snapsh
     request->set_runtimeid(instanceInfo.runtimeid());
     request->set_containerid(instanceInfo.containerid());  // containerID is same as runtimeID in container mode
     request->set_ttl(ttl);  // Set TTL from parameter
+    request->set_leaverunning(leaveRunning);  // sandboxd PR#16 physical mode
     auto future = snapshotRuntimeSync_.AddSynchronizer(requestID);
 
     YRLOG_INFO("{}|send SnapshotRuntime request to agent({}) for instance({}), ttl: {}",

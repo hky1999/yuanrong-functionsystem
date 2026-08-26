@@ -394,6 +394,19 @@ litebus::Future<SharedStreamMsg> InstanceProxy::CallResult(const std::string &sr
     return dispatcher->CallResult(request).Then(func);
 }
 
+SharedStreamMsg InstanceProxy::CompleteFrontendCall(const SharedStreamMsg &callResult,
+                                                    const SharedStreamMsg &callResultAck)
+{
+    ASSERT_FS(callResult->has_callresultreq());
+    ASSERT_FS(callResultAck->has_callresultack());
+    ASSERT_FS(selfDispatcher_);
+    const auto &result = callResult->callresultreq();
+    selfDispatcher_->OnCallResult(callResultAck, result.requestid(), result.code());
+    perf_->EndRecord(result.requestid());
+    InvocationHandler::ReleaseEstimateMemory(instanceID_, result.requestid());
+    return callResultAck;
+}
+
 litebus::Future<SharedStreamMsg> InstanceProxy::RetryCallResult(const std::string &srcInstanceID,
                                                                 const std::string &dstInstanceID,
                                                                 const SharedStreamMsg &request,
@@ -773,6 +786,13 @@ litebus::Future<SharedStreamMsg> InstanceProxyWrapper::CallResult(const litebus:
                                                                   const std::shared_ptr<TimePoint> &time)
 {
     return litebus::Async(to, &InstanceProxy::CallResult, srcInstanceID, dstInstanceID, request, time);
+}
+
+litebus::Future<SharedStreamMsg> InstanceProxyWrapper::CompleteFrontendCall(const litebus::AID &to,
+                                                                            const SharedStreamMsg &callResult,
+                                                                            const SharedStreamMsg &callResultAck)
+{
+    return litebus::Async(to, &InstanceProxy::CompleteFrontendCall, callResult, callResultAck);
 }
 
 litebus::Future<std::string> InstanceProxyWrapper::GetTenantID(const litebus::AID &to)

@@ -267,6 +267,7 @@ TEST_F(SandboxdRequestBuilderTest, WritableLayerChangeBypassesTemplate)
 
     ASSERT_TRUE(status.IsOk()) << status.RawMessage();
     ASSERT_NE(startReq, nullptr);
+    EXPECT_EQ(startReq->writable_layer_limit_bytes(), 104857600U);
     EXPECT_EQ(startReq->rootfs().writable_layer_size_bytes(), 104857600U);
     EXPECT_TRUE(startReq->template_id().empty());
 }
@@ -309,13 +310,14 @@ TEST_F(SandboxdRequestBuilderTest, FlatRequestCarriesWritableLayerSize)
                            ->mutable_resources())["storage"];
     storage->set_type(resources::Value_Type_SCALAR);
     storage->mutable_scalar()->set_value(104857600);
-    storage->mutable_scalar()->set_limit(104857600);
+    storage->mutable_scalar()->set_limit(209715200);
 
     auto [status, startReq] = builder_->Build(params);
 
     ASSERT_TRUE(status.IsOk());
     ASSERT_NE(startReq, nullptr);
-    EXPECT_EQ(startReq->rootfs().writable_layer_size_bytes(), 104857600U);
+    EXPECT_EQ(startReq->writable_layer_limit_bytes(), 209715200U);
+    EXPECT_EQ(startReq->rootfs().writable_layer_size_bytes(), 209715200U);
 }
 
 TEST_F(SandboxdRequestBuilderTest, InvalidWritableLayerSizeFailsBuild)

@@ -636,6 +636,19 @@ cc_library(
     srcs = glob(["schedule_plugin/filter/usage_aware_filter/**/*.cpp"]),
     hdrs = glob(["schedule_plugin/filter/usage_aware_filter/**/*.h"]),
     copts = COPTS,
+    deps = [
+        ":resource_view",
+        ":schedule_plugin_common",
+    ],
+    alwayslink = True,
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "overcommit_filter",
+    srcs = glob(["schedule_plugin/filter/overcommit_filter/**/*.cpp"]),
+    hdrs = glob(["schedule_plugin/filter/overcommit_filter/**/*.h"]),
+    copts = COPTS,
     deps = [":schedule_plugin_common"],
     alwayslink = True,
     visibility = ["//visibility:public"],
@@ -746,6 +759,7 @@ cc_library(
         ":numa_affinity_filter",
         ":numa_affinity_scorer",
         ":usage_aware_filter",
+        ":overcommit_filter",
         ":disk_filter",
         ":disk_scorer",
     ],

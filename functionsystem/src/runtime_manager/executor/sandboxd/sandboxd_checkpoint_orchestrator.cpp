@@ -27,11 +27,13 @@ constexpr int64_t CHECKPOINT_TIMEOUT_NS = 30000000000;
 
 SandboxdCheckpointOrchestrator::SandboxdCheckpointOrchestrator(
     litebus::AID ownerAID, std::shared_ptr<GrpcClient<runtime::v1::SandboxService>> sandboxd,
-    std::shared_ptr<CkptFileManager> ckptFileManager, RuntimeStateManager &stateManager)
+    std::shared_ptr<CkptFileManager> ckptFileManager, RuntimeStateManager &stateManager,
+    std::string checkpointDir)
     : ownerAID_(std::move(ownerAID)),
       sandboxd_(std::move(sandboxd)),
       ckptFileManager_(std::move(ckptFileManager)),
-      stateManager_(stateManager)
+      stateManager_(stateManager),
+      checkpointDir_(std::move(checkpointDir))
 {
 }
 
@@ -68,7 +70,9 @@ litebus::Future<messages::SnapshotRuntimeResponse> SandboxdCheckpointOrchestrato
     const std::string sandboxID = stateManager_.GetSandboxID(runtimeID);
     const std::string checkpointID =
         fmt::format("ckpt-{}-{}", instanceID, std::chrono::system_clock::now().time_since_epoch().count());
-    const std::string checkpointPath = fmt::format("/home/yuanrong/checkpoints/{}", checkpointID);
+    // must live under sandboxd's managed checkpoint root (config.RootDir/checkpoints);
+    // the deploy scripts point --checkpoint_dir at a subdirectory of that root
+    const std::string checkpointPath = fmt::format("{}/{}", checkpointDir_, checkpointID);
 
     auto ckptReq = std::make_shared<runtime::v1::CheckpointRequest>();
     ckptReq->set_id(sandboxID);
@@ -76,8 +80,12 @@ litebus::Future<messages::SnapshotRuntimeResponse> SandboxdCheckpointOrchestrato
     ckptReq->set_timeout(CHECKPOINT_TIMEOUT_NS);
     ckptReq->set_compress(true);
     ckptReq->set_trace_id(requestID);
+    // sandboxd PR#16 requires the logical checkpoint identity and the
+    // physical mode (keep source alive or delete after publish)
+    ckptReq->set_checkpoint_id(checkpointID);
+    ckptReq->set_leave_running(request->leaverunning());
 
-    SnapshotContext context{requestID, runtimeID, checkpointID, checkpointPath, ttl};
+    SnapshotContext context{requestID, runtimeID, checkpointID, checkpointPath, sandboxID, ttl};
     return DoCheckpoint(ckptReq).Then(
         litebus::Defer(ownerAID_,
             [self = shared_from_this(), context](const runtime::v1::CheckpointResponse &response) {
@@ -106,19 +114,27 @@ litebus::Future<messages::SnapshotRuntimeResponse> SandboxdCheckpointOrchestrato
     ASSERT_IF_NULL(ckptFileManager_);
     return ckptFileManager_
         ->RegisterCheckpoint(context.checkpointID, context.checkpointPath, context.checkpointID, context.ttl)
-        .Then(litebus::Defer(ownerAID_, [self = shared_from_this(), response, context](const std::string &storageUrl) {
-                return self->OnRegisterDone(storageUrl, response, context);
+        .Then(litebus::Defer(ownerAID_,
+            [self = shared_from_this(), response, context](const CheckpointUploadResult &upload) {
+                return self->OnRegisterDone(upload, response, context);
             }));
 }
 
 litebus::Future<messages::SnapshotRuntimeResponse> SandboxdCheckpointOrchestrator::OnRegisterDone(
-    const std::string &storageUrl, messages::SnapshotRuntimeResponse response, const SnapshotContext &context)
+    const CheckpointUploadResult &upload, messages::SnapshotRuntimeResponse response, const SnapshotContext &context)
 {
     auto *info = response.mutable_snapshotinfo();
     info->set_checkpointid(context.checkpointID);
-    info->set_storage(storageUrl);
+    info->set_storage(upload.storageUrl);
     info->set_ttlseconds(context.ttl);
+    // 归档的完整性元数据：跨节点 restore 用 expected_sha256/expected_size 校验
+    info->set_size(upload.size);
+    info->set_createtime(upload.createTime);
+    info->set_sha256(upload.sha256);
+    // 源沙箱 id：strict restore（identity-checked）路径的 config.sandbox_id 来源
+    info->set_sandbox_id(context.sandboxID);
 
+    const std::string &storageUrl = upload.storageUrl;
     if (storageUrl.empty()) {
         YRLOG_ERROR("{}|RegisterCheckpoint returned empty storageUrl for runtime({})", context.requestID,
                     context.runtimeID);
@@ -142,11 +158,13 @@ litebus::Future<messages::SnapshotRuntimeResponse> SandboxdCheckpointOrchestrato
 
 litebus::Future<std::string> SandboxdCheckpointOrchestrator::DownloadForRestore(const std::string &checkpointID,
                                                                                 const std::string &storageUrl,
-                                                                                const std::string &requestID)
+                                                                                const std::string &requestID,
+                                                                                const std::string &expectedSha256,
+                                                                                int64_t expectedSize)
 {
     YRLOG_INFO("{}|downloading checkpoint({}) from {}", requestID, checkpointID, storageUrl);
     ASSERT_IF_NULL(ckptFileManager_);
-    return ckptFileManager_->DownloadCheckpoint(checkpointID, storageUrl);
+    return ckptFileManager_->DownloadCheckpoint(checkpointID, storageUrl, expectedSha256, expectedSize);
 }
 
 // ── AddRef ────────────────────────────────────────────────────────────────────

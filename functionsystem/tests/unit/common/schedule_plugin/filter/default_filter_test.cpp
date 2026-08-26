@@ -210,4 +210,37 @@ TEST_F(DefaultFilterTest, ResourceFilterTest)
     }
 }
 
+TEST_F(DefaultFilterTest, StorageFailureRequirementUsesMiBWithoutInt32Overflow)
+{
+    constexpr int64_t bytesPerMiB = 1024 * 1024;
+    constexpr int64_t storageMiB = 153600;
+    auto unit = GetAgentResourceUnit(500, 512, 1);
+    auto ins = GetInstance("instance1", "shared", 512, 500);
+    (*ins.mutable_resources()->mutable_resources())["storage"] =
+        view_utils::GetNameResourceWithValue("storage", static_cast<double>(storageMiB * bytesPerMiB));
+    functionsystem::schedule_plugin::filter::DefaultFilter filter;
+    auto preAllocated = std::make_shared<PreAllocatedContext>();
+
+    auto res = filter.Filter(preAllocated, ins, unit);
+
+    EXPECT_EQ(res.status.StatusCode(), StatusCode::PARAMETER_ERROR);
+    EXPECT_STREQ(res.status.GetMessage().c_str(), "[storage: Not Found]");
+    EXPECT_STREQ(res.required.c_str(), "storage: 153600MiB");
+}
+
+TEST_F(DefaultFilterTest, MonopolyFailureRequirementDoesNotNarrowToInt32)
+{
+    constexpr double memory = 2147483648.0;
+    auto unit = GetAgentResourceUnit(500, memory, 1);
+    auto ins = GetInstance("instance1", "monopoly", memory, 500);
+    functionsystem::schedule_plugin::filter::DefaultFilter filter;
+    auto preAllocated = std::make_shared<PreAllocatedContext>();
+    preAllocated->preAllocatedSelectedFunctionAgentSet.insert(unit.id());
+
+    auto res = filter.Filter(preAllocated, ins, unit);
+
+    EXPECT_EQ(res.status.StatusCode(), StatusCode::RESOURCE_NOT_ENOUGH);
+    EXPECT_STREQ(res.status.GetMessage().c_str(), "[(500, 2147483648) Already Allocated To Other]");
+}
+
 }  // namespace functionsystem::test::schedule_plugin::filter

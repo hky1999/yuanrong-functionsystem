@@ -31,6 +31,33 @@ namespace functionsystem::schedule_plugin::filter {
 const int32_t MAX_INT_32 = std::numeric_limits<int32_t>::max();
 
 const std::unordered_map<std::string, std::string> RESOURCE_UNIT = { { "CPU", "m" }, { "Memory", "MB" } };
+const std::string STORAGE_RESOURCE_NAME = "storage";
+constexpr double BYTES_PER_MIB = 1024.0 * 1024.0;
+
+// Format only the requirement attached to scheduling failure messages. Resource values remain in their internal
+// scheduling units for capacity and allocatable comparisons.
+std::string FormatResourceRequirementForError(const std::string &name, const resource_view::Resource &resource)
+{
+    auto value = resource.scalar().value();
+    if (name == STORAGE_RESOURCE_NAME) {
+        value /= BYTES_PER_MIB;
+    }
+
+    auto requestResource = name + ": " + std::to_string(static_cast<int64_t>(value));
+    if (name == STORAGE_RESOURCE_NAME) {
+        return requestResource + "MiB";
+    }
+    if (auto iter = RESOURCE_UNIT.find(name); iter != RESOURCE_UNIT.end()) {
+        requestResource += iter->second;
+    }
+    return requestResource;
+}
+
+std::string FormatMonopolyRequirementForError(double cpu, double memory)
+{
+    return "(" + std::to_string(static_cast<int64_t>(cpu)) + ", " +
+           std::to_string(static_cast<int64_t>(memory)) + ")";
+}
 
 std::string DefaultFilter::GetPluginName()
 {
@@ -48,9 +75,8 @@ Status DefaultFilter::MonopolyFilter(const std::shared_ptr<schedule_framework::P
     const auto &selectedSet = preContext->preAllocatedSelectedFunctionAgentSet;
 
     if (selectedSet.find(unit.id()) != selectedSet.end()) {
-        return Status(RESOURCE_NOT_ENOUGH, "(" + std::to_string(static_cast<int>(instanceCpu)) + ", "
-                                               + std::to_string(static_cast<int>(instanceMem))
-                                               + ") Already Allocated To Other");
+        return Status(RESOURCE_NOT_ENOUGH,
+                      FormatMonopolyRequirementForError(instanceCpu, instanceMem) + " Already Allocated To Other");
     }
 
     const auto &fragmentResources = unit.allocatable().resources();
@@ -58,9 +84,8 @@ Status DefaultFilter::MonopolyFilter(const std::shared_ptr<schedule_framework::P
     double fragmentCpu = fragmentResources.at(resource_view::CPU_RESOURCE_NAME).scalar().value();
     // monopoly need to be match precisely
     if (abs(instanceMem - fragmentMem) > EPSINON || abs(instanceCpu - fragmentCpu) > EPSINON) {
-        return Status(RESOURCE_NOT_ENOUGH, "(" + std::to_string(static_cast<int>(instanceCpu)) + ", "
-                                               + std::to_string(static_cast<int>(instanceMem))
-                                               + ") Don't Match Precisely");
+        return Status(RESOURCE_NOT_ENOUGH,
+                      FormatMonopolyRequirementForError(instanceCpu, instanceMem) + " Don't Match Precisely");
     }
 
     if (abs(instanceCpu) < EPSINON) {
@@ -68,19 +93,19 @@ Status DefaultFilter::MonopolyFilter(const std::shared_ptr<schedule_framework::P
     }
     auto bucketIndexesIter(unit.bucketindexs().find(std::to_string(instanceMem / instanceCpu)));
     if (bucketIndexesIter == unit.bucketindexs().end()) {
-        return Status(RESOURCE_NOT_ENOUGH, "(" + std::to_string(static_cast<int>(instanceCpu)) + ", "
-                                               + std::to_string(static_cast<int>(instanceMem)) + ") Not Found");
+        return Status(RESOURCE_NOT_ENOUGH,
+                      FormatMonopolyRequirementForError(instanceCpu, instanceMem) + " Not Found");
     }
     auto bucketsIter(bucketIndexesIter->second.buckets().find(std::to_string(fragmentMem)));
     if (bucketsIter == bucketIndexesIter->second.buckets().end()) {
-        return Status(RESOURCE_NOT_ENOUGH, "(" + std::to_string(static_cast<int>(instanceCpu)) + ", "
-                                               + std::to_string(static_cast<int>(instanceMem)) + ") Not Found");
+        return Status(RESOURCE_NOT_ENOUGH,
+                      FormatMonopolyRequirementForError(instanceCpu, instanceMem) + " Not Found");
     }
 
     // if mono num is 0 in node, the set of feasible node is empty
     if (bucketsIter->second.total().monopolynum() == 0) {
-        return Status(RESOURCE_NOT_ENOUGH, "(" + std::to_string(static_cast<int>(instanceCpu)) + ", "
-                                               + std::to_string(static_cast<int>(instanceMem)) + ") Not Enough");
+        return Status(RESOURCE_NOT_ENOUGH,
+                      FormatMonopolyRequirementForError(instanceCpu, instanceMem) + " Not Enough");
     }
     return Status::OK();
 }
@@ -114,11 +139,7 @@ schedule_framework::Filtered DefaultFilter::ResourceFilter(
                         req.second.scalar().value(), unit.id());
             continue;
         }
-        auto requestResource = req.first + ": " + std::to_string(static_cast<int>(req.second.scalar().value()));
-        if (auto iter = RESOURCE_UNIT.find(req.first); iter != RESOURCE_UNIT.end()) {
-            // add unit
-            requestResource += iter->second;
-        }
+        auto requestResource = FormatResourceRequirementForError(req.first, req.second);
         // Find the same type of resource as the request, like CPU and MEM.
         auto cap = capacity.resources().find(req.first);
         if (cap == capacity.resources().end()) {

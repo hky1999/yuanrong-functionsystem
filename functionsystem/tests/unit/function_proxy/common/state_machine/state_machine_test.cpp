@@ -89,32 +89,37 @@ TEST_F(InstanceStateMachineTest, LowReliabilityTypeTransitionStateToRunning)
 {
     const std::string function = "default/0-test-helloWorld/$latest";
     auto scheduleReq = std::make_shared<messages::ScheduleRequest>();
-    scheduleReq->mutable_instance()->mutable_instancestatus()->set_code(0);
+    scheduleReq->set_requestid("low-reliability-request");
+    scheduleReq->mutable_instance()->set_requestid("low-reliability-request");
+    scheduleReq->mutable_instance()->set_instanceid("low-reliability-instance");
+    scheduleReq->mutable_instance()->set_functionproxyid(TEST_NODE_ID);
+    scheduleReq->mutable_instance()->mutable_instancestatus()->set_code(
+        static_cast<int32_t>(InstanceState::CREATING));
     scheduleReq->mutable_instance()->set_function(function);
     scheduleReq->mutable_instance()->mutable_createoptions()->operator[](functionsystem::RELIABILITY_TYPE) = "low";
     scheduleReq->mutable_instance()->set_lowreliability(true);
     auto context = std::make_shared<InstanceContext>(scheduleReq);
-    auto instanceStateMachine = std::make_shared<InstanceStateMachine>(TEST_NODE_ID, context, false);
+    auto instanceStateMachine = std::make_shared<InstanceStateMachine>(TEST_NODE_ID, context, true);
 
     auto mockControlPlaneObserver = std::make_shared<MockObserver>();
     instanceStateMachine->BindControlPlaneObserver(mockControlPlaneObserver);
     EXPECT_CALL(*mockControlPlaneObserver, WatchInstance).Times(1).WillRepeatedly(Return());
-    EXPECT_CALL(*mockControlPlaneObserver, PutInstanceEvent).Times(2).WillRepeatedly(Return(Status::OK()));
+    EXPECT_CALL(*mockControlPlaneObserver, PutInstanceEvent).Times(1).WillRepeatedly(Return(Status::OK()));
 
     auto mockInstanceOpt = std::make_shared<MockInstanceOperator>();
     instanceStateMachine->instanceOpt_ = mockInstanceOpt;
+    EXPECT_CALL(*mockInstanceOpt, Create(_, _, true))
+        .WillOnce(Return(OperateResult{ Status::OK(), "", 0, 11 }));
     EXPECT_CALL(*mockInstanceOpt, Modify)
-        .WillOnce(Return(OperateResult{ Status::OK(), "", 2 }))
-        .WillOnce(Return(OperateResult{ Status(StatusCode::FAILED), "", 3 }));
+        .WillOnce(Return(OperateResult{ Status(StatusCode::FAILED), "", 1, 12 }));
 
     instanceStateMachine->SetDataSystemHost("127.0.0.1");
-    auto ret = instanceStateMachine->TransitionTo(TransContext{ InstanceState::SCHEDULING, 0, "" });
-    ret = instanceStateMachine->TransitionTo(TransContext{ InstanceState::CREATING, 0, "" });
-    ret = instanceStateMachine->TransitionTo(TransContext{ InstanceState::RUNNING, 0, "" });
+    auto ret = instanceStateMachine->TransitionTo(TransContext{ InstanceState::RUNNING, 0, "" });
     ASSERT_AWAIT_READY(ret);
     ASSERT_TRUE(ret.Get().preState.IsSome());
     ASSERT_TRUE(!ret.Get().status.IsError());
     EXPECT_EQ(ret.Get().preState, InstanceState::CREATING);
+    EXPECT_EQ(ret.Get().version, 1);
     ret = instanceStateMachine->TransitionTo(TransContext{ InstanceState::RUNNING, 0, "" });
     ASSERT_AWAIT_READY(ret);
     ASSERT_TRUE(ret.Get().preState.IsSome());
@@ -126,6 +131,212 @@ TEST_F(InstanceStateMachineTest, LowReliabilityTypeTransitionStateToRunning)
     ASSERT_AWAIT_READY(ret);
     EXPECT_EQ(instanceStateMachine->GetLastSaveFailedState(), 6);
     instanceStateMachine->UnBindControlPlaneObserver();
+}
+
+TEST_F(InstanceStateMachineTest, LowReliabilityInitialRunningConflictReturnsResolvedWinner)
+{
+    const std::string function = "default/0-test-helloWorld/$latest";
+    const std::string instanceID = "shared-low-reliability-instance";
+    auto scheduleReq = std::make_shared<messages::ScheduleRequest>();
+    scheduleReq->set_requestid("loser-request");
+    auto loserInfo = scheduleReq->mutable_instance();
+    loserInfo->set_requestid("loser-request");
+    loserInfo->set_instanceid(instanceID);
+    loserInfo->set_function(function);
+    loserInfo->set_functionproxyid(TEST_NODE_ID);
+    loserInfo->set_tenantid("tenant");
+    loserInfo->mutable_instancestatus()->set_code(static_cast<int32_t>(InstanceState::CREATING));
+    (*loserInfo->mutable_createoptions())[functionsystem::RELIABILITY_TYPE] = "low";
+    loserInfo->set_lowreliability(true);
+
+    auto instanceStateMachine = std::make_shared<InstanceStateMachine>(
+        TEST_NODE_ID, std::make_shared<InstanceContext>(scheduleReq), true);
+    auto mockInstanceOpt = std::make_shared<MockInstanceOperator>();
+    instanceStateMachine->instanceOpt_ = mockInstanceOpt;
+
+    resources::InstanceInfo winnerInfo = *loserInfo;
+    winnerInfo.set_requestid("winner-request");
+    winnerInfo.set_functionproxyid("winner-proxy");
+    winnerInfo.set_runtimeid("winner-runtime");
+    winnerInfo.mutable_instancestatus()->set_code(static_cast<int32_t>(InstanceState::RUNNING));
+    winnerInfo.set_version(1);
+    resources::RouteInfo routeInfo;
+    TransToRouteInfoFromInstanceInfo(winnerInfo, routeInfo);
+    std::string routeJson;
+    ASSERT_TRUE(TransToJsonFromRouteInfo(routeJson, routeInfo));
+
+    EXPECT_CALL(*mockInstanceOpt, Create(_, _, true))
+        .WillOnce(Return(OperateResult{
+            Status(StatusCode::INSTANCE_TRANSACTION_WRONG_VERSION), "", 0, 0 }));
+    EXPECT_CALL(*mockInstanceOpt, GetInstance(GenInstanceRouteKey(instanceID)))
+        .WillOnce(Return(OperateResult{ Status::OK(), routeJson, 0, 17 }));
+
+    auto ret = instanceStateMachine->TransitionTo(TransContext{ InstanceState::RUNNING, 0, "" });
+    ASSERT_AWAIT_READY(ret);
+    ASSERT_TRUE(ret.Get().preState.IsNone());
+    EXPECT_EQ(ret.Get().status.StatusCode(), StatusCode::INSTANCE_TRANSACTION_WRONG_VERSION);
+    EXPECT_EQ(ret.Get().savedInfo.instanceid(), winnerInfo.instanceid());
+    EXPECT_EQ(ret.Get().savedInfo.requestid(), winnerInfo.requestid());
+    EXPECT_EQ(ret.Get().savedInfo.functionproxyid(), winnerInfo.functionproxyid());
+    EXPECT_EQ(ret.Get().savedInfo.instancestatus().code(), static_cast<int32_t>(InstanceState::RUNNING));
+    EXPECT_TRUE(ret.Get().savedInfo.runtimeid().empty());
+    EXPECT_EQ(ret.Get().previousInfo.requestid(), "loser-request");
+    EXPECT_EQ(ret.Get().currentModRevision, 17);
+}
+
+TEST_F(InstanceStateMachineTest, LowReliabilityInitialRunningConflictRejectsInvalidRoute)
+{
+    const std::string function = "default/0-test-helloWorld/$latest";
+    const std::string instanceID = "shared-low-reliability-instance";
+    auto scheduleReq = std::make_shared<messages::ScheduleRequest>();
+    scheduleReq->set_requestid("loser-request");
+    auto loserInfo = scheduleReq->mutable_instance();
+    loserInfo->set_requestid("loser-request");
+    loserInfo->set_instanceid(instanceID);
+    loserInfo->set_function(function);
+    loserInfo->set_functionproxyid(TEST_NODE_ID);
+    loserInfo->set_tenantid("tenant");
+    loserInfo->mutable_instancestatus()->set_code(static_cast<int32_t>(InstanceState::CREATING));
+    (*loserInfo->mutable_createoptions())[functionsystem::RELIABILITY_TYPE] = "low";
+    loserInfo->set_lowreliability(true);
+
+    auto instanceStateMachine = std::make_shared<InstanceStateMachine>(
+        TEST_NODE_ID, std::make_shared<InstanceContext>(scheduleReq), true);
+    auto mockInstanceOpt = std::make_shared<MockInstanceOperator>();
+    instanceStateMachine->instanceOpt_ = mockInstanceOpt;
+
+    resources::InstanceInfo winnerInfo = *loserInfo;
+    winnerInfo.set_requestid("winner-request");
+    winnerInfo.set_functionproxyid("winner-proxy");
+    winnerInfo.mutable_instancestatus()->set_code(static_cast<int32_t>(InstanceState::RUNNING));
+    resources::RouteInfo routeInfo;
+    TransToRouteInfoFromInstanceInfo(winnerInfo, routeInfo);
+    routeInfo.clear_functionproxyid();
+    std::string routeJson;
+    ASSERT_TRUE(TransToJsonFromRouteInfo(routeJson, routeInfo));
+
+    EXPECT_CALL(*mockInstanceOpt, Create(_, _, true))
+        .WillOnce(Return(OperateResult{
+            Status(StatusCode::INSTANCE_TRANSACTION_WRONG_VERSION), "", 0, 0 }));
+    EXPECT_CALL(*mockInstanceOpt, GetInstance(GenInstanceRouteKey(instanceID)))
+        .WillOnce(Return(OperateResult{ Status::OK(), routeJson, 0, 18 }));
+
+    auto ret = instanceStateMachine->TransitionTo(TransContext{ InstanceState::RUNNING, 0, "" });
+    ASSERT_AWAIT_READY(ret);
+    EXPECT_TRUE(ret.Get().preState.IsNone());
+    EXPECT_TRUE(ret.Get().savedInfo.instanceid().empty());
+    EXPECT_EQ(ret.Get().status.StatusCode(), StatusCode::INSTANCE_TRANSACTION_WRONG_VERSION);
+}
+
+TEST_F(InstanceStateMachineTest, LowReliabilityInitialRunningConflictUsesSharedRouteOnly)
+{
+    const std::string function = "default/0-test-helloWorld/$latest";
+    const std::string instanceID = "shared-low-reliability-instance";
+    auto scheduleReq = std::make_shared<messages::ScheduleRequest>();
+    auto loserInfo = scheduleReq->mutable_instance();
+    loserInfo->set_requestid("loser-request");
+    loserInfo->set_instanceid(instanceID);
+    loserInfo->set_function(function);
+    loserInfo->set_functionproxyid(TEST_NODE_ID);
+    loserInfo->set_tenantid("tenant");
+    loserInfo->set_lowreliability(true);
+    loserInfo->mutable_instancestatus()->set_code(static_cast<int32_t>(InstanceState::RUNNING));
+    (*loserInfo->mutable_createoptions())[functionsystem::RELIABILITY_TYPE] = "low";
+
+    auto stateMachine = std::make_shared<InstanceStateMachine>(
+        TEST_NODE_ID, std::make_shared<InstanceContext>(scheduleReq), true);
+    auto mockInstanceOpt = std::make_shared<MockInstanceOperator>();
+    stateMachine->instanceOpt_ = mockInstanceOpt;
+
+    auto winnerInfo = *loserInfo;
+    winnerInfo.set_requestid("winner-request");
+    winnerInfo.set_functionproxyid("winner-proxy");
+    winnerInfo.set_version(1);
+    resources::RouteInfo routeInfo;
+    TransToRouteInfoFromInstanceInfo(winnerInfo, routeInfo);
+    std::string routeJson;
+    ASSERT_TRUE(TransToJsonFromRouteInfo(routeJson, routeInfo));
+
+    EXPECT_CALL(*mockInstanceOpt, GetInstance(GenInstanceRouteKey(instanceID)))
+        .WillOnce(Return(OperateResult{ Status::OK(), routeJson, 0, 17 }));
+
+    auto ret = stateMachine->ResolveInitialLowReliabilityCreateConflict(
+        *loserInfo, *loserInfo,
+        Status(StatusCode::INSTANCE_TRANSACTION_WRONG_VERSION, "route exists"));
+    ASSERT_AWAIT_READY(ret);
+    EXPECT_EQ(ret.Get().savedInfo.instanceid(), winnerInfo.instanceid());
+    EXPECT_EQ(ret.Get().savedInfo.requestid(), winnerInfo.requestid());
+    EXPECT_EQ(ret.Get().savedInfo.functionproxyid(), winnerInfo.functionproxyid());
+    EXPECT_TRUE(ret.Get().savedInfo.runtimeid().empty());
+    EXPECT_EQ(ret.Get().currentModRevision, 17);
+    EXPECT_EQ(ret.Get().status.StatusCode(), StatusCode::INSTANCE_TRANSACTION_WRONG_VERSION);
+}
+
+TEST_F(InstanceStateMachineTest, LowReliabilityInitialRunningCreateIsNarrowlyScoped)
+{
+    const bool previousForceLowReliability = IsForceLowReliabilityInstanceEnabled();
+    SetForceLowReliabilityInstance(false);
+    auto scheduleReq = std::make_shared<messages::ScheduleRequest>();
+    auto instance = scheduleReq->mutable_instance();
+    instance->set_requestid("scope-request");
+    instance->set_instanceid("scope-instance");
+    instance->set_function("default/0-test-scope/$latest");
+    instance->mutable_instancestatus()->set_code(static_cast<int32_t>(InstanceState::RUNNING));
+    (*instance->mutable_createoptions())[functionsystem::RELIABILITY_TYPE] = "low";
+    auto stateMachine = std::make_shared<InstanceStateMachine>(
+        TEST_NODE_ID, std::make_shared<InstanceContext>(scheduleReq), true);
+
+    EXPECT_TRUE(stateMachine->IsInitialLowReliabilityRunningPersistence(
+        *instance, InstanceState::CREATING, 0));
+    EXPECT_FALSE(stateMachine->IsInitialLowReliabilityRunningPersistence(
+        *instance, InstanceState::SCHEDULING, 0));
+    EXPECT_FALSE(stateMachine->IsInitialLowReliabilityRunningPersistence(
+        *instance, InstanceState::CREATING, 1));
+
+    (*instance->mutable_createoptions())[functionsystem::RELIABILITY_TYPE] = "high";
+    EXPECT_FALSE(stateMachine->IsInitialLowReliabilityRunningPersistence(
+        *instance, InstanceState::CREATING, 0));
+    SetForceLowReliabilityInstance(true);
+    EXPECT_TRUE(stateMachine->IsInitialLowReliabilityRunningPersistence(
+        *instance, InstanceState::CREATING, 0));
+    SetForceLowReliabilityInstance(previousForceLowReliability);
+    (*instance->mutable_createoptions())[functionsystem::RELIABILITY_TYPE] = "low";
+
+    instance->set_groupid("group");
+    EXPECT_FALSE(stateMachine->IsInitialLowReliabilityRunningPersistence(
+        *instance, InstanceState::CREATING, 0));
+    instance->clear_groupid();
+
+    (*instance->mutable_createoptions())[functionsystem::APP_ENTRYPOINT] = "driver.py";
+    EXPECT_FALSE(stateMachine->IsInitialLowReliabilityRunningPersistence(
+        *instance, InstanceState::CREATING, 0));
+    instance->mutable_createoptions()->erase(functionsystem::APP_ENTRYPOINT);
+
+    (*instance->mutable_createoptions())[functionsystem::RESOURCE_OWNER_KEY] =
+        functionsystem::STATIC_FUNCTION_OWNER_VALUE;
+    EXPECT_FALSE(stateMachine->IsInitialLowReliabilityRunningPersistence(
+        *instance, InstanceState::CREATING, 0));
+    instance->mutable_createoptions()->erase(functionsystem::RESOURCE_OWNER_KEY);
+
+    instance->set_ischeckpointed(true);
+    EXPECT_FALSE(stateMachine->IsInitialLowReliabilityRunningPersistence(
+        *instance, InstanceState::CREATING, 0));
+    instance->set_ischeckpointed(false);
+
+    instance->mutable_snapshotinfo();
+    EXPECT_FALSE(stateMachine->IsInitialLowReliabilityRunningPersistence(
+        *instance, InstanceState::CREATING, 0));
+    instance->clear_snapshotinfo();
+
+    (*instance->mutable_createoptions())[functionsystem::RECOVER_RETRY_TIMES_KEY] = "1";
+    EXPECT_FALSE(stateMachine->IsInitialLowReliabilityRunningPersistence(
+        *instance, InstanceState::CREATING, 0));
+    instance->mutable_createoptions()->erase(functionsystem::RECOVER_RETRY_TIMES_KEY);
+
+    SetForceLowReliabilityInstance(previousForceLowReliability);
+    auto drGuard = function_proxy::DirectRoutingConfig::EnableForTest();
+    EXPECT_FALSE(stateMachine->IsInitialLowReliabilityRunningPersistence(
+        *instance, InstanceState::CREATING, 0));
 }
 
 

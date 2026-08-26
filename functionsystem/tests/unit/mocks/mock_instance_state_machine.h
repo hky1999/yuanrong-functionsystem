@@ -93,6 +93,7 @@ public:
     MOCK_METHOD(std::shared_ptr<InstanceContext>, GetInstanceContextCopy, (), (override));
     MOCK_METHOD(litebus::Future<std::string>, GetCancelFuture, (), (override));
     MOCK_METHOD(int64_t, GetModRevision, (), (override));
+    MOCK_METHOD(void, SetModRevision, (const int64_t modRevision), (override));
     MOCK_METHOD(void, TagStop, (), (override));
 };
 }  // namespace functionsystem::test

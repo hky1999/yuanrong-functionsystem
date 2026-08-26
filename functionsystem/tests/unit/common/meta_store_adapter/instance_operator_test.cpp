@@ -167,6 +167,48 @@ TEST_F(InstanceOperatorTest, CreateRouteExist)
     EXPECT_TRUE(TransToInstanceInfoFromJson(instanceInfoSaved, fut.Get().value));
 }
 
+TEST_F(InstanceOperatorTest, CreateSameInstanceWithDifferentRouteIsConflict)
+{
+    InstanceOperator instanceOpt(metaStoreClient_);
+
+    const std::string value1 =
+        R"({"instanceID":"0ee7cafc-93b9-4be3-ae01-000000000075","requestID":"request-1","functionProxyID":"proxy-1"})";
+    const std::string value2 =
+        R"({"instanceID":"0ee7cafc-93b9-4be3-ae01-000000000075","requestID":"request-2","functionProxyID":"proxy-2"})";
+    auto instancePutInfo = std::make_shared<StoreInfo>(key, value1);
+    auto routePutInfo = std::make_shared<StoreInfo>(routeKey, value1);
+    auto future = instanceOpt.Create(instancePutInfo, routePutInfo, false);
+    ASSERT_AWAIT_READY(future);
+    ASSERT_TRUE(future.Get().status.IsOk());
+
+    // The request-scoped key is an exact retry, but the caller's expected
+    // route differs. The failed two-key transaction must not be treated as
+    // idempotent success after inspecting only the first key.
+    routePutInfo->value = value2;
+    future = instanceOpt.Create(instancePutInfo, routePutInfo, false);
+    ASSERT_AWAIT_READY(future);
+    EXPECT_EQ(future.Get().status.StatusCode(), StatusCode::INSTANCE_TRANSACTION_WRONG_VERSION);
+    EXPECT_EQ(future.Get().value, value1);
+}
+
+TEST_F(InstanceOperatorTest, CreateSameInstanceWithMissingRouteIsNotIdempotent)
+{
+    InstanceOperator instanceOpt(metaStoreClient_);
+
+    const std::string value =
+        R"({"instanceID":"0ee7cafc-93b9-4be3-ae01-000000000075","requestID":"request-1","functionProxyID":"proxy-1"})";
+    auto instancePutInfo = std::make_shared<StoreInfo>(key, value);
+    auto future = instanceOpt.Create(instancePutInfo, nullptr, false);
+    ASSERT_AWAIT_READY(future);
+    ASSERT_TRUE(future.Get().status.IsOk());
+
+    auto routePutInfo = std::make_shared<StoreInfo>(routeKey, value);
+    future = instanceOpt.Create(instancePutInfo, routePutInfo, false);
+    ASSERT_AWAIT_READY(future);
+    EXPECT_EQ(future.Get().status.StatusCode(), StatusCode::INSTANCE_TRANSACTION_GET_INFO_FAILED);
+    EXPECT_TRUE(future.Get().value.empty());
+}
+
 TEST_F(InstanceOperatorTest, CreateInstanceETCDUnavailable)
 {
     auto helper = GrpcClientHelper(10);

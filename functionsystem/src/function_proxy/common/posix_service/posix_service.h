@@ -29,6 +29,9 @@ using UpdatePosixClientCallback = std::function<void(const std::string &instance
 struct PosixMetaData {
     std::string instanceID;
     std::string runtimeID;
+    std::string sourceID;
+    std::string destinationID;
+    std::string streamRole;
     std::string token;
     std::string accessKey;
     std::string timestamp;
@@ -64,6 +67,7 @@ private:
 
     inline static std::mutex mutex_;
     inline static std::unordered_map<std::string, std::shared_ptr<grpc::PosixClient>> clients_;
+    inline static std::unordered_map<std::string, std::shared_ptr<grpc::PosixClient>> eventClients_;
     PosixMetaData GetMetaData(const ::grpc::CallbackServerContext *context) const;
 };
 

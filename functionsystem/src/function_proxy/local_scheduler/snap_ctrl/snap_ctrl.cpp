@@ -82,6 +82,12 @@ void SnapCtrl::BindInstanceCtrl(const std::shared_ptr<InstanceCtrl> &instanceCtr
     litebus::Async(aid_, &SnapCtrlActor::BindInstanceCtrl, instanceCtrl);
 }
 
+void SnapCtrl::BindIdleMgr(const std::shared_ptr<IdleMgr> &idleMgr)
+{
+    ASSERT_IF_NULL(snapCtrlActor_);
+    litebus::Async(aid_, &SnapCtrlActor::BindIdleMgr, idleMgr);
+}
+
 void SnapCtrl::BindClientManager(const std::shared_ptr<ControlInterfaceClientManagerProxy> &clientManager)
 {
     ASSERT_IF_NULL(snapCtrlActor_);
@@ -101,6 +107,18 @@ litebus::Future<KillResponse> SnapCtrl::HandleSnapStart(
 {
     ASSERT_IF_NULL(snapCtrlActor_);
     return litebus::Async(aid_, &SnapCtrlActor::HandleSnapStart, requestID, checkpointID, payload);
+}
+
+litebus::Future<KillResponse> SnapCtrl::HandleWake(const std::string &requestID, const std::string &instanceID)
+{
+    ASSERT_IF_NULL(snapCtrlActor_);
+    return litebus::Async(aid_, &SnapCtrlActor::HandleWake, requestID, instanceID);
+}
+
+litebus::Future<std::vector<std::pair<std::string, SnapCtrlActor::ParkedEntry>>> SnapCtrl::GetParkedInstances()
+{
+    ASSERT_IF_NULL(snapCtrlActor_);
+    return litebus::Async(aid_, &SnapCtrlActor::GetParkedInstances);
 }
 
 void SnapCtrl::SnapStart(

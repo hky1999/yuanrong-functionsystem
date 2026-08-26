@@ -177,6 +177,8 @@ private:
     std::shared_ptr<litebus::Promise<messages::QuerySchedulingQueueResponse>> getSchedulingQueuePromise_;
 
     BACK_OFF_RETRY_HELPER(DomainSchedMgrActor, messages::QueryResourcesInfoResponse, queryResourceHelper_);
+    BACK_OFF_RETRY_HELPER(DomainSchedMgrActor, messages::QuerySchedulingQueueResponse,
+                          getSchedulingQueueHelper_);
     std::shared_ptr<litebus::AID> domainSchedulerAID_;
     std::shared_ptr<HeartbeatObserveDriver> heartbeatObserveDriver_ = nullptr;
 

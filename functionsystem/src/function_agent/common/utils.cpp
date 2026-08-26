@@ -35,6 +35,8 @@ const static std::string RUNTIME_ENV_PREFIX = "func-";
 const std::string DEV_CLUSTER_IPS_KEY = "dev_cluster_ips";  // NOLINT
 const std::string CRYPTO_ALGORITHM_STR = "cryptoAlgorithm";
 const std::string ENV_KEY = "envKey";
+const std::string STORAGE_RESOURCE_NAME = "storage";
+const std::string STORAGE_LIMIT_EXTENSION = "STORAGE_LIMIT";
 const int CONVERSION = 20;  // MB -> TB
 const int DEFAULT_QUOTA = 512;
 const int QUOTA_NO_MONITOR = -1;
@@ -156,6 +158,29 @@ void ParseDelegateEnv(const std::string &value, messages::RuntimeConfig &runtime
     }
 }
 
+void SetResourceLimits(const std::shared_ptr<messages::DeployInstanceRequest> &req,
+                       messages::RuntimeConfig &runtimeConf)
+{
+    const auto &extension = req->scheduleoption().extension();
+    auto &resources = *runtimeConf.mutable_resources()->mutable_resources();
+    if (auto cpuLimitIter = extension.find("CPU_LIMIT");
+        cpuLimitIter != extension.end() && resources.find(CPU_RESOURCE_NAME) != resources.end()) {
+        resources[CPU_RESOURCE_NAME].mutable_scalar()->set_limit(std::stod(cpuLimitIter->second));
+    }
+    // Go sandbox raw-create writes the all-caps variant; accept both spellings
+    auto memLimitIter = extension.find("Memory_LIMIT");
+    if (memLimitIter == extension.end()) {
+        memLimitIter = extension.find("MEMORY_LIMIT");
+    }
+    if (memLimitIter != extension.end() && resources.find(MEMORY_RESOURCE_NAME) != resources.end()) {
+        resources[MEMORY_RESOURCE_NAME].mutable_scalar()->set_limit(std::stod(memLimitIter->second));
+    }
+    if (auto storageLimitIter = extension.find(STORAGE_LIMIT_EXTENSION);
+        storageLimitIter != extension.end() && resources.find(STORAGE_RESOURCE_NAME) != resources.end()) {
+        resources[STORAGE_RESOURCE_NAME].mutable_scalar()->set_limit(std::stod(storageLimitIter->second));
+    }
+}
+
 messages::RuntimeConfig SetRuntimeConfig(const std::shared_ptr<messages::DeployInstanceRequest> &req)
 {
     ASSERT_IF_NULL(req);
@@ -167,20 +192,8 @@ messages::RuntimeConfig SetRuntimeConfig(const std::shared_ptr<messages::DeployI
     }
     (*runtimeConf.mutable_resources()) = req->resources();
 
-    // Set CPU/Memory limit from scheduleOption.extension (set by SDK InvokeOptions.cpu_limit/mem_limit).
-    const auto &extension = req->scheduleoption().extension();
-    if (auto cpuLimitIter = extension.find("CPU_LIMIT"); cpuLimitIter != extension.end()) {
-        auto &resources = *runtimeConf.mutable_resources()->mutable_resources();
-        if (resources.find(CPU_RESOURCE_NAME) != resources.end()) {
-            resources[CPU_RESOURCE_NAME].mutable_scalar()->set_limit(std::stod(cpuLimitIter->second));
-        }
-    }
-    if (auto memLimitIter = extension.find("Memory_LIMIT"); memLimitIter != extension.end()) {
-        auto &resources = *runtimeConf.mutable_resources()->mutable_resources();
-        if (resources.find(MEMORY_RESOURCE_NAME) != resources.end()) {
-            resources[MEMORY_RESOURCE_NAME].mutable_scalar()->set_limit(std::stod(memLimitIter->second));
-        }
-    }
+    // Set resource limits from scheduleOption.extension.
+    SetResourceLimits(req, runtimeConf);
 
     AddHeteroConfig(req, runtimeConf);
     AddDiskConfig(req, runtimeConf);

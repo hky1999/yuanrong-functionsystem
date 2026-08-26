@@ -84,6 +84,36 @@ TEST(MetricsActorSandboxRuntimeCapabilitiesTest, AcceptsEmptySnapshotWithoutPubl
     EXPECT_EQ(unit.nodelabels().count(SANDBOX_RUNTIME_LABEL), size_t{0});
 }
 
+// D-7: the sandboxd-Stats feed must overlay per-instance Memory actualuse
+// even when the pid-based instance collectors report nothing (runsc pid=0)
+TEST(MetricsActorInstanceMemoryUsageTest, OverlayFeedsPerInstanceActualuse)
+{
+    TestMetricsActor actor;
+
+    // pid-based collector reported nothing for id-1; Stats feed says 1536 MB
+    actor.UpdateInstanceMemoryUsage("id-1", 1536.0);
+    // invalid reports must be dropped
+    actor.UpdateInstanceMemoryUsage("", 100.0);
+    actor.UpdateInstanceMemoryUsage("id-2", -1.0);
+
+    auto unit = actor.BuildResourceUnit({});
+    ASSERT_EQ(unit.instances().count("id-1"), size_t{1});
+    const auto &actual = unit.instances().at("id-1").actualuse().resources();
+    ASSERT_EQ(actual.count(resource_view::MEMORY_RESOURCE_NAME), size_t{1});
+    EXPECT_EQ(actual.at(resource_view::MEMORY_RESOURCE_NAME).scalar().value(), 1536.0);
+    EXPECT_EQ(unit.instances().count("id-2"), size_t{0});
+
+    // a later report replaces the value; DeleteInstance drops the instance
+    actor.UpdateInstanceMemoryUsage("id-1", 2048.0);
+    unit = actor.BuildResourceUnit({});
+    EXPECT_EQ(unit.instances().at("id-1").actualuse().resources().at(resource_view::MEMORY_RESOURCE_NAME)
+                  .scalar().value(),
+              2048.0);
+    actor.DeleteInstance("/deploy", "id-1");
+    unit = actor.BuildResourceUnit({});
+    EXPECT_EQ(unit.instances().count("id-1"), size_t{0});
+}
+
 TEST(MetricsActorGpuCountTest, BuildsSparseGpuCountResource)
 {
     TestMetricsActor actor;

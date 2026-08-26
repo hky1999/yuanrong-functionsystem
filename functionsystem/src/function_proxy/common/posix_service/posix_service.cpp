@@ -24,6 +24,10 @@
 
 namespace functionsystem {
 using namespace runtime_rpc;
+namespace {
+constexpr const char *FUNCTION_PROXY_STREAM_ID = "function-proxy";
+constexpr const char *EVENT_STREAM_ROLE = "event";
+}
 ::grpc::ServerBidiReactor<StreamingMessage, StreamingMessage> *FailureReactor(const ::grpc::Status &status)
 {
     class Reactor : public ::grpc::ServerBidiReactor<StreamingMessage, StreamingMessage> {
@@ -94,6 +98,31 @@ using namespace runtime_rpc;
         }
     }
 
+    const bool isEventConnection = metaData.streamRole == EVENT_STREAM_ROLE;
+    if (isEventConnection) {
+        if (metaData.destinationID != FUNCTION_PROXY_STREAM_ID
+            || !PosixService::CheckClientIsReady(metaData.instanceID)) {
+            YRLOG_ERROR("invalid event connection for instance({}), destination({})", metaData.instanceID,
+                        metaData.destinationID);
+            return FailureReactor(::grpc::Status(::grpc::StatusCode::FAILED_PRECONDITION,
+                                                 "event connection requires a ready control stream"));
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (auto iter = eventClients_.find(metaData.instanceID);
+            iter != eventClients_.end() && !iter->second->IsDone()) {
+            YRLOG_ERROR("event connection already exists for instance {}", metaData.instanceID);
+            return FailureReactor(
+                ::grpc::Status(::grpc::StatusCode::ALREADY_EXISTS, "event connection is already existed."));
+        }
+        auto reactor = std::make_shared<grpc::PosixStream::ServerReactor>();
+        auto eventClient = std::make_shared<grpc::PosixStream>(
+            reactor, context, metaData.instanceID, metaData.runtimeID);
+        eventClients_[metaData.instanceID] = eventClient;
+        YRLOG_INFO("accepted event MessageStream from instance({}), runtime({})",
+                   metaData.instanceID, metaData.runtimeID);
+        return reactor.get();
+    }
+
     if (PosixService::CheckClientIsReady(metaData.instanceID)) {
         YRLOG_ERROR(
             "client connect request unauthorized, instance id: {} already running, can't accept an new connection",
@@ -129,6 +158,15 @@ PosixMetaData PosixService::GetMetaData(const ::grpc::CallbackServerContext *con
         if (key == "runtime_id") {
             metaData.runtimeID = std::string(metaIte.second.data(), metaIte.second.length());
         }
+        if (key == "source_id") {
+            metaData.sourceID = std::string(metaIte.second.data(), metaIte.second.length());
+        }
+        if (key == "dst_id") {
+            metaData.destinationID = std::string(metaIte.second.data(), metaIte.second.length());
+        }
+        if (key == "stream_role") {
+            metaData.streamRole = std::string(metaIte.second.data(), metaIte.second.length());
+        }
         if (key == "authorization") {
             metaData.token = std::string(metaIte.second.data(), metaIte.second.length());
         }
@@ -156,8 +194,23 @@ bool PosixService::CheckClientIsReady(const std::string &instanceID)
 
 void PosixService::DeleteClient(const std::string &instanceID)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-    (void)clients_.erase(instanceID);
+    std::shared_ptr<grpc::PosixClient> controlClient;
+    std::shared_ptr<grpc::PosixClient> eventClient;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (auto iter = clients_.find(instanceID); iter != clients_.end()) {
+            controlClient = std::move(iter->second);
+            (void)clients_.erase(iter);
+        }
+        if (auto iter = eventClients_.find(instanceID); iter != eventClients_.end()) {
+            eventClient = std::move(iter->second);
+            (void)eventClients_.erase(iter);
+        }
+    }
+    // Destroy streams after releasing mutex_: stopping a stream may synchronously
+    // wait for its reactor callback, which must never run under the registry lock.
+    eventClient.reset();
+    controlClient.reset();
 }
 
 void PosixService::UpdateClient(const std::string &instanceID, const std::shared_ptr<grpc::PosixClient> &client)

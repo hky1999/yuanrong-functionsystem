@@ -120,6 +120,14 @@ litebus::Future<std::pair<bool, std::shared_ptr<runtime_rpc::StreamingMessage>>>
     return std::make_pair<bool, std::shared_ptr<runtime_rpc::StreamingMessage>>(false, std::move(response));
 }
 
+std::pair<bool, std::shared_ptr<runtime_rpc::StreamingMessage>> FrontendAdapterTrue(
+    const std::string &, const std::shared_ptr<runtime_rpc::StreamingMessage> &)
+{
+    auto response = std::make_shared<runtime_rpc::StreamingMessage>();
+    response->mutable_callresultack()->set_code(common::ErrorCode::ERR_NONE);
+    return { true, response };
+}
+
 TEST_F(InvocationHandlerTest, CallResultAdapter)
 {
     std::shared_ptr<runtime_rpc::StreamingMessage> response = std::make_shared<runtime_rpc::StreamingMessage>();
@@ -151,6 +159,24 @@ TEST_F(InvocationHandlerTest, CallResultAdapter)
     responseFuture = InvocationHandler::CallResultAdapter("from", std::move(request2));
     ASSERT_AWAIT_READY(responseFuture);
     EXPECT_EQ(responseFuture.Get()->callresultack().code(), common::ERR_INNER_COMMUNICATION);
+}
+
+TEST_F(InvocationHandlerTest, FrontendConsumedCallResultCompletesProxyCall)
+{
+    InvocationHandler::RegisterFrontendCallResultReceiver(FrontendAdapterTrue);
+    auto request = std::make_shared<runtime_rpc::StreamingMessage>();
+    request->mutable_callresultreq()->set_instanceid("function-proxy");
+    request->mutable_callresultreq()->set_requestid("frontend-request");
+    expectedAid_.SetName("runtime-instance");
+
+    auto ack = std::make_shared<runtime_rpc::StreamingMessage>();
+    ack->mutable_callresultack()->set_code(common::ERR_NONE);
+    EXPECT_CALL(*instanceProxy_, CompleteFrontendCall(expectedAid_, request, _)).WillOnce(Return(ack));
+
+    auto responseFuture = InvocationHandler::CallResultAdapter("runtime-instance", request);
+    ASSERT_AWAIT_READY(responseFuture);
+    EXPECT_EQ(responseFuture.Get()->callresultack().code(), common::ERR_NONE);
+    InvocationHandler::RegisterFrontendCallResultReceiver(nullptr);
 }
 
 TEST_F(InvocationHandlerTest, AuthorizeTest)

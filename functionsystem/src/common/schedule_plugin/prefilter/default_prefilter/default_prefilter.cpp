@@ -20,6 +20,12 @@
 
 namespace functionsystem::schedule_plugin::prefilter {
 
+std::string FormatMonopolyRequirementForError(double cpu, double memory)
+{
+    return "(" + std::to_string(static_cast<int64_t>(cpu)) + ", " +
+           std::to_string(static_cast<int64_t>(memory)) + ")";
+}
+
 Status CheckParam(const std::shared_ptr<schedule_framework::PreAllocatedContext> &ctx,
                   const resource_view::InstanceInfo &instance)
 {
@@ -87,8 +93,7 @@ std::shared_ptr<schedule_framework::PreFilterResult> DefaultPreFilter::PrecisePr
     if (bucketIndexesIter == bucketIndexes.end()) {
         YRLOG_WARN("{}|(schedule)the proportion({}) of instance({}) isn't found", inst.requestID, proportionStr,
                    inst.instanceID);
-        std::string errMsg = "(" + std::to_string(static_cast<int>(inst.cpuVal)) + ", "
-                             + std::to_string(static_cast<int>(inst.memVal)) + ") Not Found";
+        std::string errMsg = FormatMonopolyRequirementForError(inst.cpuVal, inst.memVal) + " Not Found";
         return std::make_shared<schedule_framework::ProtoMapPreFilterResult<resource_view::ResourceUnit>>(
             resourceUnit.fragment(), Status{ StatusCode::RESOURCE_NOT_ENOUGH, errMsg });
     }
@@ -98,8 +103,7 @@ std::shared_ptr<schedule_framework::PreFilterResult> DefaultPreFilter::PrecisePr
     if (bucketsIter == buckets.end()) {
         YRLOG_WARN("{}|(schedule)the mem({}) of instance({}) isn't found", inst.requestID, std::to_string(inst.memVal),
                    inst.instanceID);
-        std::string errMsg = "(" + std::to_string(static_cast<int>(inst.cpuVal)) + ", "
-                             + std::to_string(static_cast<int>(inst.memVal)) + ") Not Found";
+        std::string errMsg = FormatMonopolyRequirementForError(inst.cpuVal, inst.memVal) + " Not Found";
         return std::make_shared<schedule_framework::ProtoMapPreFilterResult<resource_view::ResourceUnit>>(
             resourceUnit.fragment(), Status{ StatusCode::RESOURCE_NOT_ENOUGH, errMsg });
     }
@@ -110,8 +114,7 @@ std::shared_ptr<schedule_framework::PreFilterResult> DefaultPreFilter::PrecisePr
     if (total.monopolynum() == 0) {
         YRLOG_WARN("{}|(schedule)the num of pod([{}, {}]) required by the instance({}) is 0", inst.requestID,
                    inst.memVal, inst.cpuVal, inst.instanceID);
-        std::string errMsg = "(" + std::to_string(static_cast<int>(inst.cpuVal)) + ", "
-                             + std::to_string(static_cast<int>(inst.memVal)) + ") Not Enough";
+        std::string errMsg = FormatMonopolyRequirementForError(inst.cpuVal, inst.memVal) + " Not Enough";
         return std::make_shared<schedule_framework::ProtoMapPreFilterResult<resource_view::ResourceUnit>>(
             resourceUnit.fragment(), Status{ StatusCode::RESOURCE_NOT_ENOUGH, errMsg });
     }

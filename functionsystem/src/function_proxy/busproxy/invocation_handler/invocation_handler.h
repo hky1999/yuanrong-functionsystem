@@ -36,6 +36,8 @@ public:
         const std::string &from, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
     static litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> CallResult(
         const std::string &from, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
+    static litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> EventAdapter(
+        const std::string &from, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
 
     using CreateCallResultReciver =
         std::function<litebus::Future<std::pair<bool, std::shared_ptr<runtime_rpc::StreamingMessage>>>(
@@ -51,6 +53,12 @@ public:
     static void RegisterFrontendCallResultReceiver(const FrontendCallResultReceiver frontendCallResult)
     {
         frontendCallResultReceiver_ = frontendCallResult;
+    }
+    using FrontendEventReceiver =
+        std::function<bool(const std::string &, const std::shared_ptr<runtime_rpc::StreamingMessage> &)>;
+    static void RegisterFrontendEventReceiver(const FrontendEventReceiver frontendEvent)
+    {
+        frontendEventReceiver_ = frontendEvent;
     }
     static void BindUrl(const std::string &url)
     {
@@ -113,6 +121,7 @@ private:
         const SharedStreamMsg &request, const std::shared_ptr<busproxy::TimePoint> &time);
     inline static CreateCallResultReciver createCallResultReceiver_ = nullptr;
     inline static FrontendCallResultReceiver frontendCallResultReceiver_ = nullptr;
+    inline static FrontendEventReceiver frontendEventReceiver_ = nullptr;
     inline static std::string localUrl_;
     inline static std::shared_ptr<busproxy::InstanceProxyWrapper> instanceProxy_{ nullptr };
     inline static std::shared_ptr<functionsystem::MemoryMonitor> memoryMonitor_{ nullptr };

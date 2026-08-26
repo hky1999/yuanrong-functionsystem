@@ -304,11 +304,14 @@ TEST_F(DomainSchedMgrActorTest, GetSchedulingQueue)
 
     auto req = std::make_shared<messages::QuerySchedulingQueueRequest>();
     req->set_requestid("request");
-    EXPECT_CALL(*scheduler.get(), MockGetSchedulingQueue(testing::_, testing::_, testing::_)).Times(1);
+    litebus::Future<std::string> receivedRequest;
+    EXPECT_CALL(*scheduler.get(), MockGetSchedulingQueue(testing::_, testing::_, testing::_))
+        .WillOnce(testing::DoAll(FutureArg<2>(&receivedRequest)));
 
     auto future = litebus::Async(actor->GetAID(), &DomainSchedMgrActor::GetSchedulingQueue, "MockDomainScheduler",
                                  scheduler->GetAID().Url(), req);
 
+    ASSERT_AWAIT_READY(receivedRequest);
     scheduler->ResponseGetSchedulingQueue(actor->GetAID(), "");
     messages::QuerySchedulingQueueResponse rsp;
     rsp.set_requestid("request");
@@ -316,6 +319,90 @@ TEST_F(DomainSchedMgrActorTest, GetSchedulingQueue)
 
     EXPECT_AWAIT_READY(future);
     EXPECT_EQ(future.IsOK(), true);
+    litebus::Terminate(actor->GetAID());
+    litebus::Terminate(scheduler->GetAID());
+    litebus::Await(actor->GetAID());
+    litebus::Await(scheduler->GetAID());
+}
+
+TEST_F(DomainSchedMgrActorTest, GetSchedulingQueueRetriesWithUpdatedDomainAddress)
+{
+    auto actor = std::make_shared<global_scheduler::DomainSchedMgrActor>("TestDomainSchedActor", HEARTBEAT_TIMEOUT);
+    auto scheduler =
+        std::make_shared<MockDomainSchedSrvActor>("MockDomainScheduler" + DOMAIN_SCHEDULER_SRV_ACTOR_NAME_POSTFIX);
+    actor->getSchedulingQueueHelper_.SetBackOffStrategy([](int64_t) { return 100; }, 3);
+    litebus::Spawn(actor);
+    litebus::Spawn(scheduler);
+
+    auto req = std::make_shared<messages::QuerySchedulingQueueRequest>();
+    req->set_requestid("request-before-domain-recovery");
+    litebus::Future<std::string> receivedRequest;
+    EXPECT_CALL(*scheduler, MockGetSchedulingQueue(testing::_, testing::_, testing::_))
+        .WillOnce(testing::DoAll(FutureArg<2>(&receivedRequest)));
+
+    auto future = litebus::Async(actor->GetAID(), &DomainSchedMgrActor::GetSchedulingQueue, "MockDomainScheduler",
+                                 "127.0.0.1:1", req);
+    ASSERT_AWAIT_NO_SET_FOR(future, 50);
+
+    auto connectFuture = litebus::Async(actor->GetAID(), &DomainSchedMgrActor::Connect, "MockDomainScheduler",
+                                        scheduler->GetAID().Url());
+    ASSERT_AWAIT_READY(connectFuture);
+    ASSERT_AWAIT_READY(receivedRequest);
+
+    messages::QuerySchedulingQueueResponse rsp;
+    rsp.set_requestid(req->requestid());
+    scheduler->ResponseGetSchedulingQueue(actor->GetAID(), rsp.SerializeAsString());
+
+    ASSERT_AWAIT_READY(future);
+    EXPECT_EQ(future.Get().requestid(), req->requestid());
+    litebus::Terminate(actor->GetAID());
+    litebus::Terminate(scheduler->GetAID());
+    litebus::Await(actor->GetAID());
+    litebus::Await(scheduler->GetAID());
+}
+
+TEST_F(DomainSchedMgrActorTest, GetSchedulingQueueRebuildsPromiseAfterRetryTimeout)
+{
+    auto actor = std::make_shared<global_scheduler::DomainSchedMgrActor>("TestDomainSchedActor", HEARTBEAT_TIMEOUT);
+    auto scheduler =
+        std::make_shared<MockDomainSchedSrvActor>("MockDomainScheduler" + DOMAIN_SCHEDULER_SRV_ACTOR_NAME_POSTFIX);
+    actor->getSchedulingQueueHelper_.SetBackOffStrategy([](int64_t) { return 100; }, 1);
+    litebus::Spawn(actor);
+    litebus::Spawn(scheduler);
+
+    auto staleReq = std::make_shared<messages::QuerySchedulingQueueRequest>();
+    staleReq->set_requestid("request-to-stale-domain");
+    auto staleFuture = litebus::Async(actor->GetAID(), &DomainSchedMgrActor::GetSchedulingQueue,
+                                      "MockDomainScheduler", "127.0.0.1:1", staleReq);
+
+    ASSERT_AWAIT_SET(staleFuture);
+    ASSERT_TRUE(staleFuture.IsError());
+    auto stalePromise = actor->getSchedulingQueuePromise_;
+
+    auto connectFuture = litebus::Async(actor->GetAID(), &DomainSchedMgrActor::Connect, "MockDomainScheduler",
+                                        scheduler->GetAID().Url());
+    ASSERT_AWAIT_READY(connectFuture);
+
+    auto recoveredReq = std::make_shared<messages::QuerySchedulingQueueRequest>();
+    recoveredReq->set_requestid("request-after-domain-recovery");
+    litebus::Future<std::string> receivedRequest;
+    EXPECT_CALL(*scheduler, MockGetSchedulingQueue(testing::_, testing::_, testing::_))
+        .WillOnce(testing::DoAll(FutureArg<2>(&receivedRequest)));
+
+    auto recoveredFuture = litebus::Async(actor->GetAID(), &DomainSchedMgrActor::GetSchedulingQueue,
+                                          "MockDomainScheduler", scheduler->GetAID().Url(), recoveredReq);
+    ASSERT_AWAIT_READY(receivedRequest);
+    EXPECT_NE(actor->getSchedulingQueuePromise_, stalePromise);
+
+    messages::QuerySchedulingQueueResponse staleRsp;
+    staleRsp.set_requestid(staleReq->requestid());
+    scheduler->ResponseGetSchedulingQueue(actor->GetAID(), staleRsp.SerializeAsString());
+    messages::QuerySchedulingQueueResponse recoveredRsp;
+    recoveredRsp.set_requestid(recoveredReq->requestid());
+    scheduler->ResponseGetSchedulingQueue(actor->GetAID(), recoveredRsp.SerializeAsString());
+
+    ASSERT_AWAIT_READY(recoveredFuture);
+    EXPECT_EQ(recoveredFuture.Get().requestid(), recoveredReq->requestid());
     litebus::Terminate(actor->GetAID());
     litebus::Terminate(scheduler->GetAID());
     litebus::Await(actor->GetAID());

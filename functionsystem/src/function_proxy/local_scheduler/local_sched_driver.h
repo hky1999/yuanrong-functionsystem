@@ -36,6 +36,8 @@
 #include "local_scheduler/resource_group_controller/resource_group_ctrl.h"
 #include "local_scheduler/gc_actor/local_gc_actor.h"
 #include "local_scheduler/gc_actor/runtime_reconcile_actor.h"
+#include "local_scheduler/pressure_monitor/pressure_monitor_actor.h"
+#include "local_scheduler/pressure_monitor/pressure_event_watcher.h"
 #include "local_scheduler/snap_ctrl/snap_ctrl.h"
 #include "local_scheduler/subscription_manager/subscription_mgr.h"
 #include "local_scheduler/grpc_server/exec_service/exec_stream_service.h"
@@ -92,6 +94,30 @@ struct LocalSchedStartParam {
     bool runtimeInstanceDebugEnable;
     bool unRegisterWhileStop;
     bool enableFakeSuspendResume{ false };
+    // W2 step-5: watermark-driven pressure monitor knobs (see PressureMonitorConfig)
+    bool enablePressurePark{ false };
+    double pressureHighWatermark{ 0.85 };
+    double pressureLowWatermark{ 0.70 };
+    uint32_t pressureCheckIntervalMs{ 5000 };
+    uint32_t pressureSustainSamples{ 2 };
+    uint32_t pressureParkTtlSec{ 86400 };
+    uint32_t pressureMaxParked{ 8 };
+    // D-2 event-driven watermarks (PressureEventWatcher)
+    bool enablePressureEvent{ false };
+    std::string pressureEventCgroupRoot{ "/sys/fs/cgroup/sandbox" };
+    uint32_t pressureEventMinGapMs{ 1000 };
+    // D-3 upgrade-as-signal ladder (owned by the pressure monitor actor)
+    bool enableUpgradeLadder{ false };
+    uint64_t upgradeStepMb{ 8192 };
+    uint64_t upgradeCapMb{ 32768 };
+    double upgradeSafetyRatio{ 0.9 };
+    double upgradeHighRatio{ 0.9 };
+    // W-CPUL CPU upgrade ladder (second PressureEventWatcher on cpu.stat)
+    bool enableCpuUpgradeLadder{ false };
+    double cpuUpgradeStepRatio{ 1.5 };
+    double cpuUpgradeCapCpus{ 8.0 };
+    double cpuUpgradeSafetyRatio{ 0.9 };
+    double cpuUpgradeNodeCpus{ 0.0 };
     std::string udsPath;
     std::string sessionGrpcPort;
     std::string address;  // LiteBus address (ip:port format), used to extract IP for gRPC servers
@@ -109,7 +135,6 @@ struct LocalSchedStartParam {
     std::string tcpTunnelRootCert;
     std::string tcpTunnelModuleCert;
     std::string tcpTunnelModuleKey;
-    bool enableFrontendProxyService = false;
 };
 
 class LocalSchedulingApiRouter : public ApiRouterRegister {
@@ -138,7 +163,7 @@ public:
 
     bool IsFrontendProxyDispatcherAvailable() const
     {
-        return param_.enableFrontendProxyService && isStarted_ && frontendProxyServiceRegistered_;
+        return isStarted_ && frontendProxyServiceRegistered_;
     }
 
 protected:
@@ -188,6 +213,8 @@ private:
     std::shared_ptr<SnapCtrl> snapCtrl_;
     std::shared_ptr<LocalGcActor> gcActor_;
     std::shared_ptr<RuntimeReconcileActor> runtimeReconcileActor_;
+    std::shared_ptr<PressureMonitorActor> pressureMonitorActor_;
+    std::unique_ptr<PressureEventWatcher> pressureEventWatcher_;  // D-2: wakes the monitor on memory.high
     std::shared_ptr<InstanceCtrlMetaStoreHealthyObserver> metaStoreHealthyObserver_;
     std::shared_ptr<functionsystem::grpc::CommonGrpcServer> posixGrpcServer_;
     std::unique_ptr<TcpTunnelServer> tcpTunnelServer_;

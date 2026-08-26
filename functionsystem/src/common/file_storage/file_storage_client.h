@@ -51,23 +51,6 @@ public:
      * @return Status indicating success or failure
      */
     Status DeleteFile(const std::string &key);
-
-private:
-    /**
-     * Read file content into buffer
-     * @param filePath File path to read
-     * @param content Output buffer for file content
-     * @return Status indicating success or failure
-     */
-    Status ReadFileContent(const std::string &filePath, std::string &content);
-
-    /**
-     * Write content to file
-     * @param filePath File path to write
-     * @param content Content to write
-     * @return Status indicating success or failure
-     */
-    Status WriteFileContent(const std::string &filePath, const std::string &content);
 };
 
 }  // namespace functionsystem::file_storage

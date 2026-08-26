@@ -23,6 +23,7 @@ add_subdirectory(bundle_manager)
 add_subdirectory(resource_group_controller)
 add_subdirectory(subscription_manager)
 add_subdirectory(gc_actor)
+add_subdirectory(pressure_monitor)
 
 target_sources(${UNIT_TEST_MODULE} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/local_sched_driver_test.cpp)
 

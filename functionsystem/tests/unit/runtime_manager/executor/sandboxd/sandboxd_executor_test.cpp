@@ -16,10 +16,13 @@
 
 #include "runtime_manager/executor/sandboxd/sandboxd_executor.h"
 #include "common/status/status.h"
+#include "runtime_manager/port/port_manager.h"
 
 #include <gtest/gtest.h>
 
+#include <memory>
 #include <string>
+#include <vector>
 
 using namespace functionsystem::runtime_manager;
 
@@ -79,6 +82,83 @@ TEST(SandboxdExecutorTest, IsRetryableWaitErrorClassifiesTransportErrors)
     EXPECT_TRUE(SandboxdExecutor::IsRetryableWaitError(Status(GRPC_DEADLINE_EXCEEDED)));
     EXPECT_FALSE(SandboxdExecutor::IsRetryableWaitError(Status(GRPC_NOT_FOUND)));
     EXPECT_FALSE(SandboxdExecutor::IsRetryableWaitError(Status(SUCCESS)));
+}
+
+TEST(SandboxdExecutorTest, SandboxReclaimBackoffIsExponentialAndCapped)
+{
+    EXPECT_EQ(SandboxdExecutor::SandboxReclaimBackoffMs(1), 1000u);
+    EXPECT_EQ(SandboxdExecutor::SandboxReclaimBackoffMs(2), 2000u);
+    EXPECT_EQ(SandboxdExecutor::SandboxReclaimBackoffMs(6), 32000u);
+    EXPECT_EQ(SandboxdExecutor::SandboxReclaimBackoffMs(7), 60000u);
+    EXPECT_EQ(SandboxdExecutor::SandboxReclaimBackoffMs(100), 60000u);
+}
+
+TEST(SandboxdExecutorTest, FailedLocalReclaimKeepsRecoveredPortsUntilDeleteSucceeds)
+{
+    struct PortManagerReset {
+        ~PortManagerReset()
+        {
+            PortManager::GetInstance().Clear();
+        }
+    } reset;
+
+    int firstPort = -1;
+    for (int candidate = 20000; candidate <= 65534; ++candidate) {
+        if (!PortManager::GetInstance().CheckPortInUse(candidate) &&
+            !PortManager::GetInstance().CheckPortInUse(candidate + 1)) {
+            firstPort = candidate;
+            break;
+        }
+    }
+    ASSERT_GT(firstPort, 0);
+
+    const std::string runtimeID = "recovered-runtime";
+    const std::string sandboxID = "recovered-sandbox";
+    auto &portManager = PortManager::GetInstance();
+    portManager.InitPortResource(firstPort, 2);
+    ASSERT_TRUE(portManager.ReservePorts(runtimeID, {firstPort, firstPort + 1}).IsOk());
+
+    auto healthCheck = std::make_shared<HealthCheck>("recovered-port-release-health-check");
+    SandboxdExecutor executor("recovered-port-release-executor", litebus::AID(),
+                              "/tmp/recovered-port-release-checkpoints");
+    executor.SetHealthCheckClient(healthCheck);
+
+    messages::RuntimeInstanceInfo instanceInfo;
+    instanceInfo.set_instanceid("recovered-instance");
+    instanceInfo.set_runtimeid(runtimeID);
+    const std::string portMappings = "[\"public+http:" + std::to_string(firstPort) +
+                                     ":8080\",\"public+http:" + std::to_string(firstPort + 1) + ":8081\"]";
+    executor.stateManager_.Register({runtimeID, sandboxID, {}, portMappings, instanceInfo});
+
+    (void)executor.CleanupSandboxAfterMaxRetries(runtimeID, sandboxID);
+
+    ASSERT_TRUE(executor.stateManager_.IsActive(runtimeID));
+    EXPECT_EQ(executor.stateManager_.GetSandboxID(runtimeID), sandboxID);
+    ASSERT_EQ(executor.sandboxLifecycleStates_.count(runtimeID), 1u);
+    EXPECT_EQ(executor.sandboxLifecycleStates_.at(runtimeID), SandboxdExecutor::SandboxLifecycleStatus::ABNORMAL);
+    ASSERT_EQ(executor.sandboxReclaims_.count(runtimeID), 1u);
+    EXPECT_TRUE(portManager.ReservePorts("other-runtime", {firstPort}).IsError());
+    EXPECT_TRUE(portManager.ReservePorts("other-runtime", {firstPort + 1}).IsError());
+
+    auto failedDelete = executor.OnReclaimSandboxDone(
+        runtimeID, sandboxID, "delete-request",
+        litebus::Try<runtime::v1::DeleteResponse>(static_cast<int32_t>(GRPC_UNAVAILABLE)));
+    ASSERT_TRUE(failedDelete.Get().IsError());
+    ASSERT_EQ(executor.sandboxReclaims_.count(runtimeID), 1u);
+    EXPECT_EQ(executor.sandboxReclaims_.at(runtimeID).failedAttempts, 1u);
+    EXPECT_TRUE(executor.stateManager_.IsActive(runtimeID));
+    EXPECT_TRUE(portManager.ReservePorts("other-runtime", {firstPort}).IsError());
+    EXPECT_TRUE(portManager.ReservePorts("other-runtime", {firstPort + 1}).IsError());
+
+    auto successfulDelete = executor.OnReclaimSandboxDone(
+        runtimeID, sandboxID, "delete-request",
+        litebus::Try<runtime::v1::DeleteResponse>(runtime::v1::DeleteResponse{}));
+    ASSERT_TRUE(successfulDelete.Get().IsOk());
+    EXPECT_FALSE(executor.stateManager_.IsActive(runtimeID));
+    EXPECT_EQ(executor.sandboxLifecycleStates_.count(runtimeID), 0u);
+    EXPECT_EQ(executor.sandboxReclaims_.count(runtimeID), 0u);
+    EXPECT_TRUE(portManager.GetPort(runtimeID).empty());
+    EXPECT_EQ(portManager.RequestPorts("next-runtime", 2), (std::vector<int>{firstPort, firstPort + 1}));
 }
 
 }  // namespace functionsystem::test

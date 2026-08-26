@@ -43,6 +43,7 @@ DomainSchedMgrActor::DomainSchedMgrActor(const std::string &name, const uint32_t
         return GenerateRandomNumber(base + lower * attempt, base + upper * attempt);
     };
     queryResourceHelper_.SetBackOffStrategy(backOff, RETRY_MAX_TIMES);
+    getSchedulingQueueHelper_.SetBackOffStrategy(backOff, RETRY_MAX_TIMES);
 }
 
 void DomainSchedMgrActor::Init()
@@ -277,26 +278,22 @@ litebus::Future<messages::QuerySchedulingQueueResponse> DomainSchedMgrActor::Get
     const std::string &name, const std::string &address,
     const std::shared_ptr<messages::QuerySchedulingQueueRequest> &req)
 {
-    if (getSchedulingQueuePromise_) {
+    if (getSchedulingQueuePromise_ && !getSchedulingQueuePromise_->GetFuture().IsError()) {
+        // If getSchedulingQueueHelper_ exceeds its retry limit, the future enters the error state and the
+        // next request must rebuild the promise.
         YRLOG_INFO("{}|another getSchedulingQueuePromise_ is in progress", req->requestid());
         return getSchedulingQueuePromise_->GetFuture();
     }
     getSchedulingQueuePromise_ = std::make_shared<litebus::Promise<messages::QuerySchedulingQueueResponse>>();
-    auto future = getSchedulingQueuePromise_->GetFuture();
-    YRLOG_DEBUG("{}|send a get scheduling queue request to domainScheduler.", req->requestid());
-
-    Send(litebus::AID(name + DOMAIN_SCHEDULER_SRV_ACTOR_NAME_POSTFIX, address), "GetSchedulingQueue",
-         req->SerializeAsString());
-
-    return future.OnComplete(
-        [req, aid(GetAID()), name, address](const litebus::Future<messages::QuerySchedulingQueueResponse> &future) {
-            if (future.IsError()) {
-                YRLOG_DEBUG("{}|send a get scheduling queue request to domainScheduler timeout.", req->requestid());
-                return litebus::Async(aid, &DomainSchedMgrActor::GetSchedulingQueue, name, address, req);
-            }
-
-            return future;
-        });
+    YRLOG_DEBUG("{}|send a get scheduling queue request to domainScheduler, address is {}", req->requestid(),
+                address);
+    if (domainSchedulerAID_ == nullptr) {
+        domainSchedulerAID_ = std::make_shared<litebus::AID>(name + DOMAIN_SCHEDULER_SRV_ACTOR_NAME_POSTFIX, address);
+    }
+    auto future = getSchedulingQueueHelper_.Begin(req->requestid(), domainSchedulerAID_, "GetSchedulingQueue",
+                                                  req->SerializeAsString());
+    getSchedulingQueuePromise_->Associate(future);
+    return getSchedulingQueuePromise_->GetFuture();
 }
 
 void DomainSchedMgrActor::ResponseGetSchedulingQueue(const litebus::AID &from, std::string &&name, std::string &&msg)
@@ -306,14 +303,14 @@ void DomainSchedMgrActor::ResponseGetSchedulingQueue(const litebus::AID &from, s
         YRLOG_WARN("invalid QuerySchedulingQueueResponse {}", msg);
         return;
     }
-    if (!getSchedulingQueuePromise_) {
+    if (!getSchedulingQueuePromise_ || getSchedulingQueueHelper_.Exist(resp.requestid()).IsNone()) {
         YRLOG_WARN("{}|No task exists for QuerySchedulingQueueResponse.", resp.requestid());
         return;
     }
     YRLOG_DEBUG("{}|received a response from domainScheduler for QuerySchedulingQueueResponse: {}", resp.requestid(),
                 resp.DebugString());
 
-    getSchedulingQueuePromise_->SetValue(resp);
+    getSchedulingQueueHelper_.End(resp.requestid(), std::move(resp));
     getSchedulingQueuePromise_ = nullptr;
 }
 

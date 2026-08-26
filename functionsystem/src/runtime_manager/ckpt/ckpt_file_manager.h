@@ -38,10 +38,14 @@ public:
      * Download checkpoint file from remote storage
      * @param checkpointID Unique checkpoint identifier
      * @param storageUrl Remote storage URL (used as storage key)
+     * @param expectedSha256 sha256 from SnapshotInfo; verified when non-empty
+     * @param expectedSize archive size from SnapshotInfo; verified when > 0
      * @return Future with local file path
      */
     litebus::Future<std::string> DownloadCheckpoint(const std::string &checkpointID,
-                                                     const std::string &storageUrl) const;
+                                                     const std::string &storageUrl,
+                                                     const std::string &expectedSha256 = "",
+                                                     int64_t expectedSize = 0) const;
 
     /**
      * Register a locally created checkpoint (zips, uploads to storage, and registers)
@@ -49,9 +53,9 @@ public:
      * @param localPath Local checkpoint directory path (may contain multiple files)
      * @param storageUrl Ignored (storageUrl is derived from localPath as parentPath.zip)
      * @param ttl Time to live in seconds (0 means no expiration)
-     * @return Future with storageUrl (parentPath.zip)
+     * @return Future with CheckpointUploadResult (storageUrl + sha256/size/createTime)
      */
-    litebus::Future<std::string> RegisterCheckpoint(const std::string &checkpointID,
+    litebus::Future<CheckpointUploadResult> RegisterCheckpoint(const std::string &checkpointID,
                                                     const std::string &localPath,
                                                     const std::string &storageUrl,
                                                     int32_t ttl = 0) const;

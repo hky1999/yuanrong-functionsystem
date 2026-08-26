@@ -429,25 +429,6 @@ bool IsValidImageName(const std::string &image)
     return true;
 }
 
-// Reject host paths that would let the container escape or hijack the daemon.
-bool IsSafeBindSource(const std::string &path)
-{
-    if (path.empty() || path == "/") {
-        return false;
-    }
-    static const std::vector<std::string> blocked = {
-        "/etc", "/proc", "/sys", "/dev", "/boot", "/var/run/docker.sock", "/run/docker.sock"
-    };
-    for (const auto &b : blocked) {
-        if (path == b || path.rfind(b + "/", 0) == 0) {
-            return false;
-        }
-    }
-    if (path.find("..") != std::string::npos) {
-        return false;
-    }
-    return true;
-}
 }
 
 std::string DockerExecutor::GetRuntimeImage(const std::shared_ptr<messages::StartInstanceRequest> &request)

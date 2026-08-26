@@ -37,6 +37,7 @@ std::unordered_map<std::string, std::unordered_set<std::string>> PLUGINS_MAP = {
     { "Disk", { DISK_FILTER_NAME, DISK_SCORER_NAME }},
     { "NUMA", { NUMA_AFFINITY_FILTER_NAME, NUMA_AFFINITY_SCORER_NAME }},
     { "UsageAware", { USAGE_AWARE_FILTER_NAME } },
+    { "Overcommit", { OVERCOMMIT_FILTER_NAME } },
 };
 
 InstanceCtrl::InstanceCtrl(const std::shared_ptr<InstanceCtrlActor> &instanceCtrlActor)

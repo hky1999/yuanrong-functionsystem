@@ -24,6 +24,7 @@
 #include "async/defer.hpp"
 #include "common/logs/logging.h"
 #include "common/types/instance_state.h"
+#include "common/utils/struct_transfer.h"
 
 namespace functionsystem::local_scheduler {
 
@@ -65,6 +66,10 @@ void AddLocalInstanceRequest(ReconcileRequestMap &agentRequests,
     entry->set_runtimeid(info.runtimeid());
     entry->set_containerid(info.containerid());
     entry->set_instanceid(instanceID);
+    const auto portMappings = info.extensions().find(PORT_FORWARD_KEY);
+    if (portMappings != info.extensions().end()) {
+        entry->set_portmappings(portMappings->second);
+    }
 }
 }  // namespace
 

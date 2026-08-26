@@ -183,4 +183,18 @@ TEST_F(DefaultPrefilterTest, PrecisePreFilter)
     }
 }
 
+TEST_F(DefaultPrefilterTest, FailureRequirementDoesNotNarrowToInt32)
+{
+    constexpr double memory = 2147483648.0;
+    functionsystem::schedule_plugin::prefilter::DefaultPreFilter filter;
+    auto preAllocated = std::make_shared<PreAllocatedContext>();
+    auto unit = GetNewLocalResourceUnit(true, false, false, 1);
+    auto ins = GetInstance("instance1", "monopoly", memory, 500);
+
+    auto filterRet = filter.PreFilter(preAllocated, ins, unit);
+
+    EXPECT_EQ(filterRet->status().StatusCode(), StatusCode::RESOURCE_NOT_ENOUGH);
+    EXPECT_EQ(filterRet->status().GetMessage(), "[(500, 2147483648) Not Found]");
+}
+
 }  // namespace functionsystem::test::schedule_plugin::prefilter
