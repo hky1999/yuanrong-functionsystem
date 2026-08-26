@@ -19,7 +19,9 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <string>
+#include <unordered_set>
 
 #include "common/metrics/metrics_adapter.h"
 #include "common/metrics/metrics_constants.h"
@@ -42,6 +44,15 @@ class SimulateObserver : public function_proxy::DataPlaneObserver, public litebu
 public:
     SimulateObserver() : DataPlaneObserver(nullptr), litebus::ActorBase("SimulateObserver"){};
     virtual ~SimulateObserver() = default;
+
+    // P2 #8: count MarkInstanceUsed calls (SDK-invoke idle-claim wiring)
+    std::atomic<size_t> usedMarks{0};
+    std::unordered_set<std::string> usedInstances;
+    void MarkInstanceUsed(const std::string &instanceID) override
+    {
+        usedMarks++;
+        usedInstances.insert(instanceID);
+    }
 
     void SetInstanceView(const std::shared_ptr<InstanceView> instanceView)
     {
@@ -364,6 +375,22 @@ TEST_F(InstanceProxyTest, CallLocalTest)
     std::string callerIns = "callerIns";
     std::string calleeIns = "calleeIns";
     CallTest(callerIns, calleeIns, true);
+}
+
+// P2 #8: an invoke landing on an instance (local self or forwarded in) must
+// mark that instance as ever-used — SDK exec rides the Invoke channel and
+// SessionCountDelta alone never fires, so idle bookkeeping used to treat
+// purely-invoke-driven sandboxes as reclaimable orphans.
+TEST_F(InstanceProxyTest, InvokeMarksDestinationUsed)
+{
+    std::string callerIns = "mark-caller";
+    std::string calleeIns = "mark-callee";
+    CallTest(callerIns, calleeIns, true);
+    // local dispatch: the callee proxy actor received the forward
+    ASSERT_GE(observer_->usedMarks.load(), 1u);
+    EXPECT_TRUE(observer_->usedInstances.count(calleeIns) > 0 ||
+                observer_->usedInstances.count(callerIns) > 0)
+        << "invoke must mark dst (or its dispatching proxy) as used";
 }
 
 TEST_F(InstanceProxyTest, CallLocalWithAuthorizeTest)
