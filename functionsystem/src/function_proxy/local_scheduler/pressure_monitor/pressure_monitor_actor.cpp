@@ -264,15 +264,32 @@ void PressureMonitorActor::UnparkOldest(const std::pair<std::string, SnapCtrlAct
     wakeCooldown_[oldest.first] = kWakeCooldownCycles; // D-4 restore-storm guard
     YRLOG_INFO("pressure monitor on node {}: ratio {} low, FIFO unpark instance({}) from checkpoint({}) request={}",
                nodeID_, lastRatio_, oldest.first, oldest.second.checkpointID, requestID);
-    snapCtrl_->HandleWake(requestID, oldest.first).Then([instanceID(oldest.first)](const KillResponse &rsp) {
+    snapCtrl_->HandleWake(requestID, oldest.first).Then([aid(GetAID()), instanceID(oldest.first)](const KillResponse &rsp) {
         if (rsp.code() != common::ERR_NONE) {
             YRLOG_WARN("pressure FIFO unpark of instance({}) failed: code={} msg={}", instanceID,
                        static_cast<uint32_t>(rsp.code()), rsp.message());
+            // W10-1: failure means the entry stayed parked; the full cooldown
+            // would defer its retry by 300s. Shorten it (posted back to this
+            // actor so wakeCooldown_ stays single-threaded).
+            litebus::Async(aid, &PressureMonitorActor::OnWakeFailed, instanceID);
         } else {
             YRLOG_INFO("pressure FIFO unpark of instance({}) succeeded", instanceID);
         }
         return rsp;
     });
+}
+
+void PressureMonitorActor::OnWakeFailed(const std::string &instanceID)
+{
+    // W10-1: the entry stayed parked; retry soon instead of riding the full
+    // kWakeCooldownCycles storm guard. SnapCtrl's own wakeFails give-up
+    // (D-5 F4) still bounds the retry loop if the failure is persistent.
+    auto it = wakeCooldown_.find(instanceID);
+    if (it != wakeCooldown_.end()) {
+        it->second = kWakeRetryCycles;
+        YRLOG_INFO("pressure monitor on node {}: failed wake of instance({}) rescheduled in {} cycles",
+                   nodeID_, instanceID, kWakeRetryCycles);
+    }
 }
 
 }  // namespace functionsystem::local_scheduler

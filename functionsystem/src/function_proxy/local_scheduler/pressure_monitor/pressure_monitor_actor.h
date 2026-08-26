@@ -156,6 +156,9 @@ private:
     /** FIFO fallback: wake the oldest parked instance. */
     void UnparkOldest(const std::pair<std::string, SnapCtrlActor::ParkedEntry> &oldest);
 
+    /** W10-1: a failed wake must retry soon, not ride the full storm cooldown. */
+    void OnWakeFailed(const std::string &instanceID);
+
     std::string nodeID_;
     PressureMonitorConfig config_;
 
@@ -189,6 +192,11 @@ private:
     // SnapStarts and froze every other restore on the node). An instance that
     // just got a wake request is skipped for this many cycles (5s each).
     static constexpr uint32_t kWakeCooldownCycles = 60;
+    // W10-1: a FAILED wake (e.g. stale state machine, admission transient) is
+    // retried after this short backoff, not the full storm cooldown -- with 60
+    // cycles (300s) a failed unpark looked permanent at run scale (W9-2 v4:
+    // 2/5 wakes failed "retry later" and never ran again before phase end).
+    static constexpr uint32_t kWakeRetryCycles = 2;
     std::unordered_map<std::string, uint32_t> wakeCooldown_;
 };
 

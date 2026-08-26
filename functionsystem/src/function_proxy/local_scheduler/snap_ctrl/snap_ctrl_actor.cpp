@@ -340,6 +340,16 @@ void SnapCtrlActor::ForgetParkedByCheckpoint(const std::string &checkpointID)
     }
 }
 
+void SnapCtrlActor::FinishSnapStart(const std::string &checkpointID)
+{
+    // W10-2: the restore chain settled (success or failure); allow a later
+    // SnapStart for this checkpoint again (e.g. a retry after a failure).
+    if (restoringCheckpoints_.erase(checkpointID) > 0) {
+        YRLOG_INFO("snapstart of checkpoint({}) settled, in-flight restores: {}", checkpointID,
+                   restoringCheckpoints_.size());
+    }
+}
+
 std::vector<std::pair<std::string, SnapCtrlActor::ParkedEntry>> SnapCtrlActor::GetParkedInstances()
 {
     std::vector<std::pair<std::string, ParkedEntry>> out;
@@ -377,6 +387,23 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapStart(const std::string &
         return errorRsp;
     }
 
+    // W10-2: one restore per checkpoint at a time. Duplicate SnapStarts for
+    // the same checkpoint (retried RPCs, a second wake path racing the first)
+    // each mint a fresh synthetic "ckpt-" instance and restore a DUPLICATE
+    // sandbox; the loser then fails with an identity/replay conflict (W9-2
+    // v4: every successful restore was followed by one such noisy failure).
+    // Reject the duplicate outright -- the parked-registry waking flag covers
+    // the wake path only, this covers every caller of HandleSnapStart.
+    if (restoringCheckpoints_.count(checkpointID) > 0) {
+        YRLOG_WARN("{}|snapstart of checkpoint {} rejected: a restore is already in flight for it",
+                   requestID, checkpointID);
+        KillResponse errorRsp;
+        errorRsp.set_code(static_cast<common::ErrorCode>(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY)));
+        errorRsp.set_message("restore already in flight for checkpoint: " + checkpointID);
+        return errorRsp;
+    }
+    restoringCheckpoints_.insert(checkpointID);
+
     YRLOG_INFO("{}|start snapstart from checkpoint: {}", requestID, checkpointID);
 
     // 3. 构造 RestoreSnapshotRequest
@@ -389,6 +416,9 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapStart(const std::string &
     ASSERT_IF_NULL(localSchedSrv_);
     return localSchedSrv_->SnapStartCheckpoint(req).Then(
         [aid(GetAID()), requestID, checkpointID](const messages::RestoreSnapshotResponse &rsp) -> KillResponse {
+            // W10-2: settle the in-flight marker on the actor thread (this
+            // continuation may run on the localSchedSrv actor)
+            litebus::Async(aid, &SnapCtrlActor::FinishSnapStart, checkpointID);
             KillResponse killRsp;
             killRsp.set_code(static_cast<common::ErrorCode>(rsp.code()));
             killRsp.set_message(rsp.message());

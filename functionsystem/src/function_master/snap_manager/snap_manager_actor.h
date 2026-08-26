@@ -19,6 +19,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <memory>
 
 #include "actor/actor.hpp"
@@ -171,6 +172,11 @@ private:
         // Snapshot cache and scheduler (refactored components)
         SnapshotCache cache;
         std::unique_ptr<SnapshotScheduler> scheduler{nullptr};
+
+        // W10-2: requestIDs of SnapStarts whose schedule is in flight; resent
+        // duplicates (local timeout retry) are absorbed instead of minting a
+        // second synthetic restore instance for the same checkpoint.
+        std::unordered_set<std::string> inFlightSnapStarts;
 
         // Watcher for etcd
         std::shared_ptr<Watcher> snapshotWatcher{nullptr};

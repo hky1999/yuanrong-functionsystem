@@ -382,7 +382,13 @@ private:
     REQUEST_SYNC_HELPER(LocalSchedSrvActor, messages::RecordSnapshotResponse,
                         recordSnapshotTimeout_, recordSnapshotSync_);
 
-    const uint32_t snapStartCheckpointTimeout_ = 10000;
+    // W10-2: the SnapStart round trip includes the domain-scheduler hop and
+    // measures 10-20s live (response arriving after a 10s timeout is dropped
+    // as "no matching request", the promise then settles as a spurious error,
+    // the parked entry survives a SUCCESSFUL physical restore, and the wake
+    // path re-fires duplicates every monitor tick). 30s covers the observed
+    // tail; the parked-registry waking flag still bounds concurrency.
+    const uint32_t snapStartCheckpointTimeout_ = 30000;
     REQUEST_SYNC_HELPER(LocalSchedSrvActor, messages::RestoreSnapshotResponse,
                         snapStartCheckpointTimeout_, snapStartCheckpointSync_);
     const uint32_t listSnapshotTimeout_ = 10000;

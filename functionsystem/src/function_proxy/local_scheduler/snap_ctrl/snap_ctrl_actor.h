@@ -23,6 +23,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -274,6 +275,14 @@ private:
 
     /** OnWakeComplete: registry bookkeeping, returns rsp unchanged. */
     KillResponse OnWakeComplete(const std::string &instanceID, const KillResponse &rsp);
+
+    // W10-2: checkpoints whose restore (SnapStart chain) is currently in
+    // flight; a concurrent SnapStart for the same checkpoint is rejected so
+    // duplicate restores cannot mint two sandboxes from one checkpoint.
+    std::unordered_set<std::string> restoringCheckpoints_;
+
+    /** Settle the in-flight marker when a SnapStart settles (any outcome). */
+    void FinishSnapStart(const std::string &checkpointID);
 };
 
 }  // namespace functionsystem::local_scheduler

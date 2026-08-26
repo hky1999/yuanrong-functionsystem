@@ -83,6 +83,24 @@ schedule_framework::Filtered UsageAwareFilter::Filter(const std::shared_ptr<sche
     double total = capMem->second.scalar().value();
     double safety = GetSafety();
 
+    // W10-1: a parked-instance restore carries the synthetic "ckpt-" identity
+    // minted by snap_manager for the wake chain. Its admission was already
+    // decided by the pressure monitor's low-watermark unpark against the
+    // ledger view (parked usage subtracted on instance removal); this filter's
+    // unit actualuse is the agent's raw cgroup sum, which still carries the
+    // parked sandboxes' residual page cache until their cgroups are torn down.
+    // Vetoing the restore against that stale physical number deadlocks the
+    // park/unpark loop (W9-2 v4: unpark rejected "used 41240" seconds after
+    // the parks that were supposed to relieve exactly that pressure). Stay
+    // neutral: the booked/allocatable DefaultFilter still applies, and the
+    // monitor re-samples between unparks so a restore wave self-throttles.
+    if (instance.instanceid().rfind("ckpt-", 0) == 0 || instance.requestid().rfind("ckpt-", 0) == 0) {
+        YRLOG_INFO("{}|usage aware filter stays neutral for parked restore instance({}): "
+                   "unpark already gated by the pressure monitor's ledger watermark",
+                   instance.requestid(), instance.instanceid());
+        return schedule_framework::Filtered{ Status::OK(), false, -1 };
+    }
+
     // reserve a slice for the incoming instance, capped by its own request:
     // a small instance must not be blocked by a fixed large floor
     double reserve = GetFloorMb();

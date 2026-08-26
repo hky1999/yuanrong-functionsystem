@@ -550,13 +550,38 @@ void SnapManagerActor::MasterBusiness::HandleSnapStart(const litebus::AID &from,
     // Build ScheduleRequest from snapshot metadata
     auto scheduleReq = member_->scheduler->BuildScheduleRequest(meta, *req);
 
+    // W10-2: dedupe by requestID. The local side's timeout retry re-SENDS the
+    // same RestoreSnapshotRequest while the original schedule is still in
+    // flight; every send mints a fresh synthetic "ckpt-" instance and restores
+    // a DUPLICATE sandbox whose loser fails with an identity/replay conflict
+    // (W9-2 v4: one noisy failure per successful restore). Same requestID is
+    // by definition the same logical restore: absorb the resend and let the
+    // first attempt's response answer it.
+    const auto &dedupeKey = req->requestid();
+    if (!dedupeKey.empty() && member_->inFlightSnapStarts.count(dedupeKey) > 0) {
+        YRLOG_WARN("snapstart requestID {} for snapshot {} resent while in flight, absorbing duplicate",
+                   dedupeKey, snapshotID);
+        return;
+    }
+    if (!dedupeKey.empty()) {
+        member_->inFlightSnapStarts.insert(dedupeKey);
+    }
+
     // Invoke global scheduler
     auto weakActor = actor_;
+    auto member = member_;
     member_->scheduler->Schedule(scheduleReq).OnComplete(
-        [weakActor, req, from, scheduleReq, meta](const litebus::Future<Status> &future) {
+        [weakActor, member, req, from, scheduleReq, meta, dedupeKey](const litebus::Future<Status> &future) {
             auto actor = weakActor.lock();
             if (!actor) {
                 return;
+            }
+            // W10-2: settle the in-flight marker before responding (posted to
+            // the actor thread; the map is otherwise touched in HandleSnapStart)
+            if (!dedupeKey.empty()) {
+                litebus::Async(actor->GetAID(), [member, key(dedupeKey)]() {
+                    member->inFlightSnapStarts.erase(key);
+                });
             }
             auto code = future.IsError() ? future.GetErrorCode() : future.Get().StatusCode();
             auto message = future.IsError() ? "failed to schedule." : future.Get().RawMessage();

@@ -1780,6 +1780,21 @@ void InstanceCtrlActor::RegisterStateChangeCallback(
             // made the caller drop the parked entry while nothing ever deploys
             // (phantom restore); fail the promise instead so the wake path
             // counts a failure and retries (F4 wakeFails converges).
+            // W10-1: a stale machine also blocks every retry identically (the
+            // duplicate-state check funnels here before ToScheduling's W7-P2
+            // supersede can run). Supersede it now -- the same semantics as
+            // the wake restore path -- so the NEXT attempt schedules fresh
+            // instead of failing forever. Guard: parked-instance restores only
+            // (wake under the original id, or the synthetic "ckpt-" identity
+            // of the snapstart chain); unrelated machines keep legacy behavior.
+            const auto &staleInstanceID = scheduleReq->instance().instanceid();
+            if (function_proxy::ParkedInstanceRegistry::Instance().IsParked(staleInstanceID)
+                || staleInstanceID.rfind("ckpt-", 0) == 0) {
+                YRLOG_WARN("superseding stale state machine (state {}, no pending future) of parked restore "
+                           "instance({}) so the next wake attempt schedules fresh",
+                           static_cast<int32_t>(currentState), staleInstanceID);
+                instanceControlView_->Delete(staleInstanceID, stateMachine->GetVersion());
+            }
             runtimePromise->SetValue(GenScheduleResponse(
                 StatusCode::FAILED,
                 "instance state machine is in state " + std::to_string(static_cast<int32_t>(currentState))

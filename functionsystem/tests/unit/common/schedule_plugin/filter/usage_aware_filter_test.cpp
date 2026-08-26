@@ -90,6 +90,33 @@ TEST_F(UsageAwareFilterTest, RejectWhenUsageExceedsLine)
     EXPECT_EQ(out.availableForRequest, -1);
 }
 
+// W10-1: a parked-instance restore (synthetic "ckpt-" identity from the wake
+// chain) stays neutral even when raw actualuse is over the line -- its
+// admission was the pressure monitor's ledger-gated unpark decision, and the
+// raw number still carries the parked sandboxes' residual page cache.
+TEST_F(UsageAwareFilterTest, ParkedRestoreStaysNeutralOverLine)
+{
+    UsageAwareFilter filter;
+    auto ctx = std::make_shared<PreAllocatedContext>();
+    // same numbers as RejectWhenUsageExceedsLine, but a ckpt- restore identity
+    auto unit = MakeUnit(40000, 35000);
+    auto inst = MakeInstance(32000);
+    inst.set_instanceid("ckpt-3b4b4ab3-6a8f-4434-8000-0000000000cf");
+    auto out = filter.Filter(ctx, inst, unit);
+    EXPECT_EQ(out.status, StatusCode::SUCCESS);
+
+    // the requestid form (snapstart request ids also carry the ckpt- prefix)
+    auto inst2 = MakeInstance(32000);
+    inst2.set_requestid("ckpt-51837400-0000-4000-8000-5d930bf9abf0");
+    auto out2 = filter.Filter(ctx, inst2, unit);
+    EXPECT_EQ(out2.status, StatusCode::SUCCESS);
+
+    // non-restore instances are still rejected under the same pressure
+    auto inst3 = MakeInstance(32000);
+    auto out3 = filter.Filter(ctx, inst3, unit);
+    EXPECT_EQ(out3.status, StatusCode::RESOURCE_NOT_ENOUGH);
+}
+
 TEST_F(UsageAwareFilterTest, BoundaryExactlyAtLine)
 {
     UsageAwareFilter filter;
