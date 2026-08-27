@@ -534,14 +534,22 @@ void InstanceView::OnParkedExpired(const std::string &instanceID)
         return;  // already restored
     }
     (void)parkedHoldTimers_.erase(instanceID);
-    function_proxy::ParkedInstanceRegistry::Instance().Clear(instanceID);
+    // W13: do NOT clear the park mark here. Expiry only ends the bounded
+    // INVOKE hold (fail held callers, tear the routing actor down) — the
+    // instance is still parked (checkpoint restorable). Clearing the mark
+    // used to un-park it semantically: the failed callers' auto-recreate
+    // then sailed past the recreate guard, deployed a fresh sandbox under
+    // the parked id, and the later wake restored a second one on top
+    // (v9: fleet collapse to 0 under sustained pressure). The mark stays
+    // until the wake path's ClearParked or the park TTL cleanup.
     auto iter = localInstances_.find(instanceID);
     if (iter == localInstances_.end()) {
         return;
     }
     auto instanceProxy = iter->second;
     (void)localInstances_.erase(iter);
-    YRLOG_WARN("instance view parked instance ({}) hold TTL expired without restore, failing held invokes",
+    YRLOG_WARN("instance view parked instance ({}) hold TTL expired without restore, failing held invokes "
+               "(park mark retained; wake restore still available)",
                instanceID);
     (void)litebus::Async(instanceProxy->GetAID(), &InstanceProxy::Delete).OnComplete([instanceProxy]() {
         litebus::Terminate(instanceProxy->GetAID());
