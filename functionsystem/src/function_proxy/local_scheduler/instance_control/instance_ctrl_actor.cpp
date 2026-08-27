@@ -6400,6 +6400,27 @@ litebus::Future<Status> InstanceCtrlActor::ToScheduling(const std::shared_ptr<me
         }
     }
     if (!scheduleReq->instance().instanceid().empty()) {
+        // W13: the recreate guard must run REGARDLESS of whether a state
+        // machine still exists. The park's ForceDeleteInstance removes the
+        // machine, so the client stack's auto-recreate (its reaction to an
+        // invoke hiccup in the park window) arrives with machine==nullptr
+        // and used to sail through to a fresh SCHEDULING machine that then
+        // failed and went stale — the exact source the wake path tripped on
+        // (W15: 6 wake failures, 0 hits of the machine-exists guard).
+        // A wake restore carries the checkpoint in snapshotinfo; anything
+        // else under a parked id is a recreate and is rejected with a
+        // retryable busy code so the caller keeps retrying the invoke.
+        if (scheduleReq->instance().instancestatus().code() == static_cast<uint32_t>(InstanceState::NEW)
+            && scheduleReq->instance().snapshotinfo().checkpointid().empty()
+            && function_proxy::ParkedInstanceRegistry::Instance().IsParked(
+                scheduleReq->instance().instanceid())) {
+            YRLOG_WARN("rejecting recreate of parked instance({}) without snapshot "
+                       "(invoke-path auto-recreate); wake restore required",
+                       scheduleReq->instance().instanceid());
+            return Status(StatusCode::ERR_INSTANCE_BUSY,
+                          "instance is parked, retry the invoke after the wake restore: " +
+                              scheduleReq->instance().instanceid());
+        }
         auto stateMachine = instanceControlView_->GetInstance(scheduleReq->instance().instanceid());
         if (scheduleReq->instance().instancestatus().code() == static_cast<uint32_t>(InstanceState::NEW) &&
             stateMachine != nullptr) {
@@ -6410,21 +6431,6 @@ litebus::Future<Status> InstanceCtrlActor::ToScheduling(const std::shared_ptr<me
             // supersede it instead of failing 1004.
             if (function_proxy::ParkedInstanceRegistry::Instance().IsParked(
                     scheduleReq->instance().instanceid())) {
-                if (scheduleReq->instance().snapshotinfo().checkpointid().empty()) {
-                    // W13: a CREATE under a parked instance id is not a wake
-                    // restore (those carry the checkpoint in snapshotinfo) —
-                    // it is the client stack's auto-recreate reaction to an
-                    // invoke hiccup during the park window. Proceeding would
-                    // deploy a second sandbox from under the parked entry and
-                    // leave the loser's SCHEDULING machine stale. Reject so
-                    // the caller keeps retrying the invoke instead.
-                    YRLOG_WARN("rejecting recreate of parked instance({}) without snapshot "
-                               "(invoke-path auto-recreate); wake restore required",
-                               scheduleReq->instance().instanceid());
-                    return Status(StatusCode::ERR_INSTANCE_BUSY,
-                                  "instance is parked, retry the invoke after the wake restore: " +
-                                      scheduleReq->instance().instanceid());
-                }
                 YRLOG_WARN("superseding stale state machine of parked instance({}) for wake restore",
                            scheduleReq->instance().instanceid());
                 instanceControlView_->Delete(scheduleReq->instance().instanceid(), -1);
