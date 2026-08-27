@@ -1793,7 +1793,10 @@ void InstanceCtrlActor::RegisterStateChangeCallback(
                 YRLOG_WARN("superseding stale state machine (state {}, no pending future) of parked restore "
                            "instance({}) so the next wake attempt schedules fresh",
                            static_cast<int32_t>(currentState), staleInstanceID);
-                instanceControlView_->Delete(staleInstanceID, stateMachine->GetVersion());
+                // modRevision -1: unconditional — a version-checked delete can
+                // silently no-op against a machine the recreate loop touched
+                // since we read it (W13).
+                instanceControlView_->Delete(staleInstanceID, -1);
             }
             runtimePromise->SetValue(GenScheduleResponse(
                 StatusCode::FAILED,
@@ -6407,10 +6410,24 @@ litebus::Future<Status> InstanceCtrlActor::ToScheduling(const std::shared_ptr<me
             // supersede it instead of failing 1004.
             if (function_proxy::ParkedInstanceRegistry::Instance().IsParked(
                     scheduleReq->instance().instanceid())) {
+                if (scheduleReq->instance().snapshotinfo().checkpointid().empty()) {
+                    // W13: a CREATE under a parked instance id is not a wake
+                    // restore (those carry the checkpoint in snapshotinfo) —
+                    // it is the client stack's auto-recreate reaction to an
+                    // invoke hiccup during the park window. Proceeding would
+                    // deploy a second sandbox from under the parked entry and
+                    // leave the loser's SCHEDULING machine stale. Reject so
+                    // the caller keeps retrying the invoke instead.
+                    YRLOG_WARN("rejecting recreate of parked instance({}) without snapshot "
+                               "(invoke-path auto-recreate); wake restore required",
+                               scheduleReq->instance().instanceid());
+                    return Status(StatusCode::ERR_INSTANCE_BUSY,
+                                  "instance is parked, retry the invoke after the wake restore: " +
+                                      scheduleReq->instance().instanceid());
+                }
                 YRLOG_WARN("superseding stale state machine of parked instance({}) for wake restore",
                            scheduleReq->instance().instanceid());
-                instanceControlView_->Delete(scheduleReq->instance().instanceid(),
-                                             stateMachine->GetVersion());
+                instanceControlView_->Delete(scheduleReq->instance().instanceid(), -1);
             } else {
                 return Status(StatusCode::ERR_INSTANCE_DUPLICATED,
                               "you are not allowed to create instance with the same instance id, please kill first " +
