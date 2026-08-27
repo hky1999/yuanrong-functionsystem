@@ -310,6 +310,26 @@ KillResponse SnapCtrlActor::OnWakeComplete(const std::string &instanceID, const 
     auto it = parkedInstances_.find(instanceID);
     if (it != parkedInstances_.end()) {
         it->second.waking = false;  // settled: pickable again on the next retry
+        // W16: the stale-state-machine failure is self-healing — the branch
+        // that emitted it already superseded (deleted) the stale machine, so
+        // the very next attempt schedules fresh. W15b measured two such
+        // transients spaced by the 2-cycle monitor cooldown: 21s to restore,
+        // one failure away from the F4 give-up dropping the entry entirely.
+        // Re-wake immediately (short settle delay for the domain layer's own
+        // in-flight re-dispatch) and keep this class out of the F4 budget.
+        if (msg.find("without a pending schedule future") != std::string::npos) {
+            if (++it->second.staleRetries <= kWakeStaleRetryMax) {
+                YRLOG_WARN("wake of instance({}) hit a stale state machine (superseded); "
+                           "immediate retry {}/{} in {}ms",
+                           instanceID, it->second.staleRetries, kWakeStaleRetryMax, kWakeStaleRetryDelayMs);
+                (void)litebus::AsyncAfter(kWakeStaleRetryDelayMs, GetAID(),
+                                          &SnapCtrlActor::HandleWake,
+                                          "stale-retry-" + std::to_string(it->second.staleRetries), instanceID);
+                return rsp;
+            }
+            YRLOG_WARN("wake of instance({}) exhausted {} stale retries, falling back to cooldown pacing",
+                       instanceID, kWakeStaleRetryMax);
+        }
         if (++it->second.wakeFails >= kWakeGiveUpAfter) {
             YRLOG_WARN("wake of instance({}) failed {} times (last: {}), dropping parked entry; "
                        "signal-19 restore by checkpointID({}) remains available",

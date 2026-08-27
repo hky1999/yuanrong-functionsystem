@@ -56,6 +56,12 @@ public:
     // consecutive non-terminal wake failures after which the parked entry is
     // dropped (D-5 F4); the checkpoint stays restorable via signal 19
     static constexpr uint32_t kWakeGiveUpAfter = 3;
+    // W16: stale-state-machine transients re-wake immediately (self-healing
+    // class — the emitting branch already superseded the machine); bounded
+    // separately from the F4 budget. 1.5s lets the domain layer's own in-
+    // flight re-dispatch settle before the retry reads the machine table.
+    static constexpr uint32_t kWakeStaleRetryMax = 4;
+    static constexpr uint64_t kWakeStaleRetryDelayMs = 1500;
 
     /**
      * Handle INSTANCE_SNAPSHOT_SIGNAL
@@ -119,6 +125,12 @@ public:
         // producing a duplicate restore and a replay-conflict failure). Entries
         // with a live wake are skipped by the picker; reset only when it settles.
         bool waking = false;
+        // W16: consecutive stale-state-machine transients superseded by this
+        // wake chain. Self-healing class: the supersede clears the blocker, so
+        // the next attempt succeeds — re-wake immediately instead of riding
+        // the monitor cooldown (21s -> ~3s observed), and never burn the
+        // D-5 F4 give-up budget on it.
+        uint32_t staleRetries = 0;
     };
 
     /**
