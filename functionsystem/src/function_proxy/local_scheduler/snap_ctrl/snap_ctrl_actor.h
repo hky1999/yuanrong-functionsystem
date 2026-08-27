@@ -295,6 +295,11 @@ private:
 
     /** Settle the in-flight marker when a SnapStart settles (any outcome). */
     void FinishSnapStart(const std::string &checkpointID);
+
+    /** W16: immediate re-wake after a stale-state-machine transient. */
+    void RetryWake(const std::string &instanceID);
+
+    uint64_t retrySeq_ = 0;  // requestID sequence for stale retries
 };
 
 }  // namespace functionsystem::local_scheduler

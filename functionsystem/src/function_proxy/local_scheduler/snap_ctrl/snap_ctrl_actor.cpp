@@ -323,8 +323,7 @@ KillResponse SnapCtrlActor::OnWakeComplete(const std::string &instanceID, const 
                            "immediate retry {}/{} in {}ms",
                            instanceID, it->second.staleRetries, kWakeStaleRetryMax, kWakeStaleRetryDelayMs);
                 (void)litebus::AsyncAfter(kWakeStaleRetryDelayMs, GetAID(),
-                                          &SnapCtrlActor::HandleWake,
-                                          "stale-retry-" + std::to_string(it->second.staleRetries), instanceID);
+                                          &SnapCtrlActor::RetryWake, instanceID);
                 return rsp;
             }
             YRLOG_WARN("wake of instance({}) exhausted {} stale retries, falling back to cooldown pacing",
@@ -338,6 +337,15 @@ KillResponse SnapCtrlActor::OnWakeComplete(const std::string &instanceID, const 
         }
     }
     return rsp;
+}
+
+void SnapCtrlActor::RetryWake(const std::string &instanceID)
+{
+    // W16: void-returning wrapper so AsyncAfter can schedule the immediate
+    // stale-transient re-wake (HandleWake returns a Future).
+    const auto requestID = "stale-retry-" + std::to_string(++retrySeq_);
+    HandleWake(requestID, instanceID)
+        .Then(litebus::Defer(GetAID(), &SnapCtrlActor::OnWakeComplete, instanceID, std::placeholders::_1));
 }
 
 void SnapCtrlActor::ForgetParked(const std::string &instanceID)
