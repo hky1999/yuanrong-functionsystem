@@ -54,6 +54,20 @@ public:
      * ERR_INSTANCE_BUSY on timeout (drain incomplete).
      */
     using DrainProvider = std::function<litebus::Future<Status>(const std::string &instanceID, uint64_t timeoutMs)>;
+    // W19-1: demand-driven restore hook — fired when a parked hold expires
+    // with callers still retrying (the watermark FIFO may starve a parked
+    // instance while node pressure stays high; the expired-held retries are
+    // the demand signal). The provider (wired by snap_ctrl) wakes the
+    // instance from its checkpoint. Fire-and-forget: failures fall back to
+    // the existing watermark path.
+    using WakeProvider = std::function<void(const std::string &instanceID)>;
+    void SetWakeProvider(WakeProvider provider) { wakeProvider_ = std::move(provider); }
+    void NotifyHoldExpired(const std::string &instanceID)
+    {
+        if (wakeProvider_ && IsParked(instanceID)) {
+            wakeProvider_(instanceID);
+        }
+    }
 
     static ParkedInstanceRegistry &Instance()
     {
@@ -233,6 +247,8 @@ private:
     bool drainForceOnTimeout_{ false };
     DrainProvider drainProvider_;
     std::function<void(const std::string &)> releaseDrainProvider_;
+
+    WakeProvider wakeProvider_;
 };
 }  // namespace functionsystem::function_proxy
 

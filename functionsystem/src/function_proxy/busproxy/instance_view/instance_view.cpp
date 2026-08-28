@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <string>
+
 #include "instance_view.h"
 
 #include "async/async.hpp"
@@ -27,6 +29,10 @@
 #include "common/utils/struct_transfer.h"
 
 namespace functionsystem::busproxy {
+
+// W18-P2: parked-hold TTL expiry failure — retryable, never terminal.
+const std::string PARKED_HOLD_RETRYABLE_MESSAGE =
+    "instance is parked (invoke hold TTL expired); retry after the wake restore";
 namespace {
 // drain poll interval: how often the park drain phase re-checks the in-flight count
 constexpr uint32_t PARK_DRAIN_POLL_INTERVAL_MS = 200;
@@ -568,9 +574,14 @@ void InstanceView::OnParkedExpired(const std::string &instanceID)
     YRLOG_WARN("instance view parked instance ({}) hold TTL expired without restore, failing held invokes "
                "(park mark retained; wake restore still available)",
                instanceID);
-    (void)litebus::Async(instanceProxy->GetAID(), &InstanceProxy::Delete).OnComplete([instanceProxy]() {
-        litebus::Terminate(instanceProxy->GetAID());
-    });
+    // W19-1: demand-driven restore — the expired-held retries ARE the wake
+    // signal. Fire the wake provider (snap_ctrl) so the restore starts now
+    // instead of starving behind a high watermark (W18-P3: 90481608 expired
+    // 18:42, watermark never dropped, harness gave up 18:47).
+    function_proxy::ParkedInstanceRegistry::Instance().NotifyHoldExpired(instanceID);
+    (void)litebus::Async(instanceProxy->GetAID(), &InstanceProxy::FailHeldRetryable,
+                         PARKED_HOLD_RETRYABLE_MESSAGE)
+             .OnComplete([instanceProxy]() { litebus::Terminate(instanceProxy->GetAID()); });
 }
 
 litebus::Future<Status> InstanceView::DrainInstanceInFlight(const std::string &instanceID, uint64_t timeoutMs)
