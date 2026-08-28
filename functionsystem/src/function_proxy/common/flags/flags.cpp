@@ -111,7 +111,7 @@ const uint32_t PRESSURE_EVENT_MIN_GAP_MS = 1000;
 const std::string DEFAULT_LOCAL_SCHEDULE_PLUGINS =
     R"("["Default", "ResourceSelector", "Label", "Heterogeneous"]")";
 
-const uint32_t PARKED_INVOKE_HOLD_SECONDS = 300;
+const uint32_t PARKED_INVOKE_HOLD_SECONDS = 1200; // W18-P2: ≥ LLM response p99 (GLM flash 752s) — expiry is now retryable, this just bounds invoke latency
 const uint32_t MIN_PARKED_INVOKE_HOLD_SECONDS = 10;
 const uint32_t MAX_PARKED_INVOKE_HOLD_SECONDS = 1800;
 

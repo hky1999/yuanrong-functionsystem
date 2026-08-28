@@ -784,6 +784,16 @@ bool InstanceProxy::Delete()
     return true;
 }
 
+bool InstanceProxy::FailHeldRetryable(const std::string &message)
+{
+    ASSERT_FS(selfDispatcher_);
+    // W18-P2: ERR_INSTANCE_BUSY — the client stack's resilience layer retries
+    // busy invokes in place; the parked instance's wake (directed or FIFO)
+    // eventually restores and the retry lands. Never terminal.
+    selfDispatcher_->Fatal(message, StatusCode::ERR_INSTANCE_BUSY);
+    return true;
+}
+
 void InstanceProxy::InitDispatcher()
 {
     selfDispatcher_ = std::make_shared<RequestDispatcher>(instanceID_, true, tenantID_, shared_from_this(), perf_);

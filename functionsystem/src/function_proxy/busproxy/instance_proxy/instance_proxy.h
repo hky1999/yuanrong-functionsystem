@@ -104,6 +104,14 @@ public:
 
     bool Delete();
 
+    /**
+     * W18-P2: fail all held invokes with a RETRYABLE busy error instead of
+     * the terminal exit code. Used by the parked-hold TTL expiry: the
+     * instance is still parked (checkpoint restorable), so callers must keep
+     * retrying rather than treating this as instance death.
+     */
+    bool FailHeldRetryable(const std::string &message);
+
     static void BindObserver(const std::shared_ptr<function_proxy::DataPlaneObserver> &observer)
     {
         observer_ = observer;
