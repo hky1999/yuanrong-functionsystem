@@ -1858,24 +1858,26 @@ void SandboxdExecutor::ReportSandboxUsageMetrics(const messages::RuntimeInstance
     // D-7: also feed the resource view -- the pid-based instance collectors
     // are no-ops under runsc (pid=0), so this Stats poll is the only live
     // per-instance memory source for admission/park decisions.
-    if (instanceMemoryUsageReporter_ != nullptr) {
-        const double memoryMb = static_cast<double>(response.memory_usage_bytes()) / (1024.0 * 1024.0);
-        YRLOG_INFO("[D-7] sandbox stats bridge: instance({}) runtime({}) memory {} MB", info.instanceid(), runtimeID,
-                   memoryMb);
-        instanceMemoryUsageReporter_(info.instanceid(), memoryMb);
-    }
-
+    // W17: the bridge log now also carries the delta-derived CPU cores so
+    // per-trial CPU curves are reconstructable from logs (memory-only before).
     auto previousIt = sandboxStatsSnapshots_.find(runtimeID);
+    double cpuUsageCores = -1.0;
     if (previousIt != sandboxStatsSnapshots_.end()) {
         const auto elapsedNs =
             std::chrono::duration_cast<std::chrono::nanoseconds>(collectedAt - previousIt->second.collectedAt).count();
         if (elapsedNs > 0 && response.cpu_usage_ns() >= previousIt->second.cpuUsageNs) {
-            const double cpuUsageCores = static_cast<double>(response.cpu_usage_ns() - previousIt->second.cpuUsageNs)
-                                         / static_cast<double>(elapsedNs);
+            cpuUsageCores = static_cast<double>(response.cpu_usage_ns() - previousIt->second.cpuUsageNs)
+                            / static_cast<double>(elapsedNs);
             ReportSandboxGauge({ functionsystem::metrics::YR_SANDBOX_CPU_USAGE_CORES,
                   "sandbox cpu usage expressed as used cores", "cores" },
                 labels, cpuUsageCores);
         }
+    }
+    if (instanceMemoryUsageReporter_ != nullptr) {
+        const double memoryMb = static_cast<double>(response.memory_usage_bytes()) / (1024.0 * 1024.0);
+        YRLOG_INFO("[D-7] sandbox stats bridge: instance({}) runtime({}) memory {} MB cpu {} cores", info.instanceid(),
+                   runtimeID, memoryMb, cpuUsageCores);
+        instanceMemoryUsageReporter_(info.instanceid(), memoryMb);
     }
 
     sandboxStatsSnapshots_[runtimeID] = SandboxStatsSnapshot{ response.cpu_usage_ns(), collectedAt };
