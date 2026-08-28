@@ -43,6 +43,14 @@ SnapCtrlActor::SnapCtrlActor(const std::string &name, const std::string &nodeID)
 void SnapCtrlActor::Init()
 {
     BasisActor::Init();
+    // W19-1: hold-TTL expiry now carries a demand signal — wire the wake
+    // provider so expired-held retries trigger an immediate restore instead
+    // of starving behind the watermark FIFO.
+    function_proxy::ParkedInstanceRegistry::Instance().SetWakeProvider(
+        [aid(GetAID())](const std::string &instanceID) {
+            YRLOG_INFO("hold-expiry wake requested for parked instance({})", instanceID);
+            litebus::AsyncAfter(0, aid, &SnapCtrlActor::RetryWake, instanceID);
+        });
     YRLOG_INFO("SnapCtrlActor initialized on node: {}", nodeID_);
 }
 

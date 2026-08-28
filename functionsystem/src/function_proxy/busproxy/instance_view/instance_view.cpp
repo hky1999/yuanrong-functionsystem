@@ -557,6 +557,11 @@ void InstanceView::OnParkedExpired(const std::string &instanceID)
     YRLOG_WARN("instance view parked instance ({}) hold TTL expired without restore, failing held invokes "
                "(park mark retained; wake restore still available)",
                instanceID);
+    // W19-1: demand-driven restore — the expired-held retries ARE the wake
+    // signal. Fire the wake provider (snap_ctrl) so the restore starts now
+    // instead of starving behind a high watermark (W18-P3: 90481608 expired
+    // 18:42, watermark never dropped, harness gave up 18:47).
+    function_proxy::ParkedInstanceRegistry::Instance().NotifyHoldExpired(instanceID);
     (void)litebus::Async(instanceProxy->GetAID(), &InstanceProxy::FailHeldRetryable,
                          PARKED_HOLD_RETRYABLE_MESSAGE)
              .OnComplete([instanceProxy]() { litebus::Terminate(instanceProxy->GetAID()); });
