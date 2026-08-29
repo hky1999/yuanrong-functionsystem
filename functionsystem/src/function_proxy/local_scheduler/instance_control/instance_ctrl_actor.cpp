@@ -1494,6 +1494,26 @@ litebus::Future<ScheduleResponse> InstanceCtrlActor::Schedule(
     }
 
     if (!scheduleReq->instance().instanceid().empty()) {
+        // W22: parked-instance recreate pre-check at the SCHEDULE ENTRY —
+        // BEFORE any state machine can be created. The W13 guard in
+        // ToScheduling runs AFTER TryGenerateNewInstance has already created
+        // a machine; each rejected create leaves a stale SCHEDOLING machine
+        // that later blocks the legitimate wake restore (W20 steady2 root
+        // cause: park → invoke retry → recreate → machine → stale → unpark
+        // blocked). Rejecting here means no machine is ever created for a
+        // parked recreate, keeping the unpark schedule path clean.
+        if (scheduleReq->instance().instancestatus().code() == static_cast<uint32_t>(InstanceState::NEW)
+            && scheduleReq->instance().snapshotinfo().checkpointid().empty()
+            && function_proxy::ParkedInstanceRegistry::Instance().IsParked(
+                scheduleReq->instance().instanceid())) {
+            YRLOG_WARN("schedule-entry guard: rejecting recreate of parked instance({}) "
+                       "before machine creation (W22); wake restore unaffected",
+                       scheduleReq->instance().instanceid());
+            runtimePromise->SetValue(GenScheduleResponse(StatusCode::ERR_INSTANCE_BUSY,
+                "instance is parked, retry after wake restore: " + scheduleReq->instance().instanceid(),
+                *scheduleReq));
+            return runtimePromise->GetFuture();
+        }
         auto stateMachine = instanceControlView_->GetInstance(scheduleReq->instance().instanceid());
         if (scheduleReq->instance().instancestatus().code() == static_cast<uint32_t>(InstanceState::NEW)
             && stateMachine != nullptr) {
