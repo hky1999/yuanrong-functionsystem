@@ -86,11 +86,15 @@ void CommitmentLedger::OnRaise(const std::string &unitId, uint64_t raisedBytes, 
     }
     auto &unit = Units()[unitId];
     if (!unit.anchored || unit.commitmentBytes == 0) {
-        // anchor a fresh promise window at the current use
+        // anchor a fresh promise window at the current use. A previous window
+        // on this unit has been fully consumed: its promised total must not
+        // leak into the new window (F1: re-raise after exhaustion tripled
+        // the first window's outstanding).
         unit.baseUseBytes = useBytes;
         unit.highWaterBytes = useBytes;
         unit.lowWaterBytes = useBytes;
         unit.anchored = true;
+        unit.promisedBytes = 0;
     } else if (useBytes > unit.highWaterBytes) {
         // incremental raise on a live window: the window has already seen
         // this much reality; the next sample will cash it in
