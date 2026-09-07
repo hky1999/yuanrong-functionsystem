@@ -55,15 +55,19 @@ public:
 
     void Init() override;
 
-    // consecutive non-terminal wake failures after which the parked entry is
-    // dropped (D-5 F4); the checkpoint stays restorable via signal 19
-    static constexpr uint32_t kWakeGiveUpAfter = 3;
-    // W16: stale-state-machine transients re-wake immediately (self-healing
-    // class — the emitting branch already superseded the machine); bounded
-    // separately from the F4 budget. 1.5s lets the domain layer's own in-
-    // flight re-dispatch settle before the retry reads the machine table.
-    static constexpr uint32_t kWakeStaleRetryMax = 4;
-    static constexpr uint64_t kWakeStaleRetryDelayMs = 1500;
+    // Direct-restore logical-context bounds (process-local, payload budget
+    // not RSS; entries are retained for the process lifetime — capacity
+    // retirement and restart recovery remain open). The reservation counts
+    // every RETAINED copy: context strings, restoreContexts_ key,
+    // restoringCheckpoints_ key/value, the settlement callback's captured
+    // requestID/nonce, the captured registration list and the bounded
+    // response. Transient relay-request serialization is not retained.
+    static constexpr size_t kMaxRestoreContexts = 4096;
+    static constexpr size_t kMaxRestoreContextBytes = 64ULL * 1024 * 1024;
+    static constexpr size_t kMaxRestoreRequestIDBytes = 1024;
+    static constexpr size_t kMaxRestoreCheckpointIDBytes = 4096;
+    static constexpr size_t kMaxRestorePayloadBytes = 64 * 1024;
+    static constexpr size_t kMaxRestoreResponseBytes = 64 * 1024;
 
     /**
      * Handle INSTANCE_SNAPSHOT_SIGNAL
@@ -135,10 +139,15 @@ public:
     /** Registry entry for one parked instance. */
     struct ParkedEntry {
         std::string checkpointID;
+        // Completion fence: a fresh UUID minted per park registration. An
+        // async restore completion may clear this entry only by matching this
+        // exact identity, never by scanning the checkpoint. Internal
+        // bookkeeping only: never exposed in payloads or logs.
+        std::string registrationID;
         std::chrono::steady_clock::time_point parkedAt;
-        // consecutive non-terminal wake failures (D-5 F4): a checkpoint whose
-        // restore keeps timing out (e.g. RPC deadline < 24G restore) must not
-        // be retried forever; kWakeGiveUpAfter drops the entry
+        // error-outcome wake completions observed so far (saturating).
+        // Diagnostic only: no threshold drops the entry — a count of errors
+        // is not physical retirement evidence.
         uint32_t wakeFails = 0;
         // W9: a wake for this entry is IN FLIGHT. The restore chain can take
         // minutes and its response may time out and retry at the localSchedSrv
@@ -147,12 +156,13 @@ public:
         // producing a duplicate restore and a replay-conflict failure). Entries
         // with a live wake are skipped by the picker; reset only when it settles.
         bool waking = false;
-        // W16: consecutive stale-state-machine transients superseded by this
-        // wake chain. Self-healing class: the supersede clears the blocker, so
-        // the next attempt succeeds — re-wake immediately instead of riding
-        // the monitor cooldown (21s -> ~3s observed), and never burn the
-        // D-5 F4 give-up budget on it.
-        uint32_t staleRetries = 0;
+        // F8 phase 1: the owned wake dispatch settled with a non-success code,
+        // so the physical restore outcome is UNKNOWN. The entry is retained
+        // with its full identity (checkpoint/registration/source/hold token),
+        // excluded from new wakes and the FIFO picker, and never auto-retried
+        // or dropped. Authoritative physical-result reconciliation and restart
+        // recovery are pending and will be implemented separately.
+        bool wakeUnknown = false;
         uint64_t wakeAttempt = 0;
         std::string sourceSandboxID;
         std::string sourceRuntimeID;
@@ -333,23 +343,70 @@ private:
     /** Drop a registry entry after a successful wake/restore. */
     void ForgetParked(const std::string &instanceID);
 
-    /** Drop registry entries whose checkpoint matches a direct SnapStart. */
-    void ForgetParkedByCheckpoint(const std::string &checkpointID);
+    /** (instanceID, registrationID) pinned before an async restore relay. */
+    using ParkedRegistration = std::pair<std::string, std::string>;
+
+    /** Exact registrations parked on checkpointID right now; bounded by the map. */
+    std::vector<ParkedRegistration> CaptureParkedRegistrations(const std::string &checkpointID);
+
+    /** Drop only entries whose current nonempty registration matches the capture. */
+    void ForgetParkedRegistrations(const std::vector<ParkedRegistration> &captured);
 
     /** OnWakeComplete: registry bookkeeping, returns rsp unchanged. */
     KillResponse OnWakeComplete(const std::string &instanceID, const std::string &checkpointID,
                                 uint64_t attempt, const KillResponse &rsp);
 
+    /**
+     * Registration fence around HandleWake's completion: delegates to
+     * OnWakeComplete only when the captured registration is nonempty and is
+     * still the entry's current one; a replacement park stays untouched.
+     */
+    KillResponse OnWakeCompleteIfCurrent(const std::string &instanceID, const std::string &checkpointID,
+                                         uint64_t attempt, const std::string &registrationID,
+                                         const KillResponse &rsp);
+
     // W10-2: checkpoints whose restore (SnapStart chain) is currently in
-    // flight; a concurrent SnapStart for the same checkpoint is rejected so
-    // duplicate restores cannot mint two sandboxes from one checkpoint.
-    std::unordered_set<std::string> restoringCheckpoints_;
+    // flight, bound to the owning context's private nonce; a concurrent
+    // SnapStart for the same checkpoint is rejected so duplicate restores
+    // cannot mint two sandboxes from one checkpoint.
+    std::unordered_map<std::string, std::string> restoringCheckpoints_;
 
-    /** Settle the in-flight marker when a SnapStart settles (any outcome). */
-    void FinishSnapStart(const std::string &checkpointID);
+    /**
+     * One logical direct-restore context per caller requestID: the immutable
+     * checkpoint + exact payload, the first captured registrations, a private
+     * nonce and the retained response promise. Identical retries share the
+     * retained future; changed requests conflict; entries are never evicted
+     * (process-local — retirement/restart recovery remain open).
+     */
+    struct RestoreContext {
+        std::string checkpointID;
+        std::string payload;
+        std::vector<ParkedRegistration> captured;
+        std::string nonce;
+        litebus::Promise<KillResponse> promise;
+        bool completed = false;
+    };
+    std::unordered_map<std::string, std::shared_ptr<RestoreContext>> restoreContexts_;
+    size_t restoreContextBytes_ = 0;
 
-    /** W16: immediate re-wake after a stale-state-machine transient. */
+    /**
+     * Actor-thread settlement of one dispatched restore relay, posted once
+     * for any outcome. Verifies the context nonce, the not-yet-completed
+     * flag and its own active marker before any mutation; stale or duplicate
+     * callbacks do nothing (including no marker removal).
+     */
+    void OnRestoreRelayComplete(const std::string &requestID, const std::string &nonce,
+        const litebus::Future<messages::RestoreSnapshotResponse> &future);
+
+    /** Mark exactly the captured registrations unresolved (identity kept,
+     *  waking untouched so the owning wake completion settles it once). */
+    void MarkCapturedRegistrationsUnknown(const std::vector<ParkedRegistration> &captured);
+
+    /** Void wrapper so AsyncAfter can schedule a wake (HandleWake returns a
+     *  Future); HandleWake owns the unresolved-outcome rejection. */
     void RetryWake(const std::string &instanceID);
+    /** Queued-callback fence: re-wakes only the still-matching entry; an
+     *  unresolved-outcome entry is never restarted by an old callback. */
     void RetryWakeIfCurrent(const std::string &instanceID, const std::string &checkpointID, uint64_t attempt);
     uint64_t wakeAttemptSeq_ = 0;
 

@@ -18,10 +18,12 @@
 #include "hold_attempt_policy.h"
 
 #include <chrono>
+#include <limits>
 #include <nlohmann/json.hpp>
 
 #include "async/async.hpp"
 #include "async/defer.hpp"
+#include "async/uuid_generator.hpp"
 #include "common/constants/actor_name.h"
 #include "common/logs/logging.h"
 #include "common/proto/pb/message_pb.h"
@@ -465,6 +467,10 @@ KillResponse SnapCtrlActor::OnHandleSnapshot(const std::string &instanceID, bool
             // checkpoint is the only handle left. Record it for wake/FIFO unpark.
             ParkedEntry entry;
             entry.checkpointID = result.snapshotInfo.checkpointid();
+            // Fresh registration per park, even for an identical checkpoint
+            // and physical source: async completions clear this entry only by
+            // this exact identity (completion fence).
+            entry.registrationID = litebus::uuid_generator::UUID::GetRandomUUID().ToString();
             entry.sourceSandboxID = result.snapshotInfo.sandbox_id();
             entry.sourceRuntimeID = result.snapshotInfo.source_runtime_id();
             entry.sourceGeneration = result.snapshotInfo.source_generation();
@@ -562,6 +568,18 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleWake(const std::string &reque
         rsp.set_message("instance is not parked on this node: " + instanceID);
         return rsp;
     }
+    if (it->second.wakeUnknown) {
+        // F8 phase 1: a previous wake settled with an unknown physical
+        // outcome; a new logical request could mint a duplicate sandbox, so
+        // no restart happens before authoritative reconciliation (pending,
+        // implemented separately). Nothing below (sequence, waking flag) is
+        // touched by this rejection.
+        YRLOG_WARN("{}|wake rejected: instance({}) has an unresolved wake outcome", requestID, instanceID);
+        KillResponse rsp;
+        rsp.set_code(static_cast<common::ErrorCode>(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY)));
+        rsp.set_message("parked instance has an unresolved wake outcome: " + instanceID);
+        return rsp;
+    }
     if (it->second.waking) {
         // W9: a previous wake for this entry is still in flight (its restore
         // chain can outlive the monitor's wake cooldown); a second concurrent
@@ -573,13 +591,43 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleWake(const std::string &reque
         rsp.set_message("wake already in flight for parked instance: " + instanceID);
         return rsp;
     }
+    // F8: a retained restore context under this caller ID must still target
+    // exactly this park (same checkpoint, wake payload and registration) —
+    // an old cached success/error must never become the completion of a NEW
+    // wake. Rejected before any waking/sequence mutation and without
+    // attaching a new completion wrapper.
+    const auto contextIt = restoreContexts_.find(requestID);
+    if (contextIt != restoreContexts_.end()) {
+        const auto &context = contextIt->second;
+        bool capturesThisPark = context->checkpointID == it->second.checkpointID && context->payload.empty();
+        if (capturesThisPark) {
+            capturesThisPark = false;
+            for (const auto &captured : context->captured) {
+                if (captured.first == instanceID && captured.second == it->second.registrationID) {
+                    capturesThisPark = true;
+                    break;
+                }
+            }
+        }
+        if (!capturesThisPark) {
+            YRLOG_WARN("{}|wake rejected: request id conflicts with a retained restore context", requestID);
+            KillResponse rsp;
+            rsp.set_code(common::ERR_PARAM_INVALID);
+            rsp.set_message("wake request id conflicts with a retained restore context");
+            return rsp;
+        }
+    }
     it->second.waking = true;
     const auto attempt = ++wakeAttemptSeq_;
     it->second.wakeAttempt = attempt;
     const auto checkpointID = it->second.checkpointID;
+    // Copied by value: the completion fences on the registration dispatched
+    // here, not on whatever re-registers the entry while the restore runs.
+    const auto registrationID = it->second.registrationID;
     YRLOG_INFO("{}|wake parked instance({}) from checkpoint({})", requestID, instanceID, checkpointID);
     return HandleSnapStart(requestID, checkpointID, "")
-        .Then(litebus::Defer(GetAID(), &SnapCtrlActor::OnWakeComplete, instanceID, checkpointID, attempt, std::placeholders::_1));
+        .Then(litebus::Defer(GetAID(), &SnapCtrlActor::OnWakeCompleteIfCurrent, instanceID, checkpointID, attempt,
+                             registrationID, std::placeholders::_1));
 }
 
 KillResponse SnapCtrlActor::OnWakeComplete(const std::string &instanceID, const std::string &checkpointID,
@@ -596,64 +644,43 @@ KillResponse SnapCtrlActor::OnWakeComplete(const std::string &instanceID, const 
         ForgetParked(instanceID);
         return rsp;
     }
-    // 步6 正规化：终态失败（checkpoint 工件不存在/过期、同 ID 实例已重建）
-    // 时丢弃注册表项，否则水位 FIFO unpark 会每周期无限重试。工件若仍在，
-    // 外部 signal 19（按 checkpointID）恢复不受影响；瞬时错误保留条目重试。
-    const auto &msg = rsp.message();
-    const bool terminal = msg.find("not found") != std::string::npos
-        || msg.find("has expired") != std::string::npos
-        || msg.find("same instance id") != std::string::npos;
-    if (terminal) {
-        YRLOG_WARN("wake of instance({}) failed terminally ({}), dropping parked entry; "
-                   "signal-19 restore by checkpointID remains available",
-                   instanceID, msg);
-        ForgetParked(instanceID);
+    // F8 phase 1: an error completion is not physical retirement evidence —
+    // the restore may still have happened, or failed for a caller-local
+    // reason. Neither the error text nor a failure count may drop the entry,
+    // and retrying UNKNOWN with a new logical request could mint a duplicate
+    // sandbox. Mark the owned entry unresolved and retain its full identity
+    // (checkpoint/registration/source/hold token); no budget or hold release.
+    // Authoritative physical-result reconciliation and restart recovery are
+    // pending and will be implemented separately.
+    current->second.wakeUnknown = true;
+    if (current->second.wakeFails != std::numeric_limits<uint32_t>::max()) {
+        ++current->second.wakeFails;
+    }
+    YRLOG_WARN("wake of instance({}) settled with code({}): physical outcome unresolved, entry retained, "
+               "no auto-retry pending reconciliation",
+               instanceID, static_cast<int32_t>(rsp.code()));
+    return rsp;
+}
+
+KillResponse SnapCtrlActor::OnWakeCompleteIfCurrent(const std::string &instanceID, const std::string &checkpointID,
+                                                    uint64_t attempt, const std::string &registrationID,
+                                                    const KillResponse &rsp)
+{
+    const auto current = parkedInstances_.find(instanceID);
+    if (registrationID.empty() || current == parkedInstances_.end()
+        || current->second.registrationID != registrationID) {
+        // A stale or unfenced wake completion cannot settle a newer registration.
         return rsp;
     }
-    // D-5 F4: non-terminal failures (e.g. a 24G checkpoint restore exceeding
-    // the RPC deadline, code 1017) must not retry forever -- the monitor's
-    // wake cooldown re-picks the same oldest entry every 300s. Give up after
-    // kWakeGiveUpAfter consecutive failures; the checkpoint itself stays on
-    // disk (park TTL) and signal-19 by checkpointID still works.
-    auto it = parkedInstances_.find(instanceID);
-    if (it != parkedInstances_.end()) {
-        it->second.waking = false;  // settled: pickable again on the next retry
-        // W16: the stale-state-machine failure is self-healing — the branch
-        // that emitted it already superseded (deleted) the stale machine, so
-        // the very next attempt schedules fresh. W15b measured two such
-        // transients spaced by the 2-cycle monitor cooldown: 21s to restore,
-        // one failure away from the F4 give-up dropping the entry entirely.
-        // Re-wake immediately (short settle delay for the domain layer's own
-        // in-flight re-dispatch) and keep this class out of the F4 budget.
-        if (msg.find("without a pending schedule future") != std::string::npos) {
-            if (++it->second.staleRetries <= kWakeStaleRetryMax) {
-                YRLOG_WARN("wake of instance({}) hit a stale state machine (superseded); "
-                           "immediate retry {}/{} in {}ms",
-                           instanceID, it->second.staleRetries, kWakeStaleRetryMax, kWakeStaleRetryDelayMs);
-                (void)litebus::AsyncAfter(kWakeStaleRetryDelayMs, GetAID(),
-                                          &SnapCtrlActor::RetryWakeIfCurrent, instanceID, checkpointID, attempt);
-                return rsp;
-            }
-            YRLOG_WARN("wake of instance({}) exhausted {} stale retries, falling back to cooldown pacing",
-                       instanceID, kWakeStaleRetryMax);
-        }
-        if (++it->second.wakeFails >= kWakeGiveUpAfter) {
-            YRLOG_WARN("wake of instance({}) failed {} times (last: {}), dropping parked entry; "
-                       "signal-19 restore by checkpointID({}) remains available",
-                       instanceID, it->second.wakeFails, msg, it->second.checkpointID);
-            ForgetParked(instanceID);
-        }
-    }
-    return rsp;
+    return OnWakeComplete(instanceID, checkpointID, attempt, rsp);
 }
 
 void SnapCtrlActor::RetryWake(const std::string &instanceID)
 {
-    // W16: void-returning wrapper so AsyncAfter can schedule the immediate
-    // stale-transient re-wake (HandleWake returns a Future).
+    // void-returning wrapper so AsyncAfter can schedule a wake request
+    // (HandleWake returns a Future); HandleWake owns the unresolved-outcome
+    // and in-flight rejections.
     const auto requestID = "stale-retry-" + std::to_string(++retrySeq_);
-    // HandleWake already owns the single completion callback. Attaching a
-    // second one here counted failures twice and could clear a newer wake.
     (void)HandleWake(requestID, instanceID);
 }
 
@@ -661,8 +688,10 @@ void SnapCtrlActor::RetryWakeIfCurrent(const std::string &instanceID, const std:
                                      uint64_t attempt)
 {
     const auto current = parkedInstances_.find(instanceID);
+    // F8 phase 1: an entry whose wake settled unknown must not be restarted
+    // by an old queued callback; only a still-matching settled entry proceeds.
     if (current == parkedInstances_.end() || current->second.checkpointID != checkpointID
-        || current->second.wakeAttempt != attempt || current->second.waking) {
+        || current->second.wakeAttempt != attempt || current->second.waking || current->second.wakeUnknown) {
         return;
     }
     RetryWake(instanceID);
@@ -675,26 +704,49 @@ void SnapCtrlActor::ForgetParked(const std::string &instanceID)
     }
 }
 
-void SnapCtrlActor::ForgetParkedByCheckpoint(const std::string &checkpointID)
+std::vector<SnapCtrlActor::ParkedRegistration> SnapCtrlActor::CaptureParkedRegistrations(
+    const std::string &checkpointID)
 {
-    for (auto it = parkedInstances_.begin(); it != parkedInstances_.end();) {
-        if (it->second.checkpointID == checkpointID) {
-            YRLOG_INFO("parked instance({}) restored by direct snapstart, registry size before: {}", it->first,
-                       parkedInstances_.size());
-            it = parkedInstances_.erase(it);
-        } else {
-            ++it;
+    std::vector<ParkedRegistration> captured;
+    for (const auto &entry : parkedInstances_) {
+        if (entry.second.checkpointID == checkpointID && !entry.second.registrationID.empty()) {
+            captured.emplace_back(entry.first, entry.second.registrationID);
         }
+    }
+    return captured;
+}
+
+void SnapCtrlActor::ForgetParkedRegistrations(const std::vector<ParkedRegistration> &captured)
+{
+    for (const auto &capturedRegistration : captured) {
+        const auto it = parkedInstances_.find(capturedRegistration.first);
+        // Match the exact registration only — never a checkpoint scan: an
+        // entry registered after the capture (or an unfenced one) must
+        // survive this completion.
+        if (it == parkedInstances_.end() || it->second.registrationID.empty()
+            || it->second.registrationID != capturedRegistration.second) {
+            continue;
+        }
+        YRLOG_INFO("parked instance({}) restored by direct snapstart, registry size before: {}", it->first,
+                   parkedInstances_.size());
+        parkedInstances_.erase(it);
     }
 }
 
-void SnapCtrlActor::FinishSnapStart(const std::string &checkpointID)
+void SnapCtrlActor::MarkCapturedRegistrationsUnknown(const std::vector<ParkedRegistration> &captured)
 {
-    // W10-2: the restore chain settled (success or failure); allow a later
-    // SnapStart for this checkpoint again (e.g. a retry after a failure).
-    if (restoringCheckpoints_.erase(checkpointID) > 0) {
-        YRLOG_INFO("snapstart of checkpoint({}) settled, in-flight restores: {}", checkpointID,
-                   restoringCheckpoints_.size());
+    for (const auto &capturedRegistration : captured) {
+        const auto it = parkedInstances_.find(capturedRegistration.first);
+        // Exact-registration fence (same as ForgetParkedRegistrations): only
+        // the first captured set is marked. waking is left untouched so a
+        // wake dispatch's own completion wrapper settles and counts it once.
+        if (it == parkedInstances_.end() || it->second.registrationID.empty()
+            || it->second.registrationID != capturedRegistration.second) {
+            continue;
+        }
+        it->second.wakeUnknown = true;
+        YRLOG_WARN("restore of instance({}) settled without success: outcome unresolved, entry retained",
+                   capturedRegistration.first);
     }
 }
 
@@ -703,8 +755,9 @@ std::vector<std::pair<std::string, SnapCtrlActor::ParkedEntry>> SnapCtrlActor::G
     std::vector<std::pair<std::string, ParkedEntry>> out;
     out.reserve(parkedInstances_.size());
     for (const auto &entry : parkedInstances_) {
-        if (entry.second.waking) {
-            // a wake is in flight for this entry: invisible to the FIFO picker
+        if (entry.second.waking || entry.second.wakeUnknown) {
+            // a wake is in flight or its outcome is unresolved: invisible to
+            // the FIFO picker (an unknown entry must not be re-dispatched)
             continue;
         }
         out.emplace_back(entry.first, entry.second);
@@ -716,23 +769,55 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapStart(const std::string &
                                                              const std::string &checkpointID,
                                                              const std::string &payload)
 {
-    // 1. 验证 checkpointID
-    if (checkpointID.empty()) {
-        YRLOG_ERROR("{}|HandleSnapStart: empty checkpointID", requestID);
-        KillResponse errorRsp;
-        errorRsp.set_code(static_cast<common::ErrorCode>(static_cast<int32_t>(StatusCode::ERR_PARAM_INVALID)));
-        errorRsp.set_message("empty checkpointID");
-        return errorRsp;
-    }
+    auto rejected = [](common::ErrorCode code, const std::string &message) {
+        KillResponse rsp;
+        rsp.set_code(code);
+        rsp.set_message(message);
+        return rsp;
+    };
+    const auto paramInvalid = static_cast<common::ErrorCode>(static_cast<int32_t>(StatusCode::ERR_PARAM_INVALID));
+    const auto busy = static_cast<common::ErrorCode>(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY));
 
-    // 2. 解析 SnapStartOptions payload
+    // 1. Bounded admission before any copy/parse; an oversized payload is
+    // never retained.
+    if (requestID.empty() || requestID.size() > kMaxRestoreRequestIDBytes) {
+        return rejected(paramInvalid, "invalid restore request id");
+    }
+    if (checkpointID.empty() || checkpointID.size() > kMaxRestoreCheckpointIDBytes) {
+        YRLOG_ERROR("{}|HandleSnapStart: invalid checkpointID", requestID);
+        return rejected(paramInvalid, "invalid restore checkpoint id");
+    }
+    if (payload.size() > kMaxRestorePayloadBytes) {
+        return rejected(paramInvalid, "oversized restore payload");
+    }
     SnapStartOptions options;
     if (!payload.empty() && !options.ParseFromString(payload)) {
         YRLOG_ERROR("{}|failed to parse SnapStartOptions payload", requestID);
-        KillResponse errorRsp;
-        errorRsp.set_code(static_cast<common::ErrorCode>(static_cast<int32_t>(StatusCode::ERR_PARAM_INVALID)));
-        errorRsp.set_message("invalid SnapStartOptions payload");
-        return errorRsp;
+        return rejected(paramInvalid, "invalid SnapStartOptions payload");
+    }
+
+    // 2. One logical restore context per caller requestID. An identical
+    // request returns the SAME retained future before any unknown/active
+    // state is consulted — a completed context replays its first result and
+    // never repeats cleanup or captures new registrations. A changed
+    // checkpoint/payload is a generic conflict that touches nothing.
+    const auto existing = restoreContexts_.find(requestID);
+    if (existing != restoreContexts_.end()) {
+        if (existing->second->checkpointID == checkpointID && existing->second->payload == payload) {
+            return existing->second->promise.GetFuture();
+        }
+        YRLOG_WARN("{}|restore request id conflicts with a retained context", requestID);
+        return rejected(paramInvalid, "restore request id conflicts with a retained context");
+    }
+
+    // Signal-19/direct restore must not bypass an unresolved parked wake.
+    for (const auto &entry : parkedInstances_) {
+        if (entry.second.checkpointID == checkpointID && entry.second.wakeUnknown) {
+            KillResponse response;
+            response.set_code(busy);
+            response.set_message("checkpoint has an unresolved wake outcome");
+            return response;
+        }
     }
 
     // W10-2: one restore per checkpoint at a time. Duplicate SnapStarts for
@@ -740,60 +825,175 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapStart(const std::string &
     // each mint a fresh synthetic "ckpt-" instance and restore a DUPLICATE
     // sandbox; the loser then fails with an identity/replay conflict (W9-2
     // v4: every successful restore was followed by one such noisy failure).
-    // Reject the duplicate outright -- the parked-registry waking flag covers
-    // the wake path only, this covers every caller of HandleSnapStart.
     if (restoringCheckpoints_.count(checkpointID) > 0) {
         YRLOG_WARN("{}|snapstart of checkpoint {} rejected: a restore is already in flight for it",
                    requestID, checkpointID);
-        KillResponse errorRsp;
-        errorRsp.set_code(static_cast<common::ErrorCode>(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY)));
-        errorRsp.set_message("restore already in flight for checkpoint: " + checkpointID);
-        return errorRsp;
+        return rejected(busy, "restore already in flight for checkpoint: " + checkpointID);
     }
-    restoringCheckpoints_.insert(checkpointID);
+
+    // No eviction, including completed contexts: a full map refuses new work
+    // while existing replays still work.
+    if (restoreContexts_.size() >= kMaxRestoreContexts) {
+        return rejected(busy, "restore context capacity exhausted");
+    }
+
+    ASSERT_IF_NULL(localSchedSrv_);
+
+    // Reserved serialized-payload budget with checked arithmetic (a payload
+    // budget, not RSS). Retained copies per accepted context:
+    //   requestID  x2 — restoreContexts_ key + settlement callback capture
+    //   checkpoint x2 — context copy + restoringCheckpoints_ key
+    //   payload    x1 — context copy (the relay request serialization is a
+    //                   transient copy bounded by these same values)
+    //   nonce      x3 — context copy + restoringCheckpoints_ value +
+    //                   settlement callback capture
+    //   captured   x1 — context vector, one entry per string
+    //   response   x1 — the full bounded response allowance
+    // The captured aggregate is validated BEFORE the list is copied, one
+    // string at a time (no pre-addition overflow).
+    uint64_t reserved = 0;
+    const auto addReserved = [&reserved](uint64_t bytes) {
+        if (reserved > kMaxRestoreContextBytes || bytes > kMaxRestoreContextBytes - reserved) {
+            reserved = kMaxRestoreContextBytes + 1;  // saturates: refused below
+        } else {
+            reserved += bytes;
+        }
+    };
+    addReserved(static_cast<uint64_t>(requestID.size()) * 2);
+    addReserved(static_cast<uint64_t>(checkpointID.size()) * 2);
+    addReserved(payload.size());
+    const auto nonce = litebus::uuid_generator::UUID::GetRandomUUID().ToString();
+    addReserved(static_cast<uint64_t>(nonce.size()) * 3);
+    addReserved(kMaxRestoreResponseBytes);
+    for (const auto &entry : parkedInstances_) {
+        if (entry.second.checkpointID == checkpointID && !entry.second.registrationID.empty()) {
+            addReserved(entry.first.size());
+            addReserved(entry.second.registrationID.size());
+        }
+    }
+    // restoreContextBytes_ never exceeds the bound (only fitting contexts
+    // are admitted), so this subtraction cannot underflow.
+    if (reserved > kMaxRestoreContextBytes - restoreContextBytes_) {
+        return rejected(busy, "restore context payload budget exhausted");
+    }
+
+    // Completion fence: pin the exact registrations parked on this checkpoint
+    // before the async relay — the reply may arrive after a replacement park
+    // re-registered the same checkpoint/source, and only the captured
+    // registrations may be cleared. Copied by value into the retained context.
+    auto context = std::make_shared<RestoreContext>();
+    context->checkpointID = checkpointID;
+    context->payload = payload;
+    context->captured = CaptureParkedRegistrations(checkpointID);
+    context->nonce = nonce;
+    const auto contextIt = restoreContexts_.emplace(requestID, std::move(context)).first;
+    restoringCheckpoints_[checkpointID] = nonce;
+    restoreContextBytes_ += static_cast<size_t>(reserved);
 
     YRLOG_INFO("{}|start snapstart from checkpoint: {}", requestID, checkpointID);
 
-    // 3. 构造 RestoreSnapshotRequest
+    // 3. 构造 RestoreSnapshotRequest；下游沿用原始 caller ID（relay 自行
+    //    mint 私有 transport ID）
     auto req = std::make_shared<messages::RestoreSnapshotRequest>();
     req->set_requestid(requestID);
     req->set_checkpointid(checkpointID);
     *req->mutable_snapstartoptions() = options;
 
-    // 4. 通过 localSchedSrv_ 转发到 function_master 的 ckpt_manager
-    ASSERT_IF_NULL(localSchedSrv_);
-    return localSchedSrv_->SnapStartCheckpoint(req).Then(
-        [aid(GetAID()), requestID, checkpointID](const messages::RestoreSnapshotResponse &rsp) -> KillResponse {
-            // W10-2: settle the in-flight marker on the actor thread (this
-            // continuation may run on the localSchedSrv actor)
-            litebus::Async(aid, &SnapCtrlActor::FinishSnapStart, checkpointID);
-            KillResponse killRsp;
-            killRsp.set_code(static_cast<common::ErrorCode>(rsp.code()));
-            killRsp.set_message(rsp.message());
+    // 4. 通过 localSchedSrv_ 转发到 function_master 的 ckpt_manager。任意
+    //    结局只投递一次 actor 线程 settlement（caller ID + 私有 nonce）。
+    localSchedSrv_->SnapStartCheckpoint(req)
+        .OnComplete(litebus::Defer(GetAID(), &SnapCtrlActor::OnRestoreRelayComplete, requestID, nonce,
+                                   std::placeholders::_1));
+    return contextIt->second->promise.GetFuture();
+}
 
-            if (rsp.code() == common::ERR_NONE) {
-                YRLOG_INFO("{}|snapstart checkpoint {} succeeded, new instanceID: {}", requestID, checkpointID,
-                           rsp.instanceid());
-                // direct restore (signal 19): drop any parked-registry entry
-                // pointing at this checkpoint so the instance cannot be
-                // double-woken afterwards.
-                litebus::Async(aid, &SnapCtrlActor::ForgetParkedByCheckpoint, checkpointID);
-                SnapStartedInfo info;
-                info.set_instanceid(rsp.instanceid());
-                if (rsp.has_snapstartinfo()) {
-                    info.set_routeaddress(rsp.snapstartinfo().routeaddress());
-                    info.set_portmappings(rsp.snapstartinfo().portmappings());
-                    info.set_functionproxyid(rsp.snapstartinfo().functionproxyid());
-                    info.set_nodeid(rsp.snapstartinfo().nodeid());
-                    info.set_namespace_(rsp.snapstartinfo().namespace_());
-                }
-                killRsp.set_payload(info.SerializeAsString());
-            } else {
-                YRLOG_ERROR("{}|snapstart checkpoint {} failed: {}", requestID, checkpointID, rsp.message());
+void SnapCtrlActor::OnRestoreRelayComplete(const std::string &requestID, const std::string &nonce,
+                                           const litebus::Future<messages::RestoreSnapshotResponse> &future)
+{
+    // Exactly-once settlement: unknown request, wrong nonce, an already
+    // completed context or a superseded active marker all do nothing —
+    // including no marker removal.
+    const auto contextIt = restoreContexts_.find(requestID);
+    if (contextIt == restoreContexts_.end() || contextIt->second->nonce != nonce
+        || contextIt->second->completed) {
+        return;
+    }
+    const auto &context = contextIt->second;
+    const auto activeIt = restoringCheckpoints_.find(context->checkpointID);
+    if (activeIt == restoringCheckpoints_.end() || activeIt->second != nonce) {
+        return;  // a newer dispatch owns the marker; it is not ours to erase
+    }
+
+    KillResponse rsp;
+    bool success = false;
+    if (future.IsError()) {
+        // Transport failure: a bounded generic unresolved response; no raw
+        // transport error text is logged or returned.
+        rsp.set_code(common::ERR_INNER_SYSTEM_ERROR);
+        rsp.set_message("restore outcome unresolved");
+        YRLOG_WARN("{}|restore relay transport failed with code({})", requestID, future.GetErrorCode());
+    } else if (future.Get().ByteSizeLong() > kMaxRestoreResponseBytes) {
+        // An oversized relay response is never retained.
+        rsp.set_code(common::ERR_INNER_SYSTEM_ERROR);
+        rsp.set_message("restore response exceeded the bounded size");
+        YRLOG_WARN("{}|restore relay response exceeded the bounded size", requestID);
+    } else {
+        const auto &relayRsp = future.Get();
+        rsp.set_code(static_cast<common::ErrorCode>(relayRsp.code()));
+        if (relayRsp.code() == common::ERR_NONE) {
+            // Preserve every SnapStartedInfo field (proto: instanceID plus
+            // the five SnapstartInfo fields), then bound the TRANSFORMED
+            // response: wrapping the serialized info as a payload can grow
+            // the protobuf envelope past the reservation, and an oversize
+            // outcome must become a generic unresolved error BEFORE any
+            // success mutation or registration clear below.
+            SnapStartedInfo info;
+            info.set_instanceid(relayRsp.instanceid());
+            if (relayRsp.has_snapstartinfo()) {
+                info.set_routeaddress(relayRsp.snapstartinfo().routeaddress());
+                info.set_portmappings(relayRsp.snapstartinfo().portmappings());
+                info.set_functionproxyid(relayRsp.snapstartinfo().functionproxyid());
+                info.set_nodeid(relayRsp.snapstartinfo().nodeid());
+                info.set_namespace_(relayRsp.snapstartinfo().namespace_());
             }
+            KillResponse candidate;
+            candidate.set_code(static_cast<common::ErrorCode>(relayRsp.code()));
+            candidate.set_message(relayRsp.message());
+            candidate.set_payload(info.SerializeAsString());
+            if (candidate.ByteSizeLong() > kMaxRestoreResponseBytes) {
+                rsp.set_code(common::ERR_INNER_SYSTEM_ERROR);
+                rsp.set_message("restore response exceeded the bounded size");
+                YRLOG_WARN("{}|transformed restore response exceeded the bounded size", requestID);
+            } else {
+                rsp = candidate;
+                success = true;
+                YRLOG_INFO("{}|snapstart checkpoint {} succeeded, new instanceID: {}", requestID,
+                           context->checkpointID, relayRsp.instanceid());
+            }
+        } else {
+            // Diagnostic code only: the relay's raw text never reaches the
+            // caller — a generic unresolved message is returned.
+            rsp.set_message("restore outcome unresolved");
+            YRLOG_WARN("{}|snapstart checkpoint {} settled with code({})", requestID, context->checkpointID,
+                       relayRsp.code());
+        }
+    }
 
-            return killRsp;
-        });
+    if (success) {
+        // Direct restore: clear ONLY the first captured registrations, so a
+        // later park of the same checkpoint survives and the instance cannot
+        // be double-woken afterwards.
+        ForgetParkedRegistrations(context->captured);
+    } else {
+        // An error is not retirement evidence: the captured entries are kept
+        // unresolved with their full identity; waking is left untouched so a
+        // wake dispatch's own completion wrapper settles and counts it once.
+        MarkCapturedRegistrationsUnknown(context->captured);
+    }
+
+    restoringCheckpoints_.erase(activeIt);
+    context->completed = true;
+    context->promise.SetValue(rsp);
 }
 
 void SnapCtrlActor::SnapStart(
