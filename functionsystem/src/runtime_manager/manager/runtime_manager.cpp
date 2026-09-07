@@ -144,6 +144,8 @@ void RuntimeManager::Init()
     ActorBase::Receive("StartInstance", &RuntimeManager::StartInstance);
     ActorBase::Receive("StopInstance", &RuntimeManager::StopInstance);
     ActorBase::Receive("SnapshotRuntime", &RuntimeManager::SnapshotRuntime);
+    ActorBase::Receive("SnapshotRuntimeIfGeneration", &RuntimeManager::SnapshotRuntimeIfGeneration);
+    ActorBase::Receive("ResizeSandbox", &RuntimeManager::ResizeSandbox);
     ActorBase::Receive("QueryInstanceStatusInfo", &RuntimeManager::QueryInstanceStatusInfo);
     ActorBase::Receive("CleanStatus", &RuntimeManager::CleanStatus);
     ActorBase::Receive("UpdateCred", &RuntimeManager::UpdateCred);
@@ -472,11 +474,63 @@ void RuntimeManager::StopInstance(const litebus::AID &from, std::string && /* na
             return healthCheckClient->StopHeathCheckByPID(exePtr);
         })
         .Then([executor, request]() { return executor->StopInstance(request, false); })
-        .OnComplete(litebus::Defer(GetAID(), &RuntimeManager::DeleteInstanceMetrics, std::placeholders::_1, request))
-        .OnComplete(litebus::Defer(GetAID(), &RuntimeManager::DestroyDebugServer, std::placeholders::_1, request))
-        .OnComplete(litebus::Defer(GetAID(), &RuntimeManager::ReleasePort, std::placeholders::_1, request))
         .OnComplete(
             litebus::Defer(GetAID(), &RuntimeManager::StopInstanceResponse, from, std::placeholders::_1, request));
+}
+
+void RuntimeManager::ResizeSandbox(const litebus::AID &from, std::string &&, std::string &&msg)
+{
+    // This is a control-plane command, never a sandbox-selected network route.
+    if (functionAgentAID_.Name().empty() || from != functionAgentAID_) {
+        YRLOG_WARN("reject ResizeSandbox from unregistered function-agent {}", from.HashString());
+        return;
+    }
+    auto request = std::make_shared<messages::ResizeSandboxRequest>();
+    if (msg.size() > 64 * 1024 || !request->ParseFromString(msg)) {
+        YRLOG_WARN("invalid ResizeSandbox request from registered function-agent");
+        return;
+    }
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    auto executor = std::dynamic_pointer_cast<SandboxdExecutorProxy>(FindExecutor(EXECUTOR_TYPE::SANDBOXD));
+    if (executor == nullptr || request->resize().deadline_unix_ms() <= nowMs
+        || request->resize().deadline_unix_ms() > nowMs + 60000) {
+        messages::ResizeSandboxResponse response;
+        response.set_requestid(request->requestid());
+        response.set_instanceid(request->instanceid());
+        response.set_runtimeid(request->runtimeid());
+        response.set_sandboxid(request->resize().sandbox_id());
+        response.set_resourcegeneration(request->resize().resource_generation());
+        response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+        response.set_message("sandboxd executor or command deadline unavailable before dispatch");
+        response.set_outcome(messages::ResizeSandboxResponse::REJECTED_BEFORE_DISPATCH);
+        Send(from, "ResizeSandboxResponse", response.SerializeAsString());
+        return;
+    }
+    executor->ResizeSandbox(request).OnComplete(
+        [aid(GetAID()), from, request](const litebus::Future<messages::ResizeSandboxResponse> &result) {
+            litebus::Async(aid, &RuntimeManager::OnResizeSandboxComplete, from, request, result);
+        });
+}
+
+void RuntimeManager::OnResizeSandboxComplete(const litebus::AID &from,
+    const std::shared_ptr<messages::ResizeSandboxRequest> &request,
+    const litebus::Future<messages::ResizeSandboxResponse> &result)
+{
+    messages::ResizeSandboxResponse response;
+    if (result.IsOK()) {
+        response = result.Get();
+    } else {
+        response.set_requestid(request->requestid());
+        response.set_instanceid(request->instanceid());
+        response.set_runtimeid(request->runtimeid());
+        response.set_sandboxid(request->resize().sandbox_id());
+        response.set_resourcegeneration(request->resize().resource_generation());
+        response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+        response.set_message("resize executor completion failed; reconcile before releasing budget");
+        response.set_outcome(messages::ResizeSandboxResponse::UNKNOWN);
+    }
+    Send(from, "ResizeSandboxResponse", response.SerializeAsString());
 }
 
 void RuntimeManager::SnapshotRuntime(const litebus::AID &from, std::string &&, std::string &&msg)
@@ -542,6 +596,75 @@ Status RuntimeManager::ResolveSnapshotExecutorType(const messages::SnapshotRunti
 
     executorType = authoritativeType;
     return Status::OK();
+}
+
+void RuntimeManager::SnapshotRuntimeIfGeneration(const litebus::AID &from, std::string &&, std::string &&msg)
+{
+    // Generation-fenced snapshot execution on a channel separate from the
+    // legacy SnapshotRuntime handler; replies use only the new response name.
+    if (functionAgentAID_.Name().empty() || from != functionAgentAID_) {
+        YRLOG_WARN("reject SnapshotRuntimeIfGeneration from unregistered function-agent {}", from.HashString());
+        return;
+    }
+    auto request = std::make_shared<messages::SnapshotRuntimeRequest>();
+    if (msg.size() > 64 * 1024 || !request->ParseFromString(msg)) {
+        YRLOG_WARN("invalid SnapshotRuntimeIfGeneration request from registered function-agent");
+        return;
+    }
+    // Only SandboxdExecutorProxy interprets the expected identity pair; another
+    // executor would snapshot without the fence and report hollow success.
+    auto executor = std::dynamic_pointer_cast<SandboxdExecutorProxy>(FindExecutor(EXECUTOR_TYPE::SANDBOXD));
+    const auto validID = [](const std::string &id) {
+        return !id.empty() && id.size() <= 256 && id.find_first_not_of(" \t\n\r\v\f") != std::string::npos;
+    };
+    if (executor == nullptr || !validID(request->requestid()) || !validID(request->instanceid())
+        || !validID(request->runtimeid()) || !validID(request->expected_sandbox_id())
+        || !validID(request->expected_resource_generation())) {
+        messages::SnapshotRuntimeResponse response;
+        response.set_requestid(request->requestid());
+        response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+        response.set_message("sandboxd executor or complete expected identity unavailable before dispatch");
+        Send(from, "SnapshotRuntimeIfGenerationResponse", response.SerializeAsString());
+        return;
+    }
+    YRLOG_INFO("{}|begin generation-fenced snapshot for instance({}), runtime({}), expected sandbox({})",
+               request->requestid(), request->instanceid(), request->runtimeid(), request->expected_sandbox_id());
+    executor->SnapshotRuntime(request).OnComplete(
+        [aid(GetAID()), from, request](const litebus::Future<messages::SnapshotRuntimeResponse> &result) {
+            litebus::Async(aid, &RuntimeManager::OnSnapshotRuntimeIfGenerationComplete, from, request, result);
+        });
+}
+
+void RuntimeManager::OnSnapshotRuntimeIfGenerationComplete(const litebus::AID &from,
+    const std::shared_ptr<messages::SnapshotRuntimeRequest> &request,
+    const litebus::Future<messages::SnapshotRuntimeResponse> &result)
+{
+    messages::SnapshotRuntimeResponse response;
+    if (result.IsOK()) {
+        response = result.Get();
+        if (response.requestid() != request->requestid()) {
+            response.clear_snapshotinfo();
+            response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+            response.set_message("snapshot reply does not match the fenced request; outcome unknown");
+        } else if (response.code() == static_cast<int32_t>(StatusCode::SUCCESS)
+                   && (!response.has_snapshotinfo()
+                       || response.snapshotinfo().source_runtime_id() != request->runtimeid()
+                       || response.snapshotinfo().sandbox_id() != request->expected_sandbox_id()
+                       || response.snapshotinfo().source_generation() != request->expected_resource_generation()
+                       || response.snapshotinfo().checkpointid().empty())) {
+            // A checkpoint exists but is not proven to belong to the expected
+            // sandbox/generation; report unknown instead of success.
+            response.clear_snapshotinfo();
+            response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+            response.set_message("snapshot source identity unverified; outcome unknown, reconcile checkpoint state");
+        }
+    } else {
+        // A failed future carries no response payload; never call Get on it.
+        response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+        response.set_message("snapshot executor completion failed; outcome unknown, reconcile checkpoint state");
+    }
+    response.set_requestid(request->requestid());
+    Send(from, "SnapshotRuntimeIfGenerationResponse", response.SerializeAsString());
 }
 
 void RuntimeManager::HandlePrestartRuntimeExit(const pid_t pid)
@@ -776,9 +899,9 @@ std::shared_ptr<ExecutorProxy> RuntimeManager::CreateSandboxdExecutor()
         // D-7: bridge the sandboxd Stats poll into the resource view so
         // per-instance actualuse is populated even though runsc reports pid=0
         auto metricsClient = metricsClient_;
-        executor->SetInstanceMemoryUsageReporter(
-            [metricsClient](const std::string &instanceID, double memoryMb) {
-                metricsClient->UpdateInstanceMemoryUsage(instanceID, memoryMb);
+        executor->SetInstanceResourceSampleReporter(
+            [metricsClient](const std::string &instanceID, const resources::SandboxResourceSample &sample) {
+                metricsClient->UpdateInstanceResourceSample(instanceID, sample);
             });
     }
     litebus::Spawn(executor, false);
@@ -948,6 +1071,11 @@ void RuntimeManager::SendStopInstanceResponse(const litebus::AID &from, const st
         }
         (void)runtimeResponseMap_.erase(runtimeID);
         (void)instanceInfoMap_.erase(runtimeID);
+    if (response->code() == static_cast<int32_t>(StatusCode::SUCCESS)) {
+        if (auto iter(instanceInfoMap_.find(runtimeID)); iter != instanceInfoMap_.end()) {
+            (void)instanceResponseMap_.erase(iter->second.instanceid());
+            (void)instanceInfoMap_.erase(iter);
+        }
     }
     Send(from, "StopInstanceResponse", response->SerializeAsString());
 }
@@ -958,17 +1086,25 @@ void RuntimeManager::OnGetRuntimeStatus(const litebus::AID &from,
                                         const litebus::Future<Status> &instanceStatus)
 {
     if (instanceStatus.IsError() || instanceStatus.Get().StatusCode() != StatusCode::SUCCESS) {
+        const auto reason = instanceStatus.IsError()
+            ? "runtime exit observation failed: " + std::to_string(instanceStatus.GetErrorCode())
+            : instanceStatus.Get().RawMessage();
         YRLOG_ERROR("{}|{}|failed to stop runtime({}), {}.", request->traceid(), request->requestid(),
-                    request->runtimeid(), instanceStatus.Get().RawMessage());
+                    request->runtimeid(), reason);
         response->set_code(static_cast<int32_t>(RUNTIME_MANAGER_STOP_INSTANCE_FAILED));
-        response->set_message(instanceStatus.Get().RawMessage());
+        response->set_message(reason);
     } else {
         YRLOG_INFO("{}|{}|success to stop runtime({}).", request->traceid(), request->requestid(),
                    request->runtimeid());
         response->set_code(static_cast<int32_t>(StatusCode::SUCCESS));
         response->set_message("stop instance success");
+        // Retain identity, telemetry and port ownership until exit is confirmed.
+        const litebus::Future<Status> retired(Status::OK());
+        DeleteInstanceMetrics(retired, request);
+        DestroyDebugServer(retired, request);
+        ReleasePort(retired, request);
+        healthCheckClient_->RemoveRuntimeStatusCache(request->runtimeid());
     }
-    healthCheckClient_->RemoveRuntimeStatusCache(request->runtimeid());
     SendStopInstanceResponse(from, request->runtimeid(), response);
 }
 

@@ -170,12 +170,13 @@ bool UpgradeLadder::TryRaise(const std::string &poolDir, uint64_t actualUseBytes
     // global step (8 GiB) past its booked size in one go; large sandboxes are
     // unaffected (step < currentMax there).
     const uint64_t stepBytes = std::min(config_.stepBytes, currentMax);
-    const uint64_t newMax = std::min(currentMax + stepBytes, config_.capBytes);
+    const uint64_t raiseBytes = std::min(stepBytes, config_.capBytes - currentMax);
+    const uint64_t newMax = currentMax + raiseBytes;
     // P2.0: self-admission must not spend promised-but-unrealized headroom
     // on another rung — the ledger's outstanding bytes ride the same safety
     // line, so ladder raises cannot amplify each other into overcommit
     const uint64_t outstanding = resource_view::CommitmentLedger::Outstanding(nodeID_);
-    if (actualUseBytes + outstanding + stepBytes > static_cast<uint64_t>(config_.safetyRatio * capacityBytes)) {
+    if (actualUseBytes + outstanding + raiseBytes > static_cast<uint64_t>(config_.safetyRatio * capacityBytes)) {
         return false; // node admission denies this rung
     }
     if (!WriteUint64File(dir + "/memory.max", newMax)) {
@@ -183,6 +184,9 @@ bool UpgradeLadder::TryRaise(const std::string &poolDir, uint64_t actualUseBytes
                    poolDir);
         return false;
     }
+    // The hard limit is now effective even if the soft-limit write fails.
+    // Publish its reservation before any partial-success return.
+    resource_view::CommitmentLedger::OnRaise(nodeID_, raiseBytes, actualUseBytes);
     const uint64_t newHigh = static_cast<uint64_t>(config_.highRatio * newMax);
     if (!WriteUint64File(dir + "/memory.high", newHigh)) {
         // max is already raised; a stale (lower) high only keeps the throttle
@@ -194,9 +198,6 @@ bool UpgradeLadder::TryRaise(const std::string &poolDir, uint64_t actualUseBytes
     YRLOG_INFO("upgrade ladder on node {}: raised sandbox {} max {} -> {} bytes, high -> {} (use {} / cap {}"
                ", commitment {})",
                nodeID_, poolDir, currentMax, newMax, newHigh, actualUseBytes, capacityBytes, newMax - currentMax);
-    // P2.0: publish the promised headroom; admission (filter + this ladder)
-    // accounts for it until node usage growth cashes it in
-    resource_view::CommitmentLedger::OnRaise(nodeID_, newMax - currentMax, actualUseBytes);
     return true;
 }
 

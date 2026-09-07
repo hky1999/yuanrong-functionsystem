@@ -17,6 +17,8 @@
 #include "resource_view_actor.h"
 
 #include <utility>
+#include <chrono>
+#include <cmath>
 
 #include "async/async.hpp"
 #include "litebus.hpp"
@@ -28,6 +30,8 @@
 #include "common/status/status.h"
 #include "common/types/instance_state.h"
 #include "resource_tool.h"
+#include "resource_sample_freshness.h"
+#include "restore_admission.h"
 #include "scala_resource_tool.h"
 #include "usage_trend_tracker.h"
 #include "utils/string_utils.hpp"
@@ -559,6 +563,7 @@ Status ResourceViewActor::DeleteResourceUnit(const std::string &unitID)
     DeleteResourceBySubUnit(*view_, fragmentIter->second);
     DeleteBucketIndexBySubUnit(*view_, fragmentIter->second);
     DeleteInstancesBySubUnit(*view_, fragmentIter->second);
+    for (const auto &entry : fragmentIter->second.instances()) { resourceAdmissionTimes_.erase(entry.first); }
 
     // unmap request id to unit id
     for (auto &valueInstIter : fragmentIter->second.instances()) {
@@ -681,11 +686,19 @@ void ResourceViewActor::SimplifyInstanceInfo(const InstanceInfo &instance, Insta
     simplifiedInstance.set_instanceid(instance.instanceid());
     simplifiedInstance.set_requestid(instance.requestid());
     simplifiedInstance.set_runtimeid(instance.runtimeid());
+    // Preserve only the explicit elastic contract here; admission bookkeeping
+    // is reconstructed by the owning view, never accepted from the caller.
+    const auto elastic = instance.createoptions().find(SCHEDULER_ELASTIC_RESOURCES);
+    if (elastic != instance.createoptions().end()) {
+        (*simplifiedInstance.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = elastic->second;
+    }
+    simplifiedInstance.set_resource_admission_pending(UsesElasticAdmission(instance));
     simplifiedInstance.set_runtimeaddress(instance.runtimeaddress());
     simplifiedInstance.set_functionagentid(instance.functionagentid());
     simplifiedInstance.set_unitid(instance.unitid().empty() ? instance.functionagentid() : instance.unitid());
     simplifiedInstance.set_function(instance.function());
     simplifiedInstance.mutable_resources()->CopyFrom(instance.resources());
+    simplifiedInstance.mutable_snapshotinfo()->CopyFrom(instance.snapshotinfo());
     simplifiedInstance.mutable_actualuse()->CopyFrom(instance.actualuse());
     simplifiedInstance.mutable_scheduleoption()->CopyFrom(instance.scheduleoption());
     simplifiedInstance.mutable_labels()->CopyFrom(instance.labels());
@@ -750,9 +763,55 @@ Status ResourceViewActor::AddInstances(const std::map<std::string, InstanceAlloc
             MarkSnapshotMonopolyIndexDirty();
             continue;
         }
-        const auto status = ValidateInstanceAllocation(inst.first, simplifyInstance);
-        if (status.IsError()) {
-            inst.second.allocatedPromise->SetValue(status);
+        auto selected = simplifyInstance.unitid();
+        if (view_->fragment().find(selected) == view_->fragment().end()
+            || view_->fragment().at(selected).status() != static_cast<uint32_t>(UnitStatus::NORMAL)) {
+            YRLOG_WARN("unable to allocate instances({}). the ({}) is unavailable", inst.first, selected);
+            inst.second.allocatedPromise->SetValue(Status(StatusCode::ERR_INNER_SYSTEM_ERROR));
+            continue;
+        }
+        // This actor serializes actual allocations across scheduling windows.
+        // Recheck restore reservations after earlier allocations became visible.
+        const auto &selectedUnit = view_->fragment().at(selected);
+        // Cold allocations from independent scheduling windows must also
+        // obey the instance cap, even before the first resource sample.
+        const auto maxInstances = GetUsageAdmissionSettings().maxInstances;
+        if (maxInstances > 0 && selectedUnit.instances().size() >= static_cast<size_t>(maxInstances)) {
+            inst.second.allocatedPromise->SetValue(
+                Status(RESOURCE_NOT_ENOUGH, "Instances: Node Instance Cap Reached"));
+            continue;
+        }
+        bool restoreAdmission = !simplifyInstance.snapshotinfo().checkpointid().empty()
+            || simplifyInstance.resource_admission_pending();
+        for (const auto &entry : selectedUnit.instances()) {
+            restoreAdmission = restoreAdmission || !entry.second.snapshotinfo().checkpointid().empty()
+                || entry.second.resource_admission_pending();
+        }
+        const auto resizeReserve = OutstandingResize(selected);
+        if (restoreAdmission || resizeReserve.cpuMillicores > 0 || resizeReserve.memoryMb > 0) {
+            const auto verdict = CheckRestoreAllocation(simplifyInstance, selectedUnit, resizeReserve);
+            if (!verdict.IsOk()) {
+                inst.second.allocatedPromise->SetValue(verdict);
+                continue;
+            }
+        }
+        // Check capacity: skip resources with value 0 (e.g. nvidia.com/gpu:0) to avoid
+        // false "insufficient resource" when the node has no such resource type at all.
+        auto checkResources = simplifyInstance.resources();
+        for (auto it = checkResources.mutable_resources()->begin();
+             it != checkResources.mutable_resources()->end();) {
+            if (ScalaValueIsEmpty(it->second)) {
+                it = checkResources.mutable_resources()->erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (checkResources > view_->fragment().at(selected).allocatable()) {
+            YRLOG_WARN(
+                "unable to allocate instances({}). the ({}) has insufficient resources may caused by capacity "
+                "decrement",
+                inst.first, selected);
+            inst.second.allocatedPromise->SetValue(Status(StatusCode::ERR_INNER_SYSTEM_ERROR));
             continue;
         }
         AddInstance(simplifyInstance);
@@ -910,6 +969,7 @@ void ResourceViewActor::ClearResourceView()
 {
     SnapshotMutationGuard snapshotGuard(*this);
     view_.reset(new ResourceUnit());
+    resourceAdmissionTimes_.clear();
     reqIDToUnitIDMap_.clear();
     MarkSnapshotStructureDirty("");
     MarkSnapshotIndexesDirty(true, true);
@@ -1177,6 +1237,11 @@ void ResourceViewActor::AddInstance(const InstanceInfo &instance)
     StoreChange(view_->revision(), resourceUnitChange);
 
     AddInstanceToView(instance);
+    if (!instance.snapshotinfo().checkpointid().empty() || instance.resource_admission_pending()) {
+        resourceAdmissionTimes_[instance.instanceid()] = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
 
     const auto &functionAgentID = instance.unitid();
     auto agent = view_->mutable_fragment()->find(functionAgentID);
@@ -1334,6 +1399,7 @@ void ResourceViewActor::DeleteLabels(const InstanceInfo &instInfo)
 
 void ResourceViewActor::DeleteInstanceFromView(const InstanceInfo &instance)
 {
+    resourceAdmissionTimes_.erase(instance.instanceid());
     ASSERT_IF_NULL(view_);
     auto nodeLabels = view_->mutable_nodelabels();
     DeleteLabel(instance, *nodeLabels);
@@ -1424,6 +1490,10 @@ void ResourceViewActor::UpdateResourceUnitActual(const std::shared_ptr<ResourceU
 {
     ASSERT_IF_NULL(view_);
     auto unit = view_->mutable_fragment()->find(value->id());
+    if (value->memory_sample_unix_ms() > 0
+        && unit->second.memory_sample_unix_ms() > value->memory_sample_unix_ms()) {
+        return; // delayed resource reports must not roll back node usage
+    }
     // update top level actual use
     if (view_->has_actualuse()) {
         if (!IsValid(view_->actualuse() - unit->second.actualuse())) {
@@ -1439,6 +1509,8 @@ void ResourceViewActor::UpdateResourceUnitActual(const std::shared_ptr<ResourceU
 
     // update fragment
     *unit->second.mutable_actualuse() = std::move(*value->mutable_actualuse());
+    unit->second.set_memory_sample_unix_ms(value->memory_sample_unix_ms());
+    unit->second.set_cpu_sample_unix_ms(value->cpu_sample_unix_ms());
 
     // D-7: merge the reported per-instance actualuse into the view. The
     // collectors already report it (BuildResourceUnitWithInstance), but
@@ -1453,17 +1525,72 @@ void ResourceViewActor::UpdateResourceUnitActual(const std::shared_ptr<ResourceU
         if (viewInst == unit->second.mutable_instances()->end()) {
             continue;
         }
-        (*viewInst->second.mutable_actualuse()) = reportedIt.second.actualuse();
+        const auto &reported = reportedIt.second;
+        if (reported.has_sandbox_resource_sample()
+            && !viewInst->second.runtimeid().empty()
+            && viewInst->second.runtimeid() != reported.sandbox_resource_sample().runtime_id()) {
+            continue;
+        }
+        if (reported.has_sandbox_resource_sample() && viewInst->second.has_sandbox_resource_sample()
+            && reported.sandbox_resource_sample().sampled_at_unix_ms()
+                <= viewInst->second.sandbox_resource_sample().sampled_at_unix_ms()) {
+            continue;
+        }
+        (*viewInst->second.mutable_actualuse()) = reported.actualuse();
+        if (reported.has_sandbox_resource_sample()) {
+            viewInst->second.mutable_sandbox_resource_sample()->CopyFrom(reported.sandbox_resource_sample());
+        } else {
+            viewInst->second.clear_sandbox_resource_sample();
+        }
+        const auto observationNowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        if ((!viewInst->second.snapshotinfo().checkpointid().empty() || viewInst->second.resource_admission_pending())
+            && resourceAdmissionTimes_.find(reportedIt.first) == resourceAdmissionTimes_.end()) {
+            // A recovered view must receive a new physical sample before
+            // dropping a reservation whose original admission time is unknown.
+            resourceAdmissionTimes_[reportedIt.first] = observationNowMs;
+        }
+        const auto admitted = resourceAdmissionTimes_.find(reportedIt.first);
+        if (admitted != resourceAdmissionTimes_.end() && reported.has_sandbox_resource_sample()) {
+            const auto &sample = reported.sandbox_resource_sample();
+            const auto cpuObservedMs = UsableNodeCPUSampleTime(*value, observationNowMs, DEFAULT_RESOURCE_SAMPLE_MAX_AGE_MS);
+            const auto memoryObservedMs = UsableNodeMemorySampleTime(*value, observationNowMs, DEFAULT_RESOURCE_SAMPLE_MAX_AGE_MS);
+            if (!sample.resource_generation().empty() && !sample.runtime_id().empty()
+                && reported.runtimeid() == sample.runtime_id() && !sample.sandbox_id().empty()
+                && sample.cpu_usage_known() && std::isfinite(sample.cpu_usage_cores()) && sample.cpu_usage_cores() >= 0
+                && sample.sampled_at_unix_ms() > admitted->second
+                && observationNowMs - sample.sampled_at_unix_ms() <= DEFAULT_RESOURCE_SAMPLE_MAX_AGE_MS
+                && cpuObservedMs > admitted->second
+                && memoryObservedMs >= sample.sampled_at_unix_ms()) {
+                // Physical Stats and both node CPU/Memory windows postdate admission.
+                // Release the temporary restore ceiling, not the normal booking.
+                viewInst->second.clear_snapshotinfo();
+                viewInst->second.set_resource_admission_pending(false);
+                resourceAdmissionTimes_.erase(admitted);
+            }
+        }
         auto topInst = view_->mutable_instances()->find(reportedIt.first);
         if (topInst != view_->mutable_instances()->end() && topInst->second.unitid() == value->id()) {
-            (*topInst->second.mutable_actualuse()) = reportedIt.second.actualuse();
+            (*topInst->second.mutable_actualuse()) = viewInst->second.actualuse();
+            topInst->second.mutable_snapshotinfo()->CopyFrom(viewInst->second.snapshotinfo());
+            topInst->second.set_resource_admission_pending(viewInst->second.resource_admission_pending());
+            if (viewInst->second.has_sandbox_resource_sample()) {
+                topInst->second.mutable_sandbox_resource_sample()->CopyFrom(viewInst->second.sandbox_resource_sample());
+            } else {
+                topInst->second.clear_sandbox_resource_sample();
+            }
         }
     }
 
+    ReconcileResize(unit->second);
+
     // D-form admission input: feed the per-unit memory trend so the
     // usage-aware filter can predict bursts instead of chasing last sample
-    auto memIt = value->actualuse().resources().find(MEMORY_RESOURCE_NAME);
-    if (memIt != value->actualuse().resources().end()) {
+    // The incoming protobuf was moved into the fragment above; depending on
+    // arena ownership it may now contain the old fragment rather than the report.
+    const auto &actualResources = unit->second.actualuse().resources();
+    auto memIt = actualResources.find(MEMORY_RESOURCE_NAME);
+    if (memIt != actualResources.end()) {
         UsageTrendTracker::Record(value->id(), memIt->second.scalar().value());
     }
 }

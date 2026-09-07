@@ -50,6 +50,12 @@ void MetricsClient::DeleteInstanceMetrics(const std::string &deployDir, const st
     litebus::Async(actor_->GetAID(), &MetricsActor::DeleteInstance, deployDir, instanceID);
 }
 
+void MetricsClient::UpdateInstanceResourceSample(const std::string &instanceID,
+                                                const resources::SandboxResourceSample &sample) const
+{
+    litebus::Async(actor_->GetAID(), &MetricsActor::UpdateInstanceResourceSample, instanceID, sample);
+}
+
 void MetricsClient::UpdateInstanceMemoryUsage(const std::string &instanceID, double memoryMb) const
 {
     litebus::Async(actor_->GetAID(), &MetricsActor::UpdateInstanceMemoryUsage, instanceID, memoryMb);

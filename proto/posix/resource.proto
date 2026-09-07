@@ -290,6 +290,44 @@ message SnapshotInfo {
     SnapshotStatus status = 6;
     string sourceNodeID = 7;
     string sha256 = 8;
+
+  string checkpointID = 1;
+  string storage = 2;
+  int64  size = 3;
+  string createTime = 4;
+  int32 ttlSeconds = 5;
+  string sha256 = 6;      // checkpoint manifest digest, checked before restore
+  string sandbox_id = 7; // source sandbox identity bound to the checkpoint
+  string source_generation = 8; // physical source lifetime from sandboxd manifest
+  string source_runtime_id = 9; // runtime mapped to the source sandbox by executor
+}
+
+// A physical sandbox observation. Missing generation/known flags are not zero usage.
+// sampled_at_unix_ms is the request-start estimate; consumers must enforce freshness.
+message SandboxResourceSample {
+    string runtime_id = 1;
+    string sandbox_id = 2;
+    string resource_generation = 3;
+    int64 sampled_at_unix_ms = 4;
+    uint64 cpu_usage_ns = 5;
+    bool cpu_usage_known = 6;
+    double cpu_usage_cores = 7;
+    bool cpu_limits_known = 8;
+    int64 cpu_quota_usec = 9;
+    uint64 cpu_period_usec = 10;
+    uint64 memory_current_bytes = 11;
+    uint64 memory_limit_bytes = 12;
+    uint64 memory_peak_bytes = 13;
+    string elastic_policy = 14;
+    bool cpu_pressure_known = 15;
+    uint64 cpu_periods = 16;
+    uint64 cpu_throttled_periods = 17;
+    uint64 cpu_throttled_ns = 18;
+    bool memory_pressure_known = 19;
+    uint64 memory_high_events = 20;
+    uint64 memory_oom_events = 21;
+    uint64 memory_oom_kill_events = 22;
+
 }
 
 message InstanceInfo {
@@ -395,10 +433,13 @@ message InstanceInfo {
     // container/sandbox internal IP (docker bridge network via inspect); empty for supervisor/runsc.
     string containerIP = 41;
     // Same-node recovery policy selected by the creating client.
-    bool failover = 42;
-    string sandboxID = 43;
-    string nodeProxyAddress = 44;
-    string sandboxIP = 45;
+    // Renumbered from upstream 42: our wire pins 42-43 for the resource
+    // admission contract; see the v3 identity adjudication.
+    bool failover = 44;
+
+    SandboxResourceSample sandbox_resource_sample = 42;
+    // Resource-view-owned reservation until physical and node observations reconcile admission.
+    bool resource_admission_pending = 43;
 }
 
 message SchedulingQueueInfo {
@@ -571,6 +612,10 @@ message ResourceUnit {
 
     // Use the identifier at initialization as the initialization time of resourceunit
     string viewInitTime = 15;
+    // Collection-start time of a valid node Memory observation; zero means unknown.
+    int64 memory_sample_unix_ms = 16;
+    // Start of a valid node CPU usage window; zero means unknown.
+    int64 cpu_sample_unix_ms = 17;
 }
 
 enum InvokeType {

@@ -27,11 +27,16 @@
 #include <vector>
 
 #include "common/resource_view/resource_view.h"
+#include "common/resource_view/resource_sample_freshness.h"
 #include "common/state_machine/instance_control_view.h"
 #include "common/status/status.h"
 #include "local_scheduler/instance_control/idle/idle_mgr.h"
+#include "local_scheduler/function_agent_manager/function_agent_mgr.h"
 #include "local_scheduler/pressure_monitor/cpu_upgrade_ladder.h"
 #include "local_scheduler/pressure_monitor/upgrade_ladder.h"
+#include "local_scheduler/pressure_monitor/pressure_event_queue.h"
+#include "local_scheduler/pressure_monitor/pressure_sample_gate.h"
+#include "local_scheduler/pressure_monitor/physical_llm_client.h"
 #include "local_scheduler/snap_ctrl/snap_ctrl.h"
 
 namespace functionsystem::local_scheduler {
@@ -44,6 +49,9 @@ struct PressureMonitorConfig {
     uint32_t sustainSamples = 2;
     uint32_t parkTtlSec = 86400; // override ckpt manager's 1800s default
     uint32_t maxParked = 8;
+    // Stats polls each second; reject stale observations using the shared policy.
+    int64_t resourceSampleMaxAgeMs = resource_view::DEFAULT_RESOURCE_SAMPLE_MAX_AGE_MS;
+    double maxIdleCpuCores = 0.02;
     // W-CPUL: the monitor hosts the ladders too; park/unpark decisions stay
     // gated on the park feature alone (ladder-only nodes never park)
     bool enablePark = true;
@@ -71,7 +79,12 @@ struct PressureMonitorConfig {
  *
  * Parks go through SnapCtrl::HandleSnapshot with leaveRunning=false and an
  * explicit ttl (parkTtlSec), so each parked instance is registered in
- * SnapCtrl's parked registry for wake/FIFO unpark.
+ * SnapCtrl's parked registry for wake/FIFO unpark. Parking is additionally
+ * gated on a physical LLM hold acquired from the bound PhysicalLLMClient:
+ * the proxy must own the victim's LLM delivery before the checkpoint is
+ * dispatched, and the hold token rides in the SnapOptions into the parked
+ * registry entry. Without a bound client the park path fails closed (the
+ * historical direct-snapshot park is never used as a fallback).
  *
  * Cycle chaining: cross-actor reads are chained with Async back onto this
  * actor (idle set -> resource view -> parked registry -> decision), and the
@@ -99,9 +112,22 @@ public:
         snapCtrl_ = snapCtrl;
     }
 
+    void BindFunctionAgentMgr(const std::shared_ptr<FunctionAgentMgr> &manager) { functionAgentMgr_ = manager; }
+
     void BindIdleMgr(const std::shared_ptr<IdleMgr> &idleMgr)
     {
         idleMgr_ = idleMgr;
+    }
+
+    /**
+     * Bind the physical LLM hold client (proxy /hold/physical endpoints).
+     * Without a bound client the pressure-park path fails closed: the proxy
+     * must own the victim's LLM delivery before any checkpoint is issued, so
+     * the historical direct-snapshot park is never used as a fallback.
+     */
+    void BindPhysicalLLMClient(const std::shared_ptr<PhysicalLLMClient> &client)
+    {
+        physicalLLMClient_ = client;
     }
 
     /**
@@ -115,8 +141,7 @@ public:
      */
     void NotifyPressureEvent(std::string poolDir, uint64_t increment)
     {
-        pendingEventDir_ = std::move(poolDir);
-        pendingEventIncrement_ = increment;
+        pendingMemoryEvents_.Push(poolDir, increment);
         SampleNow();
     }
 
@@ -129,8 +154,7 @@ public:
      */
     void NotifyCpuPressureEvent(std::string poolDir, uint64_t increment)
     {
-        pendingCpuEventDir_ = std::move(poolDir);
-        pendingCpuEventIncrement_ = increment;
+        pendingCpuEvents_.Push(poolDir, increment);
         SampleNow();
     }
 
@@ -142,16 +166,78 @@ private:
     void SampleNow();
 
     /** Stage 1: store the idle set, fetch the node resource view. */
-    void OnIdleSet(const std::vector<std::string> &idleInstances);
+    void OnIdleSet(uint64_t generation, const std::vector<std::string> &idleInstances);
 
     /** Stage 2: compute the ratio, fetch the parked registry. */
-    void OnResourceView(const std::shared_ptr<resource_view::ResourceUnit> &view);
+    void OnResourceView(uint64_t generation, const std::shared_ptr<resource_view::ResourceUnit> &view);
 
     /** Stage 3: park/unpark decision with all three inputs at hand. */
-    void Decide(const std::vector<std::pair<std::string, SnapCtrlActor::ParkedEntry>> &parked);
+    void Decide(uint64_t generation, const std::vector<std::pair<std::string, SnapCtrlActor::ParkedEntry>> &parked);
 
-    /** Park one victim via SnapCtrl (leaveRunning=false + explicit ttl). */
+    void OnSampleTimeout(uint64_t generation);
+    void ResizeUnderPressure(const resource_view::ResourceUnit &view, int64_t nowMs);
+    void OnPressureResize(const std::string &instanceID, const std::string &requestID,
+                          const litebus::Future<messages::ResizeSandboxResponse> &result);
+    std::shared_ptr<FunctionAgentMgr> functionAgentMgr_;
+    struct PressureResizeAttempt {
+        std::string requestID;
+        int64_t dispatchedAtMs;
+        messages::ResizeSandboxRequest request;
+        bool unknown = false;
+    };
+    std::unordered_map<std::string, PressureResizeAttempt> pressureResizes_;
+    std::unordered_map<std::string, resources::SandboxResourceSample> resizeSamples_;
+    std::unordered_map<std::string, int64_t> resizeAfterMs_;
+
+
+    /**
+     * Park one victim: acquire a physical LLM hold on the proxy, re-verify
+     * eligibility against fresh observations, then hand the park to SnapCtrl
+     * (leaveRunning=false, explicit ttl, hold token). Fails closed when no
+     * PhysicalLLMClient is bound or the preconditions cannot be re-proven.
+     */
     void ParkVictim(const std::string &instanceID, double instanceUseMb, int32_t priority);
+
+    /** Prepare outcome of one park attempt; re-checks the attempt UUID first. */
+    void OnParkPrepared(const std::string &instanceID, const std::string &attemptID,
+                        const litebus::Future<PhysicalHoldResult> &result);
+
+    /** Fresh idle-set + eligibility recheck after READY; dispatches or rolls the hold back. */
+    void OnParkIdleChecked(const std::string &instanceID, const std::string &attemptID,
+                           const litebus::Future<std::vector<std::string>> &idleInstances);
+
+    /** KillResponse of the dispatched park; erases the record only on success. */
+    void OnParkSnapshotDone(const std::string &instanceID, const std::string &attemptID,
+                            const litebus::Future<KillResponse> &rsp);
+
+    /** Roll the captured hold back (pre-dispatch only, exact identity + own token). */
+    void BeginParkRelease(const std::string &instanceID, const std::string &attemptID);
+
+    /** Release confirmation; erases the record only on RELEASED. */
+    void OnParkReleased(const std::string &instanceID, const std::string &attemptID,
+                        const litebus::Future<PhysicalHoldResult> &result);
+
+    /**
+     * One in-flight physical-hold park preparation. Lives from the Prepare
+     * dispatch until the hold is confirmed released or the park is accepted;
+     * UNKNOWN outcomes deliberately retain the entry — no timer may assume a
+     * missing write never happened.
+     */
+    struct ParkPreparation {
+        enum class Stage { PREPARING, READY, SNAPSHOT, RELEASING };
+        std::string attemptID;                       // private UUID per attempt
+        PhysicalLLMIdentity identity;                // instance/sandbox/runtime/generation at Prepare time
+        std::shared_ptr<InstanceStateMachine> source; // exact state machine rechecks must see again
+        std::string token;                           // owned hold token (set on HELD/READY)
+        int64_t observedAtMs = 0;                    // LLM quiescence observation time (READY only)
+        double useMb = 0.0;                          // logging only
+        int32_t priority = 0;                        // logging only
+        Stage stage = Stage::PREPARING;
+    };
+    static constexpr size_t kMaxParkPreparations = 1024;
+
+    std::shared_ptr<PhysicalLLMClient> physicalLLMClient_;
+    std::unordered_map<std::string, ParkPreparation> parkPreparations_;
 
     /** FIFO fallback: wake the oldest parked instance. */
     void UnparkOldest(const std::pair<std::string, SnapCtrlActor::ParkedEntry> &oldest);
@@ -166,21 +252,20 @@ private:
     std::shared_ptr<resource_view::ResourceView> resourceView_;
     std::shared_ptr<SnapCtrl> snapCtrl_;
     std::shared_ptr<IdleMgr> idleMgr_;
-    std::unique_ptr<UpgradeLadder> upgradeLadder_; // D-3, null unless enabled
-    std::unique_ptr<CpuUpgradeLadder> cpuUpgradeLadder_; // W-CPUL, null unless enabled
+
+    PressureSampleGate sampleGate_;
 
     // cycle state (updated in order: OnIdleSet -> OnResourceView -> Decide)
     std::unordered_set<std::string> idleInstances_;
+    int64_t lastNodeMemorySampleMs_ = 0;
     double lastRatio_ = -1.0; // <0 = no usable sample this cycle
-    std::unordered_map<std::string, double> lastInstanceUseMb_;
+    std::unordered_map<std::string, resources::SandboxResourceSample> lastInstanceSamples_;
 
     // throttle event carried across the sampling chain (cleared once consumed)
-    std::string pendingEventDir_;
-    uint64_t pendingEventIncrement_ = 0;
+    PressureEventQueue pendingMemoryEvents_;
 
     // cpu throttle event carried across the sampling chain (W-CPUL)
-    std::string pendingCpuEventDir_;
-    uint64_t pendingCpuEventIncrement_ = 0;
+    PressureEventQueue pendingCpuEvents_;
 
     uint32_t highSamples_ = 0; // consecutive samples at/above the high mark
     uint64_t requestSeq_ = 0;  // requestID sequence for pressure-* tracing

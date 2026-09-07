@@ -69,6 +69,8 @@ using KillInstanceRequest = std::shared_ptr<messages::KillInstanceRequest>;
 struct KillInstanceRequestWrapper {
     litebus::AID from;
     KillInstanceRequest request;
+    litebus::AID runtimeManager;
+    std::string runtimeManagerID;
 };
 
 struct SnapshotRuntimeFinalizeContext {
@@ -236,6 +238,10 @@ public:
      */
     virtual void SnapshotRuntime(const litebus::AID &from, std::string &&name, std::string &&msg);
 
+    void ResizeSandbox(const litebus::AID &from, std::string &&name, std::string &&msg);
+    void ResizeSandboxResponse(const litebus::AID &from, std::string &&name, std::string &&msg);
+    void ResizeSandboxTimeout(const std::string &forwardID);
+
     /**
      * response to snapshot runtime request from runtime manager to function agent
      * @param from: runtime manager's AID
@@ -251,6 +257,27 @@ public:
         const litebus::AID &from, std::string &&name, std::string &&msg);
     virtual void ListLocalSnapshots(const litebus::AID &from, std::string &&name, std::string &&msg);
     virtual void DeleteLocalSnapshot(const litebus::AID &from, std::string &&name, std::string &&msg);
+
+    /**
+     * generation-fenced request to snapshot a runtime instance from local
+     * scheduler to function agent; relayed to the runtime manager over a
+     * dedicated channel that never emits the legacy SnapshotRuntime message
+     * @param from: local scheduler's AID
+     * @param name: function name
+     * @param msg: request data, type is messages::SnapshotRuntimeRequest
+     */
+    void SnapshotRuntimeIfGeneration(const litebus::AID &from, std::string &&name, std::string &&msg);
+
+    /**
+     * response to the generation-fenced snapshot request from runtime manager
+     * to function agent; only the fenced channel's own pending entry completes
+     * @param from: runtime manager's AID
+     * @param name: function name
+     * @param msg: response data, type is messages::SnapshotRuntimeResponse
+     */
+    void SnapshotRuntimeIfGenerationResponse(const litebus::AID &from, std::string &&name, std::string &&msg);
+
+    void SnapshotRuntimeIfGenerationTimeout(const std::string &forwardID);
 
     litebus::Future<bool> GracefulShutdown();
 
@@ -626,6 +653,26 @@ private:
     };
     /** <requestID : pending SnapshotRuntime request> for response forwarding */
     std::unordered_map<std::string, PendingSnapshotRequest> snapshotRequests_;
+    /** <requestID : caller's AID> for snapshot response forwarding */
+    std::unordered_map<std::string, litebus::AID> snapshotRequests_;
+    struct ResizePending {
+        litebus::AID requester;
+        litebus::AID runtimeManager;
+        std::shared_ptr<messages::ResizeSandboxRequest> request;
+        litebus::Timer timeout;
+    };
+    std::unordered_map<std::string, ResizePending> resizeRequests_;
+    // Pending relay state for the generation-fenced snapshot channel. Separate
+    // from snapshotRequests_ so legacy unfenced attempts can never be completed
+    // by a fenced response or vice versa.
+    struct SnapshotIfGenerationPending {
+        litebus::AID requester;
+        litebus::AID runtimeManager;
+        std::string runtimeManagerID;
+        std::shared_ptr<messages::SnapshotRuntimeRequest> request;
+        litebus::Timer timeout;
+    };
+    std::unordered_map<std::string, SnapshotIfGenerationPending> snapshotIfGenerationRequests_;
     std::string agentID_;
     std::string alias_;
     std::unordered_map<std::string, litebus::Promise<DeployResult>> deployingObjects_;

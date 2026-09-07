@@ -27,6 +27,7 @@
 
 #include "common/status/status.h"
 #include "meta_store_client/meta_store_struct.h"
+#include "common/constants/warmup_type.h"
 
 namespace functionsystem {
 using namespace functionsystem::resource_view;
@@ -250,13 +251,6 @@ struct ExtendedMetaData {
     Initializer initializer;
     UserAgency userAgency;
     CustomGracefulShutdown customGracefulShutdown;
-};
-
-enum class WarmupType {
-    NONE = 0,
-    SEED = 1,
-    PRELOAD = 2,
-    INVALID = 255,
 };
 
 inline WarmupType StringToWarmupType(const std::string &str)

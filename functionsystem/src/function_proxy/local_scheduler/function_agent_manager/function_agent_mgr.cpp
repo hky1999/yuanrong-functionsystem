@@ -182,6 +182,30 @@ litebus::Future<std::optional<messages::LocalSnapshotMetadata>> FunctionAgentMgr
                           leaveRunning);
 }
 
+litebus::Future<messages::SnapshotRuntimeResponse> FunctionAgentMgr::SnapshotRuntimeIfGeneration(
+    const resource_view::InstanceInfo &instanceInfo,
+    const std::shared_ptr<messages::SnapshotRuntimeRequest> &request)
+{
+    ASSERT_IF_NULL(actor_);
+    if (request == nullptr) {
+        messages::SnapshotRuntimeResponse response;
+        response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+        response.set_message("snapshot request is missing");
+        return response;
+    }
+    // clone the caller's request so later caller mutation cannot reach the actor
+    auto owned = std::make_shared<messages::SnapshotRuntimeRequest>(*request);
+    return litebus::Async(actor_->GetAID(), &FunctionAgentMgrActor::SnapshotRuntimeIfGeneration, instanceInfo, owned);
+}
+
+litebus::Future<messages::ResizeSandboxResponse> FunctionAgentMgr::ResizeSandbox(
+    const resource_view::InstanceInfo &instanceInfo,
+    const std::shared_ptr<messages::ResizeSandboxRequest> &request)
+{
+    ASSERT_IF_NULL(actor_);
+    return litebus::Async(actor_->GetAID(), &FunctionAgentMgrActor::ResizeSandbox, instanceInfo, request);
+}
+
 litebus::Future<messages::ReconcileRuntimesResponse> FunctionAgentMgr::ReconcileRuntimes(
     const std::string &funcAgentID, const std::shared_ptr<messages::ReconcileRuntimesRequest> &request)
 {

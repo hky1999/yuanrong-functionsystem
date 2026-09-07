@@ -210,9 +210,14 @@ message SnapOptions {
   int32           ttl  = 2;  // seconds
   bool            leaveRunning = 3;
   string          functionType = 4;  // moduleName.className for actors
-  string          name = 5;
-  uint64          checkpointTimeoutMs = 6;
-}
+  string          hold_token = 5; // proxy physical-hold attempt; park only
+  string          expected_runtime_id = 6;
+  string          expected_sandbox_id = 7;
+  string          expected_resource_generation = 8;
+  // Upstream snapshot-family fields, renumbered during the 2026-09-11
+  // scheduler-line rebase (our wire pins 5-8).
+  string          name = 9;
+  uint64          checkpointTimeoutMs = 10;}
 
 message SnapStartOptions {
   common.SnapType type = 1;

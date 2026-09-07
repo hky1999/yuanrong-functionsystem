@@ -66,8 +66,49 @@ litebus::Future<messages::SnapshotRuntimeResponse> SandboxdCheckpointOrchestrato
         return response;
     }
 
+    // Capture the birth identity once. The resource generation is the
+    // daemon-issued incarnation recorded at Start/Restore registration — it
+    // is never re-read via Stats.
+    const std::optional<SandboxInfo> info = stateManager_.Find(runtimeID);
+    if (!info.has_value() || info->sandboxID.empty() || info->registrationID.empty() ||
+        info->resourceGeneration.empty()) {
+        YRLOG_ERROR("{}|TakeSnapshot: runtime({}) lacks complete birth identity (sandboxID/registrationID/"
+                    "resourceGeneration)",
+                    requestID, runtimeID);
+        response.set_code(static_cast<int32_t>(StatusCode::RUNTIME_MANAGER_CHECKPOINT_FAILED));
+        response.set_message(fmt::format("runtime {} birth identity incomplete", runtimeID));
+        return response;
+    }
+    const std::string &sandboxID          = info->sandboxID;
+    const std::string &registrationID     = info->registrationID;
+    const std::string &resourceGeneration = info->resourceGeneration;
+
+    // Identity-checking callers must supply BOTH expected fields (or neither);
+    // a half-filled pair is ambiguous, and a full pair must match the captured
+    // birth identity. Legacy callers (both empty) still checkpoint
+    // conditionally against the stored creation-time generation.
+    const std::string &expectedSandboxID  = request->expected_sandbox_id();
+    const std::string &expectedGeneration = request->expected_resource_generation();
+    if (expectedSandboxID.empty() != expectedGeneration.empty()) {
+        YRLOG_ERROR("{}|TakeSnapshot: runtime({}) supplied only one of expected_sandbox_id/"
+                    "expected_resource_generation",
+                    requestID, runtimeID);
+        response.set_code(static_cast<int32_t>(StatusCode::PARAMETER_ERROR));
+        response.set_message("expected_sandbox_id and expected_resource_generation must be provided together");
+        return response;
+    }
+    if (!expectedSandboxID.empty() && (expectedSandboxID != sandboxID || expectedGeneration != resourceGeneration)) {
+        YRLOG_ERROR("{}|TakeSnapshot: runtime({}) identity mismatch: expected sandbox({}) generation({}), captured "
+                    "sandbox({}) generation({})",
+                    requestID, runtimeID, expectedSandboxID, expectedGeneration, sandboxID, resourceGeneration);
+        response.set_code(static_cast<int32_t>(StatusCode::PARAMETER_ERROR));
+        response.set_message(fmt::format("sandbox identity mismatch: expected sandbox({}) generation({}), captured "
+                                         "sandbox({}) generation({})",
+                                         expectedSandboxID, expectedGeneration, sandboxID, resourceGeneration));
+        return response;
+    }
+
     // Generate unique checkpoint ID and local path
-    const std::string sandboxID = stateManager_.GetSandboxID(runtimeID);
     const std::string checkpointID =
         fmt::format("ckpt-{}-{}", instanceID, std::chrono::system_clock::now().time_since_epoch().count());
     // must live under sandboxd's managed checkpoint root (config.RootDir/checkpoints);
@@ -84,9 +125,12 @@ litebus::Future<messages::SnapshotRuntimeResponse> SandboxdCheckpointOrchestrato
     // physical mode (keep source alive or delete after publish)
     ckptReq->set_checkpoint_id(checkpointID);
     ckptReq->set_leave_running(request->leaverunning());
+    // Agent tools mutate the writable rootfs; memory-only park cannot restore that state.
+    ckptReq->set_include_filesystem(true);
 
-    SnapshotContext context{requestID, runtimeID, checkpointID, checkpointPath, sandboxID, ttl};
-    return DoCheckpoint(ckptReq).Then(
+    SnapshotContext context{
+        requestID, runtimeID, checkpointID, checkpointPath, sandboxID, ttl, registrationID, resourceGeneration};
+    return DoCheckpoint(ckptReq, resourceGeneration).Then(
         litebus::Defer(ownerAID_,
             [self = shared_from_this(), context](const runtime::v1::CheckpointResponse &response) {
                 return self->OnCheckpointDone(response, context);
@@ -108,9 +152,42 @@ litebus::Future<messages::SnapshotRuntimeResponse> SandboxdCheckpointOrchestrato
         return response;
     }
 
+    // The daemon must echo the exact generation this checkpoint was
+    // conditioned on; a missing or different value means the image does not
+    // belong to the expected incarnation — reject without uploading and
+    // without adopting the response identity.
+    if (ckptResponse.source_generation().empty() || ckptResponse.source_generation() != context.resourceGeneration) {
+        YRLOG_ERROR("{}|checkpoint generation mismatch for runtime({}): expected({}) got({})", context.requestID,
+                    context.runtimeID, context.resourceGeneration, ckptResponse.source_generation());
+        response.set_code(static_cast<int32_t>(StatusCode::RUNTIME_MANAGER_CHECKPOINT_FAILED));
+        response.set_message(fmt::format("checkpoint generation mismatch: expected({}) got({})",
+                                         context.resourceGeneration, ckptResponse.source_generation()));
+        return response;
+    }
+
+    // The registry must still hold the exact captured incarnation before the
+    // image is uploaded: a replacement Start/Restore under the same runtimeID
+    // means this checkpoint no longer maps to a live sandbox.
+    const std::optional<SandboxInfo> current = stateManager_.Find(context.runtimeID);
+    if (!current.has_value() || current->runtimeID != context.runtimeID || current->sandboxID != context.sandboxID ||
+        current->registrationID != context.registrationID ||
+        current->resourceGeneration != context.resourceGeneration) {
+        YRLOG_ERROR("{}|sandbox identity changed before upload for runtime({}): captured sandbox({}) "
+                    "registration({}) generation({})",
+                    context.requestID, context.runtimeID, context.sandboxID, context.registrationID,
+                    context.resourceGeneration);
+        response.set_code(static_cast<int32_t>(StatusCode::RUNTIME_MANAGER_CHECKPOINT_FAILED));
+        response.set_message("sandbox identity changed before checkpoint upload");
+        return response;
+    }
+
     YRLOG_INFO("{}|checkpoint succeeded, uploading checkpoint({}) for runtime({})", context.requestID,
                context.checkpointID, context.runtimeID);
 
+    // Birth identity stays authoritative through the asynchronous upload; the
+    // daemon echo was verified above to match it exactly.
+    response.mutable_snapshotinfo()->set_source_generation(context.resourceGeneration);
+    response.mutable_snapshotinfo()->set_source_runtime_id(context.runtimeID);
     ASSERT_IF_NULL(ckptFileManager_);
     return ckptFileManager_
         ->RegisterCheckpoint(context.checkpointID, context.checkpointPath, context.checkpointID, context.ttl)
@@ -140,6 +217,23 @@ litebus::Future<messages::SnapshotRuntimeResponse> SandboxdCheckpointOrchestrato
                     context.runtimeID);
         response.set_code(static_cast<int32_t>(StatusCode::RUNTIME_MANAGER_CHECKPOINT_FAILED));
         response.set_message("checkpoint registration failed: empty storage URL");
+        return response;
+    }
+
+    // The upload finished, but the mapping must still be the exact captured
+    // incarnation before the checkpoint ID is recorded. On mismatch or
+    // absence the replacement entry is left untouched and the uploaded
+    // reference is NOT released blindly — cleanup is deferred to later
+    // reconciliation.
+    const std::optional<SandboxInfo> current = stateManager_.Find(context.runtimeID);
+    if (!current.has_value() || current->runtimeID != context.runtimeID || current->sandboxID != context.sandboxID ||
+        current->registrationID != context.registrationID ||
+        current->resourceGeneration != context.resourceGeneration) {
+        YRLOG_ERROR("{}|sandbox identity changed before checkpoint registration for runtime({}): checkpoint({}) "
+                    "storage({}) left for reconciliation",
+                    context.requestID, context.runtimeID, context.checkpointID, storageUrl);
+        response.set_code(static_cast<int32_t>(StatusCode::RUNTIME_MANAGER_CHECKPOINT_FAILED));
+        response.set_message("sandbox identity changed before checkpoint registration");
         return response;
     }
 
@@ -220,12 +314,31 @@ litebus::Future<Status> SandboxdCheckpointOrchestrator::ReleaseRef(const std::st
 // ── gRPC wrapper ─────────────────────────────────────────────────────────────
 
 litebus::Future<runtime::v1::CheckpointResponse> SandboxdCheckpointOrchestrator::DoCheckpoint(
-    const std::shared_ptr<runtime::v1::CheckpointRequest> &req)
+    const std::shared_ptr<runtime::v1::CheckpointRequest> &req, const std::string &expectedGeneration)
 {
+    // Conditional-only: an empty expected generation means the caller could
+    // not pin the incarnation to guard against, so refuse to send an
+    // unconditional Checkpoint. Checked before the client assertion so an
+    // unbound sandboxd_ still yields an ordinary failure, not an abort.
+    if (expectedGeneration.empty()) {
+        runtime::v1::CheckpointResponse err;
+        err.set_success(false);
+        err.set_message(
+            fmt::format("conditional checkpoint rejected for sandbox {}: empty expected generation", req->id()));
+        YRLOG_ERROR("{}|{}", req->trace_id(), err.message());
+        return err;
+    }
+
     ASSERT_IF_NULL(sandboxd_);
+
+    auto wrapper = std::make_shared<runtime::v1::CheckpointIfGenerationRequest>();
+    *wrapper->mutable_checkpoint() = *req;
+    wrapper->set_expected_generation(expectedGeneration);
     auto resp = std::make_shared<runtime::v1::CheckpointResponse>();
-    return sandboxd_->CallAsyncX("Checkpoint", *req, resp.get(), &runtime::v1::SandboxService::Stub::AsyncCheckpoint)
-        .Then([req, resp](const Status &status) -> litebus::Future<runtime::v1::CheckpointResponse> {
+    return sandboxd_
+        ->CallAsyncX("CheckpointIfGeneration", *wrapper, resp.get(),
+                     &runtime::v1::SandboxService::Stub::AsyncCheckpointIfGeneration)
+        .Then([req, wrapper, resp](const Status &status) -> litebus::Future<runtime::v1::CheckpointResponse> {
             if (status.IsOk()) {
                 return *resp;
             }

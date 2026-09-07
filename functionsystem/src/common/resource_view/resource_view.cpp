@@ -82,6 +82,19 @@ litebus::Future<Status> ResourceView::UpdateResourceUnitDelta(const std::shared_
     return litebus::Async(implActor_->GetAID(), &ResourceViewActor::UpdateResourceUnitDelta, changes);
 }
 
+litebus::Future<Status> ResourceView::ReserveResize(const messages::ResizeSandboxRequest &request)
+{
+    return litebus::Async(implActor_->GetAID(), &ResourceViewActor::ReserveResize, request);
+}
+litebus::Future<Status> ResourceView::ObserveResize(const messages::ResizeSandboxResponse &response)
+{
+    return litebus::Async(implActor_->GetAID(), &ResourceViewActor::ObserveResize, response);
+}
+litebus::Future<Status> ResourceView::CancelResizeBeforeDispatch(const std::string &reservationID)
+{
+    return litebus::Async(implActor_->GetAID(), &ResourceViewActor::CancelResizeBeforeDispatch, reservationID);
+}
+
 litebus::Future<Status> ResourceView::AddInstances(const std::map<std::string, InstanceAllocatedInfo> &insts)
 {
     ASSERT_IF_NULL(implActor_);

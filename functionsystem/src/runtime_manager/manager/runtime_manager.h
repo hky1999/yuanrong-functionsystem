@@ -66,6 +66,17 @@ public:
     void SnapshotRuntime(const litebus::AID &from, std::string &&name, std::string &&msg);
 
     /** Delete one exact reusable checkpoint after the logical Snapshot READY commit. */
+    void ResizeSandbox(const litebus::AID &from, std::string &&name, std::string &&msg);
+
+    /**
+     * Generation-fenced snapshot when receiving the fenced snapshot message
+     * from function agent. Only the sandboxd executor honors the expected
+     * physical identity pair, so no other executor type is consulted.
+     *
+     * @param from Function agent aid.
+     * @param msg Snapshot request with complete expected identity.
+     */
+    void SnapshotRuntimeIfGeneration(const litebus::AID &from, std::string &&name, std::string &&msg);
 
     /**
      * OOM Kill instance when receive event from metrics actor.
@@ -150,6 +161,14 @@ protected:
     void Finalize() override;
 
 private:
+    void OnResizeSandboxComplete(const litebus::AID &from,
+        const std::shared_ptr<messages::ResizeSandboxRequest> &request,
+        const litebus::Future<messages::ResizeSandboxResponse> &result);
+
+    void OnSnapshotRuntimeIfGenerationComplete(const litebus::AID &from,
+        const std::shared_ptr<messages::SnapshotRuntimeRequest> &request,
+        const litebus::Future<messages::SnapshotRuntimeResponse> &result);
+
     enum class SandboxRuntimeDiscoveryState { NOT_REQUIRED, PENDING, READY };
 
     EXECUTOR_TYPE ResolveStopExecutorType(const std::shared_ptr<messages::StopInstanceRequest> &request);

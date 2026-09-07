@@ -101,6 +101,20 @@ struct PreAllocatedContext : public schedule_framework::ScheduleContext {
     std::unordered_map<std::string, std::vector<std::shared_ptr<PodSpec>>> instanceFeasiblePodSpec;
     // key: instanceID, value: function_agent selected in PRE_ALLOCATION
     std::unordered_map<std::string, std::string> preAllocatedSelectedFunctionAgentMap;
+    // Restore footprints differ from create-time bookings (e.g. 512 MiB -> 8 GiB).
+    std::unordered_map<std::string, resource_view::Resource> preAllocatedRestoreMemory;
+
+    void RememberRestoreMemory(const resource_view::InstanceInfo &instance)
+    {
+        if (instance.snapshotinfo().checkpointid().empty()) {
+            preAllocatedRestoreMemory.erase(instance.instanceid());
+            return;
+        }
+        const auto memory = instance.resources().resources().find(resource_view::MEMORY_RESOURCE_NAME);
+        preAllocatedRestoreMemory[instance.instanceid()] = memory == instance.resources().resources().end()
+            ? resource_view::Resource{} : memory->second;
+    }
+
     // key: function_agent selected in PRE_ALLOCATION
     std::set<std::string> preAllocatedSelectedFunctionAgentSet;
     // key: requestID, value: (key: childNodeId, value: NodeInfo)

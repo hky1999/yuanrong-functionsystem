@@ -51,7 +51,8 @@ struct SandboxInfo {
     std::string checkpointID;      // empty = no checkpoint
     std::string portMappingsJson;  // empty = no port mappings
     messages::RuntimeInstanceInfo instanceInfo;
-    std::string sandboxIP;
+    std::string registrationID; // fresh for each local registration, including same-ID replacement
+    std::string resourceGeneration; // daemon-issued incarnation from Start/Restore
 };
 
 /**
@@ -115,8 +116,8 @@ public:
 
     // ── Partial updates (applied after sandbox is already registered) ─────────
 
-    void UpdateSandboxID(const std::string &runtimeID, const std::string &sandboxID);
-    void UpdateNetworkEndpoint(const std::string &runtimeID, const std::string &sandboxIP);
+    void UpdateSandboxID(const std::string &runtimeID, const std::string &sandboxID,
+                         const std::string &resourceGeneration = "");
     void UpdateCheckpoint(const std::string &runtimeID, const std::string &checkpointID);
     void UpdatePortMappings(const std::string &runtimeID, const std::string &portMappingsJson);
     void UpdateInstanceInfo(const std::string &runtimeID,

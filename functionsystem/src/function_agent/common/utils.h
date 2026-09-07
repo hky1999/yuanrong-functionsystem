@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <optional>
 #include <async/option.hpp>
 #include "async/future.hpp"
 #include "common/proto/pb/message_pb.h"

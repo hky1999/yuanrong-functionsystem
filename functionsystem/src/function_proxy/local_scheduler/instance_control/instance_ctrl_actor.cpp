@@ -358,12 +358,16 @@ void InstanceCtrlActor::Init()
                        instanceInfo.requestid(), instanceInfo.instanceid());
             return litebus::Async(aid, &InstanceCtrlActor::DeleteInstanceInControlView, Status::OK(), instanceInfo);
         }
-        return litebus::Async(aid, &InstanceCtrlActor::DeleteInstanceInResourceView, Status::OK(), instanceInfo)
-            .Then(litebus::Defer(aid, &InstanceCtrlActor::ShutDownInstance, instanceInfo,
-                                 static_cast<uint32_t>(instanceInfo.gracefulshutdowntime())))
-            .Then([instanceInfo, aid](const Status &) {
-                return litebus::Async(aid, &InstanceCtrlActor::KillRuntime, instanceInfo, false);
+        // Physical termination must precede releasing the scheduler's allocation.
+        return litebus::Async(aid, &InstanceCtrlActor::ShutDownInstance, instanceInfo,
+                static_cast<uint32_t>(instanceInfo.gracefulshutdowntime()))
+            .Then([instanceInfo, aid](const Status &previous) {
+                // Still attempt physical termination, but never erase an earlier failure.
+                return litebus::Async(aid, &InstanceCtrlActor::KillRuntime, instanceInfo, false)
+                    .Then([previous](const Status &killed) { return previous.IsError() ? previous : killed; });
             })
+            .Then(litebus::Defer(aid, &InstanceCtrlActor::DeleteInstanceInResourceView, std::placeholders::_1,
+                                 instanceInfo))
             .Then(litebus::Defer(aid, &InstanceCtrlActor::DeleteInstanceInControlView, std::placeholders::_1,
                                  instanceInfo))
             .Then(litebus::Defer(aid, &InstanceCtrlActor::ReportInstanceExitLatency, std::placeholders::_1,
@@ -497,6 +501,7 @@ litebus::Future<Status> InstanceCtrlActor::ReportInstanceExitLatency(const Statu
 litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInResourceView(const Status &status,
                                                                         const InstanceInfo &instanceInfo)
 {
+    if (status.IsError()) { return status; }
     ASSERT_IF_NULL(resourceViewMgr_);
     auto type = resource_view::GetResourceType(instanceInfo);
     return resourceViewMgr_->GetInf(type)->DeleteInstances({ instanceInfo.instanceid() });
@@ -505,7 +510,9 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInResourceView(const St
 litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Status &status,
                                                                        const InstanceInfo &instanceInfo)
 {
-
+    // A failed physical/control step is not successful retirement. Keep identity
+    // and state available for reconciliation instead of publishing deletion.
+    if (status.IsError()) { return status; }
     if (traefikRegistry_) {
         (void)litebus::Async(GetAID(), &InstanceCtrlActor::UnregisterTraefikRoute, instanceInfo.instanceid());
     }
@@ -518,7 +525,7 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
         .Then([insCtrlView(instanceControlView_), instanceID(instanceInfo.instanceid()),
                requestID(instanceInfo.requestid())](const Status &status) {
             insCtrlView->OnDelInstance(instanceID, requestID, status.IsOk());
-            return Status::OK();
+            return status;
         })
         .Then([instanceID(instanceInfo.instanceid())](const Status &status) {
             if (status.IsOk()) {
@@ -737,7 +744,7 @@ litebus::Future<KillResponse> InstanceCtrlActor::HandleKill(const std::string &s
             // the ORIGINAL id of a parked instance, which only exists in
             // SnapCtrl's parked registry on this node.
             ASSERT_IF_NULL(snapCtrl_);
-            return snapCtrl_->HandleWake(killReq->requestid(), killReq->instanceid());
+            return snapCtrl_->HandleDirectedWake(killReq->requestid(), killReq->instanceid(), killReq->payload());
         }
         case LIST_CHECKPOINTS_BY_FUNCTION_KEY_SIGNAL: {
             ASSERT_IF_NULL(localSchedSrv_);
@@ -1617,9 +1624,8 @@ litebus::Future<Status> InstanceCtrlActor::RecordFrontendKillRuntimeResult(
             evidence->second.state = "terminated";
         }
     }
-    // Preserve legacy kill response semantics; the cleanup snapshot reports the
-    // runtime result independently instead of converting it into false success.
-    return Status::OK();
+    // Callers must retain failed/unknown retirement instead of publishing success.
+    return Status(static_cast<StatusCode>(response.code()), response.message());
 }
 
 litebus::Future<KillResponse> InstanceCtrlActor::SendSignal(const std::shared_ptr<KillContext> &killCtx,
@@ -7015,6 +7021,26 @@ litebus::Future<Status> InstanceCtrlActor::DeleteSchedulingInstance(const std::s
         (void)litebus::Async(GetAID(), &InstanceCtrlActor::UnregisterTraefikRoute, instanceID);
     }
     return Status::OK();
+}
+
+litebus::Future<Status> InstanceCtrlActor::RetireSnapshotSource(const std::string &instanceID,
+    const std::shared_ptr<InstanceStateMachine> &source, const std::string &runtimeID)
+{
+    ASSERT_IF_NULL(instanceControlView_);
+    const auto current = instanceControlView_->GetInstance(instanceID);
+    if (source == nullptr || runtimeID.empty() || current != source
+        || current->GetInstanceInfo().runtimeid() != runtimeID) {
+        return Status(StatusCode::ERR_INSTANCE_BUSY, "snapshot source changed before retirement");
+    }
+    const auto state = current->GetInstanceState();
+    if (state != InstanceState::RUNNING && state != InstanceState::FATAL && state != InstanceState::EXITED) {
+        // Do not register an ID-only delayed state callback against a changing runtime.
+        return Status(StatusCode::ERR_INSTANCE_BUSY, "snapshot source retirement not settled");
+    }
+    const auto info = current->GetInstanceInfo();
+    (void)instanceRegisteredReadyCallback_.erase(info.requestid());
+    EraseReadyCallResultCallbackByRequestID(info.requestid());
+    return exitHandler_(info);
 }
 
 litebus::Future<Status> InstanceCtrlActor::ForceDeleteInstance(const std::string &instanceID)

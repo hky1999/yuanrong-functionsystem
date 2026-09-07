@@ -17,6 +17,7 @@
 #include "local_sched_driver.h"
 
 #include <charconv>
+#include <cstdlib>
 
 #include "common/constants/actor_name.h"
 #include "local_scheduler/traefik_registry/traefik_registry.h"
@@ -27,6 +28,7 @@
 #include "local_scheduler/instance_control/posix_api_handler/posix_api_handler.h"
 #include "local_scheduler/gc_actor/local_gc_actor.h"
 #include "local_scheduler/local_group_ctrl/local_group_ctrl_actor.h"
+#include "local_scheduler/pressure_monitor/physical_llm_client.h"
 #include "local_scheduler/grpc_server/bus_service/bus_service.h"
 #include "local_scheduler/grpc_server/data_plane_gateway_activity_service.h"
 #include "local_scheduler/grpc_server/frontend_proxy_service/frontend_proxy_lifecycle_handler.h"
@@ -353,6 +355,18 @@ Status LocalSchedDriver::ContinueAfterSnapCtrlBinding()
         pressureMonitorActor_->BindResourceView(resourceViewMgr_->GetInf(resource_view::ResourceType::PRIMARY));
         pressureMonitorActor_->BindSnapCtrl(snapCtrl_);
         pressureMonitorActor_->BindIdleMgr(instanceCtrl_->GetIdleMgr());
+        pressureMonitorActor_->BindFunctionAgentMgr(funcAgentMgr_);
+        // F7 physical hold: bind the proxy client only when both runtime env
+        // vars are nonempty (values are never logged; the URL/token envelope
+        // is validated inside PhysicalLLMClient). When unset, no client is
+        // bound and the actor fails closed for park until configured.
+        const char *transducerURLEnv = std::getenv("AKERNEL_SCHEDULER_TRANSDUCER_URL");
+        const char *holdTokenEnv = std::getenv("AKERNEL_SCHEDULER_HOLD_CONTROL_TOKEN");
+        if (transducerURLEnv != nullptr && *transducerURLEnv != '\0' && holdTokenEnv != nullptr
+            && *holdTokenEnv != '\0') {
+            pressureMonitorActor_->BindPhysicalLLMClient(std::make_shared<PhysicalLLMClient>(
+                std::string(transducerURLEnv), std::string(holdTokenEnv)));
+        }
         litebus::Spawn(pressureMonitorActor_);
 
         // D-2 event-driven watermarks: wake the monitor as soon as a sandbox

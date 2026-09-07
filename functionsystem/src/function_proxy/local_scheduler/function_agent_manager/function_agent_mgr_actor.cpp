@@ -19,7 +19,9 @@
 #include <async/collect.hpp>
 #include <async/defer.hpp>
 #include <exception>
+#include <async/uuid_generator.hpp>
 #include <iostream>
+#include <limits>
 #include <nlohmann/json.hpp>
 
 #include "common/constants/signal.h"
@@ -160,6 +162,8 @@ void FunctionAgentMgrActor::Init()
     Receive("DeleteReusableSnapshotArtifact", &FunctionAgentMgrActor::DeleteReusableSnapshotArtifact);
     Receive("DeleteReusableSnapshotArtifactResponse",
             &FunctionAgentMgrActor::DeleteReusableSnapshotArtifactResponse);
+    Receive("SnapshotRuntimeIfGenerationResponse", &FunctionAgentMgrActor::SnapshotRuntimeIfGenerationResponse);
+    Receive("ResizeSandboxResponse", &FunctionAgentMgrActor::ResizeSandboxResponse);
     Receive("QueryDebugInstanceInfosResponse", &FunctionAgentMgrActor::QueryDebugInstanceInfosResponse);
     Receive("ReconcileRuntimesResponse", &FunctionAgentMgrActor::ReconcileRuntimesResponse);
     Receive("StaticFunctionScheduleRequest", &FunctionAgentMgrActor::StaticFunctionScheduleRequest);
@@ -1745,6 +1749,196 @@ void FunctionAgentMgrActor::UpdateNetworkPolicyResponse(
     YRLOG_INFO("{}|network policy update completed with code({})",
                response.requestid(), response.code());
     (void)updateNetworkPolicySync_.Synchronized(response.requestid(), response);
+namespace {
+messages::ResizeSandboxResponse ResizeTransportResult(const messages::ResizeSandboxRequest &request,
+    messages::ResizeSandboxResponse::Outcome outcome, const std::string &reason)
+{
+    messages::ResizeSandboxResponse response;
+    response.set_requestid(request.requestid());
+    response.set_instanceid(request.instanceid());
+    response.set_runtimeid(request.runtimeid());
+    response.set_sandboxid(request.resize().sandbox_id());
+    response.set_resourcegeneration(request.resize().resource_generation());
+    response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_COMMUNICATION));
+    response.set_outcome(outcome);
+    response.set_message(reason);
+    return response;
+}
+}  // namespace
+
+litebus::Future<messages::ResizeSandboxResponse> FunctionAgentMgrActor::ResizeSandbox(
+    const resource_view::InstanceInfo &instanceInfo,
+    const std::shared_ptr<messages::ResizeSandboxRequest> &request)
+{
+    if (request == nullptr) {
+        return ResizeTransportResult({}, messages::ResizeSandboxResponse::REJECTED_BEFORE_DISPATCH,
+                                     "resize request is missing");
+    }
+    // Duplicate delivery joins the existing operation, never creates another
+    // budgeted command. Conflicting reuse is uncertain, not a safe rejection.
+    for (auto &entry : resizePending_) {
+        if (entry.second.request.requestid() != request->requestid()) {
+            continue;
+        }
+        if (request->ByteSizeLong() <= 64 * 1024
+            && entry.second.request.SerializeAsString() == request->SerializeAsString()) {
+            return entry.second.completion.GetFuture();
+        }
+        return ResizeTransportResult(*request, messages::ResizeSandboxResponse::UNKNOWN,
+                                     "reservation ID conflicts with an in-flight resize");
+    }
+    const auto budgetView = resourceView_.lock();
+    const auto agent = funcAgentTable_.find(instanceInfo.functionagentid());
+    const auto &sample = instanceInfo.sandbox_resource_sample();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    if (request->requestid().empty() || request->ByteSizeLong() > 64 * 1024 || !request->has_resize()
+        || request->resize().deadline_unix_ms() <= nowMs || request->resize().deadline_unix_ms() > nowMs + 60000
+        || !request->resize().has_expected() || !request->resize().has_target()
+        || request->instanceid().empty() || request->instanceid() != instanceInfo.instanceid()
+        || request->runtimeid().empty() || request->runtimeid() != instanceInfo.runtimeid()
+        || request->runtimeid() != sample.runtime_id()
+        || request->resize().sandbox_id().empty() || request->resize().sandbox_id() != sample.sandbox_id()
+        || request->resize().resource_generation().empty()
+        || request->resize().resource_generation() != sample.resource_generation()
+        || budgetView == nullptr || agent == funcAgentTable_.end() || resizePending_.size() >= 1024) {
+        return ResizeTransportResult(*request, messages::ResizeSandboxResponse::REJECTED_BEFORE_DISPATCH,
+                                     "resize identity, deadline, registered route or pending capacity unavailable");
+    }
+    // Reserve on the same actor that commits create/restore allocations.
+    // The transport UUID is also the private budget lease; callers cannot reuse it.
+    const auto wireID = litebus::uuid_generator::UUID::GetRandomUUID().ToString();
+    ResizePending pending{agent->second.aid, *request, {}, {}};
+    pending.budgetView = budgetView;
+    auto future = pending.completion.GetFuture();
+    pending.timeout = litebus::AsyncAfter(15000, GetAID(), &FunctionAgentMgrActor::ResizeSandboxTimeout, wireID);
+    resizePending_.emplace(wireID, std::move(pending));
+    auto reserved = *request;
+    reserved.set_requestid(wireID);
+    budgetView->ReserveResize(reserved).OnComplete([aid = GetAID(), wireID, budgetView](const litebus::Future<Status> &result) {
+        litebus::Async(aid, &FunctionAgentMgrActor::OnResizeReserved, wireID, result, budgetView);
+    });
+    return future;
+}
+
+void FunctionAgentMgrActor::OnResizeReserved(const std::string &wireID, const litebus::Future<Status> &result,
+                                             const std::shared_ptr<resource_view::ResourceView> &budgetView)
+{
+    auto it = resizePending_.find(wireID);
+    if (it == resizePending_.end()) {
+        if (result.IsOK() && result.Get().IsOk()) { (void)budgetView->CancelResizeBeforeDispatch(wireID); }
+        return;
+    }
+    if (it->second.dispatched) { return; }
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const bool routeAlive = aidTable_.find(it->second.agent) != aidTable_.end();
+    if (!result.IsOK() || !result.Get().IsOk() || !routeAlive
+        || it->second.request.resize().deadline_unix_ms() <= nowMs) {
+        if (result.IsOK() && result.Get().IsOk()) { (void)budgetView->CancelResizeBeforeDispatch(wireID); }
+        auto response = ResizeTransportResult(it->second.request, result.IsOK()
+            ? messages::ResizeSandboxResponse::REJECTED_BEFORE_DISPATCH : messages::ResizeSandboxResponse::UNKNOWN,
+            result.IsOK() ? (result.Get().IsOk() ? "resize route or deadline expired after reservation" : result.Get().ToString())
+                          : "resize reservation result unavailable");
+        if (result.IsOK() && !result.Get().IsOk()) {
+            response.set_code(static_cast<int32_t>(result.Get().StatusCode()));
+        }
+        litebus::TimerTools::Cancel(it->second.timeout);
+        auto completion = it->second.completion;
+        resizePending_.erase(it);
+        completion.SetValue(response);
+        return;
+    }
+    it->second.dispatched = true;
+    auto forwarded = it->second.request;
+    forwarded.set_requestid(wireID);
+    Send(it->second.agent, "ResizeSandbox", forwarded.SerializeAsString());
+}
+
+void FunctionAgentMgrActor::ResizeSandboxResponse(const litebus::AID &from, std::string &&, std::string &&msg)
+{
+    messages::ResizeSandboxResponse response;
+    if (msg.size() > 64 * 1024 || !response.ParseFromString(msg)) {
+        return;
+    }
+    auto it = resizePending_.find(response.requestid());
+    if (it == resizePending_.end() || !it->second.dispatched || it->second.agent != from) {
+        return;
+    }
+    const auto &request = it->second.request;
+    if (response.instanceid() != request.instanceid() || response.runtimeid() != request.runtimeid()
+        || response.sandboxid() != request.resize().sandbox_id()
+        || response.resourcegeneration() != request.resize().resource_generation()) {
+        return;
+    }
+    response.set_requestid(request.requestid());
+    if (response.outcome() != messages::ResizeSandboxResponse::UNKNOWN
+        && response.outcome() != messages::ResizeSandboxResponse::REJECTED_BEFORE_DISPATCH
+        && response.outcome() != messages::ResizeSandboxResponse::OBSERVED) {
+        response = ResizeTransportResult(request, messages::ResizeSandboxResponse::UNKNOWN,
+                                         "resize reply has an unknown outcome enum");
+    } else if (response.outcome() == messages::ResizeSandboxResponse::OBSERVED
+        && (!response.has_result() || !response.result().has_actual()
+            || response.result().actual().resource_generation() != response.resourcegeneration()
+            || !response.result().actual().cpu_limits_known()
+            || response.result().actual().cpu_quota_usec() <= 0
+            || response.result().actual().cpu_period_usec() == 0
+            || response.result().actual().memory_limit_bytes() == 0
+            || response.result().actual().memory_limit_bytes()
+                > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
+            || response.result().actual().cpu_period_usec() != request.resize().expected().cpu_period_usec()
+            || response.result().actual().cpu_quota_usec() < request.resize().expected().cpu_quota_usec()
+            || response.result().actual().cpu_quota_usec() > request.resize().target().cpu_quota_usec()
+            || response.result().actual().memory_limit_bytes() < request.resize().expected().memory_limit_bytes()
+            || response.result().actual().memory_limit_bytes() > request.resize().target().memory_limit_bytes())) {
+        response = ResizeTransportResult(request, messages::ResizeSandboxResponse::UNKNOWN,
+                                         "resize observed result has no matching physical readback");
+    }
+    if (it->second.budgetView) {
+        auto budgetResponse = response;
+        budgetResponse.set_requestid(it->first);
+        (void)it->second.budgetView->ObserveResize(budgetResponse);
+    }
+    litebus::TimerTools::Cancel(it->second.timeout);
+    auto completion = it->second.completion;
+    resizePending_.erase(it);
+    completion.SetValue(response);
+}
+
+void FunctionAgentMgrActor::ResizeSandboxTimeout(const std::string &wireID)
+{
+    auto it = resizePending_.find(wireID);
+    if (it == resizePending_.end()) {
+        return;
+    }
+    if (!it->second.dispatched && it->second.budgetView) {
+        (void)it->second.budgetView->CancelResizeBeforeDispatch(wireID);
+    }
+    auto response = ResizeTransportResult(it->second.request, messages::ResizeSandboxResponse::UNKNOWN,
+                                          "resize transport timeout; reconcile before releasing reservation");
+    auto completion = it->second.completion;
+    resizePending_.erase(it);
+    completion.SetValue(response);
+}
+
+void FunctionAgentMgrActor::Finalize()
+{
+    while (!resizePending_.empty()) {
+        auto it = resizePending_.begin();
+        const auto wireID = it->first;
+        litebus::TimerTools::Cancel(it->second.timeout);
+        ResizeSandboxTimeout(wireID);
+    }
+    // Pending promises cannot rely on timers once the actor is gone; drain with
+    // the same unknown-outcome path as the transport timeout. No hold or budget
+    // is released here.
+    while (!snapshotIfGenerationPending_.empty()) {
+        auto it = snapshotIfGenerationPending_.begin();
+        const auto wireID = it->first;
+        litebus::TimerTools::Cancel(it->second.timeout);
+        SnapshotRuntimeIfGenerationTimeout(wireID);
+    }
+    BasisActor::Finalize();
 }
 
 litebus::Future<messages::SnapshotRuntimeResponse> FunctionAgentMgrActor::SnapshotRuntime(
@@ -2291,6 +2485,142 @@ void FunctionAgentMgrActor::DeleteReusableSnapshotArtifactResponse(
     }
     reusableSnapshotDeleteExpectedAgent_.erase(expected);
     (void)reusableSnapshotDeleteSync_.Synchronized(response.requestid(), response);
+namespace {
+bool InvalidSnapshotIdentityField(const std::string &value)
+{
+    // identity fields must be present, non-blank and bounded
+    return value.empty() || value.size() > 256 || value.find_first_not_of(" \t\r\n\f\v") == std::string::npos;
+}
+
+messages::SnapshotRuntimeResponse SnapshotIfGenerationFailure(const messages::SnapshotRuntimeRequest &request,
+                                                              const std::string &message)
+{
+    messages::SnapshotRuntimeResponse response;
+    response.set_requestid(request.requestid());
+    response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+    response.set_message(message);
+    return response;
+}
+}  // namespace
+
+litebus::Future<messages::SnapshotRuntimeResponse> FunctionAgentMgrActor::SnapshotRuntimeIfGeneration(
+    const resource_view::InstanceInfo &instanceInfo,
+    const std::shared_ptr<messages::SnapshotRuntimeRequest> &request)
+{
+    if (request == nullptr) {
+        messages::SnapshotRuntimeRequest empty;
+        return SnapshotIfGenerationFailure(empty, "snapshot request is missing");
+    }
+
+    const auto &funcAgentID = instanceInfo.functionagentid();
+
+    // The expected identity is taken only from the caller's request: never
+    // query Stats and never adopt another expected identity. Size, identity,
+    // instance view and route are validated before any duplicate join so a
+    // duplicate can never bypass them. An agent AID with an empty name is not
+    // a routable actor even when it carries a URL.
+    const auto agent = funcAgentTable_.find(funcAgentID);
+    if (request->ByteSizeLong() > 64 * 1024
+        || InvalidSnapshotIdentityField(request->requestid())
+        || InvalidSnapshotIdentityField(request->instanceid())
+        || InvalidSnapshotIdentityField(request->runtimeid())
+        || InvalidSnapshotIdentityField(request->expected_sandbox_id())
+        || InvalidSnapshotIdentityField(request->expected_resource_generation())
+        || request->instanceid() != instanceInfo.instanceid()
+        || request->runtimeid() != instanceInfo.runtimeid()
+        || agent == funcAgentTable_.end() || agent->second.aid.Name().empty()) {
+        return SnapshotIfGenerationFailure(*request, "snapshot identity, size or registered route validation failed");
+    }
+
+    // Duplicate delivery joins the existing operation only when the registered
+    // route also still matches, i.e. the captured agent AID equals the agent's
+    // current AID. A conflicting payload never disturbs the original pending
+    // entry. Both verdicts precede the pending-capacity check.
+    for (auto &entry : snapshotIfGenerationPending_) {
+        if (entry.second.request.requestid() != request->requestid()) {
+            continue;
+        }
+        if (request->ByteSizeLong() <= 64 * 1024
+            && entry.second.request.SerializeAsString() == request->SerializeAsString()
+            && entry.second.funcAgentID == funcAgentID
+            && entry.second.agent == agent->second.aid) {
+            return entry.second.completion.GetFuture();
+        }
+        return SnapshotIfGenerationFailure(*request, "request ID conflicts with an in-flight generation snapshot");
+    }
+    if (snapshotIfGenerationPending_.size() >= 1024) {
+        return SnapshotIfGenerationFailure(*request, "generation snapshot pending capacity unavailable");
+    }
+
+    // The transport UUID is private to this actor; callers never see or reuse it.
+    const auto wireID = litebus::uuid_generator::UUID::GetRandomUUID().ToString();
+    SnapshotIfGenerationPending pending;
+    pending.funcAgentID = funcAgentID;
+    pending.agent = agent->second.aid;
+    pending.request = *request;  // actor-owned immutable copy while pending
+    pending.timeout = litebus::AsyncAfter(120000, GetAID(),
+                                          &FunctionAgentMgrActor::SnapshotRuntimeIfGenerationTimeout, wireID);
+    auto future = pending.completion.GetFuture();
+    snapshotIfGenerationPending_.emplace(wireID, std::move(pending));
+
+    auto forwarded = *request;
+    forwarded.set_requestid(wireID);
+    Send(agent->second.aid, "SnapshotRuntimeIfGeneration", forwarded.SerializeAsString());
+    return future;
+}
+
+void FunctionAgentMgrActor::SnapshotRuntimeIfGenerationResponse(const litebus::AID &from, std::string &&,
+                                                                std::string &&msg)
+{
+    messages::SnapshotRuntimeResponse response;
+    if (msg.empty() || msg.size() > 64 * 1024 || !response.ParseFromString(msg)) {
+        return;  // unparseable replies leave the entry pending until its timer fires
+    }
+    auto it = snapshotIfGenerationPending_.find(response.requestid());
+    if (it == snapshotIfGenerationPending_.end()) {
+        return;  // late or unknown private transport ID
+    }
+    // The reply must come from the captured agent AID, and that AID must still
+    // be the registered route for the captured function agent.
+    auto agent = funcAgentTable_.find(it->second.funcAgentID);
+    if (it->second.agent != from || agent == funcAgentTable_.end() || agent->second.aid != from) {
+        return;
+    }
+    const auto &request = it->second.request;
+    if (response.code() == 0) {
+        const auto &snapshot = response.snapshotinfo();
+        if (!response.has_snapshotinfo() || snapshot.checkpointid().empty()
+            || snapshot.source_runtime_id() != request.runtimeid()
+            || snapshot.sandbox_id() != request.expected_sandbox_id()
+            || snapshot.source_generation() != request.expected_resource_generation()) {
+            // An unverifiable success must never be delivered as success, and
+            // the unverifiable payload must not travel with the error either.
+            response.clear_snapshotinfo();
+            response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+            response.set_message("snapshot success payload does not match the pinned expected identity");
+        }
+    }
+    response.set_requestid(request.requestid());
+    litebus::TimerTools::Cancel(it->second.timeout);
+    auto completion = it->second.completion;
+    snapshotIfGenerationPending_.erase(it);
+    completion.SetValue(response);
+}
+
+void FunctionAgentMgrActor::SnapshotRuntimeIfGenerationTimeout(const std::string &wireID)
+{
+    auto it = snapshotIfGenerationPending_.find(wireID);
+    if (it == snapshotIfGenerationPending_.end()) {
+        return;
+    }
+    // The relay owns only its transport bookkeeping: on an unknown outcome the
+    // caller retains any hold or budget until authoritative reconciliation, so
+    // the timeout only reports the unknown result and clears its own entry.
+    auto response = SnapshotIfGenerationFailure(
+        it->second.request, "snapshot outcome unknown after transport timeout; reconcile before retry");
+    auto completion = it->second.completion;
+    snapshotIfGenerationPending_.erase(it);
+    completion.SetValue(response);
 }
 
 litebus::Future<messages::ReconcileRuntimesResponse> FunctionAgentMgrActor::ReconcileRuntimes(

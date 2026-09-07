@@ -49,7 +49,7 @@ const std::vector<std::string> DEPLOY_OPTION_KEYS = { CONDA_CONFIG,       CONDA_
                                                       CONTAINER_EXTRA_CONFIG, CONTAINER_NETWORK,
                                                       CONTAINER_NETWORK_POLICY, CONTAINER_INHERIT_ENTRYPOINT,
                                                       EXEC_PATH, HOST_USER,
-                                                      CONTAINER_ENV_VARS };
+                                                      CONTAINER_ENV_VARS, SCHEDULER_ELASTIC_RESOURCES };
 const std::vector<std::string> POSIX_ENV_KEYS = { YR_APP_MODE,
                                                   YR_WORKING_DIR,
                                                   UNZIPPED_WORKING_DIR,

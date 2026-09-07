@@ -75,11 +75,19 @@ void MockRuntimeManagerActor::CleanStatus(const litebus::AID &from, std::string 
     }
 }
 
-void MockRuntimeManagerActor::StopInstance(const litebus::AID &from, std::string &&, std::string &&)
+void MockRuntimeManagerActor::StopInstance(const litebus::AID &from, std::string &&, std::string &&msg)
 {
     receiveStopInstanceRequest_ = true;
     if (isNeedToResponse_) {
-        Send(from, "StopInstanceResponse", MockStopInstanceResponse());
+        auto reply = MockStopInstanceResponse();
+        messages::StopInstanceRequest request;
+        messages::StopInstanceResponse response;
+        if (request.ParseFromString(msg) && response.ParseFromString(reply)) {
+            // The runtime manager echoes the actual dispatch ID, not the caller ID.
+            response.set_requestid(request.requestid());
+            reply = response.SerializeAsString();
+        }
+        Send(from, "StopInstanceResponse", std::move(reply));
     }
 }
 

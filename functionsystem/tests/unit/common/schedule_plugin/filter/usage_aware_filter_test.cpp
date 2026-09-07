@@ -17,10 +17,12 @@
 #include "common/schedule_plugin/filter/usage_aware_filter/usage_aware_filter.h"
 
 #include <chrono>
+#include <limits>
 #include <thread>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <chrono>
 
 #include "common/resource_view/commitment_ledger.h"
 #include "common/resource_view/usage_trend_tracker.h"
@@ -48,6 +50,8 @@ protected:
     static resource_view::ResourceUnit MakeUnit(double capacityMem, double actualMem)
     {
         auto unit = view_utils::Get1DResourceUnit();
+        unit.set_memory_sample_unix_ms(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
         unit.mutable_capacity()->mutable_resources()->at(view_utils::RESOURCE_MEM_NAME).mutable_scalar()->set_value(
             capacityMem);
         unit.mutable_actualuse()->mutable_resources()->at(view_utils::RESOURCE_MEM_NAME).mutable_scalar()->set_value(
@@ -90,31 +94,69 @@ TEST_F(UsageAwareFilterTest, RejectWhenUsageExceedsLine)
     EXPECT_EQ(out.availableForRequest, -1);
 }
 
-// W10-1: a parked-instance restore (synthetic "ckpt-" identity from the wake
-// chain) stays neutral even when raw actualuse is over the line -- its
-// admission was the pressure monitor's ledger-gated unpark decision, and the
-// raw number still carries the parked sandboxes' residual page cache.
-TEST_F(UsageAwareFilterTest, ParkedRestoreStaysNeutralOverLine)
+// A checkpoint-shaped name is never proof that wake admission ran elsewhere.
+TEST_F(UsageAwareFilterTest, CheckpointPrefixDoesNotBypassPressure)
 {
     UsageAwareFilter filter;
     auto ctx = std::make_shared<PreAllocatedContext>();
-    // same numbers as RejectWhenUsageExceedsLine, but a ckpt- restore identity
     auto unit = MakeUnit(40000, 35000);
     auto inst = MakeInstance(32000);
-    inst.set_instanceid("ckpt-3b4b4ab3-6a8f-4434-8000-0000000000cf");
-    auto out = filter.Filter(ctx, inst, unit);
-    EXPECT_EQ(out.status, StatusCode::SUCCESS);
+    inst.set_instanceid("ckpt-restore");
+    EXPECT_EQ(filter.Filter(ctx, inst, unit).status, StatusCode::RESOURCE_NOT_ENOUGH);
+    inst.set_instanceid("ordinary-instance");
+    inst.set_requestid("ckpt-request");
+    EXPECT_EQ(filter.Filter(ctx, inst, unit).status, StatusCode::RESOURCE_NOT_ENOUGH);
+}
 
-    // the requestid form (snapstart request ids also carry the ckpt- prefix)
-    auto inst2 = MakeInstance(32000);
-    inst2.set_requestid("ckpt-51837400-0000-4000-8000-5d930bf9abf0");
-    auto out2 = filter.Filter(ctx, inst2, unit);
-    EXPECT_EQ(out2.status, StatusCode::SUCCESS);
+TEST_F(UsageAwareFilterTest, RestoreReservesCeilingWithOriginalInstanceIdentity)
+{
+    UsageAwareFilter filter;
+    auto ctx = std::make_shared<PreAllocatedContext>();
+    auto inst = MakeInstance(512);
+    inst.set_instanceid("original-instance");
+    inst.mutable_snapshotinfo()->set_checkpointid("snapshot-1");
+    inst.mutable_resources()->mutable_resources()->at(view_utils::RESOURCE_MEM_NAME).mutable_scalar()->set_limit(8192);
+    auto unit = MakeUnit(40000, 30000);
+    EXPECT_EQ(filter.Filter(ctx, inst, unit).status, StatusCode::RESOURCE_NOT_ENOUGH);
+    unit = MakeUnit(40000, 10000);
+    EXPECT_EQ(filter.Filter(ctx, inst, unit).status, StatusCode::SUCCESS);
+    unit.mutable_actualuse()->clear_resources();
+    EXPECT_EQ(filter.Filter(ctx, inst, unit).status, StatusCode::RESOURCE_NOT_ENOUGH);
+    unit = MakeUnit(40000, 0);
+    EXPECT_EQ(filter.Filter(ctx, inst, unit).status, StatusCode::SUCCESS);
+    unit.mutable_actualuse()->mutable_resources()->at(view_utils::RESOURCE_MEM_NAME).clear_scalar();
+    EXPECT_EQ(filter.Filter(ctx, inst, unit).status, StatusCode::RESOURCE_NOT_ENOUGH);
+    unit.mutable_actualuse()->mutable_resources()->at(view_utils::RESOURCE_MEM_NAME).mutable_scalar()->set_value(0);
+    EXPECT_EQ(filter.Filter(ctx, inst, unit).status, StatusCode::SUCCESS);
+    unit.mutable_capacity()->mutable_resources()->at(view_utils::RESOURCE_MEM_NAME).clear_scalar();
+    EXPECT_EQ(filter.Filter(ctx, inst, unit).status, StatusCode::RESOURCE_NOT_ENOUGH);
+    unit = MakeUnit(40000, 0);
+    inst.mutable_resources()->mutable_resources()->at(view_utils::RESOURCE_MEM_NAME).mutable_scalar()->set_limit(
+        std::numeric_limits<double>::quiet_NaN());
+    EXPECT_EQ(filter.Filter(ctx, inst, unit).status, StatusCode::RESOURCE_NOT_ENOUGH);
+}
 
-    // non-restore instances are still rejected under the same pressure
-    auto inst3 = MakeInstance(32000);
-    auto out3 = filter.Filter(ctx, inst3, unit);
-    EXPECT_EQ(out3.status, StatusCode::RESOURCE_NOT_ENOUGH);
+TEST_F(UsageAwareFilterTest, RestoreRequiresFreshWatermarkForEveryLeaf)
+{
+    UsageAwareFilter filter;
+    auto ctx = std::make_shared<PreAllocatedContext>();
+    auto instance = MakeInstance(512);
+    instance.mutable_snapshotinfo()->set_checkpointid("checkpoint");
+    auto unit = MakeUnit(40000, 1000);
+    const auto nowMs = unit.memory_sample_unix_ms();
+    EXPECT_EQ(filter.Filter(ctx, instance, unit).status, StatusCode::SUCCESS);
+    unit.set_memory_sample_unix_ms(nowMs - 60000);
+    EXPECT_EQ(filter.Filter(ctx, instance, unit).status, StatusCode::RESOURCE_NOT_ENOUGH);
+    unit.set_memory_sample_unix_ms(nowMs + 60000);
+    EXPECT_EQ(filter.Filter(ctx, instance, unit).status, StatusCode::RESOURCE_NOT_ENOUGH);
+    unit.set_memory_sample_unix_ms(0);
+    EXPECT_EQ(filter.Filter(ctx, instance, unit).status, StatusCode::RESOURCE_NOT_ENOUGH);
+    (*unit.mutable_fragment())["fresh"] = MakeUnit(20000, 500);
+    (*unit.mutable_fragment())["stale"] = MakeUnit(20000, 500);
+    (*unit.mutable_fragment())["stale"].set_memory_sample_unix_ms(nowMs - 60000);
+    EXPECT_EQ(filter.Filter(ctx, instance, unit).status, StatusCode::RESOURCE_NOT_ENOUGH);
+    (*unit.mutable_fragment())["stale"].set_memory_sample_unix_ms(nowMs);
+    EXPECT_EQ(filter.Filter(ctx, instance, unit).status, StatusCode::SUCCESS);
 }
 
 TEST_F(UsageAwareFilterTest, BoundaryExactlyAtLine)
@@ -251,6 +293,69 @@ TEST_F(UsageAwareFilterTest, InstanceCapReached)
     unit.mutable_instances()->erase("inst-a");
     EXPECT_EQ(filter.Filter(ctx, inst, unit).status, StatusCode::SUCCESS);
     UsageAwareFilter::SetConfig(0.9, 2048.0, 0);
+}
+
+TEST_F(UsageAwareFilterTest, ColdInstanceCapIncludesPendingBeforeTelemetry)
+{
+    UsageAwareFilter filter;
+    UsageAwareFilter::SetConfig(0.9, 2048.0, 2);
+    auto ctx = std::make_shared<PreAllocatedContext>();
+    auto unit = MakeUnit(40000, 0);
+    auto inst = MakeInstance(512);
+    (*unit.mutable_instances())["visible"] = MakeInstance(512);
+    ctx->preAllocatedSelectedFunctionAgentMap["visible"] = unit.id();
+    ctx->preAllocatedSelectedFunctionAgentMap["elsewhere"] = "other-unit";
+    EXPECT_EQ(filter.Filter(ctx, inst, unit).status, StatusCode::SUCCESS);
+    ctx->preAllocatedSelectedFunctionAgentMap["cold"] = unit.id();
+    EXPECT_EQ(filter.Filter(ctx, inst, unit).status, StatusCode::RESOURCE_NOT_ENOUGH);
+    unit.mutable_actualuse()->clear_resources();
+    EXPECT_EQ(filter.Filter(ctx, inst, unit).status, StatusCode::RESOURCE_NOT_ENOUGH);
+    // The cold instance appearing in the view must not be double-counted.
+    (*unit.mutable_instances())["cold"] = MakeInstance(512);
+    UsageAwareFilter::SetConfig(0.9, 2048.0, 3);
+    EXPECT_EQ(filter.Filter(ctx, inst, unit).status, StatusCode::SUCCESS);
+    // Synthetic restores share the physical instance-count protection.
+    UsageAwareFilter::SetConfig(0.9, 2048.0, 2);
+    inst.set_instanceid("ckpt-cold");
+    EXPECT_EQ(filter.Filter(ctx, inst, unit).status, StatusCode::RESOURCE_NOT_ENOUGH);
+}
+
+TEST_F(UsageAwareFilterTest, PendingRestoreRetainsItsCeilingForTheNextAdmission)
+{
+    UsageAwareFilter filter;
+    auto ctx = std::make_shared<PreAllocatedContext>();
+    auto unit = MakeUnit(40000, 28000); // safety 0.9 => 36000 MiB
+    auto incoming = MakeInstance(512);
+    auto restoring = MakeInstance(512);
+    restoring.set_instanceid("pending-wake");
+    restoring.mutable_snapshotinfo()->set_checkpointid("checkpoint");
+    restoring.mutable_resources()->mutable_resources()->at(view_utils::RESOURCE_MEM_NAME)
+        .mutable_scalar()->set_limit(8192);
+    ctx->preAllocatedSelectedFunctionAgentMap[restoring.instanceid()] = unit.id();
+    ctx->allocated[unit.id()].resource = restoring.resources();
+    ctx->RememberRestoreMemory(restoring);
+    // 28000 + 8192 + 512 > 36000. The old floor/booking rule incorrectly passed.
+    EXPECT_EQ(filter.Filter(ctx, incoming, unit).status, StatusCode::RESOURCE_NOT_ENOUGH);
+    auto missingUsage = unit;
+    missingUsage.mutable_actualuse()->clear_resources();
+    EXPECT_EQ(filter.Filter(ctx, incoming, missingUsage).status, StatusCode::RESOURCE_NOT_ENOUGH);
+    auto emptyNode = MakeUnit(8000, 0);
+    ctx->preAllocatedSelectedFunctionAgentMap[restoring.instanceid()] = emptyNode.id();
+    EXPECT_EQ(filter.Filter(ctx, incoming, emptyNode).status, StatusCode::RESOURCE_NOT_ENOUGH);
+    ctx->preAllocatedSelectedFunctionAgentMap[restoring.instanceid()] = unit.id();
+    restoring.mutable_resources()->mutable_resources()->at(view_utils::RESOURCE_MEM_NAME)
+        .mutable_scalar()->set_limit(4096);
+    ctx->RememberRestoreMemory(restoring); // update replaces, never accumulates twice
+    EXPECT_EQ(filter.Filter(ctx, incoming, unit).status, StatusCode::SUCCESS);
+    restoring.mutable_resources()->mutable_resources()->at(view_utils::RESOURCE_MEM_NAME)
+        .mutable_scalar()->set_limit(std::numeric_limits<double>::quiet_NaN());
+    ctx->RememberRestoreMemory(restoring);
+    EXPECT_EQ(filter.Filter(ctx, incoming, unit).status, StatusCode::RESOURCE_NOT_ENOUGH);
+    ctx->preAllocatedSelectedFunctionAgentMap[restoring.instanceid()] = "other-node";
+    EXPECT_EQ(filter.Filter(ctx, incoming, unit).status, StatusCode::SUCCESS);
+    restoring.clear_snapshotinfo();
+    ctx->RememberRestoreMemory(restoring);
+    EXPECT_TRUE(ctx->preAllocatedRestoreMemory.empty());
 }
 
 // Ph0.1 TOCTOU: same-window in-flight instances hold a floor-style reserve

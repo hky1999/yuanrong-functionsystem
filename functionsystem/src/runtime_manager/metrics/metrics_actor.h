@@ -99,6 +99,9 @@ public:
      * @param instanceID the ID of the running instance
      * @param memoryMb sandbox memory usage in MB
      */
+    void UpdateInstanceResourceSample(const std::string &instanceID,
+                                     const resources::SandboxResourceSample &sample);
+
     void UpdateInstanceMemoryUsage(const std::string &instanceID, double memoryMb);
 
     /**
@@ -186,6 +189,7 @@ private:
     // D-7: instanceID -> sandbox memory usage (MB), fed by the sandboxd Stats
     // poll; overlaid onto the reported per-instance actualuse
     std::unordered_map<std::string, double> instanceMemoryUsageMb_;
+    std::unordered_map<std::string, resources::SandboxResourceSample> instanceResourceSamples_;
     std::shared_ptr<ProcFSTools> procFSTools_{ nullptr };
     litebus::Timer updateMetricsTimer_;
     litebus::Timer pushMetricsTimer_;

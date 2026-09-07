@@ -40,6 +40,9 @@ public:
 
     // D-7: feed per-instance sandbox memory (MB) into the reported resource
     // view (runsc reports no pid, so the pid-based collector cannot)
+    void UpdateInstanceResourceSample(const std::string &instanceID,
+                                     const resources::SandboxResourceSample &sample) const;
+
     void UpdateInstanceMemoryUsage(const std::string &instanceID, double memoryMb) const;
 
     resources::ResourceUnit GetResourceUnit() const;

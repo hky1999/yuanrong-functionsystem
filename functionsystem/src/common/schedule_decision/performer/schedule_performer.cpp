@@ -76,7 +76,8 @@ void SchedulePerformer::Allocate(const std::shared_ptr<schedule_framework::PreAl
 
     // local and domain need to mark agent is selected to avoid select same agent
     // while two instance scheduling in a short time
-    context->preAllocatedSelectedFunctionAgentMap[instanceID] = selected;
+    context->preAllocatedSelectedFunctionAgentMap[ins.instanceid()] = selected;
+    context->RememberRestoreMemory(ins);
     context->preAllocatedSelectedFunctionAgentSet.insert(selected);
 }
 
@@ -152,6 +153,11 @@ void SchedulePerformer::RollBackAllocated(const std::shared_ptr<schedule_framewo
     if (context->allocatedLabels.find(selected) != context->allocatedLabels.end()) {
         context->allocatedLabels[selected] =
             context->allocatedLabels[selected] - ToLabelKVs(ins.labels()) - ToLabelKVs(ins.kvlabels());
+    }
+    const auto selectedInstance = context->preAllocatedSelectedFunctionAgentMap.find(ins.instanceid());
+    if (selectedInstance != context->preAllocatedSelectedFunctionAgentMap.end() && selectedInstance->second == selected) {
+        context->preAllocatedSelectedFunctionAgentMap.erase(selectedInstance);
+        context->preAllocatedRestoreMemory.erase(ins.instanceid());
     }
     context->preAllocatedSelectedFunctionAgentSet.erase(selected); // need to free pod while rollback
     if (auto *roundContext = dynamic_cast<schedule_framework::RoundAllocationContext *>(context.get());
@@ -242,6 +248,7 @@ bool SchedulePerformer::IsScheduled(const std::shared_ptr<schedule_framework::Pr
             PreAllocated(scheReq->instance(), context, requestID, traceID, result);
         }
         context->preAllocatedSelectedFunctionAgentMap[scheReq->instance().instanceid()] = result.id;
+        context->RememberRestoreMemory(scheReq->instance());
         context->preAllocatedSelectedFunctionAgentSet.insert(result.id);
         result.unitID = result.id;
         result.id = unit->ownerid();

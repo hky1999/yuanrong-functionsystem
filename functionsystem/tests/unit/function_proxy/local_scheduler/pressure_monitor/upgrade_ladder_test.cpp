@@ -115,6 +115,32 @@ TEST_F(UpgradeLadderTest, LowUsageRaisesOneRung)
     EXPECT_EQ(ladder.DeferredCount(), 0u);
 }
 
+// A failed soft-limit write must not erase the successful hard-limit promise.
+TEST_F(UpgradeLadderTest, FailedHighWriteStillBooksRaisedMax)
+{
+    ASSERT_NO_FATAL_FAILURE(AddSandbox("sbx-a", 8 * GiB, 7 * GiB));
+    ASSERT_TRUE(std::filesystem::remove(Root() + "/sbx-a/memory.high"));
+    ASSERT_TRUE(std::filesystem::create_directory(Root() + "/sbx-a/memory.high"));
+    UpgradeLadder ladder("node-1", DefaultConfig(), Root());
+    ladder.OnNodeUsage(4 * GiB, 64 * GiB);
+    ladder.OnThrottleEvent("sbx-a", 1);
+    EXPECT_EQ(Read("sbx-a", "memory.max"), 16 * GiB);
+    EXPECT_EQ(resource_view::CommitmentLedger::Outstanding("node-1"), 8 * GiB);
+}
+
+// Admission charges the actual capped delta, not the larger nominal step.
+TEST_F(UpgradeLadderTest, CappedRungFitsRemainingBudget)
+{
+    ASSERT_NO_FATAL_FAILURE(AddSandbox("sbx-a", 30 * GiB, 27 * GiB));
+    auto config = DefaultConfig();
+    config.safetyRatio = 1.0;
+    UpgradeLadder ladder("node-1", config, Root());
+    ladder.OnNodeUsage(60 * GiB, 64 * GiB);
+    ladder.OnThrottleEvent("sbx-a", 1);
+    EXPECT_EQ(Read("sbx-a", "memory.max"), 32 * GiB);
+    EXPECT_EQ(resource_view::CommitmentLedger::Outstanding("node-1"), 2 * GiB);
+}
+
 /**
  * Feature: the same event under a hot node is deferred, not written.
  * Steps: use 55G + step 8G > 0.9*64G; OnThrottleEvent.

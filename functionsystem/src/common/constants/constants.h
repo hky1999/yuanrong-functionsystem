@@ -338,6 +338,7 @@ const std::string CONTAINER_EXTRA_CONFIG = "extra_config";
 const std::string CONTAINER_NETWORK = "network";
 
 const std::string CONTAINER_NETWORK_POLICY = "network_policy";
+const std::string SCHEDULER_ELASTIC_RESOURCES = "scheduler_elastic_resources";
 
 const std::string CONTAINER_INHERIT_ENTRYPOINT = "inherit_entrypoint";
 

@@ -15,6 +15,7 @@
  */
 
 #include "snap_ctrl_actor.h"
+#include "hold_attempt_policy.h"
 
 #include <chrono>
 #include <nlohmann/json.hpp>
@@ -26,6 +27,7 @@
 #include "common/proto/pb/message_pb.h"
 #include "common/proto/pb/posix_pb.h"
 #include "common/resource_view/resource_type.h"
+#include "common/types/instance_state.h"
 #include "common/utils/struct_transfer.h"
 #include "local_scheduler/function_agent_manager/function_agent_mgr.h"
 #include "local_scheduler/instance_control/idle/idle_mgr.h"
@@ -34,6 +36,15 @@
 #include "local_scheduler/local_scheduler_service/local_sched_srv.h"
 
 namespace functionsystem::local_scheduler {
+
+namespace {
+// Expected identity fields must be present, non-blank and bounded; a partial
+// tuple never authorizes a conditional snapshot.
+bool InvalidSnapshotExpectedField(const std::string &value)
+{
+    return value.empty() || value.size() > 256 || value.find_first_not_of(" \t\r\n\f\v") == std::string::npos;
+}
+}  // namespace
 
 SnapCtrlActor::SnapCtrlActor(const std::string &name, const std::string &nodeID)
     : BasisActor(name), nodeID_(nodeID)
@@ -65,6 +76,10 @@ static litebus::Future<SnapshotResult> RecordSnapshotMetadata(const std::shared_
         return SnapshotResult{ .code = runtimeRsp.code(),
                                .message = runtimeRsp.message(),
                                .snapshotInfo = runtimeRsp.snapshotinfo() };
+    }
+    if (runtimeRsp.snapshotinfo().checkpointid().empty()) {
+        return SnapshotResult{ .code = common::ERR_INNER_SYSTEM_ERROR,
+            .message = "successful snapshot reply has no checkpoint identity", .snapshotInfo = runtimeRsp.snapshotinfo() };
     }
     auto req = std::make_shared<messages::RecordSnapshotRequest>();
     *req->mutable_snapshotinfo() = runtimeRsp.snapshotinfo();
@@ -98,6 +113,72 @@ static litebus::Future<SnapshotResult> RecordSnapshotMetadata(const std::shared_
         });
 }
 
+litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshotIfSource(const std::string &requestID,
+                                                                    const std::string &instanceID,
+                                                                    const std::string &payload,
+                                                                    const std::shared_ptr<InstanceStateMachine> &source)
+{
+    // Every validation precedes any park/drain/gate mutation: a rejected
+    // conditional request must leave the instance's state exactly as it was.
+    // A null view is a safe rejection: source-aware invalid input must never
+    // abort the actor on a missing binding.
+    auto rejected = [&requestID, &instanceID](common::ErrorCode code, const std::string &reason) {
+        YRLOG_ERROR("{}|{}|conditional snapshot rejected: {}", requestID, instanceID, reason);
+        KillResponse rsp;
+        rsp.set_code(code);
+        rsp.set_message(reason);
+        return rsp;
+    };
+    if (instanceControlView_ == nullptr) {
+        return rejected(common::ERR_INNER_SYSTEM_ERROR, "instance control view is not bound");
+    }
+    if (source == nullptr) {
+        return rejected(static_cast<common::ErrorCode>(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY)),
+                        "conditional snapshot requires a captured source");
+    }
+    if (instanceControlView_->GetInstance(instanceID) != source) {
+        return rejected(static_cast<common::ErrorCode>(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY)),
+                        "captured source is no longer the instance state machine");
+    }
+    if (source->GetInstanceState() != InstanceState::RUNNING) {
+        return rejected(static_cast<common::ErrorCode>(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY)),
+                        "captured source is not RUNNING");
+    }
+    SnapOptions options;
+    if (payload.empty() || !options.ParseFromString(payload)) {
+        return rejected(static_cast<common::ErrorCode>(StatusCode::ERR_PARAM_INVALID),
+                        "invalid conditional snapshot payload");
+    }
+    if (InvalidSnapshotExpectedField(options.expected_runtime_id())
+        || InvalidSnapshotExpectedField(options.expected_sandbox_id())
+        || InvalidSnapshotExpectedField(options.expected_resource_generation())) {
+        return rejected(static_cast<common::ErrorCode>(StatusCode::ERR_PARAM_INVALID),
+                        "conditional snapshot requires a complete expected identity tuple");
+    }
+    if (options.expected_runtime_id() != source->GetInstanceInfo().runtimeid()) {
+        return rejected(static_cast<common::ErrorCode>(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY)),
+                        "expected runtime does not match the captured snapshot source");
+    }
+    // Same actor turn: HandleSnapshot re-parses and re-fences, then runs.
+    return HandleSnapshot(requestID, instanceID, payload);
+}
+
+bool SnapCtrlActor::SnapshotSourceMatches(const std::string &instanceID,
+                                          const std::shared_ptr<InstanceStateMachine> &source,
+                                          const std::string &runtimeID)
+{
+    // Exact-pointer fence: only the originally captured machine, still the
+    // current one, RUNNING and on the same runtime, authorizes dispatch. A
+    // replacement machine's newer identity is never adopted here. A null view
+    // is a plain "cannot fence" (false), never an abort.
+    if (instanceControlView_ == nullptr || source == nullptr || runtimeID.empty()) {
+        return false;
+    }
+    return instanceControlView_->GetInstance(instanceID) == source
+        && source->GetInstanceState() == InstanceState::RUNNING
+        && source->GetInstanceInfo().runtimeid() == runtimeID;
+}
+
 litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &requestID, const std::string &instanceID,
                                                             const std::string &payload)
 {
@@ -105,6 +186,11 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
     bool leaveRunning = false;
     int32_t ttl = 0;  // Default TTL is 0 (no expiration)
     std::string functionType;
+    std::string holdToken;
+    std::string expectedRuntimeID;
+    std::string expectedSandboxID;
+    std::string expectedGeneration;
+    bool hasExpected = false;
     if (!payload.empty()) {
         SnapOptions options;
         if (!options.ParseFromString(payload)) {
@@ -117,6 +203,39 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
         leaveRunning = options.leaverunning();
         ttl = options.ttl();  // Extract TTL from SnapOptions
         functionType = options.functiontype();
+        holdToken = options.hold_token();
+        expectedRuntimeID = options.expected_runtime_id();
+        expectedSandboxID = options.expected_sandbox_id();
+        expectedGeneration = options.expected_resource_generation();
+        hasExpected = !expectedRuntimeID.empty() || !expectedSandboxID.empty() || !expectedGeneration.empty();
+        if (hasExpected && (InvalidSnapshotExpectedField(expectedRuntimeID)
+            || InvalidSnapshotExpectedField(expectedSandboxID) || InvalidSnapshotExpectedField(expectedGeneration))) {
+            // any expected field present => the complete tuple, non-blank and bounded
+            KillResponse errorRsp;
+            errorRsp.set_code(static_cast<common::ErrorCode>(StatusCode::ERR_PARAM_INVALID));
+            errorRsp.set_message("incomplete or oversized expected identity tuple");
+            return errorRsp;
+        }
+        if (!holdToken.empty() && !hasExpected) {
+            // an old token-only payload no longer authorizes a park: the token
+            // must pin the exact physical source it was taken against
+            KillResponse errorRsp;
+            errorRsp.set_code(common::ERR_PARAM_INVALID);
+            errorRsp.set_message("hold token requires the expected identity tuple");
+            return errorRsp;
+        }
+        if (!ValidParkHoldToken(holdToken, leaveRunning)) {
+            KillResponse errorRsp;
+            errorRsp.set_code(common::ERR_PARAM_INVALID);
+            errorRsp.set_message("invalid park hold token");
+            return errorRsp;
+        }
+    }
+    if (snapshotAttempts_.Busy(instanceID) || parkedInstances_.count(instanceID) != 0) {
+        KillResponse busy;
+        busy.set_code(static_cast<common::ErrorCode>(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY)));
+        busy.set_message("snapshot already pending or instance parked");
+        return busy;
     }
     // 1. 获取实例状态机
     ASSERT_IF_NULL(instanceControlView_);
@@ -130,7 +249,31 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
     }
     YRLOG_INFO("{}|{}|start snapshot, leave_running: {}", requestID, instanceID, leaveRunning);
     auto instanceInfo = stateMachine->GetInstanceInfo();
+    // Conditional-path fence, still before any gate/mark/drain mutation: the
+    // expected runtime must be this source's and the source must be RUNNING.
+    // The optional Stats cached in InstanceInfo are deliberately NOT trusted
+    // to validate the physical generation — the captured expected pair travels
+    // to the daemon, which re-checks it under its resource lock.
+    if (hasExpected && (stateMachine->GetInstanceState() != InstanceState::RUNNING
+        || expectedRuntimeID != instanceInfo.runtimeid())) {
+        KillResponse errorRsp;
+        errorRsp.set_code(static_cast<common::ErrorCode>(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY)));
+        errorRsp.set_message("conditional snapshot source is not the RUNNING expected runtime");
+        return errorRsp;
+    }
     ASSERT_IF_NULL(functionAgentMgr_);
+    const auto snapshotAttempt = snapshotAttempts_.Begin(instanceID);
+    if (!snapshotAttempt.has_value()) {
+        KillResponse busy;
+        busy.set_code(static_cast<common::ErrorCode>(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY)));
+        busy.set_message("snapshot attempt capacity exhausted");
+        return busy;
+    }
+    const auto dispatched = std::make_shared<std::atomic<bool>>(false);
+    // Set when a deferred source recheck fails: the park mark and drain may
+    // then belong to a replacement source's lifecycle, so no cleanup in this
+    // chain may clear them (reconciliation owns them instead).
+    const auto sourceMismatched = std::make_shared<std::atomic<bool>>(false);
     // Mark the instance as parked BEFORE the checkpoint starts: the deliberate sandbox
     // kill of a park is reported to the control plane as an instance exit and reaches
     // the data plane (InstanceView FATAL / delete chains) before the snapshot completes,
@@ -147,9 +290,23 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
     //    超时默认放弃本次 park（实例继续运行，上层可重试）；force 策略仅实验用。
     const bool forceOnDrainTimeout = markParked && parkedRegistry.DrainForceOnTimeout();
     return parkedRegistry.DrainInstance(instanceID)
-        .Then([this, aid(GetAID()), requestID, instanceID, instanceInfo, ttl, leaveRunning, markParked,
-               forceOnDrainTimeout, functionAgentMgr(functionAgentMgr_)](const Status &drainStatus)
-                   -> litebus::Future<messages::SnapshotRuntimeResponse> {
+        .Then(litebus::Defer(GetAID(),
+            [this, requestID, instanceID, instanceInfo, ttl, leaveRunning, markParked, forceOnDrainTimeout,
+             dispatched, sourceMismatched, functionAgentMgr(functionAgentMgr_), hasExpected, expectedSandboxID,
+             expectedGeneration, source(stateMachine), runtimeID(instanceInfo.runtimeid())](const Status &drainStatus)
+                -> litebus::Future<messages::SnapshotRuntimeResponse> {
+            // Source fence FIRST: an already-flagged or freshly detected
+            // mismatch skips every cleanup below — the mark/drain may belong
+            // to a replacement source's lifecycle now.
+            if (hasExpected && (sourceMismatched->load() || !SnapshotSourceMatches(instanceID, source, runtimeID))) {
+                sourceMismatched->store(true);
+                YRLOG_ERROR("{}|{}|snapshot source changed after drain; refusing cleanup and dispatch",
+                            requestID, instanceID);
+                messages::SnapshotRuntimeResponse mismatch;
+                mismatch.set_code(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY));
+                mismatch.set_message("snapshot source changed after drain");
+                return mismatch;
+            }
             if (drainStatus.IsError()) {
                 YRLOG_ERROR("{}|{}|park drain failed: {}", requestID, instanceID, drainStatus.GetMessage());
                 if (!forceOnDrainTimeout) {
@@ -168,9 +325,24 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
                            requestID, instanceID);
             }
             // 3. 调用 PrepareSnap 验证实例状态并准备快照
-            return PrepareSnap(requestID, instanceID)
-                .Then([aid, requestID, instanceID, instanceInfo, ttl, leaveRunning, markParked,
-                       functionAgentMgr](const Status &status) -> litebus::Future<messages::SnapshotRuntimeResponse> {
+            return PrepareSnap(requestID, instanceID, hasExpected ? source : nullptr,
+                hasExpected ? runtimeID : "", hasExpected ? sourceMismatched : nullptr)
+                .Then(litebus::Defer(GetAID(),
+                    [this, requestID, instanceID, instanceInfo, ttl, leaveRunning, markParked, functionAgentMgr,
+                     dispatched, sourceMismatched, hasExpected, expectedSandboxID, expectedGeneration, source,
+                     runtimeID](const Status &status) -> litebus::Future<messages::SnapshotRuntimeResponse> {
+                        // Source fence FIRST (also pre-dispatch): an already-flagged
+                        // or freshly detected mismatch skips the failure cleanup
+                        // below, which must not clear another source's mark/drain.
+                        if (hasExpected && (sourceMismatched->load()
+                            || !SnapshotSourceMatches(instanceID, source, runtimeID))) {
+                            sourceMismatched->store(true);
+                            YRLOG_ERROR("{}|{}|snapshot source changed before dispatch", requestID, instanceID);
+                            messages::SnapshotRuntimeResponse mismatch;
+                            mismatch.set_code(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY));
+                            mismatch.set_message("snapshot source changed before dispatch");
+                            return mismatch;
+                        }
                         if (status.IsError()) {
                             YRLOG_ERROR("{}|{}|PrepareSnap failed: {}", requestID, instanceID, status.GetMessage());
                             if (markParked) {
@@ -184,20 +356,39 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
                             return errorRsp;
                         }
                         // 4. 通过 functionAgentMgr_ 发送 SnapshotRuntime 请求到 function_agent
-                        return functionAgentMgr->SnapshotRuntime(requestID, instanceInfo, ttl, leaveRunning);
-                    });
-        })
+                        dispatched->store(true);
+                        if (!hasExpected) {
+                            return functionAgentMgr->SnapshotRuntime(requestID, instanceInfo, ttl, leaveRunning);
+                        }
+                        // Conditional dispatch: the generation-fenced channel
+                        // carries the caller's ORIGINAL identity pair (runtime
+                        // already verified against the captured source); the
+                        // legacy unfenced message is never sent on this path.
+                        auto request = std::make_shared<messages::SnapshotRuntimeRequest>();
+                        request->set_requestid(requestID);
+                        request->set_instanceid(instanceID);
+                        request->set_runtimeid(instanceInfo.runtimeid());
+                        request->set_containerid(instanceInfo.containerid());  // containerID is same as runtimeID in container mode
+                        request->set_ttl(ttl);
+                        request->set_leaverunning(leaveRunning);  // sandboxd PR#16 physical mode
+                        request->set_expected_sandbox_id(expectedSandboxID);
+                        request->set_expected_resource_generation(expectedGeneration);
+                        return functionAgentMgr->SnapshotRuntimeIfGeneration(instanceInfo, request);
+                    }));
+            }))
         .Then([aid(GetAID()), localSchedSrv(localSchedSrv_), requestID, instanceInfo,
                functionType](const messages::SnapshotRuntimeResponse &runtimeRsp) -> litebus::Future<SnapshotResult> {
             return RecordSnapshotMetadata(localSchedSrv, runtimeRsp, instanceInfo, functionType);
         })
-        .Then([requestID, instanceID, leaveRunning, markParked, aid(GetAID()),
-               instanceCtrl(instanceCtrl_)](const SnapshotResult &result) -> litebus::Future<SnapshotResult> {
+        .Then([requestID, instanceID, leaveRunning, markParked, dispatched, sourceMismatched, aid(GetAID()),
+               instanceCtrl(instanceCtrl_), source(stateMachine), runtimeID(instanceInfo.runtimeid())](const SnapshotResult &result) -> litebus::Future<SnapshotResult> {
             if (result.code != common::ERR_NONE) {
                 // snapshot failed: the instance keeps running (or died for real), drop
                 // the park mark so later exit events take the legacy teardown path.
-                if (markParked) {
-                    // park abandoned before the delete: roll the drain back (no-op if
+                // A source mismatch is the exception: the mark/drain may belong to
+                // a replacement source now, so this chain must not clear them.
+                if (markParked && !dispatched->load() && !sourceMismatched->load()) {
+                    // park abandoned before dispatch: roll the drain back (no-op if
                     // the instance actually died — the FATAL path then governs)
                     function_proxy::ParkedInstanceRegistry::Instance().ReleaseDrain(instanceID);
                     function_proxy::ParkedInstanceRegistry::Instance().Clear(instanceID);
@@ -208,12 +399,27 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
             // 5. 日志记录最终状态
             if (!leaveRunning) {
                 YRLOG_INFO("{}|{}|snapshot completed, deleting instance", requestID, instanceID);
-                // 调用 ForceDeleteInstance 删除实例
-                if (instanceCtrl != nullptr) {
-                    instanceCtrl->ForceDeleteInstance(instanceID);
-                } else {
-                    YRLOG_WARN("{}|{}|instanceCtrl not bound, cannot delete instance", requestID, instanceID);
+                if (instanceCtrl == nullptr) {
+                    auto failed = result;
+                    failed.code = common::ERR_INNER_SYSTEM_ERROR;
+                    failed.message = "snapshot source retirement unavailable";
+                    return failed;
                 }
+                if (runtimeID.empty() || result.snapshotInfo.source_runtime_id() != runtimeID) {
+                    auto failed = result;
+                    failed.code = common::ERR_INSTANCE_BUSY;
+                    failed.message = "checkpoint runtime does not match snapshot source";
+                    return failed;
+                }
+                return instanceCtrl->RetireSnapshotSource(instanceID, source, runtimeID)
+                    .Then([result](const Status &retired) {
+                        auto completed = result;
+                        if (retired.IsError()) {
+                            completed.code = Status::GetPosixErrorCode(retired.StatusCode());
+                            completed.message = retired.RawMessage();
+                        }
+                        return completed;
+                    });
             } else {
                 YRLOG_INFO("{}|{}|snapshot completed, instance continues running", requestID, instanceID);
                 if (markParked) {  // defensive: leaveRunning cannot change mid-flight
@@ -224,13 +430,25 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
             return result;
         })
         .Then(litebus::Defer(GetAID(), &SnapCtrlActor::OnHandleSnapshot, instanceID, leaveRunning,
-                             std::placeholders::_1));
+                             std::placeholders::_1, holdToken, snapshotAttempt.value()))
+        .OnComplete(litebus::Defer(GetAID(), &SnapCtrlActor::FinishSnapshotAttempt, instanceID,
+            snapshotAttempt.value(), markParked, dispatched, std::placeholders::_1, sourceMismatched));
 }
 
 KillResponse SnapCtrlActor::OnHandleSnapshot(const std::string &instanceID, bool leaveRunning,
-                                             const SnapshotResult &result)
+                                             const SnapshotResult &result, const std::string &holdToken, uint64_t snapshotAttempt)
 {
     KillResponse rsp;
+    if (snapshotAttempt != 0 && !snapshotAttempts_.Matches(instanceID, snapshotAttempt)) {
+        rsp.set_code(static_cast<common::ErrorCode>(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY)));
+        rsp.set_message("stale snapshot completion");
+        return rsp;
+    }
+    if (result.code == common::ERR_NONE && result.snapshotInfo.checkpointid().empty()) {
+        rsp.set_code(common::ERR_INNER_SYSTEM_ERROR);
+        rsp.set_message("snapshot completion has no checkpoint identity");
+        return rsp;
+    }
     rsp.set_code(static_cast<common::ErrorCode>(result.code));
     rsp.set_message(result.message);
 
@@ -247,6 +465,10 @@ KillResponse SnapCtrlActor::OnHandleSnapshot(const std::string &instanceID, bool
             // checkpoint is the only handle left. Record it for wake/FIFO unpark.
             ParkedEntry entry;
             entry.checkpointID = result.snapshotInfo.checkpointid();
+            entry.sourceSandboxID = result.snapshotInfo.sandbox_id();
+            entry.sourceRuntimeID = result.snapshotInfo.source_runtime_id();
+            entry.sourceGeneration = result.snapshotInfo.source_generation();
+            entry.holdToken = holdToken;
             entry.parkedAt = std::chrono::steady_clock::now();
             parkedInstances_[instanceID] = entry;
             YRLOG_INFO("instance({}) parked, registered checkpoint({}), parked total: {}", instanceID,
@@ -260,6 +482,74 @@ KillResponse SnapCtrlActor::OnHandleSnapshot(const std::string &instanceID, bool
         }
     }
     return rsp;
+}
+
+void SnapCtrlActor::FinishSnapshotAttempt(const std::string &instanceID, uint64_t attempt, bool markParked,
+    const std::shared_ptr<std::atomic<bool>> &dispatched, const litebus::Future<KillResponse> &result,
+    const std::shared_ptr<std::atomic<bool>> &sourceMismatched)
+{
+    if (!snapshotAttempts_.Matches(instanceID, attempt)) { return; }
+    const bool mismatch = sourceMismatched != nullptr && sourceMismatched->load();
+    const bool success = !result.IsError() && result.Get().code() == common::ERR_NONE;
+    const bool beforeDispatch = !dispatched->load();
+    if (mismatch) {
+        // The mark/drain stay held by an unresolved owner, so the attempt must
+        // not be cleared even on a synthetic success: retaining it UNKNOWN
+        // keeps the gate fenced until authoritative reconciliation.
+        snapshotAttempts_.Finish(instanceID, attempt, false);
+        YRLOG_WARN("snapshot source changed for instance({}), retaining attempt {} unknown pending reconciliation",
+                   instanceID, attempt);
+        return;
+    }
+    snapshotAttempts_.Finish(instanceID, attempt, success || beforeDispatch);
+    if (!success && beforeDispatch && markParked) {
+        function_proxy::ParkedInstanceRegistry::Instance().ReleaseDrain(instanceID);
+        function_proxy::ParkedInstanceRegistry::Instance().Clear(instanceID);
+    }
+    if (!success && !beforeDispatch) {
+        YRLOG_WARN("snapshot outcome uncertain for instance({}), retaining attempt {} pending reconciliation",
+                   instanceID, attempt);
+    }
+}
+
+litebus::Future<KillResponse> SnapCtrlActor::HandleDirectedWake(const std::string &requestID,
+    const std::string &instanceID, const std::string &payload)
+{
+    auto rejected = [](const std::string &reason) {
+        KillResponse response;
+        response.set_code(common::ERR_PARAM_INVALID);
+        response.set_message(reason);
+        return response;
+    };
+    if (payload.empty() || payload.size() > 4096) { return rejected("wake identity payload required"); }
+    const auto command = nlohmann::json::parse(payload, nullptr, false);
+    if (!command.is_object() || !command.contains("schema") || !command["schema"].is_number_integer()
+        || (command["schema"] != 1 && command["schema"] != 2) || !command.contains("deadline_unix_ms")
+        || !command["deadline_unix_ms"].is_number_integer()) { return rejected("invalid wake identity schema"); }
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    // Compare as JSON numbers before conversion so oversized unsigned input
+    // cannot wrap into an apparently valid signed deadline.
+    if (command["deadline_unix_ms"] <= nowMs || command["deadline_unix_ms"] > nowMs + 60000) {
+        return rejected("wake identity command expired or too far in future");
+    }
+    for (const auto *field : {"sandbox_id", "runtime_id", "resource_generation"}) {
+        if (!command.contains(field) || !command[field].is_string()
+            || command[field].get_ref<const std::string &>().empty()) { return rejected("incomplete wake identity"); }
+    }
+    const auto it = parkedInstances_.find(instanceID);
+    if (it == parkedInstances_.end() || it->second.sourceSandboxID.empty()
+        || it->second.sourceRuntimeID.empty() || it->second.sourceGeneration.empty()
+        || command["sandbox_id"] != it->second.sourceSandboxID
+        || command["runtime_id"] != it->second.sourceRuntimeID
+        || command["resource_generation"] != it->second.sourceGeneration) {
+        return rejected("wake does not match parked physical source");
+    }
+    if (!WakeSchemaMatchesHoldAttempt(command, it->second.holdToken)) {
+        return rejected("wake does not match parked hold attempt");
+    }
+    // Identity, attempt comparison and wake mutation execute on this actor.
+    return HandleWake(requestID, instanceID);
 }
 
 litebus::Future<KillResponse> SnapCtrlActor::HandleWake(const std::string &requestID, const std::string &instanceID)
@@ -284,14 +574,24 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleWake(const std::string &reque
         return rsp;
     }
     it->second.waking = true;
+    const auto attempt = ++wakeAttemptSeq_;
+    it->second.wakeAttempt = attempt;
     const auto checkpointID = it->second.checkpointID;
     YRLOG_INFO("{}|wake parked instance({}) from checkpoint({})", requestID, instanceID, checkpointID);
     return HandleSnapStart(requestID, checkpointID, "")
-        .Then(litebus::Defer(GetAID(), &SnapCtrlActor::OnWakeComplete, instanceID, std::placeholders::_1));
+        .Then(litebus::Defer(GetAID(), &SnapCtrlActor::OnWakeComplete, instanceID, checkpointID, attempt, std::placeholders::_1));
 }
 
-KillResponse SnapCtrlActor::OnWakeComplete(const std::string &instanceID, const KillResponse &rsp)
+KillResponse SnapCtrlActor::OnWakeComplete(const std::string &instanceID, const std::string &checkpointID,
+                                         uint64_t attempt, const KillResponse &rsp)
 {
+    const auto current = parkedInstances_.find(instanceID);
+    if (current == parkedInstances_.end() || current->second.checkpointID != checkpointID
+        || current->second.wakeAttempt != attempt || !current->second.waking) {
+        return rsp; // duplicate/late completion cannot settle a newer park or wake
+    }
+    current->second.waking = false;
+
     if (rsp.code() == common::ERR_NONE) {
         ForgetParked(instanceID);
         return rsp;
@@ -331,7 +631,7 @@ KillResponse SnapCtrlActor::OnWakeComplete(const std::string &instanceID, const 
                            "immediate retry {}/{} in {}ms",
                            instanceID, it->second.staleRetries, kWakeStaleRetryMax, kWakeStaleRetryDelayMs);
                 (void)litebus::AsyncAfter(kWakeStaleRetryDelayMs, GetAID(),
-                                          &SnapCtrlActor::RetryWake, instanceID);
+                                          &SnapCtrlActor::RetryWakeIfCurrent, instanceID, checkpointID, attempt);
                 return rsp;
             }
             YRLOG_WARN("wake of instance({}) exhausted {} stale retries, falling back to cooldown pacing",
@@ -352,8 +652,20 @@ void SnapCtrlActor::RetryWake(const std::string &instanceID)
     // W16: void-returning wrapper so AsyncAfter can schedule the immediate
     // stale-transient re-wake (HandleWake returns a Future).
     const auto requestID = "stale-retry-" + std::to_string(++retrySeq_);
-    HandleWake(requestID, instanceID)
-        .Then(litebus::Defer(GetAID(), &SnapCtrlActor::OnWakeComplete, instanceID, std::placeholders::_1));
+    // HandleWake already owns the single completion callback. Attaching a
+    // second one here counted failures twice and could clear a newer wake.
+    (void)HandleWake(requestID, instanceID);
+}
+
+void SnapCtrlActor::RetryWakeIfCurrent(const std::string &instanceID, const std::string &checkpointID,
+                                     uint64_t attempt)
+{
+    const auto current = parkedInstances_.find(instanceID);
+    if (current == parkedInstances_.end() || current->second.checkpointID != checkpointID
+        || current->second.wakeAttempt != attempt || current->second.waking) {
+        return;
+    }
+    RetryWake(instanceID);
 }
 
 void SnapCtrlActor::ForgetParked(const std::string &instanceID)
@@ -675,23 +987,58 @@ void SnapCtrlActor::OnTransInstanceStateComplete(
     scheduleResp->SetValue(GenScheduleResponse(StatusCode::SUCCESS, "success", *scheduleReq));
 }
 
-litebus::Future<Status> SnapCtrlActor::PrepareSnap(const std::string &requestID, const std::string &instanceID)
+litebus::Future<Status> SnapCtrlActor::PrepareSnap(const std::string &requestID, const std::string &instanceID,
+    const std::shared_ptr<InstanceStateMachine> &capturedSource, const std::string &capturedRuntimeID,
+    const std::shared_ptr<std::atomic<bool>> &sourceMismatched)
 {
     YRLOG_INFO("{}|{}|PrepareSnap: instance is running, getting client", requestID, instanceID);
     // 3. 获取 client 并调用 PrepareSnap
     ASSERT_IF_NULL(clientManager_);
+    const bool conditional = capturedSource != nullptr && !capturedRuntimeID.empty();
     return clientManager_->GetControlInterfacePosixClient(instanceID)
-        .Then([requestID, instanceID](const litebus::Future<std::shared_ptr<ControlInterfacePosixClient>> &clientFuture)
-                  -> litebus::Future<Status> {
-            if (clientFuture.IsError() || clientFuture.Get() == nullptr) {
+        .Then(litebus::Defer(GetAID(),
+            [this, requestID, instanceID, conditional, capturedSource, capturedRuntimeID, sourceMismatched]
+            (const litebus::Future<std::shared_ptr<ControlInterfacePosixClient>> &clientFuture)
+                -> litebus::Future<Status> {
+            // Conditional source check before any other outcome: latching the
+            // flag here preserves the mismatch evidence even if the view
+            // changes back before a later recheck. The client manager is keyed
+            // by instanceID, so the lookup alone cannot pin the transport —
+            // that binding is enforced at send time below via
+            // PrepareSnapForRuntime, which validates the transport's runtime
+            // label and dispatches under one lock (UpdateClient retagging the
+            // underlying posix rejects instead of redirecting the request).
+            if (conditional && ((sourceMismatched != nullptr && sourceMismatched->load())
+                || !SnapshotSourceMatches(instanceID, capturedSource, capturedRuntimeID))) {
+                if (sourceMismatched != nullptr) {
+                    sourceMismatched->store(true);
+                }
+                YRLOG_ERROR("{}|{}|PrepareSnap skipped: snapshot source changed before the client lookup completed",
+                            requestID, instanceID);
+                return Status(StatusCode::ERR_INSTANCE_BUSY, "snapshot source changed before prepare");
+            }
+            // Reject the failed future before any Get; a null client is checked
+            // separately so neither path dereferences a broken future.
+            if (clientFuture.IsError()) {
                 YRLOG_ERROR("{}|{}|failed to get control interface client, error code: {}", requestID, instanceID,
                             clientFuture.GetErrorCode());
                 return Status(StatusCode::FAILED, "failed to get control interface client");
             }
+            if (clientFuture.Get() == nullptr) {
+                YRLOG_ERROR("{}|{}|failed to get control interface client, client is null", requestID, instanceID);
+                return Status(StatusCode::FAILED, "failed to get control interface client");
+            }
             auto client = clientFuture.Get();
-            // 4. 调用 PrepareSnap 接口
+            // 4. 调用 PrepareSnap 接口。Conditional snapshots dispatch ONLY via
+            // the runtime-pinned entry point with the caller's captured
+            // runtime; a pinned rejection is final — never a legacy retry,
+            // which would send on whatever transport the instance slot now
+            // holds. The unconditional path keeps the legacy entry point.
             runtime::PrepareSnapRequest prepareReq{};
-            return client->PrepareSnap(std::move(prepareReq))
+            auto prepareFuture = conditional
+                ? client->PrepareSnapForRuntime(std::move(prepareReq), capturedRuntimeID)
+                : client->PrepareSnap(std::move(prepareReq));
+            return prepareFuture
                 .Then([requestID,
                        instanceID](const litebus::Future<runtime::PrepareSnapResponse> &prepareResult) -> Status {
                     if (prepareResult.IsError()) {
@@ -710,6 +1057,6 @@ litebus::Future<Status> SnapCtrlActor::PrepareSnap(const std::string &requestID,
                     YRLOG_INFO("{}|{}|PrepareSnap succeeded", requestID, instanceID);
                     return Status::OK();
                 });
-        });
+        }));
 }
 }  // namespace functionsystem::local_scheduler

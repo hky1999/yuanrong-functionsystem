@@ -102,6 +102,15 @@ litebus::Future<KillResponse> SnapCtrl::HandleSnapshot(const std::string &reques
     return litebus::Async(aid_, &SnapCtrlActor::HandleSnapshot, requestID, instanceID, payload);
 }
 
+litebus::Future<KillResponse> SnapCtrl::HandleSnapshotIfSource(const std::string &requestID,
+                                                               const std::string &instanceID,
+                                                               const std::string &payload,
+                                                               const std::shared_ptr<InstanceStateMachine> &source)
+{
+    ASSERT_IF_NULL(snapCtrlActor_);
+    return litebus::Async(aid_, &SnapCtrlActor::HandleSnapshotIfSource, requestID, instanceID, payload, source);
+}
+
 litebus::Future<KillResponse> SnapCtrl::HandleSnapStart(
     const std::string &requestID, const std::string &checkpointID, const std::string &payload)
 {
@@ -113,6 +122,13 @@ litebus::Future<KillResponse> SnapCtrl::HandleWake(const std::string &requestID,
 {
     ASSERT_IF_NULL(snapCtrlActor_);
     return litebus::Async(aid_, &SnapCtrlActor::HandleWake, requestID, instanceID);
+}
+
+litebus::Future<KillResponse> SnapCtrl::HandleDirectedWake(const std::string &requestID,
+    const std::string &instanceID, const std::string &payload)
+{
+    ASSERT_IF_NULL(snapCtrlActor_);
+    return litebus::Async(aid_, &SnapCtrlActor::HandleDirectedWake, requestID, instanceID, payload);
 }
 
 litebus::Future<std::vector<std::pair<std::string, SnapCtrlActor::ParkedEntry>>> SnapCtrl::GetParkedInstances()

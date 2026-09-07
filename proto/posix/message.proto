@@ -26,6 +26,32 @@ option go_package = "functionsystem/pkg/common/faas_common/grpc/pb/message;messa
 
 message ResourceView {}
 
+// Internal, node-budgeted command. The scheduler must reserve before sending
+// and reconcile UNKNOWN outcomes instead of treating a timeout as no write.
+message ResizeSandboxRequest {
+  string requestID = 1;
+  string instanceID = 2;
+  string runtimeID = 3;
+  runtime.v1.ResizeResourcesRequest resize = 4;
+}
+
+message ResizeSandboxResponse {
+  enum Outcome {
+    UNKNOWN = 0;
+    REJECTED_BEFORE_DISPATCH = 1;
+    OBSERVED = 2;
+  }
+  string requestID = 1;
+  string instanceID = 2;
+  string runtimeID = 3;
+  string sandboxID = 4;
+  string resourceGeneration = 5;
+  int32 code = 6;
+  string message = 7;
+  Outcome outcome = 8;
+  runtime.v1.ResizeResourcesResponse result = 9;
+}
+
 
 // common message
 message ScheduleTopology {
@@ -1391,6 +1417,10 @@ message PublishSnapshotArtifactRequest {
   string requestID = 1;
   string snapshotID = 2;
   string instanceID = 3;
+
+  bool leaveRunning = 6;
+  string expected_sandbox_id = 7;
+  string expected_resource_generation = 8;
 }
 
 message SnapshotRuntimeResponse {
@@ -1538,6 +1568,8 @@ message RuntimeReconcileEntry {
   string containerID  = 2;  // executor implementation identifier (sandboxID for sandbox executor)
   string instanceID   = 3;
   string portMappings = 4;  // persisted host-port ownership JSON
+
+  string portMappings = 4;  // persisted JSON port mappings for runtime-manager reconstruction
 }
 
 message ReconcileRuntimesRequest {

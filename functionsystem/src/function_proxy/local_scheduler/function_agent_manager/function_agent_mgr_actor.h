@@ -317,6 +317,20 @@ public:
     void DeleteReusableSnapshotArtifactResponse(
         const litebus::AID &from, std::string &&name, std::string &&msg);
 
+    litebus::Future<messages::SnapshotRuntimeResponse> SnapshotRuntimeIfGeneration(
+        const resource_view::InstanceInfo &instanceInfo,
+        const std::shared_ptr<messages::SnapshotRuntimeRequest> &request);
+    void SnapshotRuntimeIfGenerationResponse(const litebus::AID &from, std::string &&name, std::string &&msg);
+    void SnapshotRuntimeIfGenerationTimeout(const std::string &wireID);
+
+    litebus::Future<messages::ResizeSandboxResponse> ResizeSandbox(
+        const resource_view::InstanceInfo &instanceInfo,
+        const std::shared_ptr<messages::ResizeSandboxRequest> &request);
+    void ResizeSandboxResponse(const litebus::AID &from, std::string &&name, std::string &&msg);
+    void OnResizeReserved(const std::string &wireID, const litebus::Future<Status> &result,
+                          const std::shared_ptr<resource_view::ResourceView> &budgetView);
+    void ResizeSandboxTimeout(const std::string &wireID);
+
     litebus::Future<messages::ReconcileRuntimesResponse> ReconcileRuntimes(
         const std::string &funcAgentID,
         const std::shared_ptr<messages::ReconcileRuntimesRequest> &request);
@@ -454,6 +468,7 @@ public:
 
 protected:
     void Init() override;
+    void Finalize() override;
 
     litebus::Future<Status> StartHeartbeat(const std::string &funcAgentID, const std::string &address);
 
@@ -607,6 +622,28 @@ private:
     using KillNotifyPromise = litebus::Promise<messages::KillInstanceResponse>;
     using instanceStatusNotifyPromise = litebus::Promise<messages::StaticFunctionChangeResponse>;
     std::unordered_map<std::string, FuncAgentInfo> funcAgentTable_;  // key: function agent ID
+    struct ResizePending {
+        litebus::AID agent;
+        messages::ResizeSandboxRequest request;
+        litebus::Promise<messages::ResizeSandboxResponse> completion;
+        litebus::Timer timeout;
+        std::shared_ptr<resource_view::ResourceView> budgetView = nullptr;
+        bool dispatched = false;
+    };
+    std::unordered_map<std::string, ResizePending> resizePending_;
+    // Generation-fenced snapshot mirror of ResizePending: keyed by a private
+    // transport UUID, never by the caller-visible request ID. The agent AID is
+    // the strongest route binding available here; function agents expose no
+    // registration nonce yet, so downstream must still pin the runtime-manager
+    // registration ID and the physical source identity.
+    struct SnapshotIfGenerationPending {
+        std::string funcAgentID;
+        litebus::AID agent;
+        messages::SnapshotRuntimeRequest request;
+        litebus::Promise<messages::SnapshotRuntimeResponse> completion;
+        litebus::Timer timeout;
+    };
+    std::unordered_map<std::string, SnapshotIfGenerationPending> snapshotIfGenerationPending_;
     std::unordered_map<litebus::AID, std::string> aidTable_;         // key: AID, value: function agent ID
 
     // { agentID, { requestID, { promise, retryTimes }}}

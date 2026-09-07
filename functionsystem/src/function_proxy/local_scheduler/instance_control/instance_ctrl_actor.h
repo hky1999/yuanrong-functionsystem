@@ -512,6 +512,10 @@ public:
     void OnFrontendScheduleCompleted(const litebus::Future<messages::ScheduleResponse> &future,
                                      const std::string &requestID);
     litebus::Future<Status> ForceDeleteInstance(const std::string &instanceID);
+
+    // Snapshot retirement must not target a replacement sharing the logical ID.
+    litebus::Future<Status> RetireSnapshotSource(const std::string &instanceID,
+        const std::shared_ptr<InstanceStateMachine> &source, const std::string &runtimeID);
     inline void RegisterClearGroupInstanceCallBack(ClearGroupInstanceCallBack callback)
     {
         groupInstanceClear_ = callback;

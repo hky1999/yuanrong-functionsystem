@@ -16,6 +16,8 @@
 
 #include "metrics_actor.h"
 
+#include <cmath>
+
 #include <async/async.hpp>
 #include <async/asyncafter.hpp>
 #include <async/defer.hpp>
@@ -258,6 +260,11 @@ Status MetricsActor::AddInstance(const messages::RuntimeInstanceInfo &instanceIn
         filter_[instNpuCollector->GenFilter()] = std::move(instNpuCollector);
     }
 
+    const auto previousOwner = instanceInfos_.find(instanceID);
+    if (previousOwner != instanceInfos_.end() && previousOwner->second.runtimeid() != instanceInfo.runtimeid()) {
+        instanceResourceSamples_.erase(instanceID);
+        instanceMemoryUsageMb_.erase(instanceID);
+    }
     instanceInfos_[instanceID] = instanceInfo;
     return Status(StatusCode::SUCCESS);
 }
@@ -273,12 +280,32 @@ Status MetricsActor::DeleteInstance(const std::string &deployDir, const std::str
     }
     (void)instanceInfos_.erase(instanceID);
     (void)instanceMemoryUsageMb_.erase(instanceID);
+    (void)instanceResourceSamples_.erase(instanceID);
     return Status(StatusCode::SUCCESS);
+}
+
+void MetricsActor::UpdateInstanceResourceSample(const std::string &instanceID,
+                                               const resources::SandboxResourceSample &sample)
+{
+    const auto owner = instanceInfos_.find(instanceID);
+    if (instanceID.empty() || owner == instanceInfos_.end() || sample.runtime_id().empty()
+        || owner->second.runtimeid() != sample.runtime_id() || sample.sandbox_id().empty()
+        || sample.sampled_at_unix_ms() <= 0
+        || (sample.cpu_usage_known() && (!std::isfinite(sample.cpu_usage_cores()) || sample.cpu_usage_cores() < 0))
+        || (sample.cpu_limits_known() && sample.cpu_period_usec() == 0)) {
+        return;
+    }
+    const auto previous = instanceResourceSamples_.find(instanceID);
+    if (previous != instanceResourceSamples_.end()
+        && sample.sampled_at_unix_ms() <= previous->second.sampled_at_unix_ms()) {
+        return;
+    }
+    instanceResourceSamples_[instanceID] = sample;
 }
 
 void MetricsActor::UpdateInstanceMemoryUsage(const std::string &instanceID, double memoryMb)
 {
-    if (instanceID.empty() || memoryMb < 0) {
+    if (instanceID.empty() || !std::isfinite(memoryMb) || memoryMb < 0) {
         return;
     }
     YRLOG_INFO("[D-7] metrics actor received instance({}) memory {} MB", instanceID, memoryMb);
@@ -433,6 +460,8 @@ resources::ResourceUnit MetricsActor::BuildResourceUnit(const std::vector<litebu
     auto unit = BuildResourceUnitWithInstance(allMetrics);
     auto systemUnit = BuildResourceUnitWithSystem(allMetrics);
     unit.mutable_actualuse()->CopyFrom(systemUnit.actualuse());
+    unit.set_memory_sample_unix_ms(systemUnit.memory_sample_unix_ms());
+    unit.set_cpu_sample_unix_ms(systemUnit.cpu_sample_unix_ms());
     unit.mutable_capacity()->CopyFrom(systemUnit.capacity());
     unit.mutable_allocatable()->CopyFrom(systemUnit.allocatable());
 
@@ -532,6 +561,30 @@ resources::ResourceUnit MetricsActor::BuildResourceUnitWithInstance(
         (*instanceInfo.mutable_actualuse()->mutable_resources())[resource_view::MEMORY_RESOURCE_NAME] =
             std::move(memResource);
     }
+    for (const auto &entry : instanceResourceSamples_) {
+        const auto owner = instanceInfos_.find(entry.first);
+        const auto &sample = entry.second;
+        if (owner == instanceInfos_.end() || owner->second.runtimeid() != sample.runtime_id()) {
+            continue;
+        }
+        auto &instance = (*unit.mutable_instances())[entry.first];
+        instance.set_instanceid(entry.first);
+        instance.set_runtimeid(sample.runtime_id());
+        instance.mutable_sandbox_resource_sample()->CopyFrom(sample);
+        auto &actual = *instance.mutable_actualuse()->mutable_resources();
+        auto &memory = actual[resource_view::MEMORY_RESOURCE_NAME];
+        memory.set_name(resource_view::MEMORY_RESOURCE_NAME);
+        memory.set_type(resources::Value_Type_SCALAR);
+        memory.mutable_scalar()->set_value(static_cast<double>(sample.memory_current_bytes()) / (1024.0 * 1024.0));
+        // CPU resources use millicores. First observation must not claim an idle CPU.
+        actual.erase(resource_view::CPU_RESOURCE_NAME);
+        if (sample.cpu_usage_known()) {
+            auto &cpu = actual[resource_view::CPU_RESOURCE_NAME];
+            cpu.set_name(resource_view::CPU_RESOURCE_NAME);
+            cpu.set_type(resources::Value_Type_SCALAR);
+            cpu.mutable_scalar()->set_value(sample.cpu_usage_cores() * 1000.0);
+        }
+    }
     return unit;
 }
 
@@ -547,6 +600,17 @@ resources::ResourceUnit MetricsActor::BuildResourceUnitWithSystem(
         auto metrics = futureMetrics.Get();
         if (metrics.instanceID.IsSome() || metrics.metricsType == metrics_type::LABELS) {
             continue;
+        }
+
+        if (metrics.metricsType == metrics_type::MEMORY && metrics.usage.IsSome() && metrics.limit.IsSome()
+            && std::isfinite(metrics.usage.Get()) && metrics.usage.Get() >= 0
+            && std::isfinite(metrics.limit.Get()) && metrics.limit.Get() > 0) {
+            unit.set_memory_sample_unix_ms(metrics.collectionStartUnixMs);
+        }
+        if (metrics.metricsType == metrics_type::CPU && metrics.usage.IsSome() && metrics.limit.IsSome()
+            && std::isfinite(metrics.usage.Get()) && metrics.usage.Get() >= 0
+            && std::isfinite(metrics.limit.Get()) && metrics.limit.Get() > 0) {
+            unit.set_cpu_sample_unix_ms(metrics.collectionStartUnixMs);
         }
 
         auto resourceValueType = resources::Value_Type_SCALAR;

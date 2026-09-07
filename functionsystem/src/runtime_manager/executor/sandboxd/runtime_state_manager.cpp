@@ -15,6 +15,7 @@
  */
 
 #include "runtime_state_manager.h"
+#include "async/uuid_generator.hpp"
 
 #include "common/logs/logging.h"
 
@@ -26,6 +27,7 @@ void RuntimeStateManager::Register(SandboxInfo info)
 {
     const std::string runtimeID = info.runtimeID;
     YRLOG_DEBUG("RuntimeStateManager::Register runtimeID({})", runtimeID);
+    info.registrationID = litebus::uuid_generator::UUID::GetRandomUUID().ToString();
     sandboxes_[runtimeID] = std::move(info);
 }
 
@@ -138,14 +140,21 @@ std::string RuntimeStateManager::GetPortMappingsJson(const std::string &runtimeI
 
 // ── Partial updates ───────────────────────────────────────────────────────────
 
-void RuntimeStateManager::UpdateSandboxID(const std::string &runtimeID, const std::string &sandboxID)
+void RuntimeStateManager::UpdateSandboxID(const std::string &runtimeID, const std::string &sandboxID,
+    const std::string &resourceGeneration)
 {
     auto it = sandboxes_.find(runtimeID);
     if (it == sandboxes_.end()) {
         YRLOG_WARN("RuntimeStateManager::UpdateSandboxID runtimeID({}) not found", runtimeID);
         return;
     }
+    if (it->second.sandboxID != sandboxID || (!resourceGeneration.empty()
+        && it->second.resourceGeneration != resourceGeneration)) {
+        it->second.registrationID = litebus::uuid_generator::UUID::GetRandomUUID().ToString();
+        it->second.resourceGeneration.clear();
+    }
     it->second.sandboxID = sandboxID;
+    if (!resourceGeneration.empty()) { it->second.resourceGeneration = resourceGeneration; }
 }
 
 void RuntimeStateManager::UpdateNetworkEndpoint(const std::string &runtimeID, const std::string &sandboxIP)

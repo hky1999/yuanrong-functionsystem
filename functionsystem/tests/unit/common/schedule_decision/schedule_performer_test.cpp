@@ -111,13 +111,21 @@ TEST_F(SchedulerPerformerTest, ScheduleInstanceWithoutPreemption)
     instanceSchedulerPerformer_->RegisterPreemptInstanceCallback(preemptCallbackFunc);
     auto ctx = GetPreAllocatedContext(info);
     auto scheduleItem = GetInstanceItem(0, view_utils::INST_SCALA_VALUE, view_utils::INST_SCALA_VALUE);
+    auto *restoring = scheduleItem->scheduleReq->mutable_instance();
+    restoring->mutable_snapshotinfo()->set_checkpointid("checkpoint-restore");
+    restoring->mutable_resources()->mutable_resources()->at(resource_view::MEMORY_RESOURCE_NAME)
+        .mutable_scalar()->set_limit(8192);
     auto result = instanceSchedulerPerformer_->DoSchedule(ctx, info, scheduleItem);
     EXPECT_EQ(result.code, 0);
     EXPECT_EQ(cnt, 0);
+    ASSERT_EQ(ctx->preAllocatedRestoreMemory.count(restoring->instanceid()), size_t{1});
+    EXPECT_DOUBLE_EQ(ctx->preAllocatedRestoreMemory.at(restoring->instanceid()).scalar().limit(), 8192);
     EXPECT_TRUE(ctx->preAllocatedSelectedFunctionAgentSet.find(agentUnit.id()) != ctx->preAllocatedSelectedFunctionAgentSet.end());
     result.id = agentUnit.id();
     result.unitID = agentUnit.id();
     instanceSchedulerPerformer_->RollBack(ctx, scheduleItem, result);
+    EXPECT_EQ(ctx->preAllocatedRestoreMemory.count(restoring->instanceid()), size_t{0});
+    EXPECT_EQ(ctx->preAllocatedSelectedFunctionAgentMap.count(restoring->instanceid()), size_t{0});
     EXPECT_TRUE(ctx->preAllocatedSelectedFunctionAgentSet.find(agentUnit.id()) == ctx->preAllocatedSelectedFunctionAgentSet.end());
 }
 

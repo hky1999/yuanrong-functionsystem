@@ -26,6 +26,8 @@ add_subdirectory(gc_actor)
 add_subdirectory(pressure_monitor)
 
 target_sources(${UNIT_TEST_MODULE} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/local_sched_driver_test.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/snap_ctrl_wake_test.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/snap_source_test.cpp
     ${CMAKE_CURRENT_LIST_DIR}/restore_relay_test.cpp)
 
 get_property(SRC_LOCAL_SCHEDULER_INCLUDE_DIR GLOBAL PROPERTY "SRC_LOCAL_SCHEDULER_INCLUDE_DIR")

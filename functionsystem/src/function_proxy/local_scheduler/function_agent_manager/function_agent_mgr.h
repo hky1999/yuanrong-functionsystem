@@ -147,10 +147,25 @@ public:
 
     virtual litebus::Future<::messages::SnapshotAttemptFinalizeResponse> FinalizeSnapshotAttemptOnAnyAgent(
         const ::messages::SnapshotAttemptFinalizeRequest &request);
+    /**
+     * wrap Async call of generation-fenced SnapshotRuntime interface; the
+     * expected identity is taken only from the request, never re-derived
+     * @param instanceInfo: instance view entry pinning the target agent
+     * @param request: caller request carrying expected_sandbox_id and
+     *        expected_resource_generation; cloned before the async handoff
+     * @return snapshot runtime response future
+     */
+    virtual litebus::Future<messages::SnapshotRuntimeResponse> SnapshotRuntimeIfGeneration(
+        const resource_view::InstanceInfo &instanceInfo,
+        const std::shared_ptr<messages::SnapshotRuntimeRequest> &request);
 
     virtual litebus::Future<messages::ReconcileRuntimesResponse> ReconcileRuntimes(
         const std::string &funcAgentID,
         const std::shared_ptr<messages::ReconcileRuntimesRequest> &request);
+
+    virtual litebus::Future<messages::ResizeSandboxResponse> ResizeSandbox(
+        const resource_view::InstanceInfo &instanceInfo,
+        const std::shared_ptr<messages::ResizeSandboxRequest> &request);
 
     void SetCoProcessReconcileCallback(std::function<void(const std::string &)> callback)
     {

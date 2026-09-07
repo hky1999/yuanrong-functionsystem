@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <limits>
 #include <string>
 
 #include "common/proto/pb/message_pb.h"
@@ -144,6 +145,53 @@ TEST_F(SandboxdRequestBuilderTest, RejectsRelativeCheckpointDirectory)
 }
 
 // Build succeeds and returns a flat StartRequest.
+TEST_F(SandboxdRequestBuilderTest, ElasticStartSeparatesInitialLimitsFromCeilings)
+{
+    auto params = MakeMinimalParams();
+    auto *info = params.request->mutable_runtimeinstanceinfo();
+    auto *resources = info->mutable_runtimeconfig()->mutable_resources()->mutable_resources();
+    for (const auto &name : {"CPU", "Memory"}) {
+        auto &resource = (*resources)[name];
+        resource.set_type(::resources::Value_Type_SCALAR);
+        resource.mutable_scalar()->set_value(std::string(name) == "CPU" ? 500 : 512);
+        resource.mutable_scalar()->set_limit(std::string(name) == "CPU" ? 8000 : 8192);
+    }
+    auto [legacyStatus, legacy] = builder_->Build(params);
+    ASSERT_TRUE(legacyStatus.IsOk());
+    EXPECT_EQ(legacy->resources().at("CPU"), 8000);
+    EXPECT_EQ(legacy->resources().at("Memory"), 8192);
+    (*info->mutable_deploymentconfig()->mutable_deployoptions())["scheduler_elastic_resources"] = "true";
+    auto [status, start] = builder_->Build(params);
+    ASSERT_TRUE(status.IsOk());
+    EXPECT_EQ(start->labels().at("akernel.scheduler/instance-id"), "test-instance");
+    EXPECT_EQ(start->labels().at("akernel.scheduler/runtime-id"), "test-runtime");
+    EXPECT_EQ(start->resources().at("CPU"), 500);
+    EXPECT_EQ(start->resources().at("Memory"), 512);
+    const auto policy = nlohmann::json::parse(start->labels().at("akernel.scheduler/elastic-resources"));
+    EXPECT_EQ(policy["version"], 1);
+    EXPECT_EQ(policy["CPU"]["ceiling"], 8000);
+    EXPECT_EQ(policy["Memory"]["initial"], 512);
+    EXPECT_EQ(policy["Memory"]["ceiling"], 8192);
+    EXPECT_EQ(resources->at("Memory").scalar().limit(), 8192);
+    (*resources)["Memory"].mutable_scalar()->set_limit(128);
+    EXPECT_FALSE(builder_->Build(params).first.IsOk());
+    (*resources)["Memory"].mutable_scalar()->set_limit(std::numeric_limits<double>::quiet_NaN());
+    EXPECT_FALSE(builder_->Build(params).first.IsOk());
+}
+
+TEST_F(SandboxdRequestBuilderTest, ElasticStartRequiresExplicitResourcesAndSupportedRuntime)
+{
+    auto params = MakeMinimalParams();
+    auto *info = params.request->mutable_runtimeinstanceinfo();
+    auto *options = info->mutable_deploymentconfig()->mutable_deployoptions();
+    (*options)["scheduler_elastic_resources"] = "true";
+    EXPECT_FALSE(builder_->Build(params).first.IsOk());
+    info->mutable_container()->set_runtime("kata");
+    EXPECT_FALSE(builder_->Build(params).first.IsOk());
+    (*options)["scheduler_elastic_resources"] = "typo";
+    EXPECT_FALSE(builder_->Build(params).first.IsOk());
+}
+
 TEST_F(SandboxdRequestBuilderTest, BuildReturnsFlatStartRequest)
 {
     auto params = MakeMinimalParams();

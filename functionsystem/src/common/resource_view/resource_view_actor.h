@@ -26,6 +26,8 @@
 #include "common/utils/actor_worker.h"
 #include "common/status/status.h"
 #include "resource_type.h"
+#include "restore_admission.h"
+#include "common/proto/pb/message_pb.h"
 #include "resource_poller.h"
 #include "schedule_snapshot.h"
 
@@ -108,6 +110,10 @@ public:
      * @param insts a group of instances
      * @return Return OK if successful, otherwise return the corresponding error code
      */
+    Status ReserveResize(const messages::ResizeSandboxRequest &request);
+    Status ObserveResize(const messages::ResizeSandboxResponse &response);
+    Status CancelResizeBeforeDispatch(const std::string &reservationID);
+
     Status AddInstances(const std::map<std::string, InstanceAllocatedInfo> &insts);
 
     /**
@@ -405,6 +411,23 @@ private:
     void ApplyReportedCapacityChange(ResourceUnit &agentResourceUnit, const CapacityChange &capacityChange);
     Status HandleReportedAddInstacne(const InstanceInfo &instance);
     Status HandleReportedDeleteInstacne(const InstanceInfo &instance);
+    struct ResizeBudgetEntry {
+        messages::ResizeSandboxRequest request;
+        std::string unitID;
+        int64_t reservedAtMs = 0;
+        bool observed = false;
+        runtime::v1::ResourceLimits landed;
+        int64_t observedAtMs = 0;
+        double peakCpuMillicores = 0;
+        uint64_t peakMemoryBytes = 0;
+    };
+    // Unknown writes remain reserved even after a logical instance deletion.
+    // Physical retirement/restart recovery must settle them before activation.
+    std::unordered_map<std::string, ResizeBudgetEntry> resizeBudget_;
+    AdmissionReserve OutstandingResize(const std::string &unitID) const;
+    void ReconcileResize(const ResourceUnit &unit);
+    std::unordered_map<std::string, int64_t> resourceAdmissionTimes_;
+
     void SimplifyInstanceInfo(const InstanceInfo &instance, InstanceInfo &simplifiedInstance) const;
     bool HandleReportedChanges(const std::shared_ptr<ResourceUnitChanges> &resourceUnitChanges);
     void MarkReportedChangesSnapshotDirty(const ResourceUnitChanges &resourceUnitChanges);

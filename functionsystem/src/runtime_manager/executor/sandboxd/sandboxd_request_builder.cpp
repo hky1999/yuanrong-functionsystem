@@ -860,6 +860,13 @@ std::pair<Status, std::shared_ptr<runtime::v1::StartRequest>> SandboxdRequestBui
     }
 
     ApplyExtraConfig(params.request, start.get());
+    // Bind identities from the executor's control request, never user envs or
+    // deploy options. sandboxd adds the physical generation independently.
+    const auto &instanceID = params.request->runtimeinstanceinfo().instanceid();
+    if (!instanceID.empty() && !params.runtimeID.empty()) {
+        (*start->mutable_labels())["akernel.scheduler/instance-id"] = instanceID;
+        (*start->mutable_labels())["akernel.scheduler/runtime-id"] = params.runtimeID;
+    }
     if (auto status = ApplyNetworkPolicy(params.request, params.portMappings, start.get()); !status.IsOk()) {
         return { status, nullptr };
     }
@@ -888,6 +895,9 @@ std::pair<Status, std::shared_ptr<runtime::v1::StartRequest>> SandboxdRequestBui
     }
 
     ApplyResources(params.request, start->mutable_resources());
+    if (auto status = ApplyElasticResources(params.request, start.get()); !status.IsOk()) {
+        return {status, nullptr};
+    }
     if (auto status = ApplyWritableLayerSize(params.request, start.get()); !status.IsOk()) {
         return { status, nullptr };
     }
@@ -1061,6 +1071,43 @@ void SandboxdRequestBuilder::ApplyResources(const std::shared_ptr<messages::Star
 
 Status SandboxdRequestBuilder::ApplyWritableLayerSize(const std::shared_ptr<messages::StartInstanceRequest> &request,
                                                       runtime::v1::StartRequest *start) const
+Status SandboxdRequestBuilder::ApplyElasticResources(
+    const std::shared_ptr<messages::StartInstanceRequest> &request, runtime::v1::StartRequest *start) const
+{
+    const auto &options = request->runtimeinstanceinfo().deploymentconfig().deployoptions();
+    const auto enabled = options.find(SCHEDULER_ELASTIC_RESOURCES);
+    if (enabled == options.end() || enabled->second == "false") {
+        return Status::OK();
+    }
+    if (enabled->second != "true" || start->runtime() != "runsc") {
+        return Status(StatusCode::ERR_PARAM_INVALID, "elastic resources require true and runtime runsc");
+    }
+    const auto &resources = request->runtimeinstanceinfo().runtimeconfig().resources().resources();
+    nlohmann::json policy = {{"version", 1}};
+    for (const auto &name : {CPU_RESOURCE_NAME, MEMORY_RESOURCE_NAME}) {
+        auto it = resources.find(name);
+        if (it == resources.end() || it->second.type() != ValueType::Value_Type_SCALAR
+            || !it->second.has_scalar()) {
+            return Status(StatusCode::ERR_PARAM_INVALID, "elastic resources require explicit CPU and Memory scalars");
+        }
+        const double initial = it->second.scalar().value();
+        const double limit = it->second.scalar().limit();
+        const double ceiling = limit == 0 ? initial : limit;
+        if (!std::isfinite(initial) || !std::isfinite(ceiling) || initial <= 0 || ceiling < initial
+            || std::floor(initial) != initial || std::floor(ceiling) != ceiling) {
+            return Status(StatusCode::ERR_PARAM_INVALID, "elastic resource limits must be positive integers with ceiling >= initial");
+        }
+        (*start->mutable_resources())[name] = initial;
+        policy[name] = {{"initial", initial}, {"ceiling", ceiling}};
+    }
+    // Persist with sandbox metadata and checkpoints; limits are not lost when
+    // the effective cgroup limit changes. CPU is millicores, Memory is MiB.
+    (*start->mutable_labels())["akernel.scheduler/elastic-resources"] = policy.dump();
+    return Status::OK();
+}
+
+Status SandboxdRequestBuilder::ApplyWritableLayerSize(
+    const std::shared_ptr<messages::StartInstanceRequest> &request, runtime::v1::StartRequest *start) const
 {
     const auto &resources = request->runtimeinstanceinfo().runtimeconfig().resources().resources();
     const auto iter = resources.find(STORAGE_RESOURCE_NAME);

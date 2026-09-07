@@ -20,6 +20,7 @@
 #include <actor/actor.hpp>
 #include <async/future.hpp>
 #include <chrono>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -27,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include "snapshot_attempt_gate.h"
 #include "common/logs/logging.h"
 #include "common/proto/pb/message_pb.h"
 #include "common/proto/pb/posix_pb.h"
@@ -76,6 +78,23 @@ public:
                                                   const std::string &payload);
 
     /**
+     * Handle INSTANCE_SNAPSHOT_SIGNAL with the caller's captured source state
+     * machine pinned. Every check (non-null source, exact current machine,
+     * RUNNING, payload parses with a complete expected tuple whose
+     * expected_runtime_id matches the source) precedes any park/drain/gate
+     * mutation; on success HandleSnapshot runs in the same actor turn.
+     * @param requestID: Request ID for tracing
+     * @param instanceID: ID of the instance to snapshot
+     * @param payload: core_service::SnapOptions payload with expected tuple
+     * @param source: the caller's originally captured InstanceStateMachine
+     * @return Future of KillResponse
+     */
+    litebus::Future<KillResponse> HandleSnapshotIfSource(const std::string &requestID,
+                                                         const std::string &instanceID,
+                                                         const std::string &payload,
+                                                         const std::shared_ptr<InstanceStateMachine> &source);
+
+    /**
      * Callback to convert SnapshotResult to KillResponse. Also maintains the
      * parked registry: a successful leaveRunning=false snapshot parks the
      * instance (checkpoint + delete), so it is recorded for wake/FIFO unpark.
@@ -84,7 +103,7 @@ public:
      * @param result: The snapshot result
      * @return KillResponse with appropriate code and payload
      */
-    KillResponse OnHandleSnapshot(const std::string &instanceID, bool leaveRunning, const SnapshotResult &result);
+    KillResponse OnHandleSnapshot(const std::string &instanceID, bool leaveRunning, const SnapshotResult &result, const std::string &holdToken = "", uint64_t snapshotAttempt = 0);
 
     /**
      * Handle INSTANCE_SNAPSTART_SIGNAL
@@ -110,6 +129,9 @@ public:
      */
     litebus::Future<KillResponse> HandleWake(const std::string &requestID, const std::string &instanceID);
 
+    litebus::Future<KillResponse> HandleDirectedWake(const std::string &requestID,
+        const std::string &instanceID, const std::string &payload);
+
     /** Registry entry for one parked instance. */
     struct ParkedEntry {
         std::string checkpointID;
@@ -131,6 +153,11 @@ public:
         // the monitor cooldown (21s -> ~3s observed), and never burn the
         // D-5 F4 give-up budget on it.
         uint32_t staleRetries = 0;
+        uint64_t wakeAttempt = 0;
+        std::string sourceSandboxID;
+        std::string sourceRuntimeID;
+        std::string sourceGeneration;
+        std::string holdToken;
     };
 
     /**
@@ -212,12 +239,32 @@ public:
 
 private:
     /**
+     * Exact-pointer source fence for the conditional snapshot path: the
+     * originally captured state machine must still be the instance's current
+     * machine, RUNNING, on the same runtime. A replacement machine's newer
+     * identity is never adopted here.
+     * @param instanceID: ID of the instance
+     * @param source: the originally captured state machine
+     * @param runtimeID: the runtime identity captured with the source
+     * @return true only when the exact captured source still owns the instance
+     */
+    bool SnapshotSourceMatches(const std::string &instanceID,
+                               const std::shared_ptr<InstanceStateMachine> &source,
+                               const std::string &runtimeID);
+
+    /**
      * Prepare snapshot by calling runtime PrepareSnap interface
      * @param requestID: Request ID for tracing
      * @param instanceID: ID of the instance
+     * @param capturedSource: conditional path's captured state machine; the
+     *        source is re-fenced on the actor after the client lookup
+     * @param capturedRuntimeID: runtime identity captured with the source
      * @return Status of preparation
      */
-    litebus::Future<Status> PrepareSnap(const std::string &requestID, const std::string &instanceID);
+    litebus::Future<Status> PrepareSnap(const std::string &requestID, const std::string &instanceID,
+        const std::shared_ptr<InstanceStateMachine> &capturedSource = nullptr,
+        const std::string &capturedRuntimeID = "",
+        const std::shared_ptr<std::atomic<bool>> &sourceMismatched = nullptr);
 
     /**
      * Handle DeploySnapStartInstance completion
@@ -278,6 +325,10 @@ private:
     // the checkpoint is restored (HandleWake / direct SnapStart) or when
     // the instance re-appears in the control view.
     std::unordered_map<std::string, ParkedEntry> parkedInstances_;
+    SnapshotAttemptGate snapshotAttempts_;
+    void FinishSnapshotAttempt(const std::string &instanceID, uint64_t attempt, bool markParked,
+        const std::shared_ptr<std::atomic<bool>> &dispatched, const litebus::Future<KillResponse> &result,
+        const std::shared_ptr<std::atomic<bool>> &sourceMismatched = nullptr);
 
     /** Drop a registry entry after a successful wake/restore. */
     void ForgetParked(const std::string &instanceID);
@@ -286,7 +337,8 @@ private:
     void ForgetParkedByCheckpoint(const std::string &checkpointID);
 
     /** OnWakeComplete: registry bookkeeping, returns rsp unchanged. */
-    KillResponse OnWakeComplete(const std::string &instanceID, const KillResponse &rsp);
+    KillResponse OnWakeComplete(const std::string &instanceID, const std::string &checkpointID,
+                                uint64_t attempt, const KillResponse &rsp);
 
     // W10-2: checkpoints whose restore (SnapStart chain) is currently in
     // flight; a concurrent SnapStart for the same checkpoint is rejected so
@@ -298,6 +350,8 @@ private:
 
     /** W16: immediate re-wake after a stale-state-machine transient. */
     void RetryWake(const std::string &instanceID);
+    void RetryWakeIfCurrent(const std::string &instanceID, const std::string &checkpointID, uint64_t attempt);
+    uint64_t wakeAttemptSeq_ = 0;
 
     uint64_t retrySeq_ = 0;  // requestID sequence for stale retries
 };

@@ -109,6 +109,9 @@ private:
     void ApplyResources(const std::shared_ptr<messages::StartInstanceRequest> &request,
                         google::protobuf::Map<std::string, double> *resources) const;
 
+    Status ApplyElasticResources(const std::shared_ptr<messages::StartInstanceRequest> &request,
+                                 runtime::v1::StartRequest *start) const;
+
     Status ApplyWritableLayerSize(const std::shared_ptr<messages::StartInstanceRequest> &request,
                                   runtime::v1::StartRequest *start) const;
 

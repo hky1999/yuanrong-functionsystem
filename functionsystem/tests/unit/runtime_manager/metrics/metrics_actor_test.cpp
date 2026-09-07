@@ -114,6 +114,88 @@ TEST(MetricsActorInstanceMemoryUsageTest, OverlayFeedsPerInstanceActualuse)
     EXPECT_EQ(unit.instances().count("id-1"), size_t{0});
 }
 
+TEST(MetricsActorResourceSampleTest, PreservesPhysicalIdentityAndRejectsLateOrForeignSamples)
+{
+    TestMetricsActor actor;
+    messages::RuntimeInstanceInfo owner;
+    owner.set_runtimeid("runtime-1");
+    actor.instanceInfos_["id-1"] = owner;
+    resources::SandboxResourceSample sample;
+    sample.set_runtime_id("runtime-1");
+    sample.set_sandbox_id("sandbox-1");
+    sample.set_resource_generation("generation-1");
+    sample.set_sampled_at_unix_ms(1000);
+    sample.set_memory_current_bytes(256ULL * 1024 * 1024);
+    sample.set_memory_limit_bytes(512ULL * 1024 * 1024);
+    sample.set_cpu_limits_known(true);
+    sample.set_cpu_quota_usec(50000);
+    sample.set_cpu_period_usec(100000);
+    sample.set_elastic_policy("policy");
+    actor.UpdateInstanceResourceSample("id-1", sample);
+    auto unit = actor.BuildResourceUnit({});
+    ASSERT_EQ(unit.instances().count("id-1"), size_t{1});
+    auto instance = unit.instances().at("id-1");
+    EXPECT_EQ(instance.sandbox_resource_sample().SerializeAsString(), sample.SerializeAsString());
+    EXPECT_EQ(instance.actualuse().resources().count(resource_view::CPU_RESOURCE_NAME), size_t{0});
+    EXPECT_EQ(instance.actualuse().resources().at(resource_view::MEMORY_RESOURCE_NAME).scalar().value(), 256.0);
+
+    sample.set_sampled_at_unix_ms(2000);
+    sample.set_cpu_usage_known(true);
+    sample.set_cpu_usage_cores(0.4);
+    actor.UpdateInstanceResourceSample("id-1", sample);
+    messages::UpdateResourcesRequest request;
+    ASSERT_TRUE(request.ParseFromString(actor.BuildUpdateMetricsRequest({})));
+    instance = request.resourceunit().instances().at("id-1");
+    EXPECT_EQ(instance.sandbox_resource_sample().SerializeAsString(), sample.SerializeAsString());
+    EXPECT_DOUBLE_EQ(instance.actualuse().resources().at(resource_view::CPU_RESOURCE_NAME).scalar().value(), 400.0);
+
+    sample.set_sampled_at_unix_ms(1500);
+    sample.set_memory_current_bytes(1);
+    actor.UpdateInstanceResourceSample("id-1", sample);
+    sample.set_sampled_at_unix_ms(3000);
+    sample.set_runtime_id("retired-runtime");
+    actor.UpdateInstanceResourceSample("id-1", sample);
+    actor.UpdateInstanceResourceSample("unknown-instance", sample);
+    unit = actor.BuildResourceUnit({});
+    EXPECT_EQ(unit.instances().size(), size_t{1});
+    EXPECT_EQ(unit.instances().at("id-1").sandbox_resource_sample().sampled_at_unix_ms(), 2000);
+    actor.DeleteInstance("/deploy", "id-1");
+    sample.set_runtime_id("runtime-1");
+    actor.UpdateInstanceResourceSample("id-1", sample);
+    EXPECT_TRUE(actor.BuildResourceUnit({}).instances().empty());
+}
+
+TEST(MetricsActorResourceSampleTest, CarriesOnlyValidNodeMemoryCollectionTime)
+{
+    TestMetricsActor actor;
+    Metrics memory;
+    memory.metricsType = metrics_type::MEMORY;
+    memory.collectorType = collector_type::SYSTEM;
+    memory.usage = 512.0;
+    memory.limit = 8192.0;
+    memory.collectionStartUnixMs = 1000;
+    EXPECT_EQ(actor.BuildResourceUnit({memory}).memory_sample_unix_ms(), 1000);
+    memory.limit = 0.0;
+    EXPECT_EQ(actor.BuildResourceUnit({memory}).memory_sample_unix_ms(), 0);
+}
+
+TEST(MetricsActorResourceSampleTest, CPUFreshnessIsIndependentOfMemoryAndKnownZeroIsValid)
+{
+    TestMetricsActor actor;
+    Metrics cpu;
+    cpu.metricsType = metrics_type::CPU;
+    cpu.collectorType = collector_type::NODE;
+    cpu.limit = 4000.0;
+    cpu.collectionStartUnixMs = 1000;
+    EXPECT_EQ(actor.BuildResourceUnit({cpu}).cpu_sample_unix_ms(), 0);
+    cpu.usage = 0.0;
+    auto unit = actor.BuildResourceUnit({cpu});
+    EXPECT_EQ(unit.cpu_sample_unix_ms(), 1000);
+    EXPECT_EQ(unit.memory_sample_unix_ms(), 0);
+    cpu.usage = -1.0;
+    EXPECT_EQ(actor.BuildResourceUnit({cpu}).cpu_sample_unix_ms(), 0);
+}
+
 TEST(MetricsActorGpuCountTest, BuildsSparseGpuCountResource)
 {
     TestMetricsActor actor;

@@ -98,6 +98,10 @@ public:
      * @param insts a group of instances
      * @return Return OK if successful, otherwise return the corresponding error code
      */
+    virtual litebus::Future<Status> ReserveResize(const messages::ResizeSandboxRequest &request);
+    virtual litebus::Future<Status> ObserveResize(const messages::ResizeSandboxResponse &response);
+    virtual litebus::Future<Status> CancelResizeBeforeDispatch(const std::string &reservationID);
+
     virtual litebus::Future<Status> AddInstances(const std::map<std::string, InstanceAllocatedInfo> &insts);
 
     /**

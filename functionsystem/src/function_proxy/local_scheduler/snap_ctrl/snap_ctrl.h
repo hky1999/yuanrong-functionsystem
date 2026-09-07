@@ -96,6 +96,23 @@ public:
                                                          const std::string &payload);
 
     /**
+     * Handle INSTANCE_SNAPSHOT_SIGNAL with the caller's captured source state
+     * machine pinned. The actor validates the captured source (still the
+     * exact current machine for the instance, RUNNING, payload carries a
+     * complete expected tuple whose runtime matches the source) BEFORE any
+     * park/drain/gate mutation, then runs HandleSnapshot in the same turn.
+     * @param requestID: Request ID for tracing
+     * @param instanceID: ID of the instance to snapshot
+     * @param payload: core_service::SnapOptions payload with expected tuple
+     * @param source: the caller's originally captured InstanceStateMachine
+     * @return Future of KillResponse
+     */
+    virtual litebus::Future<KillResponse> HandleSnapshotIfSource(const std::string &requestID,
+                                                                 const std::string &instanceID,
+                                                                 const std::string &payload,
+                                                                 const std::shared_ptr<InstanceStateMachine> &source);
+
+    /**
      * Handle INSTANCE_SNAPSTART_SIGNAL
      * Wrap async call to SnapCtrlActor::HandleSnapStart
      * @param requestID: Request ID for tracing
@@ -117,6 +134,9 @@ public:
      */
     virtual litebus::Future<KillResponse> HandleWake(const std::string &requestID,
                                                      const std::string &instanceID);
+
+    litebus::Future<KillResponse> HandleDirectedWake(const std::string &requestID,
+        const std::string &instanceID, const std::string &payload);
 
     /**
      * Copy of the actor's parked registry, for the pressure monitor's FIFO

@@ -41,6 +41,7 @@
 #include "runtime_manager/executor/sandboxd/runtime_state_manager.h"
 #include "sandboxd_checkpoint_orchestrator.h"
 #include "sandboxd_request_builder.h"
+#include "sandbox_stats_polls.h"
 
 namespace functionsystem::runtime_manager {
 
@@ -122,13 +123,13 @@ public:
         healthCheckClient_ = healthCheck;
     }
 
-    // D-7: wire per-instance sandbox memory (MB) from the sandboxd Stats poll
+    // Wire physical resource observations from the sandboxd Stats poll
     // into the resource view. Under runsc the pid-based collector reports
     // nothing (MakeSuccessStartResponse sets pid=0), so this feed is the only
     // source of per-instance actualuse.
-    void SetInstanceMemoryUsageReporter(std::function<void(const std::string &, double)> reporter)
+    void SetInstanceResourceSampleReporter(std::function<void(const std::string &, const resources::SandboxResourceSample &)> reporter)
     {
-        instanceMemoryUsageReporter_ = std::move(reporter);
+        instanceResourceSampleReporter_ = std::move(reporter);
     }
 
     // ── Executor interface ────────────────────────────────────────────────────
@@ -165,6 +166,9 @@ public:
         const std::shared_ptr<messages::ReconcileRuntimesRequest> &request);
 
     void InitConfig() override;
+
+    litebus::Future<messages::ResizeSandboxResponse> ResizeSandbox(
+        const std::shared_ptr<messages::ResizeSandboxRequest> &request);
 
     struct PortForwardConfig {
         uint32_t containerPort = 0;
@@ -244,10 +248,21 @@ private:
     // ── Stop helpers ──────────────────────────────────────────────────────────
 
     litebus::Future<Status> StopSandbox(const std::string &runtimeID, const std::string &requestID, bool oomKilled);
+    litebus::Future<Status> ResumeDeferredStop(const std::string &runtimeID, const std::string &startRequestID,
+        const std::string &stopRequestID, bool force, const messages::StartInstanceResponse &started);
+    void FinishDeferredStop(const std::string &runtimeID,
+        const std::shared_ptr<litebus::Promise<Status>> &completion, const litebus::Future<Status> &result);
+    struct DeferredStop {
+        std::string startRequestID;
+        std::shared_ptr<litebus::Promise<Status>> completion;
+    };
+    std::unordered_map<std::string, DeferredStop> deferredStops_;
+
     litebus::Future<Status> TerminateSandbox(const std::string &runtimeID, const std::string &requestID,
                                              const std::string &sandboxID, bool force);
     litebus::Future<Status> OnDeleteDone(const std::string &runtimeID, const std::string &requestID,
-                                         const std::string &sandboxID, const runtime::v1::DeleteResponse &response);
+                                         const std::string &sandboxID, const runtime::v1::DeleteResponse &response,
+                                         const std::string &registrationID);
     // Warm-up teardown via the Unregister RPC.
     litebus::Future<Status> UnregisterWarmUp(const std::string &runtimeID, const std::string &requestID);
     litebus::Future<Status> OnWarmUpUnregistered(const runtime::v1::NormalResponse &response,
@@ -277,22 +292,26 @@ private:
     // ── Wait retry on sandboxd disconnection ─────────────────────────────────
     void DoWaitWithRetry(const std::string &sandboxID, const std::string &runtimeID, int retryCount);
 
-    void CollectSandboxStats(const std::string &runtimeID, const std::string &sandboxID);
-    void ScheduleSandboxStatsCollection(const std::string &runtimeID, const std::string &sandboxID);
+    void StartSandboxStatsCollection(const std::string &runtimeID, const std::string &sandboxID);
+    void CollectSandboxStats(const std::string &runtimeID, const std::string &sandboxID, uint64_t ticket);
+    void ScheduleSandboxStatsCollection(const std::string &runtimeID, const std::string &sandboxID,
+        uint64_t ticket, std::chrono::steady_clock::time_point collectedAt);
     void ScheduleRunningStatusHeartbeat(const std::string &runtimeID);
     void ReportRunningStatusHeartbeat(const std::string &runtimeID);
     litebus::Future<Status> OnSandboxStatsCollected(const std::string &runtimeID, const std::string &sandboxID,
                                                     const Status &status, const runtime::v1::StatsResponse &response,
-                                                    std::chrono::steady_clock::time_point collectedAt);
+                                                    std::chrono::steady_clock::time_point collectedAt,
+                                                    uint64_t ticket);
 
     litebus::Future<Status> CleanupSandboxAfterMaxRetries(const std::string &runtimeID, const std::string &sandboxID);
     void StartSandboxReclaim(const std::string &runtimeID, const std::string &sandboxID,
                              const std::string &requestID);
     void ReclaimSandbox(const std::string &runtimeID, const std::string &sandboxID,
-                        const std::string &requestID);
+                        const std::string &requestID, const std::string &registrationID);
     litebus::Future<Status> OnReclaimSandboxDone(const std::string &runtimeID, const std::string &sandboxID,
                                                  const std::string &requestID,
-                                                 litebus::Try<runtime::v1::DeleteResponse> response);
+                                                 litebus::Try<runtime::v1::DeleteResponse> response,
+                                                 const std::string &registrationID);
 
     litebus::Future<Status> OnWaitDone(const std::string &runtimeID, const runtime::v1::WaitResponse &response);
 
@@ -350,8 +369,9 @@ private:
 
     void PurgeOrphanTracking(const std::unordered_set<std::string> &actualRunningIDs);
     void CleanupLocalRuntimeStateForOrphan(const std::string &requestID, const std::string &sandboxID);
-    void DeleteSandboxAsync(const std::string &sandboxID);
-    Status OnDeleteSandboxComplete(const std::string &sandboxID, litebus::Try<runtime::v1::DeleteResponse> rsp);
+    void DeleteSandboxAsync(const std::string &sandboxID, const std::string &generation, const std::string &requestID);
+    Status OnDeleteSandboxComplete(const std::string &sandboxID, const std::string &ticket,
+        litebus::Try<runtime::v1::DeleteIfGenerationResponse> rsp);
     Status BuildStartCommandArgs(const std::shared_ptr<messages::StartInstanceRequest> &request,
                                  const std::string &port, CommandArgs *cmdArgs);
     Status ApplyPortForwardMappings(SandboxdStartParams *params,
@@ -364,7 +384,7 @@ private:
     std::shared_ptr<GrpcClient<runtime::v1::SandboxService>> sandboxd_{nullptr};
     std::shared_ptr<HealthCheck> healthCheckClient_;
     // D-7: invoked on every sandboxd Stats poll with (instanceID, memory MB)
-    std::function<void(const std::string &, double)> instanceMemoryUsageReporter_;
+    std::function<void(const std::string &, const resources::SandboxResourceSample &)> instanceResourceSampleReporter_;
     std::shared_ptr<CkptFileManager> ckptFileManager_;
     std::shared_ptr<SandboxdCheckpointOrchestrator> ckptOrch_;
     // runtimeIDs registered as warm-up templates (route StopInstance -> Unregister)
@@ -382,14 +402,26 @@ private:
     // ── Reconciliation state ─────────────────────────────────────────────────
     uint32_t orphanGracePeriodSec_ = kDefaultOrphanGracePeriodSec;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> orphanFirstSeen_;
+    std::unordered_map<std::string, std::string> orphanGenerations_;
+    struct OrphanDeleteAttempt {
+        std::string generation;
+        std::string runtimeID;
+        std::string registrationID;
+        std::string requestID;
+        std::string ticket;
+    };
+    std::unordered_map<std::string, OrphanDeleteAttempt> orphanDeletes_;
+    std::vector<std::string> completedOrphanDeletes_;
+
 
     struct SandboxStatsSnapshot {
         uint64_t cpuUsageNs = 0;
         std::chrono::steady_clock::time_point collectedAt{};
+        std::string resourceGeneration;
     };
 
     std::unordered_map<std::string, SandboxStatsSnapshot> sandboxStatsSnapshots_;
-    std::unordered_set<std::string> sandboxStatsPollingRuntimes_;
+    SandboxStatsPolls sandboxStatsPolls_;
     std::unordered_map<std::string, SandboxLifecycleStatus> sandboxLifecycleStates_;
     std::unordered_set<std::string> userInitiatedTerminateRuntimes_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> sandboxRunningStartTimes_;
@@ -398,6 +430,7 @@ private:
         std::string sandboxID;
         uint32_t failedAttempts = 0;
         std::shared_ptr<litebus::Promise<Status>> completion;
+        std::string registrationID;
     };
     std::unordered_map<std::string, SandboxReclaimState> sandboxReclaims_;
 };
@@ -413,6 +446,12 @@ public:
     }
 
     ~SandboxdExecutorProxy() override = default;
+
+    litebus::Future<messages::ResizeSandboxResponse> ResizeSandbox(
+        const std::shared_ptr<messages::ResizeSandboxRequest> &request)
+    {
+        return litebus::Async(sandboxd_->GetAID(), &SandboxdExecutor::ResizeSandbox, request);
+    }
 
     litebus::Future<messages::StartInstanceResponse> StartInstance(
         const std::shared_ptr<messages::StartInstanceRequest> &request, const std::vector<int> &cardIDs) override

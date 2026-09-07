@@ -2058,6 +2058,28 @@ TEST(FrontendKillCleanupSnapshotTest, CompleteRequiresAllFiveObservedCleanupSign
     EXPECT_FALSE(snapshot.IsComplete());
 }
 
+TEST(FrontendKillEvidenceTest, FailedKillCannotBecomeSuccessfulRetirement)
+{
+    auto actor = std::make_shared<InstanceCtrlActor>("failed-retirement", "nodeID", instanceCtrlConfig);
+    InstanceInfo info;
+    info.set_instanceid("instance");
+    info.set_requestid("request");
+    messages::KillInstanceResponse failed;
+    failed.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+    failed.set_message("physical kill rejected");
+    auto result = actor->RecordFrontendKillRuntimeResult(info, failed);
+    ASSERT_AWAIT_READY(result);
+    EXPECT_EQ(result.Get().StatusCode(), StatusCode::ERR_INNER_SYSTEM_ERROR);
+    // No views are bound: failed termination must not release allocation or identity.
+    auto released = actor->DeleteInstanceInResourceView(result.Get(), info);
+    ASSERT_AWAIT_READY(released);
+    EXPECT_EQ(released.Get().StatusCode(), StatusCode::ERR_INNER_SYSTEM_ERROR);
+    auto cleanup = actor->DeleteInstanceInControlView(result.Get(), info);
+    ASSERT_AWAIT_READY(cleanup);
+    EXPECT_EQ(cleanup.Get().StatusCode(), StatusCode::ERR_INNER_SYSTEM_ERROR);
+    EXPECT_EQ(cleanup.Get().RawMessage(), "physical kill rejected");
+}
+
 TEST(FrontendKillEvidenceTest, OlderKillResultCannotOverwriteNewerRequestEvidence)
 {
     auto actor = std::make_shared<InstanceCtrlActor>("InstanceCtrlActor", "nodeID", instanceCtrlConfig);
@@ -6051,6 +6073,50 @@ TEST_F(InstanceCtrlTest, ToCreatingFailedByETCD)
     ASSERT_AWAIT_READY(future);
     EXPECT_EQ(future.IsOK(), true);
     EXPECT_EQ(future.Get().StatusCode(), StatusCode::ERR_ETCD_OPERATION_ERROR);
+}
+
+TEST_F(InstanceCtrlTest, SnapshotRetirementRejectsReplacementAndUnsettledSource)
+{
+    auto source = std::make_shared<MockInstanceStateMachine>("nodeID");
+    auto replacement = std::make_shared<MockInstanceStateMachine>("nodeID");
+    EXPECT_CALL(*instanceControlView_, DelInstance).Times(0);
+    EXPECT_CALL(*source, AddStateChangeCallback).Times(0);
+    EXPECT_CALL(*replacement, AddStateChangeCallback).Times(0);
+    EXPECT_CALL(*instanceControlView_, GetInstance("instanceID"))
+        .WillOnce(Return(replacement))
+        .WillOnce(Return(source))
+        .WillOnce(Return(source));
+    auto info = InstanceInfo();
+    info.set_runtimeid("runtime-new");
+    EXPECT_CALL(*source, GetInstanceInfo).WillRepeatedly(Return(info));
+    EXPECT_CALL(*source, GetInstanceState).WillOnce(Return(InstanceState::CREATING));
+    auto replaced = instanceCtrlWithMockObserver_->RetireSnapshotSource("instanceID", source, "runtime-old");
+    ASSERT_AWAIT_READY(replaced);
+    EXPECT_TRUE(replaced.Get().IsError());
+    auto rebound = instanceCtrlWithMockObserver_->RetireSnapshotSource("instanceID", source, "runtime-old");
+    ASSERT_AWAIT_READY(rebound);
+    EXPECT_TRUE(rebound.Get().IsError());
+    auto pending = instanceCtrlWithMockObserver_->RetireSnapshotSource("instanceID", source, "runtime-new");
+    ASSERT_AWAIT_READY(pending);
+    EXPECT_TRUE(pending.Get().IsError());
+}
+
+TEST_F(InstanceCtrlTest, SnapshotRetirementPropagatesControlDeletionFailure)
+{
+    auto source = std::make_shared<MockInstanceStateMachine>("nodeID");
+    EXPECT_CALL(*instanceControlView_, GetInstance("instanceID")).WillRepeatedly(Return(source));
+    auto info = InstanceInfo();
+    info.set_instanceid("instanceID");
+    info.set_runtimeid("runtime");
+    info.set_requestid("source-request");
+    info.mutable_instancestatus()->set_code(static_cast<int32_t>(InstanceState::RUNNING));
+    EXPECT_CALL(*source, GetInstanceInfo).WillRepeatedly(Return(info));
+    EXPECT_CALL(*source, GetInstanceState).WillOnce(Return(InstanceState::RUNNING));
+    EXPECT_CALL(*instanceControlView_, DelInstance("instanceID"))
+        .WillOnce(Return(Status(StatusCode::ERR_ETCD_OPERATION_ERROR, "delete failed")));
+    auto retired = instanceCtrlWithMockObserver_->RetireSnapshotSource("instanceID", source, "runtime");
+    ASSERT_AWAIT_READY(retired);
+    EXPECT_EQ(retired.Get().StatusCode(), StatusCode::ERR_ETCD_OPERATION_ERROR);
 }
 
 // force delete without agent

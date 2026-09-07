@@ -1550,4 +1550,39 @@ TEST_F(DISABLED_RuntimeManagerTest, FindExecutor_Caching_Supervisor)
     EXPECT_NE(executor1, runtimeExecutor);
 }
 
+TEST(RuntimeRetirementFailureTest, FailedStopKeepsIdentityAndFailedFutureDoesNotReadValue)
+{
+    RuntimeManager manager("retirement-failure-check");
+    const litebus::AID recipient("unused", "127.0.0.1:1");
+    messages::RuntimeInstanceInfo info;
+    info.set_instanceid("instance");
+    info.set_runtimeid("runtime");
+    manager.instanceInfoMap_["runtime"] = info;
+    manager.instanceResponseMap_["instance"] = messages::StartInstanceResponse();
+    auto request = std::make_shared<messages::StopInstanceRequest>();
+    request->set_runtimeid("runtime");
+    request->set_requestid("stop-attempt");
+    auto response = std::make_shared<messages::StopInstanceResponse>();
+    response->set_runtimeid("runtime");
+    response->set_requestid(request->requestid());
+    litebus::Future<Status> unavailable;
+    unavailable.SetFailed(123);
+    // No health/metrics/port client is bound: failure must not run cleanup.
+    manager.OnGetRuntimeStatus(recipient, request, response, unavailable);
+    EXPECT_NE(response->code(), static_cast<int32_t>(StatusCode::SUCCESS));
+    EXPECT_NE(response->message().find("123"), std::string::npos);
+    EXPECT_EQ(manager.instanceInfoMap_.count("runtime"), 1);
+    EXPECT_EQ(manager.instanceResponseMap_.count("instance"), 1);
+    manager.StopInstanceResponse(recipient, unavailable, request);
+    EXPECT_EQ(manager.instanceInfoMap_.count("runtime"), 1);
+    const litebus::Future<Status> failed(Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "not exited"));
+    manager.OnGetRuntimeStatus(recipient, request, response, failed);
+    EXPECT_EQ(response->message(), "not exited");
+    EXPECT_EQ(manager.instanceInfoMap_.count("runtime"), 1);
+    response->set_code(static_cast<int32_t>(StatusCode::SUCCESS));
+    manager.SendStopInstanceResponse(recipient, "runtime", response);
+    EXPECT_EQ(manager.instanceInfoMap_.count("runtime"), 0);
+    EXPECT_EQ(manager.instanceResponseMap_.count("instance"), 0);
+}
+
 }  // namespace functionsystem::runtime_manager

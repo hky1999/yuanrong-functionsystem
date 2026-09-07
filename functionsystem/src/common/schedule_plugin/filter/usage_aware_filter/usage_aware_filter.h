@@ -18,7 +18,6 @@
 #define FUNCTIONSYSTEM_USAGE_AWARE_FILTER_H
 
 #include <cstdint>
-#include <mutex>
 
 #include "common/proto/pb/posix/resource.pb.h"
 #include "common/resource_view/resource_type.h"
@@ -57,11 +56,6 @@ public:
     static double GetFloorMb();
     static int32_t GetMaxInstances();
 
-private:
-    static std::mutex configMutex_;
-    static double safety_;
-    static double floorMb_;
-    static int32_t maxInstances_;
 };
 }  // namespace functionsystem::schedule_plugin::filter
 

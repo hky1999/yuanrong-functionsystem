@@ -19,11 +19,15 @@
 #include <gtest/gtest.h>
 
 #include <map>
+#include <chrono>
+#include <thread>
+#include "common/schedule_plugin/filter/usage_aware_filter/usage_aware_filter.h"
 
 #include "common/constants/constants.h"
 #include "common/metrics/metrics_adapter.h"
 #include "common/resource_view/resource_poller.h"
 #include "common/resource_view/resource_tool.h"
+#include "common/resource_view/usage_trend_tracker.h"
 #include "common/types/instance_state.h"
 #include "utils/future_test_helper.h"
 #include "view_utils.h"
@@ -75,6 +79,445 @@ protected:
 private:
     std::string domainUrl_;
 };
+
+TEST_F(ResourceViewTest, RestoreReservationsSpanSeparateAllocationCalls)
+{
+    using schedule_plugin::filter::UsageAwareFilter;
+    struct ConfigGuard {
+        double safety = UsageAwareFilter::GetSafety();
+        double floor = UsageAwareFilter::GetFloorMb();
+        int32_t cap = UsageAwareFilter::GetMaxInstances();
+        ~ConfigGuard() { UsageAwareFilter::SetConfig(safety, floor, cap); }
+    } guard;
+    UsageAwareFilter::SetConfig(0.9, 2048, 0);
+    for (const bool cpuBound : {false, true}) {
+        SCOPED_TRACE(cpuBound ? "CPU budget" : "Memory budget");
+        auto view = resource_view::ResourceView::CreateResourceView(cpuBound ? "restore-cpu" : "restore-memory", CHILD_PARAM);
+        auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count(); };
+        auto unit = Get1DResourceUnit(cpuBound ? "restore-cpu-agent" : "restore-memory-agent");
+        (*unit.mutable_capacity()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(cpuBound ? 8000 : 32000);
+        (*unit.mutable_allocatable()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(cpuBound ? 8000 : 32000);
+        (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+        unit.set_cpu_sample_unix_ms(nowMs());
+        (*unit.mutable_capacity()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(40000);
+        (*unit.mutable_allocatable()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(40000);
+        (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(cpuBound ? 0 : 24000);
+        unit.set_memory_sample_unix_ms(nowMs());
+        auto added = view->AddResourceUnit(unit);
+        ASSERT_AWAIT_READY(added);
+        auto makeRestore = [&](const std::string &id) {
+            auto instance = Get1DInstance();
+            instance.set_instanceid(id);
+            instance.set_requestid("request-" + id);
+            instance.set_unitid(unit.id());
+            instance.set_runtimeid("runtime-" + id);
+            instance.mutable_schedulerchain()->Clear();
+            *instance.mutable_schedulerchain()->Add() = unit.id();
+            auto *memory = (*instance.mutable_resources()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar();
+            auto *cpu = (*instance.mutable_resources()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar();
+            cpu->set_value(500);
+            cpu->set_limit(4000);
+            memory->set_value(512);
+            memory->set_limit(8192);
+            instance.mutable_snapshotinfo()->set_checkpointid("checkpoint-" + id);
+            return instance;
+        };
+        const auto first = makeRestore("first");
+        const auto second = makeRestore("second");
+        auto allocate = [&](const resources::InstanceInfo &instance) {
+            auto promise = std::make_shared<litebus::Promise<Status>>();
+            (void)view->AddInstances({{instance.instanceid(), resource_view::InstanceAllocatedInfo{instance, promise}}});
+            return promise->GetFuture();
+        };
+        auto accepted = allocate(first);
+        ASSERT_AWAIT_READY(accepted);
+        ASSERT_TRUE(accepted.Get().IsOk());
+        auto rejected = allocate(second); // a new call, with no shared scheduling context
+        ASSERT_AWAIT_READY(rejected);
+        EXPECT_FALSE(rejected.Get().IsOk());
+        EXPECT_EQ(rejected.Get().RawMessage().find(cpuBound ? "CPU:" : "Memory:"), size_t{0});
+        auto before = view->GetResourceView();
+        ASSERT_AWAIT_READY(before);
+        ASSERT_EQ(before.Get()->instances().count("first"), size_t{1});
+        EXPECT_FALSE(before.Get()->instances().at("first").snapshotinfo().checkpointid().empty());
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        auto report = std::make_shared<ResourceUnit>(unit);
+        report->set_memory_sample_unix_ms(nowMs());
+        report->set_cpu_sample_unix_ms(report->memory_sample_unix_ms());
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(cpuBound ? 1000 : 25000);
+        auto &observed = (*report->mutable_instances())["first"];
+        observed.set_runtimeid(first.runtimeid());
+        auto *sample = observed.mutable_sandbox_resource_sample();
+        sample->set_runtime_id(first.runtimeid());
+        sample->set_sandbox_id("sandbox-first");
+        sample->set_resource_generation("generation-first");
+        sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
+        sample->set_cpu_usage_known(false);
+        auto incomplete = view->UpdateResourceUnit(std::make_shared<ResourceUnit>(*report), UpdateType::UPDATE_ACTUAL);
+        ASSERT_AWAIT_READY(incomplete);
+        auto held = view->GetResourceView();
+        ASSERT_AWAIT_READY(held);
+        EXPECT_FALSE(held.Get()->instances().at("first").snapshotinfo().checkpointid().empty());
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        report->set_memory_sample_unix_ms(nowMs());
+        report->set_cpu_sample_unix_ms(report->memory_sample_unix_ms());
+        sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
+        sample->set_cpu_usage_known(true);
+        auto refreshed = view->UpdateResourceUnit(report, UpdateType::UPDATE_ACTUAL);
+        ASSERT_AWAIT_READY(refreshed);
+        auto after = view->GetResourceView();
+        ASSERT_AWAIT_READY(after);
+        EXPECT_TRUE(after.Get()->instances().at("first").snapshotinfo().checkpointid().empty());
+        accepted = allocate(second);
+        ASSERT_AWAIT_READY(accepted);
+        EXPECT_TRUE(accepted.Get().IsOk());
+    }
+}
+
+TEST_F(ResourceViewTest, ElasticColdReservationsSpanCallsAndRequirePhysicalReconciliation)
+{
+    using schedule_plugin::filter::UsageAwareFilter;
+    struct ConfigGuard {
+        double safety = UsageAwareFilter::GetSafety();
+        double floor = UsageAwareFilter::GetFloorMb();
+        int32_t cap = UsageAwareFilter::GetMaxInstances();
+        ~ConfigGuard() { UsageAwareFilter::SetConfig(safety, floor, cap); }
+    } guard;
+    UsageAwareFilter::SetConfig(0.9, 2048, 0);
+    auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count(); };
+    for (const bool cpuBound : {false, true}) {
+        SCOPED_TRACE(cpuBound ? "cold CPU" : "cold Memory");
+        const std::string id = cpuBound ? "elastic-cold-cpu" : "elastic-cold-memory";
+        auto view = resource_view::ResourceView::CreateResourceView(id, CHILD_PARAM);
+        auto unit = Get1DResourceUnit(id + "-agent");
+        for (auto *resources : {unit.mutable_capacity(), unit.mutable_allocatable()}) {
+            (*resources->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(cpuBound ? 2000 : 32000);
+            (*resources->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(cpuBound ? 40000 : 4000);
+        }
+        (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+        (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(cpuBound ? 0 : 3000);
+        unit.set_memory_sample_unix_ms(nowMs());
+        unit.set_cpu_sample_unix_ms(nowMs());
+        auto added = view->AddResourceUnit(unit);
+        ASSERT_AWAIT_READY(added);
+        auto makeInstance = [&](const std::string &name) {
+            auto instance = Get1DInstance();
+            instance.set_instanceid(name);
+            instance.set_requestid("request-" + name);
+            instance.set_unitid(unit.id());
+            instance.set_runtimeid("runtime-" + name);
+            instance.mutable_schedulerchain()->Clear();
+            *instance.mutable_schedulerchain()->Add() = unit.id();
+            (*instance.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+            auto *cpu = (*instance.mutable_resources()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar();
+            cpu->set_value(500);
+            cpu->set_limit(8000);
+            auto *memory = (*instance.mutable_resources()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar();
+            memory->set_value(512);
+            memory->set_limit(8192);
+            return instance;
+        };
+        auto allocate = [&](const resources::InstanceInfo &instance) {
+            auto promise = std::make_shared<litebus::Promise<Status>>();
+            (void)view->AddInstances({{instance.instanceid(), resource_view::InstanceAllocatedInfo{instance, promise}}});
+            return promise->GetFuture();
+        };
+        auto first = makeInstance("cold-first");
+        auto second = makeInstance("cold-second");
+        auto accepted = allocate(first);
+        ASSERT_AWAIT_READY(accepted);
+        ASSERT_TRUE(accepted.Get().IsOk()) << accepted.Get().ToString();
+        auto rejected = allocate(second);
+        ASSERT_AWAIT_READY(rejected);
+        EXPECT_EQ(rejected.Get().RawMessage().find(cpuBound ? "CPU:" : "Memory:"), size_t{0});
+        auto before = view->GetResourceView();
+        ASSERT_AWAIT_READY(before);
+        EXPECT_TRUE(before.Get()->instances().at(first.instanceid()).resource_admission_pending());
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        auto report = std::make_shared<ResourceUnit>(unit);
+        report->set_memory_sample_unix_ms(nowMs());
+        report->set_cpu_sample_unix_ms(nowMs());
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1050);
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(cpuBound ? 50 : 3050);
+        auto &observed = (*report->mutable_instances())[first.instanceid()];
+        observed.set_runtimeid(first.runtimeid());
+        auto *sample = observed.mutable_sandbox_resource_sample();
+        sample->set_runtime_id(first.runtimeid());
+        sample->set_sandbox_id("cold-sandbox");
+        sample->set_resource_generation("cold-generation");
+        sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
+        sample->set_cpu_usage_known(true);
+        sample->set_cpu_usage_cores(0.05);
+        auto refreshed = view->UpdateResourceUnit(report, UpdateType::UPDATE_ACTUAL);
+        ASSERT_AWAIT_READY(refreshed);
+        auto after = view->GetResourceView();
+        ASSERT_AWAIT_READY(after);
+        EXPECT_FALSE(after.Get()->instances().at(first.instanceid()).resource_admission_pending());
+        accepted = allocate(second);
+        ASSERT_AWAIT_READY(accepted);
+        EXPECT_TRUE(accepted.Get().IsOk()) << accepted.Get().ToString();
+    }
+}
+
+TEST_F(ResourceViewTest, ResizeReservationsShareAdmissionAndRequireOwnUsageToSettle)
+{
+    using schedule_plugin::filter::UsageAwareFilter;
+    struct ConfigGuard {
+        double safety = UsageAwareFilter::GetSafety();
+        double floor = UsageAwareFilter::GetFloorMb();
+        int32_t cap = UsageAwareFilter::GetMaxInstances();
+        ~ConfigGuard() { UsageAwareFilter::SetConfig(safety, floor, cap); }
+    } guard;
+    UsageAwareFilter::SetConfig(0.9, 2048, 0);
+    auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count(); };
+    for (const bool cpuBound : {false, true}) {
+        SCOPED_TRACE(cpuBound ? "resize CPU" : "resize Memory");
+        const std::string id = cpuBound ? "resize-cpu-budget" : "resize-memory-budget";
+        auto view = resource_view::ResourceView::CreateResourceView(id, CHILD_PARAM);
+        auto unit = Get1DResourceUnit(id + "-agent");
+        for (auto *resources : {unit.mutable_capacity(), unit.mutable_allocatable()}) {
+            (*resources->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(cpuBound ? 2000 : 32000);
+            (*resources->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(cpuBound ? 40000 : 4000);
+        }
+        (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+        (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(3000);
+        unit.set_cpu_sample_unix_ms(nowMs());
+        unit.set_memory_sample_unix_ms(nowMs());
+        auto added = view->AddResourceUnit(unit);
+        ASSERT_AWAIT_READY(added);
+        auto makeInstance = [&](const std::string &name) {
+            auto instance = Get1DInstance();
+            instance.set_instanceid(name);
+            instance.set_requestid("request-" + name);
+            instance.set_unitid(unit.id());
+            instance.set_runtimeid("runtime-" + name);
+            instance.mutable_schedulerchain()->Clear();
+            *instance.mutable_schedulerchain()->Add() = unit.id();
+            (*instance.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+            auto *cpu = (*instance.mutable_resources()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar();
+            cpu->set_value(500);
+            cpu->set_limit(8000);
+            auto *memory = (*instance.mutable_resources()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar();
+            memory->set_value(512);
+            memory->set_limit(8192);
+            return instance;
+        };
+        auto allocate = [&](const resources::InstanceInfo &instance) {
+            auto promise = std::make_shared<litebus::Promise<Status>>();
+            (void)view->AddInstances({{instance.instanceid(), resource_view::InstanceAllocatedInfo{instance, promise}}});
+            return promise->GetFuture();
+        };
+        const auto owner = makeInstance("owner");
+        auto accepted = allocate(owner);
+        ASSERT_AWAIT_READY(accepted);
+        ASSERT_TRUE(accepted.Get().IsOk());
+        auto publish = [&](bool raised, bool consumed, bool nodeDropped, bool cpuKnown = true) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            auto report = std::make_shared<ResourceUnit>(unit);
+            report->set_memory_sample_unix_ms(nowMs());
+            report->set_cpu_sample_unix_ms(nowMs());
+            (*report->mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(
+                cpuBound && nodeDropped && !consumed ? 0 : 1000);
+            (*report->mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(
+                !cpuBound && nodeDropped ? 2000 : 3000);
+            auto &observed = (*report->mutable_instances())[owner.instanceid()];
+            observed.set_runtimeid(owner.runtimeid());
+            auto *sample = observed.mutable_sandbox_resource_sample();
+            sample->set_runtime_id(owner.runtimeid());
+            sample->set_sandbox_id("budget-sandbox");
+            sample->set_resource_generation("budget-generation");
+            sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
+            sample->set_cpu_usage_known(cpuKnown);
+            sample->set_cpu_usage_cores(cpuBound && consumed ? 1.0 : 0.05);
+            sample->set_cpu_limits_known(true);
+            sample->set_cpu_period_usec(100000);
+            sample->set_cpu_quota_usec(cpuBound && raised ? 100000 : 50000);
+            sample->set_memory_limit_bytes((!cpuBound && raised ? 1024ULL : 512ULL) * 1024 * 1024);
+            sample->set_memory_current_bytes((!cpuBound && consumed ? 1024ULL : 400ULL) * 1024 * 1024);
+            return view->UpdateResourceUnit(report, UpdateType::UPDATE_ACTUAL);
+        };
+        auto physical = publish(false, false, false, false);
+        ASSERT_AWAIT_READY(physical);
+        messages::ResizeSandboxRequest early;
+        early.set_requestid("early-cold-lease");
+        early.set_instanceid(owner.instanceid());
+        early.set_runtimeid(owner.runtimeid());
+        auto *earlyResize = early.mutable_resize();
+        earlyResize->set_sandbox_id("budget-sandbox");
+        earlyResize->set_resource_generation("budget-generation");
+        earlyResize->set_deadline_unix_ms(nowMs() + 30000);
+        earlyResize->mutable_expected()->set_cpu_quota_usec(50000);
+        earlyResize->mutable_expected()->set_cpu_period_usec(100000);
+        earlyResize->mutable_expected()->set_memory_limit_bytes(512ULL * 1024 * 1024);
+        *earlyResize->mutable_target() = earlyResize->expected();
+        earlyResize->mutable_target()->set_cpu_quota_usec(60000);
+        earlyResize->mutable_target()->set_memory_limit_bytes(544ULL * 1024 * 1024);
+        auto earlyBudget = view->ReserveResize(early);
+        ASSERT_AWAIT_READY(earlyBudget);
+        EXPECT_TRUE(earlyBudget.Get().IsOk()) << earlyBudget.Get().ToString();
+        auto earlyCancelled = view->CancelResizeBeforeDispatch(early.requestid());
+        ASSERT_AWAIT_READY(earlyCancelled);
+        physical = publish(false, false, false);
+        ASSERT_AWAIT_READY(physical);
+        messages::ResizeSandboxRequest request;
+        request.set_requestid("lease-before-dispatch");
+        request.set_instanceid(owner.instanceid());
+        request.set_runtimeid(owner.runtimeid());
+        auto *resize = request.mutable_resize();
+        resize->set_sandbox_id("budget-sandbox");
+        resize->set_resource_generation("budget-generation");
+        resize->set_deadline_unix_ms(nowMs() + 30000);
+        resize->mutable_expected()->set_cpu_quota_usec(50000);
+        resize->mutable_expected()->set_cpu_period_usec(100000);
+        resize->mutable_expected()->set_memory_limit_bytes(512ULL * 1024 * 1024);
+        *resize->mutable_target() = resize->expected();
+        resize->mutable_target()->set_cpu_quota_usec(100000);
+        resize->mutable_target()->set_memory_limit_bytes(1024ULL * 1024 * 1024);
+        auto foreign = request;
+        foreign.mutable_resize()->set_resource_generation("retired-generation");
+        auto invalid = view->ReserveResize(foreign);
+        ASSERT_AWAIT_READY(invalid);
+        EXPECT_FALSE(invalid.Get().IsOk());
+        foreign = request;
+        foreign.set_runtimeid("foreign-runtime");
+        invalid = view->ReserveResize(foreign);
+        ASSERT_AWAIT_READY(invalid);
+        EXPECT_FALSE(invalid.Get().IsOk());
+        auto reserved = view->ReserveResize(request);
+        ASSERT_AWAIT_READY(reserved);
+        ASSERT_TRUE(reserved.Get().IsOk()) << reserved.Get().ToString();
+        auto cancelled = view->CancelResizeBeforeDispatch(request.requestid());
+        ASSERT_AWAIT_READY(cancelled);
+        request.set_requestid("lease-dispatched");
+        reserved = view->ReserveResize(request);
+        ASSERT_AWAIT_READY(reserved);
+        ASSERT_TRUE(reserved.Get().IsOk());
+        auto conflicting = request;
+        conflicting.set_requestid("another-lease");
+        auto blocked = view->ReserveResize(conflicting);
+        ASSERT_AWAIT_READY(blocked);
+        EXPECT_FALSE(blocked.Get().IsOk());
+        auto candidate = makeInstance("candidate");
+        auto rejected = allocate(candidate);
+        ASSERT_AWAIT_READY(rejected);
+        EXPECT_EQ(rejected.Get().RawMessage().find(cpuBound ? "CPU:" : "Memory:"), size_t{0});
+        auto restoreCandidate = candidate;
+        restoreCandidate.mutable_snapshotinfo()->set_checkpointid("pending-checkpoint");
+        (*restoreCandidate.mutable_resources()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_limit(500);
+        (*restoreCandidate.mutable_resources()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_limit(512);
+        rejected = allocate(restoreCandidate);
+        ASSERT_AWAIT_READY(rejected);
+        EXPECT_EQ(rejected.Get().RawMessage().find(cpuBound ? "CPU:" : "Memory:"), size_t{0});
+        messages::ResizeSandboxResponse response;
+        response.set_requestid(request.requestid());
+        response.set_instanceid(owner.instanceid());
+        response.set_runtimeid(owner.runtimeid());
+        response.set_sandboxid(resize->sandbox_id());
+        response.set_resourcegeneration(resize->resource_generation());
+        response.set_outcome(messages::ResizeSandboxResponse::UNKNOWN);
+        auto unknown = view->ObserveResize(response);
+        ASSERT_AWAIT_READY(unknown);
+        physical = publish(false, false, true);
+        ASSERT_AWAIT_READY(physical);
+        // A drop elsewhere does not consume this instance's possible write.
+        auto larger = candidate;
+        (*larger.mutable_resources()->mutable_resources())[cpuBound ? RESOURCE_CPU_NAME : RESOURCE_MEM_NAME]
+            .mutable_scalar()->set_value(1400);
+        rejected = allocate(larger);
+        ASSERT_AWAIT_READY(rejected);
+        EXPECT_FALSE(rejected.Get().IsOk());
+        response.set_outcome(messages::ResizeSandboxResponse::OBSERVED);
+        auto *actual = response.mutable_result()->mutable_actual();
+        actual->set_resource_generation(resize->resource_generation());
+        actual->set_cpu_limits_known(true);
+        actual->set_cpu_period_usec(100000);
+        // Both dimensions were requested; only the binding dimension landed.
+        // Releasing the entire reservation on complete=false would over-admit.
+        response.mutable_result()->set_complete(false);
+        actual->set_cpu_quota_usec(cpuBound ? resize->target().cpu_quota_usec() : resize->expected().cpu_quota_usec());
+        actual->set_memory_limit_bytes(cpuBound ? resize->expected().memory_limit_bytes() : resize->target().memory_limit_bytes());
+        auto observed = view->ObserveResize(response);
+        ASSERT_AWAIT_READY(observed);
+        physical = publish(true, false, true);
+        ASSERT_AWAIT_READY(physical);
+        rejected = allocate(larger);
+        ASSERT_AWAIT_READY(rejected);
+        EXPECT_FALSE(rejected.Get().IsOk()); // quota readback alone does not spend the promise
+        physical = publish(true, true, true);
+        ASSERT_AWAIT_READY(physical);
+        accepted = allocate(cpuBound ? candidate : larger);
+        ASSERT_AWAIT_READY(accepted);
+        EXPECT_TRUE(accepted.Get().IsOk()) << accepted.Get().ToString();
+    }
+}
+
+TEST_F(ResourceViewTest, ColdAllocationCapSpansConcurrentRequestsWithoutTelemetry)
+{
+    using schedule_plugin::filter::UsageAwareFilter;
+    struct ConfigGuard {
+        double safety = UsageAwareFilter::GetSafety();
+        double floor = UsageAwareFilter::GetFloorMb();
+        int32_t cap = UsageAwareFilter::GetMaxInstances();
+        ~ConfigGuard() { UsageAwareFilter::SetConfig(safety, floor, cap); }
+    } guard;
+    UsageAwareFilter::SetConfig(0.9, 2048, 1);
+    auto view = resource_view::ResourceView::CreateResourceView("cold-cap", CHILD_PARAM);
+    auto unit = Get1DResourceUnit("cold-agent");
+    unit.clear_actualuse();
+    auto added = view->AddResourceUnit(unit);
+    ASSERT_AWAIT_READY(added);
+    auto allocate = [&](const std::string &id) {
+        auto instance = Get1DInstance();
+        instance.set_instanceid(id);
+        instance.set_requestid("request-" + id);
+        instance.set_unitid(unit.id());
+        instance.mutable_schedulerchain()->Clear();
+        *instance.mutable_schedulerchain()->Add() = unit.id();
+        auto promise = std::make_shared<litebus::Promise<Status>>();
+        (void)view->AddInstances({{id, resource_view::InstanceAllocatedInfo{instance, promise}}});
+        return promise->GetFuture();
+    };
+    auto first = allocate("first");
+    auto second = allocate("second"); // independently queued before observing either allocation
+    ASSERT_AWAIT_READY(first);
+    ASSERT_AWAIT_READY(second);
+    ASSERT_TRUE(first.Get().IsOk());
+    EXPECT_EQ(second.Get().StatusCode(), StatusCode::RESOURCE_NOT_ENOUGH);
+    auto occupied = view->GetResourceView();
+    ASSERT_AWAIT_READY(occupied);
+    EXPECT_EQ(occupied.Get()->instances().size(), size_t{1});
+    auto removed = view->DeleteInstances({"first"});
+    ASSERT_AWAIT_READY(removed);
+    auto replacement = allocate("replacement");
+    ASSERT_AWAIT_READY(replacement);
+    EXPECT_TRUE(replacement.Get().IsOk());
+}
+
+TEST_F(ResourceViewTest, ActualUpdatesReachAdmissionTrendTracker)
+{
+    // Other suites disable prediction; this check must not depend on link order.
+    struct ParamsGuard {
+        int64_t window = UsageTrendTracker::windowMs_;
+        int64_t horizon = UsageTrendTracker::horizonMs_;
+        ~ParamsGuard() { UsageTrendTracker::SetParams(window, horizon); }
+    } guard;
+    UsageTrendTracker::SetParams(60000, 30000);
+    auto view = resource_view::ResourceView::CreateResourceView("actual-trend", CHILD_PARAM);
+    auto unit = Get1DResourceUnit("trend-agent");
+    auto added = view->AddResourceUnit(unit);
+    ASSERT_AWAIT_READY(added);
+    for (double used : {30.0, 40.0}) {
+        auto report = std::make_shared<ResourceUnit>(unit);
+        report->mutable_actualuse()->mutable_resources()->at(RESOURCE_MEM_NAME).mutable_scalar()->set_value(used);
+        auto updated = view->UpdateResourceUnit(report, UpdateType::UPDATE_ACTUAL);
+        ASSERT_AWAIT_READY(updated);
+    }
+    EXPECT_GE(UsageTrendTracker::Predict(unit.id()), 40.0);
+}
 
 TEST_F(ResourceViewTest, AddResourceUnitSuccess)
 {
@@ -1019,6 +1462,7 @@ TEST_F(ResourceViewTest, UpdateActualMergesPerInstanceActualuse)
     // IsInstanceInResourceView); the fixture helper does not
     for (auto &inst : *unit.mutable_instances()) {
         inst.second.set_unitid(unit.id());
+        inst.second.set_runtimeid("runtime-1");
     }
     auto ret = resourceView.AddResourceUnit(unit);
     ASSERT_AWAIT_READY(ret);
@@ -1030,9 +1474,16 @@ TEST_F(ResourceViewTest, UpdateActualMergesPerInstanceActualuse)
     (*used.mutable_resources())[RESOURCE_MEM_NAME] = mem;
 
     auto report = std::make_shared<resource_view::ResourceUnit>(Get1DResourceUnit(unit.id()));
+    report->set_memory_sample_unix_ms(2000);
     auto knownInst = Get1DInstance();
     knownInst.set_instanceid(knownKey);
     (*knownInst.mutable_actualuse()) = used;
+    auto *sample = knownInst.mutable_sandbox_resource_sample();
+    sample->set_runtime_id("runtime-1");
+    sample->set_sandbox_id("sandbox-1");
+    sample->set_resource_generation("generation-1");
+    sample->set_sampled_at_unix_ms(2000);
+    sample->set_memory_limit_bytes(512ULL * 1024 * 1024);
     (*report->mutable_instances())[knownKey] = knownInst;
     auto ghostInst = Get1DInstance();
     ghostInst.set_instanceid("instance-not-in-view");
@@ -1044,6 +1495,7 @@ TEST_F(ResourceViewTest, UpdateActualMergesPerInstanceActualuse)
 
     auto rUnit = resourceView.GetResourceUnit(unit.id());
     ASSERT_TRUE(rUnit.Get().IsSome());
+    EXPECT_EQ(rUnit.Get().Get().memory_sample_unix_ms(), 2000);
     const auto &fragInstances = rUnit.Get().Get().instances();
     ASSERT_TRUE(fragInstances.contains(knownKey));
     EXPECT_DOUBLE_EQ(fragInstances.at(knownKey).actualuse().resources().at(RESOURCE_MEM_NAME).scalar()
@@ -1058,6 +1510,29 @@ TEST_F(ResourceViewTest, UpdateActualMergesPerInstanceActualuse)
     ASSERT_TRUE(viewInstances.contains(knownKey));
     EXPECT_DOUBLE_EQ(viewInstances.at(knownKey).actualuse().resources().at(RESOURCE_MEM_NAME).scalar()
                          .value(), 1536.0);
+    EXPECT_EQ(fragInstances.at(knownKey).sandbox_resource_sample().SerializeAsString(), sample->SerializeAsString());
+    EXPECT_EQ(viewInstances.at(knownKey).sandbox_resource_sample().SerializeAsString(), sample->SerializeAsString());
+    // A late sample must not roll back either index; a newer foreign runtime must not replace it.
+    for (const bool foreignRuntime : {false, true}) {
+        auto late = std::make_shared<resource_view::ResourceUnit>(Get1DResourceUnit(unit.id()));
+        late->set_memory_sample_unix_ms(foreignRuntime ? 3000 : 1000);
+        auto changed = knownInst;
+        changed.mutable_sandbox_resource_sample()->set_sampled_at_unix_ms(foreignRuntime ? 3000 : 1000);
+        if (foreignRuntime) {
+            changed.mutable_sandbox_resource_sample()->set_runtime_id("retired-runtime");
+        }
+        (*changed.mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(1);
+        (*late->mutable_instances())[knownKey] = changed;
+        ret = resourceView.UpdateResourceUnit(late, resource_view::UpdateType::UPDATE_ACTUAL);
+        ASSERT_AWAIT_READY(ret);
+        auto refreshed = resourceView.GetResourceView();
+        EXPECT_EQ(refreshed.Get()->instances().at(knownKey).sandbox_resource_sample().sampled_at_unix_ms(), 2000);
+        EXPECT_DOUBLE_EQ(refreshed.Get()->instances().at(knownKey).actualuse().resources()
+                             .at(RESOURCE_MEM_NAME).scalar().value(), 1536.0);
+        auto fragment = resourceView.GetResourceUnit(unit.id());
+        ASSERT_TRUE(fragment.Get().IsSome());
+        EXPECT_EQ(fragment.Get().Get().instances().at(knownKey).sandbox_resource_sample().sampled_at_unix_ms(), 2000);
+    }
 }
 
 TEST_F(ResourceViewTest, DynamicUpdateRemovesMissingVectorResourceWithoutAffectingOtherUnitsOrInstances)

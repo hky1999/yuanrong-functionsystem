@@ -4804,4 +4804,116 @@ TEST_F(AgentServiceActorTest, LoadConfigPkgThresholdsCfgTest)
         EXPECT_EQ(dstActor_->codePackageThresholds_.dirdepthmax(), 50);
     }
 }
+TEST_F(AgentServiceActorTest, ResizeRepliesRequirePinnedSenderAndCompleteIdentity)
+{
+    auto request = std::make_shared<messages::ResizeSandboxRequest>();
+    request->set_requestid("reservation-original");
+    request->set_instanceid("resize-instance");
+    request->set_runtimeid("resize-runtime");
+    request->mutable_resize()->set_sandbox_id("resize-sandbox");
+    request->mutable_resize()->set_resource_generation("resize-generation");
+    const litebus::AID runtimeManager("resize-runtime-manager", "127.0.0.1:1");
+    dstActor_->resizeRequests_.emplace("forward-private", function_agent::AgentServiceActor::ResizePending{
+        testFuncAgentMgrActor_->GetAID(), runtimeManager, request, litebus::Timer{}});
+    messages::ResizeSandboxResponse response;
+    response.set_requestid("forward-private");
+    response.set_instanceid(request->instanceid());
+    response.set_runtimeid(request->runtimeid());
+    response.set_sandboxid(request->resize().sandbox_id());
+    response.set_resourcegeneration(request->resize().resource_generation());
+    response.set_outcome(messages::ResizeSandboxResponse::UNKNOWN);
+
+    dstActor_->ResizeSandboxResponse(litebus::AID("wrong-manager", "127.0.0.1:1"), "", response.SerializeAsString());
+    EXPECT_EQ(dstActor_->resizeRequests_.count("forward-private"), 1u);
+    response.set_resourcegeneration("old-generation");
+    dstActor_->ResizeSandboxResponse(runtimeManager, "", response.SerializeAsString());
+    EXPECT_EQ(dstActor_->resizeRequests_.count("forward-private"), 1u);
+    response.set_resourcegeneration(request->resize().resource_generation());
+    dstActor_->ResizeSandboxResponse(runtimeManager, "", response.SerializeAsString());
+    EXPECT_EQ(dstActor_->resizeRequests_.count("forward-private"), 0u);
+    // A late timer/repeated response must not resurrect or complete any request.
+    dstActor_->ResizeSandboxTimeout("forward-private");
+    dstActor_->ResizeSandboxResponse(runtimeManager, "", response.SerializeAsString());
+    EXPECT_TRUE(dstActor_->resizeRequests_.empty());
+}
+
+TEST_F(AgentServiceActorTest, StopResponseRequiresDispatchOwnerAndPreservesFailedRuntime)
+{
+    const litebus::AID manager(dstActor_->registerRuntimeMgr_.name, dstActor_->registerRuntimeMgr_.address);
+    auto request = std::make_shared<messages::KillInstanceRequest>();
+    request->set_requestid("owned-stop");
+    request->set_instanceid("owned-instance");
+    request->set_runtimeid("owned-runtime");
+    request->set_ismonopoly(true);
+    dstActor_->isRegisterCompleted_ = true;
+    dstActor_->registerRuntimeMgr_.registered = true;
+    dstActor_->runtimesDeploymentCache_->runtimes[request->runtimeid()] = messages::RuntimeInstanceInfo();
+    dstActor_->killingRequest_[request->requestid()] = {
+        testFuncAgentMgrActor_->GetAID(), request, manager, dstActor_->registerRuntimeMgr_.id };
+    auto conflicting = *request;
+    conflicting.set_runtimeid("replacement");
+    conflicting.set_storagetype(function_agent::LOCAL_STORAGE_TYPE);
+    dstActor_->KillInstance(testFuncAgentMgrActor_->GetAID(), "", conflicting.SerializeAsString());
+    EXPECT_EQ(dstActor_->killingRequest_.at(request->requestid()).request->runtimeid(), "owned-runtime");
+    messages::StopInstanceResponse response;
+    response.set_requestid(request->requestid());
+    response.set_runtimeid(request->runtimeid());
+    response.set_code(static_cast<int32_t>(StatusCode::SUCCESS));
+    dstActor_->StopInstanceResponse(litebus::AID("other", "127.0.0.1:1"), "", response.SerializeAsString());
+    EXPECT_EQ(dstActor_->killingRequest_.count(request->requestid()), 1);
+    response.set_runtimeid("replacement");
+    dstActor_->StopInstanceResponse(manager, "", response.SerializeAsString());
+    EXPECT_EQ(dstActor_->killingRequest_.count(request->requestid()), 1);
+    response.set_runtimeid(request->runtimeid());
+    const auto epoch = dstActor_->registerRuntimeMgr_.id;
+    dstActor_->registerRuntimeMgr_.id = "replacement-manager";
+    dstActor_->StopInstanceResponse(manager, "", response.SerializeAsString());
+    EXPECT_EQ(dstActor_->killingRequest_.count(request->requestid()), 1);
+    dstActor_->registerRuntimeMgr_.id = epoch;
+    response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+    dstActor_->monopolyUsed_ = false;
+    dstActor_->StopInstanceResponse(manager, "", response.SerializeAsString());
+    EXPECT_EQ(dstActor_->killingRequest_.count(request->requestid()), 0);
+    EXPECT_FALSE(dstActor_->monopolyUsed_);
+    EXPECT_EQ(dstActor_->runtimesDeploymentCache_->runtimes.count(request->runtimeid()), 1);
+}
+
+TEST_F(AgentServiceActorTest, ReusedCallerKillIDCannotAcceptPreviousDispatchResponse)
+{
+    testRuntimeManager_->SetIsNeedToResponse(false);
+    messages::KillInstanceRequest request;
+    request.set_requestid("reused-caller-id");
+    request.set_instanceid("instance");
+    request.set_runtimeid("runtime");
+    request.set_storagetype(function_agent::LOCAL_STORAGE_TYPE);
+    const auto caller = testFuncAgentMgrActor_->GetAID();
+    const litebus::AID manager(dstActor_->registerRuntimeMgr_.name, dstActor_->registerRuntimeMgr_.address);
+    dstActor_->KillInstance(caller, "", request.SerializeAsString());
+    ASSERT_EQ(dstActor_->killingRequest_.size(), 1);
+    const auto first = dstActor_->killingRequest_.begin()->first;
+    EXPECT_NE(first, request.requestid());
+    dstActor_->KillInstance(caller, "", request.SerializeAsString());
+    ASSERT_EQ(dstActor_->killingRequest_.size(), 1);
+    EXPECT_EQ(dstActor_->killingRequest_.begin()->first, first);
+    messages::StopInstanceResponse response;
+    response.set_requestid(first);
+    response.set_runtimeid(request.runtimeid());
+    response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+    dstActor_->StopInstanceResponse(manager, "", response.SerializeAsString());
+    ASSERT_TRUE(dstActor_->killingRequest_.empty());
+    dstActor_->KillInstance(caller, "", request.SerializeAsString());
+    ASSERT_EQ(dstActor_->killingRequest_.size(), 1);
+    const auto second = dstActor_->killingRequest_.begin()->first;
+    EXPECT_NE(second, first);
+    dstActor_->StopInstanceResponse(manager, "", response.SerializeAsString());
+    ASSERT_EQ(dstActor_->killingRequest_.size(), 1);
+    EXPECT_EQ(dstActor_->killingRequest_.begin()->first, second);
+    response.set_requestid(second);
+    dstActor_->StopInstanceResponse(manager, "", response.SerializeAsString());
+    EXPECT_TRUE(dstActor_->killingRequest_.empty());
+    ASSERT_AWAIT_TRUE([&]() {
+        return testFuncAgentMgrActor_->GetKillInstanceResponse()->requestid() == request.requestid();
+    });
+}
+
 }  // namespace functionsystem::test

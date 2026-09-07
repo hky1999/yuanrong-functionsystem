@@ -15,16 +15,20 @@
  */
 
 #include "sandboxd_executor.h"
+#include "sandbox_cpu_sample.h"
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <unordered_set>
 
 #include "async/asyncafter.hpp"
+#include "async/uuid_generator.hpp"
 #include "async/collect.hpp"
 #include "common/constants/actor_name.h"
 #include "common/constants/constants.h"
+#include "common/constants/warmup_type.h"
 #include "common/logs/logging.h"
 #include "common/metrics/metrics_adapter.h"
 #include "common/resource_view/resource_type.h"
@@ -33,7 +37,6 @@
 #include "common/utils/collect_status.h"
 #include "common/utils/generate_message.h"
 #include "common/utils/port_forward_mapping.h"
-#include "common/utils/struct_transfer.h"
 #include "port/port_manager.h"
 #include "runtime_manager/config/build.h"
 #include "runtime_manager/executor/sandboxd/sandbox_command_utils.h"
@@ -54,7 +57,7 @@ constexpr int32_t CONTAINER_DELETE_TIMEOUT_SEC      = 10;
 
 constexpr int32_t WAIT_MAX_RETRIES                  = 30;
 constexpr int64_t WAIT_RETRY_INTERVAL_MS            = 10000;
-constexpr int64_t SANDBOX_STATS_COLLECT_INTERVAL_MS    = 10000;
+constexpr int64_t SANDBOX_STATS_COLLECT_INTERVAL_MS    = 1000;
 constexpr int64_t SANDBOX_RUNNING_HEARTBEAT_INTERVAL_MS = 30000;
 constexpr double CPU_MILLICORES_PER_CORE            = 1000.0;
 constexpr double BYTES_PER_MB                       = 1024.0 * 1024.0;
@@ -370,10 +373,15 @@ litebus::Future<messages::StartInstanceResponse> SandboxdExecutor::StartInstance
         return *existing;
     }
 
-    const auto registerStatus = ResolveAndRegisterRuntime(request);
-    if (registerStatus.IsError()) {
-        return GenFailStartInstanceResponse(request, registerStatus.StatusCode(), registerStatus.RawMessage());
+    if (auto stopping = deferredStops_.find(runtimeID); stopping != deferredStops_.end()) {
+        const auto result = stopping->second.completion->GetFuture();
+        if (!result.IsOK() || result.Get().IsError() || stateManager_.IsActive(runtimeID)) {
+            return GenFailStartInstanceResponse(request, StatusCode::ERR_INSTANCE_BUSY,
+                "previous create/stop retirement is unresolved");
+        }
+        deferredStops_.erase(stopping);
     }
+    stateManager_.Register(SandboxInfo{runtimeID, {}, {}, {}, info});
     stateManager_.ClearPendingDelete(runtimeID);
     sandboxLifecycleStates_.erase(runtimeID);
 
@@ -456,19 +464,7 @@ litebus::Future<messages::StartInstanceResponse> SandboxdExecutor::OnStartComple
     const std::string &runtimeID, const messages::StartInstanceResponse &response)
 {
     stateManager_.MarkStartDone(runtimeID);
-    if (!stateManager_.IsPendingDelete(runtimeID)) {
-        return response;
-    }
-    YRLOG_INFO("runtime({}) started but has pending delete; cleaning up", runtimeID);
-    stateManager_.ClearPendingDelete(runtimeID);
-    if (response.code() == static_cast<int32_t>(StatusCode::SUCCESS)) {
-        auto stopReq = std::make_shared<messages::StopInstanceRequest>();
-        stopReq->set_runtimeid(runtimeID);
-        StopInstance(stopReq, false);
-    }
-    messages::StartInstanceResponse newRsp = response;
-    newRsp.set_requestid(response.requestid());
-    return newRsp;
+    return response;
 }
 
 // ── Warm-up path (Register a reusable SandboxTemplate) ───────────────────────
@@ -638,16 +634,9 @@ litebus::Future<messages::StartInstanceResponse> SandboxdExecutor::OnRestoreDone
         return GenFailStartInstanceResponse(request, RUNTIME_MANAGER_CREATE_EXEC_FAILED, response.message());
     }
     const std::string sandboxID = response.id();
-    stateManager_.UpdateSandboxID(info.runtimeid(), sandboxID);
-    // A successful Restore returns the same endpoint facts as Start. During
-    // exact-running reconciliation List does not expose those facts, so keep
-    // the endpoint already held by RuntimeStateManager instead of clearing it.
-    if (!result.sandboxIP.empty()) {
-        stateManager_.UpdateNetworkEndpoint(info.runtimeid(), result.sandboxIP);
-    }
+    stateManager_.UpdateSandboxID(info.runtimeid(), sandboxID, response.resource_generation());
     guard->Commit();
-    sandboxStatsPollingRuntimes_.insert(info.runtimeid());
-    CollectSandboxStats(info.runtimeid(), sandboxID);
+    StartSandboxStatsCollection(info.runtimeid(), sandboxID);
     DoWaitWithRetry(sandboxID, info.runtimeid(), 0);
     ReportMetrics(info.instanceid(), info.runtimeid(), sandboxID,
                   {"yr_app_instance_start_time", " start timestamp", "ms"});
@@ -739,12 +728,10 @@ litebus::Future<messages::StartInstanceResponse> SandboxdExecutor::OnStartDone(
     }
 
     const std::string sandboxID = response.id();
-    stateManager_.UpdateSandboxID(runtimeID, sandboxID);
-    stateManager_.UpdateNetworkEndpoint(runtimeID, response.sandbox_ip());
+    stateManager_.UpdateSandboxID(runtimeID, sandboxID, response.resource_generation());
     guard->Commit();
 
-    sandboxStatsPollingRuntimes_.insert(runtimeID);
-    CollectSandboxStats(runtimeID, sandboxID);
+    StartSandboxStatsCollection(runtimeID, sandboxID);
     DoWaitWithRetry(sandboxID, runtimeID, 0);
     ReportMetrics(info.instanceid(), runtimeID, sandboxID, { "yr_app_instance_start_time", " start timestamp", "ms" });
     YRLOG_INFO("{}|{}|StartNormal success: instance({}) runtime({}) sandbox({})", info.traceid(), info.requestid(),
@@ -760,6 +747,9 @@ litebus::Future<Status> SandboxdExecutor::StopInstance(const std::shared_ptr<mes
     const std::string &runtimeID = request->runtimeid();
     const std::string &requestID = request->requestid();
 
+    if (auto pending = deferredStops_.find(runtimeID); pending != deferredStops_.end()) {
+        return pending->second.completion->GetFuture();
+    }
     // Warm-up runtimes are teardown via the Unregister RPC, not Delete.
     if (warmupRuntimes_.count(runtimeID) > 0) {
         return UnregisterWarmUp(runtimeID, requestID);
@@ -770,31 +760,73 @@ litebus::Future<Status> SandboxdExecutor::StopInstance(const std::shared_ptr<mes
 litebus::Future<Status> SandboxdExecutor::StopSandbox(const std::string &runtimeID, const std::string &requestID,
                                                       bool oomKilled)
 {
-    if (stateManager_.IsStartInProgress(runtimeID)) {
-        YRLOG_INFO("{}|runtime({}) start in progress, marking pending delete", requestID, runtimeID);
-        stateManager_.MarkPendingDelete(runtimeID);
-        return Status::OK();
+    if (auto pending = deferredStops_.find(runtimeID); pending != deferredStops_.end()) {
+        return pending->second.completion->GetFuture();
+    }
+    if (auto start = stateManager_.GetInProgressFuture(runtimeID)) {
+        const auto source = stateManager_.Find(runtimeID);
+        if (!source || source->instanceInfo.requestid().empty() || deferredStops_.size() >= 4096) {
+            return Status(StatusCode::ERR_INSTANCE_BUSY, "create/stop identity unavailable or capacity exhausted");
+        }
+        auto completion = std::make_shared<litebus::Promise<Status>>();
+        const auto sourceRequest = source->instanceInfo.requestid();
+        deferredStops_[runtimeID] = {sourceRequest, completion};
+        completion->Associate(start->Then(litebus::Defer(GetAID(), &SandboxdExecutor::ResumeDeferredStop,
+            runtimeID, sourceRequest, requestID, oomKilled, std::placeholders::_1)));
+        completion->GetFuture().OnComplete(litebus::Defer(GetAID(), &SandboxdExecutor::FinishDeferredStop,
+            runtimeID, completion, std::placeholders::_1));
+        return completion->GetFuture();
     }
 
     const auto sandboxID = stateManager_.GetSandboxID(runtimeID);
     if (sandboxID.empty()) {
         YRLOG_WARN("{}|runtime({}) not found in state manager", requestID, runtimeID);
-        return Status::OK();
-    }
-
-    // Release checkpoint reference (no-op if this sandbox was not restored)
-    if (ckptOrch_ != nullptr) {
-        ckptOrch_->ReleaseRef(runtimeID, requestID);
+        return Status(StatusCode::ERR_INSTANCE_BUSY, "physical retirement unknown for missing runtime");
     }
 
     return TerminateSandbox(runtimeID, requestID, sandboxID, oomKilled);
 }
 
+void SandboxdExecutor::FinishDeferredStop(const std::string &runtimeID,
+    const std::shared_ptr<litebus::Promise<Status>> &completion, const litebus::Future<Status> &result)
+{
+    const auto pending = deferredStops_.find(runtimeID);
+    if (pending == deferredStops_.end() || pending->second.completion != completion) { return; }
+    // Retire only this completed successful attempt, after its local physical
+    // registration is gone. A timeout, missing observation or error never frees it.
+    if (!result.IsOK() || result.Get().IsError() || stateManager_.IsActive(runtimeID)
+        || stateManager_.IsStartInProgress(runtimeID)) { return; }
+    deferredStops_.erase(pending);
+}
+
+litebus::Future<Status> SandboxdExecutor::ResumeDeferredStop(const std::string &runtimeID,
+    const std::string &startRequestID, const std::string &stopRequestID, bool force,
+    const messages::StartInstanceResponse &started)
+{
+    const auto pending = deferredStops_.find(runtimeID);
+    const auto source = stateManager_.Find(runtimeID);
+    if (pending == deferredStops_.end() || pending->second.startRequestID != startRequestID
+        || !source || source->instanceInfo.requestid() != startRequestID
+        || started.requestid() != startRequestID || started.code() != static_cast<int32_t>(StatusCode::SUCCESS)) {
+        return Status(StatusCode::ERR_INSTANCE_BUSY, "create/stop outcome requires physical reconciliation");
+    }
+    if (warmupRuntimes_.count(runtimeID) > 0) { return UnregisterWarmUp(runtimeID, stopRequestID); }
+    if (source->sandboxID.empty() || source->resourceGeneration.empty()) {
+        return Status(StatusCode::ERR_INSTANCE_BUSY, "created sandbox has no physical retirement identity");
+    }
+    return TerminateSandbox(runtimeID, stopRequestID, source->sandboxID, force);
+}
+
 litebus::Future<Status> SandboxdExecutor::TerminateSandbox(const std::string &runtimeID, const std::string &requestID,
                                                            const std::string &sandboxID, bool force)
 {
+    const auto source = stateManager_.Find(runtimeID);
+    if (!source || source->sandboxID != sandboxID || source->registrationID.empty()) {
+        return Status(StatusCode::ERR_INSTANCE_BUSY, "sandbox source changed before delete");
+    }
     auto reclaimIt = sandboxReclaims_.find(runtimeID);
-    if (reclaimIt != sandboxReclaims_.end() && reclaimIt->second.sandboxID == sandboxID) {
+    if (reclaimIt != sandboxReclaims_.end() && reclaimIt->second.sandboxID == sandboxID
+        && reclaimIt->second.registrationID == source->registrationID) {
         YRLOG_INFO("{}|sandbox({}) runtime({}) is already being reclaimed locally; joining the retrying delete",
                    requestID, sandboxID, runtimeID);
         return reclaimIt->second.completion->GetFuture();
@@ -811,14 +843,20 @@ litebus::Future<Status> SandboxdExecutor::TerminateSandbox(const std::string &ru
     userInitiatedTerminateRuntimes_.insert(runtimeID);
     return DoDelete("", runtimeID, requestID, del)
         .Then(litebus::Defer(GetAID(), &SandboxdExecutor::OnDeleteDone, runtimeID, requestID, sandboxID,
-                             std::placeholders::_1));
+                             std::placeholders::_1, source->registrationID));
 }
 
 litebus::Future<Status> SandboxdExecutor::OnDeleteDone(const std::string &runtimeID, const std::string &requestID,
     const std::string &sandboxID,
-    const runtime::v1::DeleteResponse & /* response */)
+    const runtime::v1::DeleteResponse & /* response */, const std::string &registrationID)
 {
+    const auto current = stateManager_.Find(runtimeID);
+    if (!current || current->sandboxID != sandboxID || registrationID.empty()
+        || current->registrationID != registrationID) {
+        return Status(StatusCode::ERR_INSTANCE_BUSY, "stale sandbox deletion completion");
+    }
     YRLOG_INFO("{}|sandbox({}) deleted for runtime({})", requestID, sandboxID, runtimeID);
+    if (ckptOrch_ != nullptr) { ckptOrch_->ReleaseRef(runtimeID, requestID); }
 
     PortManager::GetInstance().ReleasePorts(runtimeID);
 
@@ -1037,7 +1075,9 @@ messages::ReconcileRuntimesResponse SandboxdExecutor::OnReconcileRuntimes(
     }
 
     auto now = std::chrono::steady_clock::now();
-    int32_t orphansCleaned = 0;
+    int32_t orphansCleaned = static_cast<int32_t>(completedOrphanDeletes_.size());
+    for (const auto &id : completedOrphanDeletes_) { response.add_orphanids(id); }
+    completedOrphanDeletes_.clear();
 
     CleanupExitedSandboxes(request->requestid(), listResp, &response, &orphansCleaned);
     CleanupOrphanSandboxes(ReconcileCleanupContext{ request->requestid(), listResp, expectedIDs, now, &response,
@@ -1061,10 +1101,9 @@ void SandboxdExecutor::CleanupExitedSandboxes(const std::string &requestID,
         }
         const auto &sandboxID = sandbox.id();
         YRLOG_INFO("{}|ReconcileRuntimes: deleting exited sandbox {}", requestID, sandboxID);
-        DeleteSandboxAsync(sandboxID);
-        orphanFirstSeen_.erase(sandboxID);
-        response->add_orphanids(sandboxID);
-        ++(*orphansCleaned);
+        const auto generation = sandbox.labels().find("akernel.scheduler/resource-generation");
+        if (generation == sandbox.labels().end() || generation->second.empty()) { continue; }
+        DeleteSandboxAsync(sandboxID, generation->second, requestID);
     }
 }
 
@@ -1077,6 +1116,7 @@ void SandboxdExecutor::CleanupOrphanSandboxes(const ReconcileCleanupContext &con
         const auto &sandboxID = sandbox.id();
 
         if (context.expectedIDs.count(sandboxID) > 0) {
+            orphanGenerations_.erase(sandboxID);
             if (orphanFirstSeen_.erase(sandboxID)) {
                 YRLOG_INFO("{}|ReconcileRuntimes: orphan timer cleared for {} (re-appeared in expected)",
                            context.requestID, sandboxID);
@@ -1084,6 +1124,13 @@ void SandboxdExecutor::CleanupOrphanSandboxes(const ReconcileCleanupContext &con
             continue;
         }
 
+        const auto generation = sandbox.labels().find("akernel.scheduler/resource-generation");
+        if (generation == sandbox.labels().end() || generation->second.empty()) { continue; }
+        if (orphanGenerations_[sandboxID] != generation->second) {
+            orphanGenerations_[sandboxID] = generation->second;
+            orphanFirstSeen_[sandboxID] = context.now;
+            continue;
+        }
         auto it = orphanFirstSeen_.find(sandboxID);
         if (it == orphanFirstSeen_.end()) {
             orphanFirstSeen_.emplace(sandboxID, context.now);
@@ -1098,12 +1145,9 @@ void SandboxdExecutor::CleanupOrphanSandboxes(const ReconcileCleanupContext &con
 
         YRLOG_INFO("{}|ReconcileRuntimes: deleting orphan sandbox {} (orphan for {}s)", context.requestID, sandboxID,
                    elapsedSec);
-        CleanupLocalRuntimeStateForOrphan(context.requestID, sandboxID);
-        DeleteSandboxAsync(sandboxID);
-        orphanFirstSeen_.erase(it);
-        context.actualRunningIDs->erase(sandboxID);
-        context.response->add_orphanids(sandboxID);
-        ++(*context.orphansCleaned);
+        DeleteSandboxAsync(sandboxID, generation->second, context.requestID);
+        // Keep the observed running set and local resources until a matching
+        // physical receipt arrives; dispatch is not a completed cleanup.
     }
 }
 
@@ -1150,6 +1194,7 @@ void SandboxdExecutor::AddMissingAndConfirmedEntries(const std::shared_ptr<messa
             stateManager_.Register(
                 {entry.runtimeid(), entry.containerid(), {}, entry.portmappings(), instanceInfo, {}});
             stateManager_.MarkStartDone(entry.runtimeid());
+            StartSandboxStatsCollection(entry.runtimeid(), entry.containerid());
             DoWaitWithRetry(entry.containerid(), entry.runtimeid(), 0);
         } else {
             stateManager_.UpdatePortMappings(entry.runtimeid(), entry.portmappings());
@@ -1166,7 +1211,7 @@ void SandboxdExecutor::CleanupLocalRuntimeStateForOrphan(const std::string &requ
 
     YRLOG_WARN(
         "{}|ReconcileRuntimes: orphan sandbox {} is still registered as runtime({}); "
-        "releasing local runtime resources before orphan delete",
+        "releasing local runtime resources after confirmed orphan delete",
         requestID, sandboxID, runtimeID);
 
     if (ckptOrch_ != nullptr) {
@@ -1182,6 +1227,7 @@ void SandboxdExecutor::PurgeOrphanTracking(const std::unordered_set<std::string>
 {
     for (auto it = orphanFirstSeen_.begin(); it != orphanFirstSeen_.end();) {
         if (actualRunningIDs.count(it->first) == 0) {
+            orphanGenerations_.erase(it->first);
             it = orphanFirstSeen_.erase(it);
         } else {
             ++it;
@@ -1189,33 +1235,64 @@ void SandboxdExecutor::PurgeOrphanTracking(const std::unordered_set<std::string>
     }
 }
 
-void SandboxdExecutor::DeleteSandboxAsync(const std::string &sandboxID)
+void SandboxdExecutor::DeleteSandboxAsync(const std::string &sandboxID, const std::string &generation,
+    const std::string &requestID)
 {
-    auto deleteReq = std::make_shared<runtime::v1::DeleteRequest>();
-    deleteReq->set_id(sandboxID);
-    deleteReq->set_timeout(CONTAINER_DELETE_TIMEOUT_SEC);
-    sandboxd_
-        ->CallAsync("Delete", *deleteReq, static_cast<runtime::v1::DeleteResponse *>(nullptr),
-                    &runtime::v1::SandboxService::Stub::AsyncDelete)
-        .Then([aid(GetAID()), sandboxID](litebus::Try<runtime::v1::DeleteResponse> rsp) -> litebus::Future<Status> {
-            return litebus::Async(aid, &SandboxdExecutor::OnDeleteSandboxComplete, sandboxID, rsp);
+    if (generation.empty() || orphanDeletes_.count(sandboxID) != 0 || orphanDeletes_.size() >= 4096
+        || completedOrphanDeletes_.size() >= 4096) { return; }
+    OrphanDeleteAttempt pending;
+    pending.generation = generation;
+    pending.requestID = requestID;
+    pending.ticket = litebus::uuid_generator::UUID::GetRandomUUID().ToString();
+    pending.runtimeID = stateManager_.FindRuntimeIDBySandboxID(sandboxID);
+    if (!pending.runtimeID.empty()) {
+        const auto source = stateManager_.Find(pending.runtimeID);
+        if (!source || source->resourceGeneration != generation) { return; }
+        pending.registrationID = source->registrationID;
+    }
+    auto command = std::make_shared<runtime::v1::DeleteIfGenerationRequest>();
+    command->set_id(sandboxID);
+    command->set_expected_generation(generation);
+    orphanDeletes_[sandboxID] = pending;
+    ASSERT_IF_NULL(sandboxd_);
+    sandboxd_->CallAsync("DeleteIfGeneration", *command,
+        static_cast<runtime::v1::DeleteIfGenerationResponse *>(nullptr),
+        &runtime::v1::SandboxService::Stub::AsyncDeleteIfGeneration)
+        .Then([aid(GetAID()), sandboxID, ticket(pending.ticket), command](
+            litebus::Try<runtime::v1::DeleteIfGenerationResponse> response) -> litebus::Future<Status> {
+            return litebus::Async(aid, &SandboxdExecutor::OnDeleteSandboxComplete, sandboxID, ticket, response);
         });
 }
 
-Status SandboxdExecutor::OnDeleteSandboxComplete(const std::string &sandboxID,
-    litebus::Try<runtime::v1::DeleteResponse> rsp)
+Status SandboxdExecutor::OnDeleteSandboxComplete(const std::string &sandboxID, const std::string &ticket,
+    litebus::Try<runtime::v1::DeleteIfGenerationResponse> rsp)
 {
-    if (rsp.IsOK()) {
-        YRLOG_INFO("DeleteSandboxAsync: sandbox({}) deleted", sandboxID);
+    const auto it = orphanDeletes_.find(sandboxID);
+    if (it == orphanDeletes_.end() || it->second.ticket != ticket) {
+        return Status(StatusCode::ERR_INSTANCE_BUSY, "stale orphan deletion completion");
+    }
+    const auto pending = it->second;
+    orphanDeletes_.erase(it);
+    if (rsp.IsOK() && rsp.Get().retired_generation() == pending.generation) {
+        const auto source = stateManager_.Find(pending.runtimeID);
+        if (source && source->sandboxID == sandboxID && source->registrationID == pending.registrationID
+            && source->resourceGeneration == pending.generation
+            && stateManager_.FindRuntimeIDBySandboxID(sandboxID) == pending.runtimeID) {
+            CleanupLocalRuntimeStateForOrphan(pending.requestID, sandboxID);
+        }
+        completedOrphanDeletes_.push_back(sandboxID);
+        YRLOG_INFO("{}|confirmed orphan delete sandbox({}) generation({})", pending.requestID, sandboxID,
+            pending.generation);
         return Status::OK();
     }
-    YRLOG_ERROR("DeleteSandboxAsync: sandbox({}) delete failed: {}, scheduling retry in ~{}s", sandboxID,
-                rsp.GetErrorCode(), kOrphanDeleteRetryIntervalSec);
-    auto retryFirstSeen = std::chrono::steady_clock::now() -
-                          std::chrono::seconds(static_cast<int64_t>(orphanGracePeriodSec_)) +
-                          std::chrono::seconds(static_cast<int64_t>(kOrphanDeleteRetryIntervalSec));
-    orphanFirstSeen_.emplace(sandboxID, retryFirstSeen);
-    return Status(StatusCode::ERR_INNER_SYSTEM_ERROR);
+    // Only this generation's timer may be moved by the failed attempt.
+    const auto observed = orphanGenerations_.find(sandboxID);
+    if (observed != orphanGenerations_.end() && observed->second == pending.generation) {
+        orphanFirstSeen_[sandboxID] = std::chrono::steady_clock::now()
+            - std::chrono::seconds(static_cast<int64_t>(orphanGracePeriodSec_))
+            + std::chrono::seconds(static_cast<int64_t>(kOrphanDeleteRetryIntervalSec));
+    }
+    return Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "orphan delete unconfirmed; ownership retained");
 }
 
 // ── Connectivity ──────────────────────────────────────────────────────────────
@@ -1369,19 +1446,24 @@ litebus::Future<runtime::v1::DeleteResponse> SandboxdExecutor::DoDelete(
     const std::string &instanceID, const std::string &runtimeID, const std::string &requestID,
     const std::shared_ptr<runtime::v1::DeleteRequest> &req)
 {
-    YRLOG_INFO("{}|DoDelete: sandbox({}) runtime({})", requestID, req->id(), runtimeID);
+    const auto source = stateManager_.Find(runtimeID);
+    if (!source || source->sandboxID != req->id() || source->resourceGeneration.empty()) {
+        return litebus::Status(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY));
+    }
+    auto command = std::make_shared<runtime::v1::DeleteIfGenerationRequest>();
+    command->set_id(req->id());
+    command->set_expected_generation(source->resourceGeneration);
     ASSERT_IF_NULL(sandboxd_);
-    return sandboxd_
-        ->CallAsync("Delete", *req, static_cast<runtime::v1::DeleteResponse *>(nullptr),
-                    &runtime::v1::SandboxService::Stub::AsyncDelete)
-        .Then([req, runtimeID, requestID](
-                  litebus::Try<runtime::v1::DeleteResponse> rsp) -> litebus::Future<runtime::v1::DeleteResponse> {
-            if (rsp.IsOK()) {
-                return rsp.Get();
+    return sandboxd_->CallAsync("DeleteIfGeneration", *command,
+        static_cast<runtime::v1::DeleteIfGenerationResponse *>(nullptr),
+        &runtime::v1::SandboxService::Stub::AsyncDeleteIfGeneration)
+        .Then([command](litebus::Try<runtime::v1::DeleteIfGenerationResponse> response)
+            -> litebus::Future<runtime::v1::DeleteResponse> {
+            if (!response.IsOK()) { return litebus::Status(response.GetErrorCode()); }
+            if (response.Get().retired_generation() != command->expected_generation()) {
+                return litebus::Status(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
             }
-            YRLOG_ERROR("{}|Delete gRPC failed for sandbox({}) runtime({}): {}", requestID, req->id(), runtimeID,
-                        rsp.GetErrorCode());
-            return litebus::Status(rsp.GetErrorCode());
+            return runtime::v1::DeleteResponse{};
         });
 }
 
@@ -1526,22 +1608,94 @@ void SandboxdExecutor::DoWaitWithRetry(const std::string &sandboxID, const std::
         });
 }
 
-void SandboxdExecutor::ScheduleSandboxStatsCollection(const std::string &runtimeID, const std::string &sandboxID)
+litebus::Future<messages::ResizeSandboxResponse> SandboxdExecutor::ResizeSandbox(
+    const std::shared_ptr<messages::ResizeSandboxRequest> &request)
 {
-    // D-7: the Stats poll is no longer Prometheus-only -- with the resource
-    // view reporter wired it also feeds per-instance actualuse, so it must
-    // run even when the metrics env knob is OFF (deploy strips container env)
-    if (!IsSandboxMetricsEnabled() && instanceMemoryUsageReporter_ == nullptr) {
-        return;
+    messages::ResizeSandboxResponse response;
+    if (request == nullptr) {
+        response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+        response.set_outcome(messages::ResizeSandboxResponse::REJECTED_BEFORE_DISPATCH);
+        response.set_message("resize request is missing");
+        return response;
     }
-    if (sandboxStatsPollingRuntimes_.count(runtimeID) == 0) {
-        return;
+    response.set_requestid(request->requestid());
+    response.set_instanceid(request->instanceid());
+    response.set_runtimeid(request->runtimeid());
+    response.set_sandboxid(request->resize().sandbox_id());
+    response.set_resourcegeneration(request->resize().resource_generation());
+    response.set_outcome(messages::ResizeSandboxResponse::REJECTED_BEFORE_DISPATCH);
+    response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+
+    const auto info = stateManager_.Find(request->runtimeid());
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    if (request->requestid().empty() || request->instanceid().empty() || request->runtimeid().empty()
+        || !request->has_resize() || request->resize().sandbox_id().empty()
+        || request->resize().resource_generation().empty()
+        || !request->resize().has_expected() || !request->resize().has_target()
+        || request->resize().deadline_unix_ms() <= nowMs || request->resize().deadline_unix_ms() > nowMs + 60000) {
+        response.set_message("resize requires valid request, identity, limits and unexpired deadline");
+        return response;
     }
-    if (stateManager_.GetSandboxID(runtimeID) != sandboxID) {
-        return;
+    if (!info.has_value() || !stateManager_.IsActive(request->runtimeid())
+        || info->instanceInfo.instanceid() != request->instanceid()
+        || stateManager_.GetSandboxID(request->runtimeid()) != request->resize().sandbox_id()) {
+        response.set_message("resize identity does not match an active local runtime");
+        return response;
     }
-    (void)litebus::AsyncAfter(SANDBOX_STATS_COLLECT_INTERVAL_MS, GetAID(), &SandboxdExecutor::CollectSandboxStats,
-                              runtimeID, sandboxID);
+    if (sandboxd_ == nullptr) {
+        response.set_message("sandboxd client unavailable before dispatch");
+        return response;
+    }
+
+    auto actual = std::make_shared<runtime::v1::ResizeResourcesResponse>();
+    // Keep both protobuf objects alive until gRPC completes. Never automatically
+    // retry a relative increase: the caller owns the fixed target and budget.
+    return sandboxd_->CallAsyncX("ResizeResources", request->resize(), actual.get(),
+        &runtime::v1::SandboxService::Stub::AsyncResizeResources, 5)
+        .Then([request, actual, response](const Status &status) mutable {
+            response.set_outcome(messages::ResizeSandboxResponse::UNKNOWN);
+            response.set_code(static_cast<int32_t>(status.StatusCode()));
+            response.set_message(status.RawMessage());
+            if (!status.IsOk()) {
+                // Even a transport failure can follow a successful write. The
+                // scheduler retains its reservation until same-generation Stats.
+                return response;
+            }
+            if (!actual->has_actual()
+                || actual->actual().resource_generation() != request->resize().resource_generation()
+                || !actual->actual().cpu_limits_known() || actual->actual().cpu_quota_usec() <= 0
+                || actual->actual().cpu_period_usec() == 0 || actual->actual().memory_limit_bytes() == 0
+                || actual->actual().memory_limit_bytes() > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+                response.set_message("resize response lacks matching finite resource readback");
+                return response;
+            }
+            // OBSERVED includes partial writes (complete=false). Passing this
+            // result through must not release the whole reservation on failure.
+            response.set_outcome(messages::ResizeSandboxResponse::OBSERVED);
+            *response.mutable_result() = *actual;
+            return response;
+        });
+}
+
+void SandboxdExecutor::StartSandboxStatsCollection(const std::string &runtimeID, const std::string &sandboxID)
+{
+    sandboxStatsSnapshots_.erase(runtimeID);
+    const auto ticket = sandboxStatsPolls_.Start(runtimeID);
+    CollectSandboxStats(runtimeID, sandboxID, ticket);
+}
+
+void SandboxdExecutor::ScheduleSandboxStatsCollection(const std::string &runtimeID, const std::string &sandboxID,
+    uint64_t ticket, std::chrono::steady_clock::time_point collectedAt)
+{
+    // Maintain start-to-start cadence without overlapping requests or catching
+    // up missed ticks in a burst. Slow calls remain visible as wider windows.
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - collectedAt).count();
+    const auto delayMs = SandboxStatsPolls::NextDelayMs(elapsedMs, SANDBOX_STATS_COLLECT_INTERVAL_MS);
+    (void)litebus::AsyncAfter(delayMs, GetAID(), &SandboxdExecutor::CollectSandboxStats,
+                              runtimeID, sandboxID, ticket);
 }
 
 void SandboxdExecutor::ScheduleRunningStatusHeartbeat(const std::string &runtimeID)
@@ -1571,16 +1725,18 @@ void SandboxdExecutor::ReportRunningStatusHeartbeat(const std::string &runtimeID
     ScheduleRunningStatusHeartbeat(runtimeID);
 }
 
-void SandboxdExecutor::CollectSandboxStats(const std::string &runtimeID, const std::string &sandboxID)
+void SandboxdExecutor::CollectSandboxStats(const std::string &runtimeID, const std::string &sandboxID,
+    uint64_t ticket)
 {
     // D-7: see ScheduleSandboxStatsCollection -- reporter implies collect
-    if (!IsSandboxMetricsEnabled() && instanceMemoryUsageReporter_ == nullptr) {
-        return;
-    }
-    if (sandboxStatsPollingRuntimes_.count(runtimeID) == 0) {
+    if (!IsSandboxMetricsEnabled() && instanceResourceSampleReporter_ == nullptr) {
         return;
     }
     if (sandboxID.empty() || stateManager_.GetSandboxID(runtimeID) != sandboxID) {
+        return;
+    }
+
+    if (!sandboxStatsPolls_.Begin(runtimeID, ticket)) {
         return;
     }
 
@@ -1590,24 +1746,26 @@ void SandboxdExecutor::CollectSandboxStats(const std::string &runtimeID, const s
     auto collectedAt = std::chrono::steady_clock::now();
 
     ASSERT_IF_NULL(sandboxd_);
-    sandboxd_->CallAsyncX("Stats", *req, resp.get(), &runtime::v1::SandboxService::Stub::AsyncStats)
-        .Then([runtimeID, sandboxID, resp, collectedAt,
+    sandboxd_->CallAsyncX("Stats", *req, resp.get(), &runtime::v1::SandboxService::Stub::AsyncStats, 1)
+        .Then([runtimeID, sandboxID, req, resp, collectedAt, ticket,
                aid(GetAID())](const Status &status) -> litebus::Future<Status> {
             runtime::v1::StatsResponse statsResponse;
             if (status.IsOk()) {
                 statsResponse = *resp;
             }
             return litebus::Async(aid, &SandboxdExecutor::OnSandboxStatsCollected, runtimeID, sandboxID, status,
-                                  statsResponse, collectedAt);
+                                  statsResponse, collectedAt, ticket);
         });
 }
 
 litebus::Future<Status> SandboxdExecutor::OnSandboxStatsCollected(const std::string &runtimeID,
                                                                   const std::string &sandboxID, const Status &status,
                                                                   const runtime::v1::StatsResponse &response,
-                                                                  std::chrono::steady_clock::time_point collectedAt)
+                                                                  std::chrono::steady_clock::time_point collectedAt,
+                                                                  uint64_t ticket)
 {
-    if (sandboxStatsPollingRuntimes_.count(runtimeID) == 0) {
+    const auto nextTicket = sandboxStatsPolls_.Complete(runtimeID, ticket);
+    if (!nextTicket.has_value()) {
         return Status::OK();
     }
     if (sandboxID.empty() || stateManager_.GetSandboxID(runtimeID) != sandboxID) {
@@ -1615,16 +1773,19 @@ litebus::Future<Status> SandboxdExecutor::OnSandboxStatsCollected(const std::str
     }
 
     if (!status.IsOk()) {
+        // The next success is a new baseline, not an average spanning an
+        // unobserved interval. Stale tickets return above without touching it.
+        sandboxStatsSnapshots_.erase(runtimeID);
         YRLOG_WARN("OnSandboxStatsCollected: runtime({}) sandbox({}) stats failed: {}", runtimeID, sandboxID,
                    status.RawMessage());
-        ScheduleSandboxStatsCollection(runtimeID, sandboxID);
+        ScheduleSandboxStatsCollection(runtimeID, sandboxID, *nextTicket, collectedAt);
         return Status::OK();
     }
 
     if (auto info = stateManager_.Find(runtimeID)) {
         ReportSandboxUsageMetrics(info->instanceInfo, runtimeID, response, collectedAt);
     }
-    ScheduleSandboxStatsCollection(runtimeID, sandboxID);
+    ScheduleSandboxStatsCollection(runtimeID, sandboxID, *nextTicket, collectedAt);
     return Status::OK();
 }
 
@@ -1667,10 +1828,12 @@ litebus::Future<Status> SandboxdExecutor::CleanupSandboxAfterMaxRetries(const st
 void SandboxdExecutor::StartSandboxReclaim(const std::string &runtimeID, const std::string &sandboxID,
                                            const std::string &requestID)
 {
+    const auto source = stateManager_.Find(runtimeID);
+    if (!source || source->sandboxID != sandboxID || source->registrationID.empty()) { return; }
     auto [it, inserted] = sandboxReclaims_.try_emplace(
-        runtimeID, SandboxReclaimState{ sandboxID, 0, std::make_shared<litebus::Promise<Status>>() });
+        runtimeID, SandboxReclaimState{ sandboxID, 0, std::make_shared<litebus::Promise<Status>>(), source->registrationID });
     if (!inserted) {
-        if (it->second.sandboxID == sandboxID) {
+        if (it->second.sandboxID == sandboxID && it->second.registrationID == source->registrationID) {
             YRLOG_WARN("{}|sandbox({}) runtime({}) reclaim is already scheduled", requestID, sandboxID, runtimeID);
             return;
         }
@@ -1690,17 +1853,19 @@ void SandboxdExecutor::StartSandboxReclaim(const std::string &runtimeID, const s
     YRLOG_WARN("{}|starting local reclaim for sandbox({}) runtime({}); delete failures will be retried with "
                "exponential backoff capped at {}ms",
                requestID, sandboxID, runtimeID, kSandboxReclaimMaxBackoffMs);
-    (void)litebus::Async(GetAID(), &SandboxdExecutor::ReclaimSandbox, runtimeID, sandboxID, requestID);
+    (void)litebus::Async(GetAID(), &SandboxdExecutor::ReclaimSandbox, runtimeID, sandboxID, requestID, source->registrationID);
 }
 
 void SandboxdExecutor::ReclaimSandbox(const std::string &runtimeID, const std::string &sandboxID,
-                                      const std::string &requestID)
+                                      const std::string &requestID, const std::string &registrationID)
 {
     auto reclaimIt = sandboxReclaims_.find(runtimeID);
-    if (reclaimIt == sandboxReclaims_.end() || reclaimIt->second.sandboxID != sandboxID) {
+    if (reclaimIt == sandboxReclaims_.end() || reclaimIt->second.sandboxID != sandboxID
+        || reclaimIt->second.registrationID != registrationID) {
         return;
     }
-    if (stateManager_.GetSandboxID(runtimeID) != sandboxID) {
+    const auto source = stateManager_.Find(runtimeID);
+    if (!source || source->sandboxID != sandboxID || source->registrationID != registrationID) {
         YRLOG_ERROR("{}|stop retrying local reclaim for sandbox({}) runtime({}): runtime ownership changed",
                     requestID, sandboxID, runtimeID);
         reclaimIt->second.completion->SetValue(
@@ -1710,47 +1875,53 @@ void SandboxdExecutor::ReclaimSandbox(const std::string &runtimeID, const std::s
         return;
     }
 
-    auto deleteReq = std::make_shared<runtime::v1::DeleteRequest>();
+    if (source->resourceGeneration.empty()) {
+        reclaimIt->second.completion->SetValue(
+            Status(StatusCode::ERR_INSTANCE_BUSY, "physical generation unknown; reconcile before reclaim"));
+        return;
+    }
+    auto deleteReq = std::make_shared<runtime::v1::DeleteIfGenerationRequest>();
     deleteReq->set_id(sandboxID);
-    deleteReq->set_timeout(0);
+    deleteReq->set_expected_generation(source->resourceGeneration);
     ASSERT_IF_NULL(sandboxd_);
-    sandboxd_
-        ->CallAsync("Delete", *deleteReq, static_cast<runtime::v1::DeleteResponse *>(nullptr),
-                    &runtime::v1::SandboxService::Stub::AsyncDelete)
-        .Then([aid(GetAID()), runtimeID, sandboxID,
-               requestID](litebus::Try<runtime::v1::DeleteResponse> response) -> litebus::Future<Status> {
-            return litebus::Async(aid, &SandboxdExecutor::OnReclaimSandboxDone, runtimeID, sandboxID, requestID,
-                                  response);
+    sandboxd_->CallAsync("DeleteIfGeneration", *deleteReq,
+        static_cast<runtime::v1::DeleteIfGenerationResponse *>(nullptr),
+        &runtime::v1::SandboxService::Stub::AsyncDeleteIfGeneration)
+        .Then([aid(GetAID()), runtimeID, sandboxID, requestID, registrationID, deleteReq](
+            litebus::Try<runtime::v1::DeleteIfGenerationResponse> response) -> litebus::Future<Status> {
+            litebus::Try<runtime::v1::DeleteResponse> verified =
+                response.IsOK() && response.Get().retired_generation() == deleteReq->expected_generation()
+                ? litebus::Try<runtime::v1::DeleteResponse>(runtime::v1::DeleteResponse{})
+                : litebus::Try<runtime::v1::DeleteResponse>(response.IsOK()
+                    ? static_cast<int32_t>(GRPC_INTERNAL) : response.GetErrorCode());
+            return litebus::Async(aid, &SandboxdExecutor::OnReclaimSandboxDone, runtimeID, sandboxID,
+                requestID, verified, registrationID);
         });
 }
 
 litebus::Future<Status> SandboxdExecutor::OnReclaimSandboxDone(
     const std::string &runtimeID, const std::string &sandboxID, const std::string &requestID,
-    litebus::Try<runtime::v1::DeleteResponse> response)
+    litebus::Try<runtime::v1::DeleteResponse> response, const std::string &registrationID)
 {
     auto reclaimIt = sandboxReclaims_.find(runtimeID);
-    if (reclaimIt == sandboxReclaims_.end() || reclaimIt->second.sandboxID != sandboxID) {
+    if (reclaimIt == sandboxReclaims_.end() || reclaimIt->second.sandboxID != sandboxID
+        || reclaimIt->second.registrationID != registrationID) {
         YRLOG_INFO("{}|ignore completed reclaim for stale sandbox({}) runtime({})", requestID, sandboxID, runtimeID);
         return Status::OK();
     }
 
-    if (response.IsOK() || response.GetErrorCode() == static_cast<int32_t>(GRPC_NOT_FOUND)) {
-        if (response.IsOK()) {
-            YRLOG_INFO("{}|local reclaim deleted sandbox({}) runtime({}) after {} failed attempt(s)", requestID,
-                       sandboxID, runtimeID, reclaimIt->second.failedAttempts);
-            return OnDeleteDone(runtimeID, requestID, sandboxID, response.Get());
-        }
-        YRLOG_WARN("{}|sandbox({}) runtime({}) was already absent during local reclaim; releasing retained resources",
-                   requestID, sandboxID, runtimeID);
-        return OnDeleteDone(runtimeID, requestID, sandboxID, runtime::v1::DeleteResponse{});
+    if (response.IsOK()) {
+        return OnDeleteDone(runtimeID, requestID, sandboxID, response.Get(), registrationID);
     }
+    // NotFound is not a generation receipt: a lost ack or daemon restart needs
+    // authoritative reconciliation, never an unconditional deletion fallback.
 
     ++reclaimIt->second.failedAttempts;
     const auto delayMs = SandboxReclaimBackoffMs(reclaimIt->second.failedAttempts);
     YRLOG_ERROR("{}|local reclaim failed for sandbox({}) runtime({}), grpcCode({}), failedAttempts({}); retrying in "
                 "{}ms",
                 requestID, sandboxID, runtimeID, response.GetErrorCode(), reclaimIt->second.failedAttempts, delayMs);
-    (void)litebus::AsyncAfter(delayMs, GetAID(), &SandboxdExecutor::ReclaimSandbox, runtimeID, sandboxID, requestID);
+    (void)litebus::AsyncAfter(delayMs, GetAID(), &SandboxdExecutor::ReclaimSandbox, runtimeID, sandboxID, requestID, registrationID);
     return Status(StatusCode::ERR_INNER_COMMUNICATION, "sandbox reclaim delete failed; retry scheduled");
 }
 
@@ -1862,6 +2033,29 @@ void SandboxdExecutor::ReportSandboxUsageMetrics(const messages::RuntimeInstance
     std::chrono::steady_clock::time_point collectedAt)
 {
     const auto sandboxID = stateManager_.GetSandboxID(runtimeID);
+
+    // A server that cannot read a usage field returns the protobuf zero
+    // default, which is indistinguishable from a genuine idle/empty reading.
+    // Never feed such a sample to gauges, the resource view, or the CPU
+    // baseline: drop it, break differencing so the next known sample restarts
+    // from a fresh baseline, and keep reporting requested (booked, not
+    // observed) resources only. A known zero passes this gate on purpose.
+    if (!response.cpu_usage_known() || !response.memory_usage_known() || !response.memory_limit_known()) {
+        sandboxStatsSnapshots_.erase(runtimeID);
+        const json unknownSample = {
+            {"schema", 1}, {"event", "stats_usage_unknown"}, {"instance_id", info.instanceid()},
+            {"runtime_id", runtimeID}, {"sandbox_id", sandboxID},
+            {"resource_generation", response.resource_generation()},
+            {"cpu_usage_known", response.cpu_usage_known()},
+            {"memory_usage_known", response.memory_usage_known()},
+            {"memory_limit_known", response.memory_limit_known()},
+            {"memory_peak_known", response.memory_peak_known()},
+        };
+        YRLOG_WARN("[scheduler-resource] {}", unknownSample.dump());
+        ReportSandboxRequestedResources(info, runtimeID);
+        return;
+    }
+
     auto labels = BuildSandboxMetricLabels(info, runtimeID, sandboxID);
 
     ReportSandboxGauge(
@@ -1882,26 +2076,94 @@ void SandboxdExecutor::ReportSandboxUsageMetrics(const messages::RuntimeInstance
     // W17: the bridge log now also carries the delta-derived CPU cores so
     // per-trial CPU curves are reconstructable from logs (memory-only before).
     auto previousIt = sandboxStatsSnapshots_.find(runtimeID);
+    const bool samePhysical = previousIt != sandboxStatsSnapshots_.end()
+        && !response.resource_generation().empty()
+        && previousIt->second.resourceGeneration == response.resource_generation();
     double cpuUsageCores = -1.0;
-    if (previousIt != sandboxStatsSnapshots_.end()) {
+    int64_t cpuWindowNs = 0;
+    if (samePhysical) {
         const auto elapsedNs =
             std::chrono::duration_cast<std::chrono::nanoseconds>(collectedAt - previousIt->second.collectedAt).count();
-        if (elapsedNs > 0 && response.cpu_usage_ns() >= previousIt->second.cpuUsageNs) {
-            cpuUsageCores = static_cast<double>(response.cpu_usage_ns() - previousIt->second.cpuUsageNs)
-                            / static_cast<double>(elapsedNs);
+        const auto cores = SandboxCpuCores(previousIt->second.cpuUsageNs, response.cpu_usage_ns(), elapsedNs);
+        if (cores.has_value()) {
+            cpuWindowNs = elapsedNs;
+            cpuUsageCores = *cores;
             ReportSandboxGauge({ functionsystem::metrics::YR_SANDBOX_CPU_USAGE_CORES,
                   "sandbox cpu usage expressed as used cores", "cores" },
                 labels, cpuUsageCores);
         }
     }
-    if (instanceMemoryUsageReporter_ != nullptr) {
+    // Effective limits come from cgroup accounting, not the original booking.
+    // A structured per-runtime event lets collectors retain each observation
+    // without merging unrelated instances or treating missing CPU as zero.
+    const auto timestampMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto requestAgeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - collectedAt).count();
+    const json sample = {
+        {"schema", 1}, {"instance_id", info.instanceid()}, {"runtime_id", runtimeID},
+        {"sandbox_id", sandboxID}, {"timestamp_ms", timestampMs},
+        {"sampled_at_unix_ms", timestampMs - requestAgeMs},
+        {"stats_request_duration_ms", requestAgeMs}, {"cpu_window_ns", cpuWindowNs},
+        {"resource_generation", response.resource_generation()},
+        {"cpu_pressure_known", response.cpu_pressure_known()},
+        {"cpu_periods", response.cpu_periods()},
+        {"cpu_throttled_periods", response.cpu_throttled_periods()},
+        {"cpu_throttled_ns", response.cpu_throttled_ns()},
+        {"memory_pressure_known", response.memory_pressure_known()},
+        {"memory_high_events", response.memory_high_events()},
+        {"memory_oom_events", response.memory_oom_events()},
+        {"memory_oom_kill_events", response.memory_oom_kill_events()},
+
+        {"elastic_policy", response.elastic_policy()},
+        {"first_observation", !samePhysical},
+        {"cpu_usage_ns", response.cpu_usage_ns()}, {"cpu_usage_cores", cpuUsageCores},
+        {"cpu_usage_known", response.cpu_usage_known()},
+        {"cpu_limits_known", response.cpu_limits_known()},
+        {"cpu_quota_usec", response.cpu_quota_usec()}, {"cpu_period_usec", response.cpu_period_usec()},
+        {"memory_current_bytes", response.memory_usage_bytes()},
+        {"memory_usage_known", response.memory_usage_known()},
+        {"memory_max_bytes", response.memory_limit_bytes()},
+        {"memory_limit_known", response.memory_limit_known()},
+        // Legacy servers may still fill the numeric peak without its flag;
+        // only the flag says whether it is an observation.
+        {"memory_peak_bytes", response.memory_max_usage_bytes()},
+        {"memory_peak_known", response.memory_peak_known()}
+    };
+    YRLOG_INFO("[scheduler-resource] {}", sample.dump());
+    if (instanceResourceSampleReporter_ != nullptr) {
         const double memoryMb = static_cast<double>(response.memory_usage_bytes()) / (1024.0 * 1024.0);
         YRLOG_INFO("[D-7] sandbox stats bridge: instance({}) runtime({}) memory {} MB cpu {} cores", info.instanceid(),
                    runtimeID, memoryMb, cpuUsageCores);
-        instanceMemoryUsageReporter_(info.instanceid(), memoryMb);
+        resources::SandboxResourceSample observation;
+        observation.set_runtime_id(runtimeID);
+        observation.set_sandbox_id(sandboxID);
+        observation.set_resource_generation(response.resource_generation());
+        observation.set_sampled_at_unix_ms(timestampMs - requestAgeMs);
+        observation.set_cpu_usage_ns(response.cpu_usage_ns());
+        observation.set_cpu_usage_known(cpuUsageCores >= 0.0);
+        observation.set_cpu_usage_cores(cpuUsageCores >= 0.0 ? cpuUsageCores : 0.0);
+        observation.set_cpu_limits_known(response.cpu_limits_known());
+        observation.set_cpu_quota_usec(response.cpu_quota_usec());
+        observation.set_cpu_period_usec(response.cpu_period_usec());
+        observation.set_memory_current_bytes(response.memory_usage_bytes());
+        observation.set_memory_limit_bytes(response.memory_limit_bytes());
+        observation.set_memory_peak_bytes(response.memory_max_usage_bytes());
+        observation.set_elastic_policy(response.elastic_policy());
+        observation.set_cpu_pressure_known(response.cpu_pressure_known());
+        observation.set_cpu_periods(response.cpu_periods());
+        observation.set_cpu_throttled_periods(response.cpu_throttled_periods());
+        observation.set_cpu_throttled_ns(response.cpu_throttled_ns());
+        observation.set_memory_pressure_known(response.memory_pressure_known());
+        observation.set_memory_high_events(response.memory_high_events());
+        observation.set_memory_oom_events(response.memory_oom_events());
+        observation.set_memory_oom_kill_events(response.memory_oom_kill_events());
+
+        instanceResourceSampleReporter_(info.instanceid(), observation);
     }
 
-    sandboxStatsSnapshots_[runtimeID] = SandboxStatsSnapshot{ response.cpu_usage_ns(), collectedAt };
+    sandboxStatsSnapshots_[runtimeID] = SandboxStatsSnapshot{
+        response.cpu_usage_ns(), collectedAt, response.resource_generation() };
 
     ReportSandboxRequestedResources(info, runtimeID);
 }
@@ -1909,7 +2171,7 @@ void SandboxdExecutor::ReportSandboxUsageMetrics(const messages::RuntimeInstance
 void SandboxdExecutor::ClearSandboxMetricsState(const std::string &runtimeID)
 {
     sandboxStatsSnapshots_.erase(runtimeID);
-    sandboxStatsPollingRuntimes_.erase(runtimeID);
+    sandboxStatsPolls_.Stop(runtimeID);
     userInitiatedTerminateRuntimes_.erase(runtimeID);
     sandboxRunningStartTimes_.erase(runtimeID);
 }

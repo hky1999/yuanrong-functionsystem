@@ -31,7 +31,6 @@
 #include "idle/idle_mgr.h"
 #include "instance_ctrl_actor.h"
 #include "local_scheduler/subscription_manager/subscription_mgr.h"
-#include "local_scheduler/instance_control/frontend_create_failure_snapshot.h"
 
 namespace functionsystem::local_scheduler {
 
@@ -269,29 +268,12 @@ public:
     virtual litebus::Future<KillResponse> KillFrontend(const std::string &tenantID,
                                                        const std::shared_ptr<KillRequest> &killReq);
     virtual litebus::Future<FrontendKillCleanupSnapshot> ProbeFrontendKillCleanup(
-        const std::string &requestID, const std::string &instanceID, uint64_t delayMs = 0);
-    virtual void RecordFrontendCreateFailure(const std::string &requestID, int32_t code,
-                                             const std::string &message, const std::string &instanceID,
-                                             const InstanceInfo &instance);
-    virtual litebus::Future<FrontendCreateFailureSnapshot> TakeFrontendCreateFailureSnapshot(
-        const std::string &requestID);
-    virtual void EraseFrontendCreateFailure(const std::string &requestID);
+        const std::string &requestID, const std::string &instanceID);
     virtual litebus::Future<Status> ForceDeleteInstance(const std::string &instanceID);
 
-    virtual litebus::Future<Status> TryLocalSnapshotFailover(
-        const std::string &instanceID, const std::string &sourceRuntimeID);
-    virtual litebus::Future<Status> ReleaseRuntimeForPause(
-        const resource_view::InstanceInfo &instanceInfo, const std::string &snapshotID);
-
-    virtual litebus::Future<Status> ReleasePausedInstanceResources(
-        const resource_view::InstanceInfo &instanceInfo);
-
-    virtual litebus::Future<Status> BeginPauseGate(const resource_view::InstanceInfo &identity);
-
-    virtual litebus::Future<Status> RecoverPauseGate(const resource_view::InstanceInfo &identity);
-
-    virtual litebus::Future<bool> IsPauseRuntimeFenced(
-        const std::string &instanceID, const std::string &runtimeID);
+    // Snapshot retirement must not target a replacement sharing the logical ID.
+    virtual litebus::Future<Status> RetireSnapshotSource(const std::string &instanceID,
+        const std::shared_ptr<InstanceStateMachine> &source, const std::string &runtimeID);
 
     virtual litebus::Future<std::shared_ptr<ControlInterfacePosixClient>> CreateInstanceClient(
         const std::string &instanceID, const std::string &runtimeID, const std::string &address)
@@ -315,21 +297,7 @@ public:
     virtual litebus::Future<messages::DeployInstanceResponse> DeploySnapStartInstance(
         const std::shared_ptr<messages::ScheduleRequest> &scheduleReq)
     {
-        using DeployPauseMethod = litebus::Future<messages::DeployInstanceResponse> (InstanceCtrlActor::*)(
-            const std::shared_ptr<messages::ScheduleRequest> &);
-        return litebus::Async(aid_, static_cast<DeployPauseMethod>(&InstanceCtrlActor::DeploySnapStartInstance),
-                              scheduleReq);
-    }
-
-    virtual litebus::Future<messages::DeployInstanceResponse> DeploySnapStartInstance(
-        const std::shared_ptr<messages::ScheduleRequest> &scheduleReq,
-        const resume_identity::TrustedResumeIdentity &trustedResumeIdentity)
-    {
-        using DeployResumeMethod = litebus::Future<messages::DeployInstanceResponse> (InstanceCtrlActor::*)(
-            const std::shared_ptr<messages::ScheduleRequest> &,
-            const resume_identity::TrustedResumeIdentity &);
-        return litebus::Async(aid_, static_cast<DeployResumeMethod>(&InstanceCtrlActor::DeploySnapStartInstance),
-                              scheduleReq, trustedResumeIdentity);
+        return litebus::Async(aid_, &InstanceCtrlActor::DeploySnapStartInstance, scheduleReq);
     }
 
     /**

@@ -29,6 +29,7 @@
 #include <sys/utsname.h>
 
 #include "async/future.hpp"
+#include "async/uuid_generator.hpp"
 #include "common/constants/actor_name.h"
 #include "common/logs/logging.h"
 #include "common/metrics/metrics_adapter.h"
@@ -789,9 +790,29 @@ void AgentServiceActor::KillInstance(const litebus::AID &from, std::string &&nam
         return;
     }
 
-    killingRequest_[requestID] = { from, killInstanceRequest };
+    if (requestID.empty()) { return; }
+    for (const auto &entry : killingRequest_) {
+        if (entry.second.from == from && entry.second.request->requestid() == requestID) {
+            // Never replace ownership or re-dispatch an unresolved stop attempt.
+            YRLOG_WARN("ignore already pending kill request {}", requestID);
+            return;
+        }
+    }
+    if (killingRequest_.size() >= 4096) {
+        InitKillInstanceResponse(&rsp, *killInstanceRequest);
+        rsp.set_code(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY));
+        rsp.set_message("stop attempt capacity exhausted; no new dispatch");
+        Send(from, "KillInstanceResponse", rsp.SerializeAsString());
+        return;
+    }
+    // The caller may reuse its request ID after a response. A fresh wire ID keeps
+    // a delayed runtime-manager response from completing the next attempt.
+    const auto forwardID = litebus::uuid_generator::UUID::GetRandomUUID().ToString();
+    const litebus::AID runtimeManager(registerRuntimeMgr_.name, registerRuntimeMgr_.address);
+    killingRequest_[forwardID] = { from, killInstanceRequest, runtimeManager, registerRuntimeMgr_.id };
     messages::StopInstanceRequest stopInstanceRequest;
     function_agent::SetStopRuntimeInstanceRequest(stopInstanceRequest, killInstanceRequest);
+    stopInstanceRequest.set_requestid(forwardID);
     YRLOG_INFO("{}|received Kill instance({}) request. Send stop runtime({}) request to RuntimeManager({}-{}).",
                killInstanceRequest->requestid(), killInstanceRequest->instanceid(), killInstanceRequest->runtimeid(),
                registerRuntimeMgr_.name, registerRuntimeMgr_.address);
@@ -799,6 +820,288 @@ void AgentServiceActor::KillInstance(const litebus::AID &from, std::string &&nam
          stopInstanceRequest.SerializeAsString());
 }
 
+void AgentServiceActor::ResizeSandbox(const litebus::AID &from, std::string &&, std::string &&msg)
+{
+    if (localSchedFuncAgentMgrAID_.Name().empty() || from != localSchedFuncAgentMgrAID_) {
+        YRLOG_WARN("reject ResizeSandbox from unregistered scheduler {}", from.HashString());
+        return;
+    }
+    auto request = std::make_shared<messages::ResizeSandboxRequest>();
+    if (msg.size() > 64 * 1024 || !request->ParseFromString(msg)) {
+        return;
+    }
+    for (const auto &entry : resizeRequests_) {
+        if (entry.second.requester == from && entry.second.request->requestid() == request->requestid()) {
+            // The first dispatch may already have written. A duplicate is not
+            // a new pre-dispatch rejection and must not release its reservation.
+            messages::ResizeSandboxResponse response;
+            const auto &pending = *entry.second.request;
+            response.set_requestid(pending.requestid());
+            response.set_instanceid(pending.instanceid());
+            response.set_runtimeid(pending.runtimeid());
+            response.set_sandboxid(pending.resize().sandbox_id());
+            response.set_resourcegeneration(pending.resize().resource_generation());
+            response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+            response.set_message("resize reservation already in flight; retain budget and reconcile");
+            response.set_outcome(messages::ResizeSandboxResponse::UNKNOWN);
+            Send(from, "ResizeSandboxResponse", response.SerializeAsString());
+            return;
+        }
+    }
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    if (!isRegisterCompleted_ || !registerRuntimeMgr_.registered || registerRuntimeMgr_.name.empty()
+        || registerRuntimeMgr_.address.empty() || request->requestid().empty()
+        || request->instanceid().empty() || request->runtimeid().empty()
+        || !request->has_resize() || request->resize().deadline_unix_ms() <= nowMs
+        || request->resize().deadline_unix_ms() > nowMs + 60000 || resizeRequests_.size() >= 1024) {
+        messages::ResizeSandboxResponse response;
+        response.set_requestid(request->requestid());
+        response.set_instanceid(request->instanceid());
+        response.set_runtimeid(request->runtimeid());
+        response.set_sandboxid(request->resize().sandbox_id());
+        response.set_resourcegeneration(request->resize().resource_generation());
+        response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+        response.set_message("resize route unavailable, invalid identity/deadline or pending limit reached");
+        response.set_outcome(messages::ResizeSandboxResponse::REJECTED_BEFORE_DISPATCH);
+        Send(from, "ResizeSandboxResponse", response.SerializeAsString());
+        return;
+    }
+    const litebus::AID runtimeManager(registerRuntimeMgr_.name, registerRuntimeMgr_.address);
+    // A private forwarding ID prevents an old response/timeout from completing
+    // another relay operation. Scheduler reservation IDs must remain unique;
+    // the private ID protects this hop, not an upstream ledger that reuses IDs.
+    const auto forwardID = litebus::uuid_generator::UUID::GetRandomUUID().ToString();
+    auto forwarded = *request;
+    forwarded.set_requestid(forwardID);
+    auto timeout = litebus::AsyncAfter(10000, GetAID(), &AgentServiceActor::ResizeSandboxTimeout, forwardID);
+    resizeRequests_.emplace(forwardID, ResizePending{from, runtimeManager, request, timeout});
+    Send(runtimeManager, "ResizeSandbox", forwarded.SerializeAsString());
+}
+
+void AgentServiceActor::ResizeSandboxResponse(const litebus::AID &from, std::string &&, std::string &&msg)
+{
+    messages::ResizeSandboxResponse response;
+    if (msg.size() > 64 * 1024 || !response.ParseFromString(msg)) {
+        return;
+    }
+    auto it = resizeRequests_.find(response.requestid());
+    if (it == resizeRequests_.end() || from != it->second.runtimeManager) {
+        return;
+    }
+    const auto &request = *it->second.request;
+    if (response.instanceid() != request.instanceid() || response.runtimeid() != request.runtimeid()
+        || response.sandboxid() != request.resize().sandbox_id()
+        || response.resourcegeneration() != request.resize().resource_generation()) {
+        return;  // keep the timer/reservation; this is not a reply to our command
+    }
+    response.set_requestid(request.requestid());
+    litebus::TimerTools::Cancel(it->second.timeout);
+    Send(it->second.requester, "ResizeSandboxResponse", response.SerializeAsString());
+    resizeRequests_.erase(it);
+}
+
+void AgentServiceActor::ResizeSandboxTimeout(const std::string &forwardID)
+{
+    auto it = resizeRequests_.find(forwardID);
+    if (it == resizeRequests_.end()) {
+        return;
+    }
+    const auto &request = *it->second.request;
+    messages::ResizeSandboxResponse response;
+    response.set_requestid(request.requestid());
+    response.set_instanceid(request.instanceid());
+    response.set_runtimeid(request.runtimeid());
+    response.set_sandboxid(request.resize().sandbox_id());
+    response.set_resourcegeneration(request.resize().resource_generation());
+    response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+    response.set_message("resize forwarding timed out; retain budget and reconcile Stats");
+    response.set_outcome(messages::ResizeSandboxResponse::UNKNOWN);
+    Send(it->second.requester, "ResizeSandboxResponse", response.SerializeAsString());
+    resizeRequests_.erase(it);
+}
+
+void AgentServiceActor::SnapshotRuntime(const litebus::AID &from, std::string &&name, std::string &&msg)
+{
+    auto request = std::make_shared<messages::SnapshotRuntimeRequest>();
+    if (!request->ParseFromString(msg)) {
+        YRLOG_ERROR("failed to parse SnapshotRuntimeRequest");
+        return;
+    }
+
+    const std::string &instanceID = request->instanceid();
+    const std::string &runtimeID = request->runtimeid();
+    YRLOG_INFO("{}|received SnapshotRuntime request for instance({}), runtime({})",
+               request->requestid(), instanceID, runtimeID);
+
+    // Prepare response
+    messages::SnapshotRuntimeResponse response;
+    response.set_requestid(request->requestid());
+
+    // Check if agent is registered
+    if (!registerRuntimeMgr_.registered || !isRegisterCompleted_) {
+        response.set_code(static_cast<int32_t>(StatusCode::FUNC_AGENT_NOT_REGISTERED));
+        response.set_message("function agent is not registered");
+        YRLOG_ERROR("{}|registration is not complete, ignore snapshot request for instance({})",
+                    request->requestid(), instanceID);
+        Send(from, "SnapshotRuntimeResponse", response.SerializeAsString());
+        return;
+    }
+
+    // Forward snapshot request to RuntimeManager
+    YRLOG_INFO("{}|forward SnapshotRuntime request to RuntimeManager({}-{}) for instance({}), runtime({})",
+               request->requestid(), registerRuntimeMgr_.name, registerRuntimeMgr_.address, instanceID, runtimeID);
+
+    // Store the caller's AID to send response back later
+    snapshotRequests_[request->requestid()] = from;
+
+    Send(litebus::AID(registerRuntimeMgr_.name, registerRuntimeMgr_.address), "SnapshotRuntime", std::move(msg));
+}
+
+void AgentServiceActor::SnapshotRuntimeResponse(const litebus::AID &from, std::string &&, std::string &&msg)
+{
+    messages::SnapshotRuntimeResponse response;
+    if (!response.ParseFromString(msg)) {
+        YRLOG_ERROR("failed to parse SnapshotRuntimeResponse");
+        return;
+    }
+
+    const std::string &requestID = response.requestid();
+    auto iter = snapshotRequests_.find(requestID);
+    if (iter == snapshotRequests_.end()) {
+        YRLOG_WARN("{}|snapshot request not found in snapshotRequests_", requestID);
+        return;
+    }
+
+    YRLOG_INFO("{}|received SnapshotRuntimeResponse from RuntimeManager, code: {}",
+               requestID, response.code());
+
+    // Forward response back to the original caller (FunctionAgentMgrActor)
+    Send(iter->second, "SnapshotRuntimeResponse", std::move(msg));
+    snapshotRequests_.erase(iter);
+}
+
+void AgentServiceActor::SnapshotRuntimeIfGeneration(const litebus::AID &from, std::string &&, std::string &&msg)
+{
+    // Generation-fenced snapshot relay. This channel never sends the legacy
+    // SnapshotRuntime message: a runtime manager without the receiver simply
+    // never answers, and the caller resolves through the UNKNOWN timeout
+    // instead of an unfenced physical checkpoint.
+    if (localSchedFuncAgentMgrAID_.Name().empty() || from != localSchedFuncAgentMgrAID_) {
+        YRLOG_WARN("reject SnapshotRuntimeIfGeneration from unregistered scheduler {}", from.HashString());
+        return;
+    }
+    auto request = std::make_shared<messages::SnapshotRuntimeRequest>();
+    if (msg.size() > 64 * 1024 || !request->ParseFromString(msg)) {
+        return;
+    }
+    for (const auto &entry : snapshotIfGenerationRequests_) {
+        if (entry.second.requester != from || entry.second.request->requestid() != request->requestid()) {
+            continue;
+        }
+        const auto &pending = *entry.second.request;
+        if (pending.SerializeAsString() == request->SerializeAsString()) {
+            // Exact replay of an unresolved attempt; a second dispatch could
+            // checkpoint a sandbox whose state the caller no longer expects.
+            YRLOG_WARN("{}|ignore duplicate pending SnapshotRuntimeIfGeneration request", request->requestid());
+            return;
+        }
+        // The caller reused a requestID with a different identity. The
+        // original attempt stays pending for its own resolution.
+        messages::SnapshotRuntimeResponse response;
+        response.set_requestid(pending.requestid());
+        response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+        response.set_message("snapshot reservation already in flight; retain records and reconcile");
+        Send(from, "SnapshotRuntimeIfGenerationResponse", response.SerializeAsString());
+        return;
+    }
+    const auto validID = [](const std::string &id) {
+        return !id.empty() && id.size() <= 256 && id.find_first_not_of(" \t\n\r\v\f") != std::string::npos;
+    };
+    // An empty/blank registration ID cannot pin a runtime-manager incarnation.
+    if (!isRegisterCompleted_ || !registerRuntimeMgr_.registered || registerRuntimeMgr_.name.empty()
+        || registerRuntimeMgr_.address.empty() || !validID(registerRuntimeMgr_.id)
+        || !validID(request->requestid()) || !validID(request->instanceid())
+        || !validID(request->runtimeid()) || !validID(request->expected_sandbox_id())
+        || !validID(request->expected_resource_generation()) || snapshotIfGenerationRequests_.size() >= 1024) {
+        messages::SnapshotRuntimeResponse response;
+        response.set_requestid(request->requestid());
+        response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+        response.set_message("snapshot route unavailable, invalid expected identity or pending limit reached");
+        Send(from, "SnapshotRuntimeIfGenerationResponse", response.SerializeAsString());
+        return;
+    }
+    const litebus::AID runtimeManager(registerRuntimeMgr_.name, registerRuntimeMgr_.address);
+    // A private forwarding ID keeps a stale response or timeout from completing
+    // another relay attempt; the caller's requestID is restored on reply.
+    const auto forwardID = litebus::uuid_generator::UUID::GetRandomUUID().ToString();
+    auto forwarded = *request;
+    forwarded.set_requestid(forwardID);
+    auto timeout =
+        litebus::AsyncAfter(120000, GetAID(), &AgentServiceActor::SnapshotRuntimeIfGenerationTimeout, forwardID);
+    snapshotIfGenerationRequests_.emplace(
+        forwardID, SnapshotIfGenerationPending{from, runtimeManager, registerRuntimeMgr_.id, request, timeout});
+    YRLOG_INFO("{}|relay generation-fenced snapshot for instance({}), runtime({}) to RuntimeManager({}-{}).",
+               request->requestid(), request->instanceid(), request->runtimeid(), registerRuntimeMgr_.name,
+               registerRuntimeMgr_.address);
+    Send(runtimeManager, "SnapshotRuntimeIfGeneration", forwarded.SerializeAsString());
+}
+
+void AgentServiceActor::SnapshotRuntimeIfGenerationResponse(const litebus::AID &from, std::string &&,
+                                                            std::string &&msg)
+{
+    messages::SnapshotRuntimeResponse response;
+    if (msg.size() > 64 * 1024 || !response.ParseFromString(msg)) {
+        return;
+    }
+    auto it = snapshotIfGenerationRequests_.find(response.requestid());
+    if (it == snapshotIfGenerationRequests_.end() || from != it->second.runtimeManager) {
+        return;  // late or unrouted reply; the pending timer remains authoritative
+    }
+    // The reply must come from the manager the request was dispatched to and
+    // that manager must still be the registered one.
+    if (!registerRuntimeMgr_.registered || from != litebus::AID(registerRuntimeMgr_.name, registerRuntimeMgr_.address)
+        || it->second.runtimeManagerID != registerRuntimeMgr_.id) {
+        YRLOG_WARN("{}|ignore fenced snapshot response with mismatched manager {}", response.requestid(),
+                   from.HashString());
+        return;
+    }
+    const auto &request = *it->second.request;
+    if (response.code() == static_cast<int32_t>(StatusCode::SUCCESS)) {
+        // Success is accepted only with a complete physical source fence; a
+        // checkpoint of another sandbox/generation is never handed upstream.
+        if (!response.has_snapshotinfo() || response.snapshotinfo().source_runtime_id() != request.runtimeid()
+            || response.snapshotinfo().sandbox_id() != request.expected_sandbox_id()
+            || response.snapshotinfo().source_generation() != request.expected_resource_generation()
+            || response.snapshotinfo().checkpointid().empty()) {
+            YRLOG_ERROR("{}|fenced snapshot success carries mismatched source identity", request.requestid());
+            response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+            response.set_message("snapshot source identity mismatch; outcome unknown, reconcile checkpoint state");
+            response.clear_snapshotinfo();
+        }
+    }
+    response.set_requestid(request.requestid());
+    litebus::TimerTools::Cancel(it->second.timeout);
+    Send(it->second.requester, "SnapshotRuntimeIfGenerationResponse", response.SerializeAsString());
+    snapshotIfGenerationRequests_.erase(it);
+}
+
+void AgentServiceActor::SnapshotRuntimeIfGenerationTimeout(const std::string &forwardID)
+{
+    auto it = snapshotIfGenerationRequests_.find(forwardID);
+    if (it == snapshotIfGenerationRequests_.end()) {
+        return;
+    }
+    // The physical checkpoint may still complete later; the caller must treat
+    // the outcome as unknown and reconcile. No hold or budget state is touched.
+    const auto &request = *it->second.request;
+    messages::SnapshotRuntimeResponse response;
+    response.set_requestid(request.requestid());
+    response.set_code(static_cast<int32_t>(StatusCode::ERR_INNER_SYSTEM_ERROR));
+    response.set_message("snapshot forwarding timed out; outcome unknown, reconcile checkpoint state");
+    Send(it->second.requester, "SnapshotRuntimeIfGenerationResponse", response.SerializeAsString());
+    snapshotIfGenerationRequests_.erase(it);
+}
 litebus::Future<Status> AgentServiceActor::SetDeployers(const std::string &storageType,
                                                         const std::shared_ptr<Deployer> &deployer)
 {
@@ -834,6 +1137,8 @@ void AgentServiceActor::Init()
     ActorBase::Receive("StaticFunctionScheduleResponse", &AgentServiceActor::StaticFunctionScheduleResponse);
     ActorBase::Receive("NotifyFunctionStatusChange", &AgentServiceActor::NotifyFunctionStatusChange);
     ActorBase::Receive("SnapshotRuntime", &AgentServiceActor::SnapshotRuntime);
+    ActorBase::Receive("ResizeSandbox", &AgentServiceActor::ResizeSandbox);
+    ActorBase::Receive("ResizeSandboxResponse", &AgentServiceActor::ResizeSandboxResponse);
     ActorBase::Receive("SnapshotRuntimeResponse", &AgentServiceActor::SnapshotRuntimeResponse);
     ActorBase::Receive("PublishSnapshotArtifact", &AgentServiceActor::PublishSnapshotArtifact);
     ActorBase::Receive("SnapshotAttemptFinalize", &AgentServiceActor::SnapshotAttemptFinalize);
@@ -841,6 +1146,8 @@ void AgentServiceActor::Init()
                        &AgentServiceActor::DeleteReusableSnapshotArtifact);
     ActorBase::Receive("ListLocalSnapshots", &AgentServiceActor::ListLocalSnapshots);
     ActorBase::Receive("DeleteLocalSnapshot", &AgentServiceActor::DeleteLocalSnapshot);
+    ActorBase::Receive("SnapshotRuntimeIfGeneration", &AgentServiceActor::SnapshotRuntimeIfGeneration);
+    ActorBase::Receive("SnapshotRuntimeIfGenerationResponse", &AgentServiceActor::SnapshotRuntimeIfGenerationResponse);
     ActorBase::Receive("ReconcileRuntimes", &AgentServiceActor::ReconcileRuntimes);
     ActorBase::Receive("ReconcileRuntimesResponse", &AgentServiceActor::ReconcileRuntimesResponse);
 
@@ -1072,9 +1379,27 @@ void AgentServiceActor::StopInstanceResponse(const litebus::AID &from, std::stri
     }
     auto killInstanceResponse = BuildKillInstanceResponse(responseCode, responseMessage,
                                                           requestID, killInstanceRequest->instanceid());
+    const auto &pending = request->second;
+    if (pending.runtimeManager.Name().empty() || from != pending.runtimeManager
+        || from != litebus::AID(registerRuntimeMgr_.name, registerRuntimeMgr_.address)
+        || pending.runtimeManagerID != registerRuntimeMgr_.id
+        || pending.request == nullptr || runtimeID != pending.request->runtimeid()) {
+        YRLOG_WARN("ignore stop response with mismatched manager or runtime for request {}", requestID);
+        return;
+    }
+    auto killInstanceRequest = pending.request;
+    auto killInstanceResponse = BuildKillInstanceResponse(stopInstanceResponse.code(), stopInstanceResponse.message(),
+                                                          killInstanceRequest->requestid(), killInstanceRequest->instanceid());
     YRLOG_DEBUG("{}|AgentServiceActor send KillInstanceResponse back to {}", requestID,
                 std::string(request->second.from));
     Send(request->second.from, "KillInstanceResponse", killInstanceResponse->SerializeAsString());
+    if (stopInstanceResponse.code() != static_cast<int32_t>(StatusCode::SUCCESS)) {
+        // The caller receives the failure; keep runtime/code/health ownership for
+        // reconciliation. A failed stop is not a successful deployment teardown.
+        killingRequest_.erase(request);
+        return;
+    }
+    killingRequest_.erase(request);
 
     // If a pod is exclusively occupied by an instance, the pod cannot be used by other instances after the instance
     // exits.
@@ -1973,6 +2298,14 @@ void AgentServiceActor::CommitSuicide()
 
 void AgentServiceActor::Finalize()
 {
+    for (const auto &entry : resizeRequests_) {
+        litebus::TimerTools::Cancel(entry.second.timeout);
+    }
+    resizeRequests_.clear();
+    for (const auto &entry : snapshotIfGenerationRequests_) {
+        litebus::TimerTools::Cancel(entry.second.timeout);
+    }
+    snapshotIfGenerationRequests_.clear();
     UpdateAgentStatusToLocal(static_cast<int32_t>(FUNC_AGENT_EXITED), "function_agent exited");
     remainedClearCodePackageRetryTimes_ = 0;
     (void)litebus::TimerTools::Cancel(clearCodePackageTimer_);

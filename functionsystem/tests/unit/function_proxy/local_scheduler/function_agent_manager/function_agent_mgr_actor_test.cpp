@@ -862,3 +862,100 @@ TEST_F(FuncAgentMgrActorTest, ReusableDeleteGatewaySelectsOnlyHealthyInitialized
 }
 
 }  // namespace functionsystem::test
+TEST_F(FuncAgentMgrActorTest, ResizeDuplicateJoinsButConflictingReservationStaysUnknown)
+{
+    auto request = std::make_shared<messages::ResizeSandboxRequest>();
+    request->set_requestid("reservation-1");
+    request->set_instanceid("instance");
+    request->set_runtimeid("runtime");
+    request->mutable_resize()->set_sandbox_id("sandbox");
+    request->mutable_resize()->set_resource_generation("generation");
+    FunctionAgentMgrActor::ResizePending pending{litebus::AID("agent", "127.0.0.1:1"), *request, {}, {}};
+    auto original = pending.completion.GetFuture();
+    agentMgrActorHelper_->resizePending_.emplace("wire-1", pending);
+    auto joined = agentMgrActorHelper_->ResizeSandbox({}, request);
+    EXPECT_FALSE(joined.IsOK());
+    EXPECT_EQ(agentMgrActorHelper_->resizePending_.size(), 1u);
+    auto conflict = std::make_shared<messages::ResizeSandboxRequest>(*request);
+    conflict->mutable_resize()->mutable_target()->set_memory_limit_bytes(2048);
+    EXPECT_EQ(agentMgrActorHelper_->ResizeSandbox({}, conflict).Get().outcome(),
+              messages::ResizeSandboxResponse::UNKNOWN);
+    EXPECT_FALSE(original.IsOK());
+    agentMgrActorHelper_->ResizeSandboxTimeout("wire-1");
+    EXPECT_EQ(original.Get().outcome(), messages::ResizeSandboxResponse::UNKNOWN);
+    EXPECT_EQ(joined.Get().outcome(), messages::ResizeSandboxResponse::UNKNOWN);
+    EXPECT_TRUE(agentMgrActorHelper_->resizePending_.empty());
+}
+
+TEST_F(FuncAgentMgrActorTest, ResizeReplyMustMatchSenderGenerationAndFiniteReadback)
+{
+    messages::ResizeSandboxRequest request;
+    request.set_requestid("reservation");
+    request.set_instanceid("instance");
+    request.set_runtimeid("runtime");
+    request.mutable_resize()->set_sandbox_id("sandbox");
+    request.mutable_resize()->set_resource_generation("generation");
+    const litebus::AID agent("agent", "127.0.0.1:1");
+    FunctionAgentMgrActor::ResizePending pending{agent, request, {}, {}};
+    pending.dispatched = true;
+    auto future = pending.completion.GetFuture();
+    agentMgrActorHelper_->resizePending_.emplace("wire-current", pending);
+    messages::ResizeSandboxResponse response;
+    response.set_requestid("wire-current");
+    response.set_instanceid(request.instanceid());
+    response.set_runtimeid(request.runtimeid());
+    response.set_sandboxid(request.resize().sandbox_id());
+    response.set_resourcegeneration(request.resize().resource_generation());
+    response.set_outcome(messages::ResizeSandboxResponse::OBSERVED);
+    agentMgrActorHelper_->ResizeSandboxResponse(litebus::AID("other", "127.0.0.1:1"), "", response.SerializeAsString());
+    EXPECT_FALSE(future.IsOK());
+    response.set_resourcegeneration("old-generation");
+    agentMgrActorHelper_->ResizeSandboxResponse(agent, "", response.SerializeAsString());
+    EXPECT_FALSE(future.IsOK());
+    response.set_resourcegeneration(request.resize().resource_generation());
+    // An OBSERVED envelope without actual limits must not look like success.
+    agentMgrActorHelper_->ResizeSandboxResponse(agent, "", response.SerializeAsString());
+    EXPECT_EQ(future.Get().outcome(), messages::ResizeSandboxResponse::UNKNOWN);
+    EXPECT_EQ(future.Get().requestid(), request.requestid());
+    EXPECT_TRUE(agentMgrActorHelper_->resizePending_.empty());
+
+    FunctionAgentMgrActor::ResizePending next{agent, request, {}, {}};
+    next.dispatched = true;
+    auto nextFuture = next.completion.GetFuture();
+    agentMgrActorHelper_->resizePending_.emplace("wire-next", next);
+    agentMgrActorHelper_->ResizeSandboxTimeout("wire-current");
+    agentMgrActorHelper_->ResizeSandboxResponse(agent, "", response.SerializeAsString());
+    EXPECT_FALSE(nextFuture.IsOK());
+    agentMgrActorHelper_->ResizeSandboxTimeout("wire-next");
+    EXPECT_EQ(nextFuture.Get().outcome(), messages::ResizeSandboxResponse::UNKNOWN);
+}
+
+TEST_F(FuncAgentMgrActorTest, ResizeBudgetRejectionPreservesAdmissionStatus)
+{
+    messages::ResizeSandboxRequest request;
+    request.set_requestid("caller-reservation");
+    FunctionAgentMgrActor::ResizePending pending{litebus::AID("agent", "127.0.0.1:1"), request, {}, {}};
+    auto future = pending.completion.GetFuture();
+    agentMgrActorHelper_->resizePending_.emplace("budget-wire", pending);
+    agentMgrActorHelper_->OnResizeReserved("budget-wire", litebus::Future<Status>(Status(RESOURCE_NOT_ENOUGH, "CPU budget")), nullptr);
+    ASSERT_TRUE(future.IsOK());
+    EXPECT_EQ(future.Get().code(), static_cast<int32_t>(RESOURCE_NOT_ENOUGH));
+    EXPECT_EQ(future.Get().outcome(), messages::ResizeSandboxResponse::REJECTED_BEFORE_DISPATCH);
+    EXPECT_TRUE(agentMgrActorHelper_->resizePending_.empty());
+}
+TEST_F(FuncAgentMgrActorTest, RepeatedBudgetCallbackCannotRejectAnAlreadyDispatchedCommand)
+{
+    messages::ResizeSandboxRequest request;
+    request.set_requestid("caller-reservation");
+    FunctionAgentMgrActor::ResizePending pending{litebus::AID("agent", "127.0.0.1:1"), request, {}, {}};
+    pending.dispatched = true;
+    auto future = pending.completion.GetFuture();
+    agentMgrActorHelper_->resizePending_.emplace("budget-wire", pending);
+    agentMgrActorHelper_->OnResizeReserved("budget-wire", litebus::Future<Status>(Status(RESOURCE_NOT_ENOUGH)), nullptr);
+    EXPECT_FALSE(future.IsOK());
+    EXPECT_EQ(agentMgrActorHelper_->resizePending_.size(), size_t{1});
+    agentMgrActorHelper_->ResizeSandboxTimeout("budget-wire");
+    EXPECT_EQ(future.Get().outcome(), messages::ResizeSandboxResponse::UNKNOWN);
+}
+
+}  // namespace functionsystem::test

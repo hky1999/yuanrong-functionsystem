@@ -36,9 +36,10 @@ namespace functionsystem::runtime_manager {
  * SandboxService (Checkpoint + Restore RPCs).
  *
  * It is the sandboxd counterpart of CheckpointOrchestrator: same TakeSnapshot /
- * download / ref-count flow, but drives sandboxd's SandboxCheckpoint RPC and
- * reuses the shared CkptFileManager (storage upload/download/ref) and
- * RuntimeStateManager (checkpoint-id tracking).
+ * download / ref-count flow, but drives sandboxd's conditional
+ * CheckpointIfGeneration RPC (guarded by the sandbox's birth resource
+ * generation) and reuses the shared CkptFileManager and RuntimeStateManager
+ * (checkpoint-id tracking).
  */
 class SandboxdCheckpointOrchestrator : public std::enable_shared_from_this<SandboxdCheckpointOrchestrator> {
 public:
@@ -51,9 +52,14 @@ public:
     // ── Snapshot ──────────────────────────────────────────────────────────────
 
     /**
-     * Take a checkpoint of a running sandbox.
-     * Chain: DoCheckpoint (sandboxd Checkpoint RPC) -> RegisterCheckpoint (upload)
-     * -> update state manager.
+     * Take a checkpoint of a running sandbox, conditioned on the birth
+     * identity (sandboxID/registrationID/resourceGeneration) captured once
+     * from the state manager at entry. expected_sandbox_id and
+     * expected_resource_generation must be supplied together (or not at all)
+     * and, when supplied, must match that identity; legacy requests with both
+     * empty still checkpoint against the stored creation-time generation.
+     * Chain: DoCheckpoint (sandboxd CheckpointIfGeneration RPC) ->
+     * RegisterCheckpoint (upload) -> update state manager.
      */
     litebus::Future<messages::SnapshotRuntimeResponse> TakeSnapshot(
         const std::shared_ptr<messages::SnapshotRuntimeRequest> &request);
@@ -87,8 +93,15 @@ public:
 
     // ── gRPC wrapper ──────────────────────────────────────────────────────────
 
+    /**
+     * Conditional checkpoint via sandboxd's CheckpointIfGeneration RPC.
+     * expectedGeneration is mandatory: an empty value fails locally without
+     * sending — there is no fallback to the unconditional Checkpoint RPC.
+     * The request is copied into the wrapper, and the wrapper's shared
+     * ownership is retained by the async callback for the request lifetime.
+     */
     litebus::Future<runtime::v1::CheckpointResponse> DoCheckpoint(
-        const std::shared_ptr<runtime::v1::CheckpointRequest> &req);
+        const std::shared_ptr<runtime::v1::CheckpointRequest> &req, const std::string &expectedGeneration = "");
 
 private:
     struct SnapshotContext {
@@ -100,6 +113,10 @@ private:
         // 它时只能从 SnapshotInfo 读，故随快照持久化
         std::string sandboxID;
         int32_t ttl = 0;
+        // 出生身份（Start/Restore 登记时的 registration 与 resource
+        // generation）：上传与落账前用它复核沙箱未被同 runtimeID 顶替
+        std::string registrationID;
+        std::string resourceGeneration;
     };
 
     litebus::Future<messages::SnapshotRuntimeResponse> OnCheckpointDone(
