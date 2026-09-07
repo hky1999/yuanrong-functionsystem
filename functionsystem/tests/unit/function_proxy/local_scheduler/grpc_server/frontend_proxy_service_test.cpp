@@ -325,7 +325,7 @@ TEST(FrontendProxyServiceTest, InvokeStreamForwardsEventsBeforeFinalResult)
 
     ::frontend_proxy::InvokeInstanceStreamResponse frame;
     ASSERT_TRUE(reader->Read(&frame));
-    ASSERT_TRUE(frame.has_event());
+    ASSERT_EQ(frame.payload_case(), ::frontend_proxy::InvokeInstanceStreamResponse::kEvent);
     EXPECT_EQ(frame.event(), "first-event");
     ASSERT_TRUE(reader->Read(&frame));
     ASSERT_TRUE(frame.has_final());
