@@ -83,10 +83,14 @@ litebus::Future<std::shared_ptr<ControlInterfacePosixClient>> InstanceClients::U
     auto client = GetClient(newClientInfo.instanceID);
     if (client != nullptr) {
         posix->Start();
-        client->UpdatePosix(posix);
+        // Retag with the runtime this transport was opened for: an in-flight
+        // runtime-pinned send either completes on the old transport or is
+        // rejected by the refreshed label — it can never be redirected to the
+        // new runtime's connection.
+        client->UpdatePosix(posix, newClientInfo.runtimeID);
         return std::dynamic_pointer_cast<ControlInterfacePosixClient>(client);
     }
-    auto newClient = std::make_shared<SharedClient>(posix);
+    auto newClient = std::make_shared<SharedClient>(posix, newClientInfo.runtimeID);
     (void)InsertClient(newClientInfo.instanceID, newClient);
     return newClient;
 }

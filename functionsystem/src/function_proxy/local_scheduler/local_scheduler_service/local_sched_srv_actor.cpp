@@ -20,6 +20,9 @@
 
 #include <async/asyncafter.hpp>
 #include <async/defer.hpp>
+#include <async/uuid_generator.hpp>
+
+#include <limits>
 
 #include "common/constants/actor_name.h"
 #include "common/constants/signal.h"
@@ -1237,65 +1240,237 @@ void LocalSchedSrvActor::OnResolveReusableSnapshotForCreateResponse(
     if (response.ParseFromString(msg)) {
         (void)resolveReusableSnapshotForCreateSync_.Synchronized(response.requestid(), response);
     }
+// Serialized-payload reservation accounting for the restore relay: adds one
+// component with wraparound checking instead of letting the accounting itself
+// wrap under pathological bounds.
+static bool SnapStartRelayAddChecked(size_t &total, size_t component)
+{
+    if (component > std::numeric_limits<size_t>::max() - total) {
+        return false;
+    }
+    total += component;
+    return true;
+}
+
+static ::messages::RestoreSnapshotResponse GenSnapStartRelayError(const int32_t code, const std::string &message,
+                                                                   const std::string &requestID)
+{
+    ::messages::RestoreSnapshotResponse rsp;
+    rsp.set_code(code);
+    rsp.set_message(message);
+    rsp.set_requestid(requestID);
+    return rsp;
+}
+
+std::string LocalSchedSrvActor::MintSnapStartTransportID() const
+{
+    // A duplicate UUID must never alias one operation's responses onto
+    // another's promise, so re-mint until the candidate is unique among live
+    // and completed entries; give up (the caller refuses the new operation)
+    // instead of accepting a clash.
+    for (uint32_t attempt = 0; attempt < SNAP_START_RELAY_UUID_MINT_ATTEMPTS; attempt++) {
+        auto candidate = litebus::uuid_generator::UUID::GetRandomUUID().ToString();
+        bool clash = false;
+        for (const auto &entry : snapStartRelayOps_) {
+            if (entry.second->transportRequestID == candidate) {
+                clash = true;
+                break;
+            }
+        }
+        if (!clash) {
+            return candidate;
+        }
+    }
+    return "";
 }
 
 litebus::Future<::messages::RestoreSnapshotResponse> LocalSchedSrvActor::SnapStartCheckpoint(
     const std::shared_ptr<::messages::RestoreSnapshotRequest> &req)
 {
-    auto promise = std::make_shared<litebus::Promise<messages::RestoreSnapshotResponse>>();
-    DoSnapStartCheckpoint(promise, req);
-    return promise->GetFuture();
+    // Begin validates the caller's input without mutating it; from here on the
+    // relay entry (never the caller's request) owns every byte that is re-sent.
+    if (req == nullptr) {
+        return GenSnapStartRelayError(common::ERR_PARAM_INVALID, "request is null", "");
+    }
+    const std::string &callerRequestID = req->requestid();
+    if (callerRequestID.empty() || callerRequestID.size() > SNAP_START_RELAY_MAX_ID_BYTES) {
+        return GenSnapStartRelayError(common::ERR_PARAM_INVALID, "requestID is empty or exceeds the relay bound", "");
+    }
+    if (req->ByteSizeLong() > SNAP_START_RELAY_MAX_MESSAGE_BYTES) {
+        return GenSnapStartRelayError(common::ERR_PARAM_INVALID, "request exceeds the relay bound", callerRequestID);
+    }
+    std::string requestWire = req->SerializeAsString();
+    if (requestWire.size() > SNAP_START_RELAY_MAX_MESSAGE_BYTES) {
+        return GenSnapStartRelayError(common::ERR_PARAM_INVALID, "serialized request exceeds the relay bound",
+                                      callerRequestID);
+    }
+
+    // Existing entries are consulted BEFORE current-master availability, so an
+    // identical retry keeps sharing the retained promise whether it is still
+    // in flight or already completed, even across master registration changes.
+    if (auto iter = snapStartRelayOps_.find(callerRequestID); iter != snapStartRelayOps_.end()) {
+        const auto &op = iter->second;
+        if (op->requestWire != requestWire) {
+            // Generic parameter error only: the existing entry, its pinned
+            // destination and its pending outcome are all untouched.
+            return GenSnapStartRelayError(common::ERR_PARAM_INVALID,
+                                          "requestID is already bound to a different serialized request",
+                                          callerRequestID);
+        }
+        return op->promise->GetFuture();
+    }
+
+    // Only a NEW operation needs a usable master registration to pin.
+    if (masterAid_.Name().empty() || masterAid_.Url().empty() ||
+        masterAid_.Name().size() > SNAP_START_RELAY_MAX_ID_BYTES ||
+        masterAid_.Url().size() > SNAP_START_RELAY_MAX_ID_BYTES) {
+        return GenSnapStartRelayError(common::ERR_INNER_COMMUNICATION, "master AID not available", callerRequestID);
+    }
+    if (snapStartRelayOps_.size() >= SNAP_START_RELAY_MAX_ENTRIES) {
+        return GenSnapStartRelayError(common::ERR_INSTANCE_BUSY, "restore relay entry bound reached", callerRequestID);
+    }
+    std::string transportRequestID = MintSnapStartTransportID();
+    if (transportRequestID.empty()) {
+        return GenSnapStartRelayError(common::ERR_INSTANCE_BUSY, "failed to mint a unique transport requestID",
+                                      callerRequestID);
+    }
+
+    // The transport copy differs from the original by the requestid only and
+    // is serialized exactly once; the private id keeps the caller's identifier
+    // off the wire and isolates operations that would otherwise collide on it.
+    auto transportReq = std::make_shared<::messages::RestoreSnapshotRequest>(*req);
+    transportReq->set_requestid(transportRequestID);
+    std::string transportWire = transportReq->SerializeAsString();
+    if (transportWire.size() > SNAP_START_RELAY_MAX_MESSAGE_BYTES) {
+        return GenSnapStartRelayError(common::ERR_PARAM_INVALID, "rewritten request exceeds the relay bound",
+                                      callerRequestID);
+    }
+
+    // Pin the expected SnapManager destination for this operation's whole
+    // lifetime; retries below never re-read masterAid_.
+    litebus::AID pinnedAid(SNAP_MANAGER_ACTOR_NAME, masterAid_.Url());
+
+    // Steady reservation held from Begin to process exit (no eviction, no
+    // completion-time release): both wire lengths, the maximum response, the
+    // identifiers and the pinned AID components, each added with wraparound
+    // checking. snapStartRelayReservedBytes_ <= the total bound is an
+    // invariant, so the subtraction below cannot wrap. This bounds reserved
+    // serialized payload, not process RSS.
+    size_t reserved = 0;
+    if (!SnapStartRelayAddChecked(reserved, requestWire.size()) ||
+        !SnapStartRelayAddChecked(reserved, transportWire.size()) ||
+        !SnapStartRelayAddChecked(reserved, SNAP_START_RELAY_MAX_MESSAGE_BYTES) ||
+        !SnapStartRelayAddChecked(reserved, callerRequestID.size()) ||  // map key
+        !SnapStartRelayAddChecked(reserved, callerRequestID.size()) ||  // operation copy
+        !SnapStartRelayAddChecked(reserved, transportRequestID.size()) ||
+        !SnapStartRelayAddChecked(reserved, pinnedAid.Name().size()) ||
+        !SnapStartRelayAddChecked(reserved, pinnedAid.Url().size()) ||
+        snapStartRelayReservedBytes_ > SNAP_START_RELAY_MAX_RESERVED_BYTES ||
+        reserved > SNAP_START_RELAY_MAX_RESERVED_BYTES - snapStartRelayReservedBytes_) {
+        return GenSnapStartRelayError(common::ERR_INSTANCE_BUSY, "restore relay payload bound reached",
+                                      callerRequestID);
+    }
+
+    auto op = std::make_shared<SnapStartRelayOp>();
+    op->callerRequestID = callerRequestID;
+    op->requestWire = std::move(requestWire);
+    op->transportRequestID = transportRequestID;
+    op->transportWire = std::move(transportWire);
+    op->pinnedAid = pinnedAid;
+    op->promise = std::make_shared<litebus::Promise<::messages::RestoreSnapshotResponse>>();
+    op->reserved = reserved;
+    auto [entryIter, inserted] = snapStartRelayOps_.emplace(op->callerRequestID, op);
+    if (!inserted) {
+        // Unreachable while all mutations stay on the actor thread (the lookup
+        // above is authoritative); kept fail-closed rather than overwriting a
+        // live entry if that invariant ever breaks.
+        return GenSnapStartRelayError(common::ERR_INSTANCE_BUSY, "restore relay entry already exists",
+                                      callerRequestID);
+    }
+    snapStartRelayReservedBytes_ += reserved;
+
+    DispatchSnapStartCheckpoint(entryIter->second->callerRequestID, entryIter->second->transportRequestID);
+    return op->promise->GetFuture();
 }
 
-void LocalSchedSrvActor::DoSnapStartCheckpoint(
-    const std::shared_ptr<litebus::Promise<::messages::RestoreSnapshotResponse>> &promise,
-    const std::shared_ptr<::messages::RestoreSnapshotRequest> &req)
+void LocalSchedSrvActor::DispatchSnapStartCheckpoint(const std::string &callerRequestID,
+                                                     const std::string &transportRequestID)
 {
-    if (masterAid_.Name().empty()) {
-        YRLOG_ERROR("master AID is empty, failed to send SnapStartCheckpoint");
-        messages::RestoreSnapshotResponse errorRsp;
-        errorRsp.set_code(common::ERR_INNER_COMMUNICATION);
-        errorRsp.set_message("master AID not available");
-        promise->SetValue(errorRsp);
+    auto iter = snapStartRelayOps_.find(callerRequestID);
+    if (iter == snapStartRelayOps_.end()) {
+        return;
+    }
+    const auto &op = iter->second;
+    if (op->transportRequestID != transportRequestID || op->completed) {
+        // A retry timer armed before settlement (or keyed to a superseded
+        // transport id) must not re-send after the entry completed.
         return;
     }
 
-    // 构造发送到 master snap_manager 的 AID
-    litebus::AID snapMgrAid(SNAP_MANAGER_ACTOR_NAME, masterAid_.Url());
-    YRLOG_INFO("sending SnapStartCheckpoint to snap_manager, requestID: {}, checkpointID: {}",
-               req->requestid(), req->checkpointid());
-
-    // 通过 REQUEST_SYNC_HELPER 发送并等待响应
-    auto future = snapStartCheckpointSync_.AddSynchronizer(req->requestid());
-    Send(snapMgrAid, "SnapStartCheckpoint", req->SerializeAsString());
-
-    future.OnComplete([promise, req, aid(GetAID())](
-                          const litebus::Future<messages::RestoreSnapshotResponse> &future) {
-        if (future.IsError()) {
-            YRLOG_WARN("SnapStartCheckpoint request timeout for requestID: {}, retrying...", req->requestid());
-            // 无限重试
-            litebus::Async(aid, &LocalSchedSrvActor::DoSnapStartCheckpoint, promise, req);
-            return;
-        }
-        promise->SetValue(future.Get());
-    });
+    YRLOG_INFO("{}|send SnapStartCheckpoint to pinned snap_manager {}", callerRequestID, op->pinnedAid.HashString());
+    int sendStatus = Send(op->pinnedAid, "SnapStartCheckpoint", std::string(op->transportWire));
+    if (sendStatus != 0) {
+        // A failed transport send is NOT evidence that the restore did not
+        // execute and not a terminal result: the entry stays pending and the
+        // retry below re-sends the exact stored wire to the same pinned AID.
+        YRLOG_WARN("{}|SnapStartCheckpoint transport send failed with {}, retry scheduled", callerRequestID,
+                   sendStatus);
+    }
+    (void)litebus::AsyncAfter(SNAP_START_RELAY_RETRY_INTERVAL_MS, GetAID(),
+                              &LocalSchedSrvActor::DispatchSnapStartCheckpoint, callerRequestID, transportRequestID);
 }
 
 void LocalSchedSrvActor::OnSnapStartCheckpointResponse(
     const litebus::AID &from, std::string &&name, std::string &&msg)
 {
+    // Bound the incoming message before parsing anything out of it.
+    if (msg.size() > SNAP_START_RELAY_MAX_MESSAGE_BYTES) {
+        YRLOG_WARN("drop oversized {} ({} bytes) from {}", name, msg.size(), from.HashString());
+        return;
+    }
+    if (msg.empty()) {
+        YRLOG_WARN("drop empty {} from {}", name, from.HashString());
+        return;
+    }
     messages::RestoreSnapshotResponse rsp;
     if (!rsp.ParseFromString(msg)) {
-        YRLOG_ERROR("failed to parse RestoreSnapshotResponse");
+        YRLOG_WARN("failed to parse RestoreSnapshotResponse from {}", from.HashString());
         return;
     }
 
-    YRLOG_INFO("received RestoreSnapshotResponse from {}, requestID: {}, code: {}, message: {}",
-               from.HashString(), rsp.requestid(), rsp.code(), rsp.message());
+    // Bounded scan: the map itself is entry-bounded, and only the entry that
+    // owns this private transport requestID may be touched by this response.
+    for (auto &entry : snapStartRelayOps_) {
+        const auto &callerRequestID = entry.first;
+        const auto &op = entry.second;
+        if (op->transportRequestID != rsp.requestid()) {
+            continue;
+        }
+        if (op->completed) {
+            // The first accepted response is retained in the promise; a stale
+            // duplicate cannot change it.
+            YRLOG_WARN("{}|ignore stale duplicate RestoreSnapshotResponse", callerRequestID);
+            return;
+        }
+        if (from.Name() != op->pinnedAid.Name() || from.Url() != op->pinnedAid.Url()) {
+            YRLOG_WARN("{}|ignore RestoreSnapshotResponse from unexpected sender {}", callerRequestID,
+                       from.HashString());
+            return;
+        }
 
-    if (auto status = snapStartCheckpointSync_.Synchronized(rsp.requestid(), rsp); status.IsError()) {
-        YRLOG_WARN("no matching request found for requestID: {}", rsp.requestid());
+        // Rewrite the identifier back only for the returning API. The code
+        // received here is the terminal API result of the relay operation; it
+        // is NOT evidence that the restore did or did not physically execute.
+        rsp.set_requestid(callerRequestID);
+        if (rsp.ByteSizeLong() > SNAP_START_RELAY_MAX_MESSAGE_BYTES) {
+            YRLOG_WARN("rewritten restore response exceeds reserved bound; retaining pending operation");
+            return;
+        }
+        op->completed = true;
+        op->promise->SetValue(std::move(rsp));
+        return;
     }
+    YRLOG_WARN("no snapstart relay operation matches RestoreSnapshotResponse from {}", from.HashString());
 }
 
 litebus::Future<::messages::ListSnapshotsByFunctionKeyResponse> LocalSchedSrvActor::ListSnapshotsByFunctionKey(

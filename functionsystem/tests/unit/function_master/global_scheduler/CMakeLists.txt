@@ -18,6 +18,10 @@ aux_source_directory(${CMAKE_CURRENT_LIST_DIR}/scheduler_manager GLOBAL_SCHEDULE
 target_sources(${UNIT_TEST_MODULE} PRIVATE
         ${GLOBAL_SCHEDULER_TEST_SRCS})
 
+# The restore-replay tests in this directory exercise the snap_manager actor
+# implementation, which the aggregate has never linked until now.
+target_link_libraries(${UNIT_TEST_MODULE} PRIVATE snap_manager_lib)
+
 # Route-cache policy is a narrow boundary and should remain verifiable without
 # building the repository-wide unit-test aggregate.
 add_executable(traefik_route_cache_test_bin
@@ -36,3 +40,28 @@ target_link_libraries(traefik_route_cache_test_bin PRIVATE
         ${gmock_LIB_A}
         pthread)
 add_test(NAME traefik_route_cache_test_bin COMMAND traefik_route_cache_test_bin)
+
+# Focused restore-replay coverage (pure ledger + real SnapManagerActor
+# integration over litebus) verifiable without the repository-wide unit-test
+# aggregate.
+add_executable(restore_replay_test_bin
+        ${PROJECT_SOURCE_DIR}/tests/unit/main.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/restore_replay_ledger_test.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/restore_replay_actor_test.cpp)
+target_compile_options(restore_replay_test_bin PRIVATE
+        -fno-access-control # test binds the actor's private MasterBusiness/member state
+        -Wno-missing-field-initializers)
+target_include_directories(restore_replay_test_bin PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${gtest_INCLUDE_DIR})
+target_link_libraries(restore_replay_test_bin PRIVATE
+        snap_manager_lib
+        global_scheduler_lib
+        utils
+        resource_view
+        ${litebus_ALL_LIB}
+        ${yrlogs_LIB}
+        ${gtest_LIB_A}
+        ${gmock_LIB_A}
+        pthread)
+add_test(NAME restore_replay_test_bin COMMAND restore_replay_test_bin)

@@ -23,7 +23,13 @@
 namespace functionsystem {
 class BaseClient {
 public:
-    explicit BaseClient(const std::shared_ptr<grpc::PosixClient> &posix) : posix_(posix)
+    // runtimeID labels posix_ with the runtime it was opened for; it is a
+    // send-time transport fence only — NOT a sandbox id / resource generation
+    // binding (the daemon re-checks those) and NOT a connection lease. Set in
+    // the constructor, before any publication, so the binding exists as soon
+    // as the client is observable.
+    explicit BaseClient(const std::shared_ptr<grpc::PosixClient> &posix, const std::string &runtimeID = "")
+        : posix_(posix), runtimeID_(runtimeID)
     {
     }
     virtual ~BaseClient() = default;
@@ -31,7 +37,10 @@ public:
     void Close() noexcept;
     virtual bool IsDone();
     void RegisterUserCallback(const std::function<void()> &userCb);
-    void UpdatePosix(const std::shared_ptr<grpc::PosixClient> &posix);
+    // The legacy one-argument form (runtimeID defaults to empty) invalidates
+    // the binding: an untagged transport may never satisfy a runtime-pinned
+    // request.
+    void UpdatePosix(const std::shared_ptr<grpc::PosixClient> &posix, const std::string &runtimeID = "");
 
     virtual litebus::Future<runtime::CallResponse> InitCall(const std::shared_ptr<runtime::CallRequest> &request,
                                                             uint32_t timeOutMs);
@@ -46,6 +55,10 @@ public:
 protected:
     std::shared_ptr<grpc::PosixClient> posix_;
     std::function<void()> userCb_;
+    // runtime identity posix_ is currently bound to; guarded by rwMut_
+    // together with posix_ so a runtime-pinned caller can validate the
+    // binding and dispatch under one shared lock.
+    std::string runtimeID_;
     std::shared_mutex rwMut_;
 };
 }  // namespace functionsystem

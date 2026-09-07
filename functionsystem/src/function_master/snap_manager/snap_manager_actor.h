@@ -19,7 +19,6 @@
 
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <memory>
 
 #include "actor/actor.hpp"
@@ -35,6 +34,7 @@
 #include "function_master/global_scheduler/global_sched.h"
 #include "function_master/instance_manager/instance_manager.h"
 
+#include "restore_replay_ledger.h"
 #include "snapshot_cache.h"
 #include "snapshot_scheduler.h"
 #include "reusable_snapshot_store.h"
@@ -71,6 +71,14 @@ public:
         int32_t code{0};
         std::string message{};
         ::core_service::SnapStartedInfo snapstartInfo{};
+    };
+
+    // Replay-ledger context for one SnapStart request, captured before the
+    // async scheduling boundary. Every request is tracked: a completion may
+    // only settle the entry whose identity tuple and ticket it carries.
+    struct SnapStartLedgerContext {
+        RestoreReplayLedger::Key key{};
+        RestoreReplayLedger::Ticket ticket{0};
     };
 
     SnapManagerActor() = delete;
@@ -177,6 +185,27 @@ public:
                                     const std::string &message);
 
     void SendSnapStartResponse(const SnapStartResponse &response);
+
+    /**
+     * Single completion path for every SnapStart request. Actor-thread only:
+     * first validates the response's requester identity and requestID against
+     * the captured ledger context, then serializes the exact wire response,
+     * stores it in the replay ledger (ticket-validated; first completion
+     * wins) BEFORE sending it, so a lost response replays byte-identically on
+     * retry instead of scheduling a second restore. Every non-STORED outcome
+     * — mismatched identity, unknown entry, stale/double completion, or an
+     * oversized response — fails closed: nothing is overwritten and nothing
+     * is sent, so no larger-than-bound wire response escapes and a stale
+     * callback cannot poison the original entry's replay. The identity check
+     * is bookkeeping only; it proves nothing about the runtime's physical
+     * execution identity.
+     */
+    void CompleteSnapStart(const SnapStartLedgerContext &context, const SnapStartResponse &response);
+
+    /**
+     * Send already-serialized RestoreSnapshotResponse bytes (replay path).
+     */
+    void SendSnapStartResponseBytes(const litebus::AID &to, std::string &&wireResponse);
     void SendListSnapshotsByFunctionKeyResponse(const litebus::AID &to,
                                                 const ::messages::ListSnapshotsByFunctionKeyResponse &rsp);
     void SendListSnapshotsByTenantResponse(const litebus::AID &to,
@@ -201,10 +230,17 @@ private:
         std::unique_ptr<SnapshotScheduler> scheduler{nullptr};
         std::shared_ptr<ReusableSnapshotStore> reusableSnapshotStore{nullptr};
 
-        // W10-2: requestIDs of SnapStarts whose schedule is in flight; resent
-        // duplicates (local timeout retry) are absorbed instead of minting a
-        // second synthetic restore instance for the same checkpoint.
-        std::unordered_set<std::string> inFlightSnapStarts;
+        // Bounded replay ledger for SnapStart requests, keyed by
+        // (caller AID name, url, requestID). Keeps the exact request and the
+        // exact terminal response of every tracked request so a lost response
+        // replays byte-identically instead of scheduling a second restore.
+        // Process-local only: survives master/slave role changes within this
+        // Member/process, but NOT a process restart; requests retried across
+        // a restart are treated as fresh. No eviction/TTL/persistence, so a
+        // safe retirement/persistence design is still required before full
+        // stress readiness (every distinct restore request occupies a slot
+        // forever; a pressure campaign issues far more restores than trials).
+        RestoreReplayLedger restoreLedger;
 
         // Watcher for etcd
         std::shared_ptr<Watcher> snapshotWatcher{nullptr};
@@ -269,6 +305,10 @@ private:
         static std::string BuildPauseResumeFingerprint(const messages::RestoreSnapshotRequest &req);
         static Status ValidatePauseResumeInstance(const resources::InstanceInfo &instance,
                                                   const std::string &logicalInstanceID);
+        void HandleSnapStart(const litebus::AID &from,
+                             std::shared_ptr<messages::RestoreSnapshotRequest> req,
+                             std::string wireRequest);
+        void CompleteSnapStart(const SnapStartLedgerContext &context, const SnapStartResponse &response) const;
 
         litebus::Future<Status> SaveMetadataToEtcd(const SnapshotMetadata &meta);
         litebus::Future<Status> DeleteMetadataFromEtcd(const std::string &snapshotID);
@@ -312,6 +352,9 @@ private:
     // Periodic cleanup task
     void ScheduleCleanupTask();
     void DoCleanupExpiredSnapshots();
+
+    // Shared serialization for the SnapStart response wire format
+    static std::string SerializeSnapStartResponse(const SnapStartResponse &response);
 
     std::shared_ptr<Member> member_{nullptr};
     std::unordered_map<std::string, std::shared_ptr<Business>> businesses_;

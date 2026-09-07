@@ -37,6 +37,22 @@ public:
     virtual litebus::Future<runtime::RecoverResponse> Recover(runtime::RecoverRequest &&request,
                                                               uint64_t timeoutMs = DEFAULT_RECOVER_TIMEOUT_MS);
     virtual litebus::Future<runtime::PrepareSnapResponse> PrepareSnap(runtime::PrepareSnapRequest &&request);
+    /**
+     * Runtime-pinned PrepareSnap for conditional snapshots: the request is
+     * sent only while the underlying transport is still labeled with
+     * expectedRuntimeID. The binding check and the send share one lock, so a
+     * concurrent UpdatePosix/Close cannot swap the transport in between. An
+     * empty expectation, an unbound (never tagged / retagged without a label /
+     * closed) transport or a different runtime label rejects with
+     * ERR_INSTANCE_BUSY without any send; a null transport keeps the legacy
+     * transport-failure response. Single send, no retry, no rebinding.
+     * @param request: PrepareSnap request (same payload as PrepareSnap)
+     * @param expectedRuntimeID: runtime identity the caller captured with its
+     *        source; a transport label only, NOT a sandbox/resource-generation
+     *        fence and NOT a connection lease
+     */
+    virtual litebus::Future<runtime::PrepareSnapResponse> PrepareSnapForRuntime(runtime::PrepareSnapRequest &&request,
+                                                                               const std::string &expectedRuntimeID);
     virtual litebus::Future<runtime::SnapStartedResponse> SnapStarted(runtime::SnapStartedRequest &&request);
 };
 }  // namespace functionsystem

@@ -616,3 +616,184 @@ TEST_F(SharedPosixClientTest, RecoverTest)
     (void)controlInterface->DeleteClient(instanceID);
 }
 }  // namespace functionsystem::test
+
+/**
+ * Description: client PrepareSnapForRuntime Test (runtime-pinned transport binding)
+ * Steps:
+ * 1. matching runtime label: exactly one underlying Send
+ * 2. other runtime label or empty expectation: ERR_INSTANCE_BUSY, zero Send
+ */
+TEST_F(SharedPosixClientTest, PrepareSnapForRuntimeSendsOnlyOnMatchingBinding)
+{
+    std::string instanceID = "instanceID-A";
+    auto mockControlClient = std::make_shared<MockControlClient>();
+    EXPECT_CALL(*mockControlClient, IsDone).WillRepeatedly(Return(false));
+    Prepare(instanceID, mockControlClient);
+    auto controlInterface = GetControlMgr();
+    auto created = controlInterface->GetControlInterfacePosixClient(instanceID);
+    ASSERT_AWAIT_READY(created);
+    auto client = created.Get();
+    ASSERT_NE(client, nullptr);
+
+    runtime_rpc::StreamingMessage msg;
+    msg.mutable_preparesnaprsp()->set_code(common::ERR_NONE);
+    EXPECT_CALL(*mockControlClient, Send).Times(1).WillOnce(Return(msg));
+    auto future = client->PrepareSnapForRuntime(runtime::PrepareSnapRequest{}, "runtime-A");
+    ASSERT_AWAIT_READY(future);
+    EXPECT_EQ(future.Get().code(), common::ERR_NONE);
+
+    // declared AFTER the successful send so it governs the rejections below
+    EXPECT_CALL(*mockControlClient, Send).Times(0);
+    auto mismatch = client->PrepareSnapForRuntime(runtime::PrepareSnapRequest{}, "runtime-B");
+    ASSERT_AWAIT_READY(mismatch);
+    EXPECT_EQ(mismatch.Get().code(), common::ERR_INSTANCE_BUSY);
+    auto empty = client->PrepareSnapForRuntime(runtime::PrepareSnapRequest{}, "");
+    ASSERT_AWAIT_READY(empty);
+    EXPECT_EQ(empty.Get().code(), common::ERR_INSTANCE_BUSY);
+
+    (void)controlInterface->DeleteClient(instanceID);
+}
+
+/**
+ * Description: a client re-bound to another runtime must not redirect the old
+ * runtime's pinned request to the new transport
+ * Steps:
+ * 1. bind instance client to runtime-A
+ * 2. reconnect the instance slot to runtime-B (same BaseClient object)
+ * 3. pinned "runtime-A" is rejected with zero Send on the new transport
+ * 4. pinned "runtime-B" sends exactly once on the new transport
+ */
+TEST_F(SharedPosixClientTest, ReboundClientRejectsOldRuntimeAndPermitsNew)
+{
+    std::string instanceID = "instanceID-A";
+    auto firstClient = std::make_shared<MockControlClient>();
+    // connect check reports live; the later reconnect check reports closed
+    EXPECT_CALL(*firstClient, IsDone).WillOnce(Return(false)).WillRepeatedly(Return(true));
+    EXPECT_CALL(*firstClient, Send).Times(0);
+    Prepare(instanceID, firstClient);  // runtime-A binding; Stop consumed by the rebind below
+    auto controlInterface = GetControlMgr();
+    auto created = controlInterface->GetControlInterfacePosixClient(instanceID);
+    ASSERT_AWAIT_READY(created);
+    auto client = created.Get();
+    ASSERT_NE(client, nullptr);
+
+    auto secondClient = std::make_shared<MockControlClient>();
+    EXPECT_CALL(*mockClientWrapper_, InitPosixStream(instanceID, "runtime-B", _)).WillOnce(Return(secondClient));
+    EXPECT_CALL(*secondClient, IsDone).WillOnce(Return(false));
+    EXPECT_CALL(*secondClient, Start).WillOnce(Return());
+    EXPECT_CALL(*secondClient, Stop).WillOnce(Return());  // final DeleteClient close
+    auto reconnected = controlInterface->NewControlInterfacePosixClient(instanceID, "runtime-B", "127.0.0.1:456",
+        nullptr);
+    ASSERT_AWAIT_READY(reconnected);
+    ASSERT_NE(reconnected.Get(), nullptr);
+    // same BaseClient object: the transport was swapped and retagged in place
+    EXPECT_EQ(reconnected.Get().get(), client.get());
+
+    EXPECT_CALL(*secondClient, Send).Times(0);
+    auto oldRuntime = client->PrepareSnapForRuntime(runtime::PrepareSnapRequest{}, "runtime-A");
+    ASSERT_AWAIT_READY(oldRuntime);
+    EXPECT_EQ(oldRuntime.Get().code(), common::ERR_INSTANCE_BUSY);
+
+    runtime_rpc::StreamingMessage msg;
+    msg.mutable_preparesnaprsp()->set_code(common::ERR_NONE);
+    EXPECT_CALL(*secondClient, Send).Times(1).WillOnce(Return(msg));
+    auto newRuntime = client->PrepareSnapForRuntime(runtime::PrepareSnapRequest{}, "runtime-B");
+    ASSERT_AWAIT_READY(newRuntime);
+    EXPECT_EQ(newRuntime.Get().code(), common::ERR_NONE);
+
+    (void)controlInterface->DeleteClient(instanceID);
+}
+
+/**
+ * Description: an untagged (legacy one-argument) UpdatePosix invalidates the
+ * runtime binding — the client may never satisfy a pinned request afterwards
+ */
+TEST_F(SharedPosixClientTest, UntaggedUpdatePosixInvalidatesRuntimeBinding)
+{
+    std::string instanceID = "instanceID-A";
+    auto taggedClient = std::make_shared<MockControlClient>();
+    EXPECT_CALL(*taggedClient, IsDone).WillRepeatedly(Return(false));
+    Prepare(instanceID, taggedClient);  // runtime-A binding; Stop consumed by the legacy update below
+    auto controlInterface = GetControlMgr();
+    auto created = controlInterface->GetControlInterfacePosixClient(instanceID);
+    ASSERT_AWAIT_READY(created);
+    auto client = created.Get();
+    ASSERT_NE(client, nullptr);
+
+    auto untaggedTransport = std::make_shared<MockControlClient>();
+    EXPECT_CALL(*untaggedTransport, Stop).WillOnce(Return());  // final DeleteClient close
+    client->UpdatePosix(untaggedTransport);  // legacy form: transport without a runtime label
+
+    EXPECT_CALL(*untaggedTransport, Send).Times(0);
+    auto pinned = client->PrepareSnapForRuntime(runtime::PrepareSnapRequest{}, "runtime-A");
+    ASSERT_AWAIT_READY(pinned);
+    EXPECT_EQ(pinned.Get().code(), common::ERR_INSTANCE_BUSY);
+    auto noPin = client->PrepareSnapForRuntime(runtime::PrepareSnapRequest{}, "");
+    ASSERT_AWAIT_READY(noPin);
+    EXPECT_EQ(noPin.Get().code(), common::ERR_INSTANCE_BUSY);
+
+    (void)controlInterface->DeleteClient(instanceID);
+}
+
+/**
+ * Description: a closed client keeps the legacy transport-failure response for
+ * a pinned request — the binding rejection never masks a gone transport
+ */
+TEST_F(SharedPosixClientTest, ClosedClientKeepsTransportFailureForPinnedPrepare)
+{
+    std::string instanceID = "instanceID-A";
+    auto mockControlClient = std::make_shared<MockControlClient>();
+    EXPECT_CALL(*mockControlClient, IsDone).WillRepeatedly(Return(false));
+    Prepare(instanceID, mockControlClient);  // Stop consumed by the explicit Close below
+    auto controlInterface = GetControlMgr();
+    auto created = controlInterface->GetControlInterfacePosixClient(instanceID);
+    ASSERT_AWAIT_READY(created);
+    auto client = created.Get();
+    ASSERT_NE(client, nullptr);
+
+    client->Close();  // transport dropped AND binding cleared under the lock
+    EXPECT_CALL(*mockControlClient, Send).Times(0);
+    auto future = client->PrepareSnapForRuntime(runtime::PrepareSnapRequest{}, "runtime-A");
+    ASSERT_AWAIT_READY(future);
+    EXPECT_EQ(future.Get().code(), common::ERR_REQUEST_BETWEEN_RUNTIME_BUS);
+
+    (void)controlInterface->DeleteClient(instanceID);
+}
+
+/**
+ * Description: same-runtime reconnect keeps the binding and dispatches on the
+ * NEW transport only
+ */
+TEST_F(SharedPosixClientTest, SameRuntimeReconnectSendsOnNewTransport)
+{
+    std::string instanceID = "instanceID-A";
+    auto firstClient = std::make_shared<MockControlClient>();
+    EXPECT_CALL(*firstClient, IsDone).WillOnce(Return(false)).WillRepeatedly(Return(true));
+    EXPECT_CALL(*firstClient, Send).Times(0);
+    Prepare(instanceID, firstClient);  // runtime-A binding; Stop consumed by the reconnect below
+    auto controlInterface = GetControlMgr();
+    auto created = controlInterface->GetControlInterfacePosixClient(instanceID);
+    ASSERT_AWAIT_READY(created);
+    auto client = created.Get();
+    ASSERT_NE(client, nullptr);
+
+    auto secondClient = std::make_shared<MockControlClient>();
+    EXPECT_CALL(*mockClientWrapper_, InitPosixStream(instanceID, "runtime-A", _)).WillOnce(Return(secondClient));
+    EXPECT_CALL(*secondClient, IsDone).WillOnce(Return(false));
+    EXPECT_CALL(*secondClient, Start).WillOnce(Return());
+    EXPECT_CALL(*secondClient, Stop).WillOnce(Return());  // final DeleteClient close
+    auto reconnected = controlInterface->NewControlInterfacePosixClient(instanceID, "runtime-A", "127.0.0.1:456",
+        nullptr);
+    ASSERT_AWAIT_READY(reconnected);
+    ASSERT_NE(reconnected.Get(), nullptr);
+
+    runtime_rpc::StreamingMessage msg;
+    msg.mutable_preparesnaprsp()->set_code(common::ERR_NONE);
+    EXPECT_CALL(*secondClient, Send).Times(1).WillOnce(Return(msg));
+    auto future = client->PrepareSnapForRuntime(runtime::PrepareSnapRequest{}, "runtime-A");
+    ASSERT_AWAIT_READY(future);
+    EXPECT_EQ(future.Get().code(), common::ERR_NONE);
+
+    (void)controlInterface->DeleteClient(instanceID);
+}
+}  // namespace functionsystem::test

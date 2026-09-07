@@ -61,6 +61,7 @@ void BaseClient::Close() noexcept
         posix_->Stop();
         posix_ = nullptr;
     }
+    runtimeID_.clear();
 }
 
 void BaseClient::RegisterUserCallback(const std::function<void()> &userCb)
@@ -72,7 +73,7 @@ void BaseClient::RegisterUserCallback(const std::function<void()> &userCb)
     }
 }
 
-void BaseClient::UpdatePosix(const std::shared_ptr<grpc::PosixClient> &posix)
+void BaseClient::UpdatePosix(const std::shared_ptr<grpc::PosixClient> &posix, const std::string &runtimeID)
 {
     std::unique_lock<std::shared_mutex> lock(rwMut_);
     if (posix_ != nullptr) {
@@ -82,6 +83,11 @@ void BaseClient::UpdatePosix(const std::shared_ptr<grpc::PosixClient> &posix)
     if (posix_ != nullptr && userCb_ != nullptr) {
         posix_->RegisterUserCallback(userCb_);
     }
+    // Retag atomically with the transport swap: a runtime-pinned send already
+    // holding the shared lock sees either the old pair or the new pair, never
+    // old transport + new label (or vice versa). An empty runtimeID (legacy
+    // one-argument call) deliberately invalidates the binding.
+    runtimeID_ = runtimeID;
 }
 
 litebus::Future<runtime_rpc::StreamingMessage> BaseClient::Send(

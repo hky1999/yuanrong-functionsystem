@@ -23,8 +23,11 @@
 namespace functionsystem {
 class SharedClient : public DataInterfacePosixClient, public ControlInterfacePosixClient {
 public:
-    explicit SharedClient(const std::shared_ptr<grpc::PosixClient> &posix)
-        : BaseClient(posix), DataInterfacePosixClient(posix), ControlInterfacePosixClient(posix)
+    // The virtual BaseClient base is initialized here (the intermediate-base
+    // initializations are ignored), so the runtime binding is set before the
+    // SharedClient is published through InsertClient.
+    explicit SharedClient(const std::shared_ptr<grpc::PosixClient> &posix, const std::string &runtimeID = "")
+        : BaseClient(posix, runtimeID), DataInterfacePosixClient(posix), ControlInterfacePosixClient(posix)
     {
     }
     ~SharedClient() override = default;

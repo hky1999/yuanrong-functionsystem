@@ -19,6 +19,7 @@
 
 #include <actor/actor.hpp>
 #include <async/future.hpp>
+#include <cstddef>
 #include <map>
 #include <string>
 
@@ -48,6 +49,22 @@ const uint32_t GROUP_FORWARD_SCHEDULE_TIMEOUT = 20000; // ms
 const uint32_t FORWARD_KILL_MAX_RETRY = 3;
 const uint32_t FORWARD_KILL_TIMEOUT = 5000;        // ms
 const uint32_t TRY_CANCEL_TIMEOUT = 5000;        // ms
+
+// Bounded restore relay (SnapStartCheckpoint) limits. The relay owns one
+// operation entry per distinct caller requestID; entries and their
+// serialized-payload reservations live until process exit (no eviction, no
+// TTL, completed entries included), so these bounds are the only growth
+// protection. They bound reserved serialized payload, not process RSS.
+// The retry interval keeps the W10-2 rationale: the SnapStart round trip
+// includes the domain-scheduler hop and measures 10-20s live, so 30s covers
+// the observed tail while the master-side replay ledger absorbs the
+// duplicate wire a retry produces.
+const uint32_t SNAP_START_RELAY_RETRY_INTERVAL_MS = 30000;               // ms
+const size_t SNAP_START_RELAY_MAX_ID_BYTES = 1024;                       // caller requestID / master name / master url
+const size_t SNAP_START_RELAY_MAX_MESSAGE_BYTES = 64ULL * 1024;          // per request / response message
+const size_t SNAP_START_RELAY_MAX_ENTRIES = 4096;                        // entry slot bound
+const size_t SNAP_START_RELAY_MAX_RESERVED_BYTES = 64ULL * 1024 * 1024;  // total reserved serialized payload
+const uint32_t SNAP_START_RELAY_UUID_MINT_ATTEMPTS = 8;
 
 class LocalSchedSrvActor : public BasisActor {
 public:
@@ -235,11 +252,41 @@ public:
         const std::shared_ptr<::messages::ResolveReusableSnapshotForCreateRequest> &request);
     void OnResolveReusableSnapshotForCreateResponse(
         const litebus::AID &from, std::string &&name, std::string &&msg);
-
+    /**
+     * Restore-only relay to the master's SnapManager. The actor (not the
+     * caller) owns every operation: an entry keyed by the CALLER's requestID
+     * keeps the exact original serialized bytes, a private transport UUID,
+     * the transport wire, the pinned destination AID, the retained
+     * promise and a completion flag. Identical request bytes return the SAME
+     * retained promise future (in flight or completed); changed bytes under
+     * the same requestID are a generic parameter error that never touches the
+     * existing entry; the map is bounded and never evicts. Actor thread only.
+     * Process-local: same-address master restarts and caller restarts still
+     * need persisted operation/epoch reconciliation.
+     */
     litebus::Future<::messages::RestoreSnapshotResponse> SnapStartCheckpoint(
         const std::shared_ptr<::messages::RestoreSnapshotRequest> &req);
-    void DoSnapStartCheckpoint(const std::shared_ptr<litebus::Promise<::messages::RestoreSnapshotResponse>> &promise,
-                               const std::shared_ptr<::messages::RestoreSnapshotRequest> &req);
+    /**
+     * Send (or retry) one relay operation's EXACT stored transport wire to its
+     * pinned SnapManager AID, then re-arm one retry timer, keyed by the caller
+     * requestID plus the private transport requestID. A timer firing for an
+     * entry that is missing, mismatched or completed is a no-op, so no new
+     * logical restore operation starts after an ambiguous timeout and nothing
+     * re-sends after settlement. A transport Send failure is logged only: it
+     * is not evidence the restore did not execute and never settles the
+     * caller's promise.
+     */
+    void DispatchSnapStartCheckpoint(const std::string &callerRequestID, const std::string &transportRequestID);
+    /**
+     * Accept a SnapStartCheckpointResponse only from the exact pinned
+     * SnapManager AID for the entry owning the response's private transport
+     * requestID, while that entry is still open. The first accepted response
+     * is retained immutably in the entry's promise (its requestID rewritten
+     * back to the caller's) and the entry is marked completed BEFORE the
+     * promise is set; wrong sender/ID, malformed, oversized and stale
+     * duplicate responses are ignored. A received error code is the terminal
+     * API result of the operation, not evidence about physical execution.
+     */
     void OnSnapStartCheckpointResponse(const litebus::AID &from, std::string &&name, std::string &&msg);
 
     litebus::Future<::messages::ListSnapshotsByFunctionKeyResponse> ListSnapshotsByFunctionKey(
@@ -410,15 +457,36 @@ private:
     REQUEST_SYNC_HELPER(LocalSchedSrvActor, ::messages::ResolveReusableSnapshotForCreateResponse,
                         recordSnapshotTimeout_, resolveReusableSnapshotForCreateSync_);
 
-    // W10-2: the SnapStart round trip includes the domain-scheduler hop and
-    // measures 10-20s live (response arriving after a 10s timeout is dropped
-    // as "no matching request", the promise then settles as a spurious error,
-    // the parked entry survives a SUCCESSFUL physical restore, and the wake
-    // path re-fires duplicates every monitor tick). 30s covers the observed
-    // tail; the parked-registry waking flag still bounds concurrency.
-    const uint32_t snapStartCheckpointTimeout_ = 30000;
-    REQUEST_SYNC_HELPER(LocalSchedSrvActor, messages::RestoreSnapshotResponse,
-                        snapStartCheckpointTimeout_, snapStartCheckpointSync_);
+    // Restore-only relay operations, keyed by the CALLER's requestID and owned
+    // by this actor. Replaces the previous caller-requestID REQUEST_SYNC_HELPER
+    // synchronizer, which re-serialized a caller-owned mutable request on
+    // every retry, re-resolved the destination master after every timeout and
+    // accepted a response from any actor. Entries are NEVER evicted or
+    // TTL-freed (completed ones included): the SNAP_START_RELAY_* bounds are
+    // the only growth protection, and each entry holds its serialized-payload
+    // reservation from Begin to process exit. Pending entries are never
+    // finalized into any outcome: an ambiguous timeout stays semantically
+    // UNKNOWN to the caller.
+    struct SnapStartRelayOp {
+        std::string callerRequestID;     // map key; echoed back to the caller on completion
+        std::string requestWire;         // exact original serialized bytes; immutable once stored
+        std::string transportRequestID;  // private UUID carried on the wire instead of the caller's ID
+        std::string transportWire;       // serialized once at Begin; every retry re-sends these exact bytes
+        litebus::AID pinnedAid;          // expected SnapManager NAME+URL, pinned at Begin; never re-resolved
+        std::shared_ptr<litebus::Promise<::messages::RestoreSnapshotResponse>> promise;
+        bool completed{false};           // first accepted response wins; never reset
+        size_t reserved{0};              // serialized-payload accounting held for the entry's whole lifetime
+    };
+
+    // A fresh private transport requestID that no live or completed entry
+    // already uses, so even a duplicate UUID cannot alias one operation's
+    // responses onto another's promise. Returns "" when minting keeps
+    // colliding; callers must refuse the new operation then.
+    std::string MintSnapStartTransportID() const;
+
+    std::map<std::string, std::shared_ptr<SnapStartRelayOp>> snapStartRelayOps_;
+    size_t snapStartRelayReservedBytes_ = 0;
+
     const uint32_t listSnapshotTimeout_ = 10000;
     REQUEST_SYNC_HELPER(LocalSchedSrvActor, ::messages::ListSnapshotsByFunctionKeyResponse, listSnapshotTimeout_,
                         listSnapshotsByFunctionKeySync_);

@@ -580,7 +580,7 @@ void SnapManagerActor::SendRecordSnapshotResponse(const litebus::AID &to,
     Send(to, "RecordSnapshotMetadataResponse", rsp.SerializeAsString());
 }
 
-void SnapManagerActor::SendSnapStartResponse(const SnapStartResponse &response)
+std::string SnapManagerActor::SerializeSnapStartResponse(const SnapStartResponse &response)
 {
     messages::RestoreSnapshotResponse rsp;
     rsp.set_requestid(response.requestID);
@@ -589,7 +589,48 @@ void SnapManagerActor::SendSnapStartResponse(const SnapStartResponse &response)
     if (response.snapstartInfo.ByteSizeLong() > 0) {
         rsp.mutable_snapstartinfo()->CopyFrom(response.snapstartInfo);
     }
-    Send(response.to, "SnapStartCheckpointResponse", rsp.SerializeAsString());
+    return rsp.SerializeAsString();
+}
+
+void SnapManagerActor::SendSnapStartResponse(const SnapStartResponse &response)
+{
+    Send(response.to, "SnapStartCheckpointResponse", SerializeSnapStartResponse(response));
+}
+
+void SnapManagerActor::SendSnapStartResponseBytes(const litebus::AID &to, std::string &&wireResponse)
+{
+    Send(to, "SnapStartCheckpointResponse", std::move(wireResponse));
+}
+
+void SnapManagerActor::CompleteSnapStart(const SnapStartLedgerContext &context,
+                                         const SnapStartResponse &response)
+{
+    // The response may only settle the ledger entry it was minted for. Check
+    // the captured requester identity tuple and requestID before any ledger
+    // mutation or send: a stale or mismatched callback must not poison the
+    // entry's replay. This is bookkeeping identity only; it proves nothing
+    // about the runtime's physical execution identity.
+    if (!RestoreReplayLedger::MatchesResponder(context.key, response.to.Name(), response.to.Url(),
+                                               response.requestID)) {
+        YRLOG_WARN("ignoring snapstart completion that does not match its ledger entry, requestID={}",
+                   context.key.requestID);
+        return;
+    }
+
+    std::string wireResponse = SerializeSnapStartResponse(response);
+    auto status = member_->restoreLedger.Complete(context.key, context.ticket, wireResponse);
+    if (status != RestoreReplayLedger::CompleteStatus::STORED) {
+        // Fail closed on every non-first completion: the stored response is
+        // never overwritten and no duplicate response is sent. An oversized
+        // response is neither stored nor sent — the entry stays in flight
+        // holding its reservation, so retries keep being absorbed instead of
+        // dispatching a second restore — and no larger-than-bound wire
+        // response escapes the master.
+        YRLOG_WARN("ignoring snapstart completion for requestID {}, ledger status={}",
+                   context.key.requestID, static_cast<int>(status));
+        return;
+    }
+    SendSnapStartResponseBytes(response.to, std::move(wireResponse));
 }
 
 void SnapManagerActor::SendListSnapshotsByFunctionKeyResponse(
@@ -638,11 +679,17 @@ void SnapManagerActor::MasterBusiness::SnapStartCheckpoint(const litebus::AID &f
 {
     auto req = std::make_shared<messages::RestoreSnapshotRequest>();
     if (!req->ParseFromString(msg)) {
+        // Unparseable messages are answered directly: no requestID can be
+        // extracted, so no ledger entry exists and the scheduler is never
+        // reached.
         YRLOG_ERROR("failed to parse RestoreSnapshotRequest");
         SendSnapStartResponse({from, "", common::ERR_PARAM_INVALID, "failed to parse request"});
         return;
     }
-    HandleSnapStart(from, req);
+    // Hand down the exact wire bytes: the replay ledger compares retries
+    // against them, so a requestID reused with a different checkpoint/options
+    // payload surfaces as CONFLICT instead of being silently absorbed.
+    HandleSnapStart(from, req, std::move(msg));
 }
 
 litebus::Future<Status> SnapManagerActor::MasterBusiness::DeleteSnapshot(const std::string &snapshotID)
@@ -744,7 +791,8 @@ void SnapManagerActor::MasterBusiness::HandleRecordSnapshot(const litebus::AID &
 }
 
 void SnapManagerActor::MasterBusiness::HandleSnapStart(const litebus::AID &from,
-                                                       std::shared_ptr<messages::RestoreSnapshotRequest> req)
+                                                       std::shared_ptr<messages::RestoreSnapshotRequest> req,
+                                                       std::string wireRequest)
 {
     if (req->snapstartoptions().type() == common::PAUSE_RESUME) {
         StartPauseResume(req).OnComplete(
@@ -768,13 +816,73 @@ void SnapManagerActor::MasterBusiness::HandleSnapStart(const litebus::AID &from,
     }
 
     const auto &snapshotID = req->checkpointid();
+    // Capture by value: everything crossing the async scheduling boundary
+    // below is immutable copied state, never views into the shared request.
+    std::string requestID = req->requestid();
     YRLOG_INFO("processing snapstart request for snapshot: {}", snapshotID);
 
-    // Look up snapshot metadata from cache
+    // Consult the replay ledger BEFORE metadata cache validation so a
+    // completed restore still replays even if the snapshot metadata has since
+    // expired or been removed. Every request must Begin here — including an
+    // empty requestID, which the ledger REJECTS before any metadata lookup or
+    // scheduler call, so nothing schedules without replay protection.
+    // Keyed by (caller name, url, requestID): retries of the same request
+    // share the entry, distinct callers are isolated.
+    SnapStartLedgerContext ctx;
+    ctx.key = RestoreReplayLedger::Key{from.Name(), from.Url(), requestID};
+    auto begin = member_->restoreLedger.Begin(ctx.key, wireRequest);
+    switch (begin.status) {
+        case RestoreReplayLedger::BeginStatus::REPLAY:
+            // Same request already completed: resend the exact stored wire
+            // bytes; no new schedule is dispatched.
+            YRLOG_INFO("snapstart requestID {} for snapshot {} replaying stored response",
+                       requestID, snapshotID);
+            if (auto actor = actor_.lock(); actor) {
+                actor->SendSnapStartResponseBytes(from, std::move(begin.response));
+            }
+            return;
+        case RestoreReplayLedger::BeginStatus::IN_FLIGHT:
+            // Same logical restore already executing (e.g. local timeout
+            // retry): absorb the resend; the first attempt's completion
+            // already carries this retry's answer.
+            YRLOG_WARN("snapstart requestID {} for snapshot {} resent while in flight, absorbing duplicate",
+                       requestID, snapshotID);
+            return;
+        case RestoreReplayLedger::BeginStatus::CONFLICT:
+            // Same requestID with a different payload. Generic error only:
+            // no stored request/response payload is echoed back.
+            YRLOG_WARN("snapstart requestID {} resent with a different payload, rejecting", requestID);
+            SendSnapStartResponse({from, requestID, common::ERR_PARAM_INVALID,
+                                   "requestID already used by a different snapstart request"});
+            return;
+        case RestoreReplayLedger::BeginStatus::REJECTED:
+            // Malformed or oversized request identity (e.g. empty requestID).
+            // Generic error only; no metadata or scheduler call follows.
+            YRLOG_WARN("snapstart request for snapshot {} rejected: invalid request identity", snapshotID);
+            SendSnapStartResponse({from, requestID, common::ERR_PARAM_INVALID,
+                                   "snapstart requestID is required and must be bounded"});
+            return;
+        case RestoreReplayLedger::BeginStatus::FULL:
+            // The bounded in-memory ledger is exhausted. Old entries are
+            // never evicted to make room: the caller sees busy. This needs a
+            // safe retirement/persistence design before full stress runs.
+            YRLOG_WARN("snapstart replay ledger full, refusing requestID {} for snapshot {}",
+                       requestID, snapshotID);
+            SendSnapStartResponse({from, requestID, common::ERR_INSTANCE_BUSY,
+                                   "snapstart replay ledger is full"});
+            return;
+        case RestoreReplayLedger::BeginStatus::NEW:
+            ctx.ticket = begin.ticket;
+            break;
+    }
+
+    // Look up snapshot metadata from cache. Terminal validation failures are
+    // completed through the ledger too: a retry of the same request replays
+    // the cached failure instead of scheduling again.
     auto metaOpt = member_->cache.Get(snapshotID);
     if (!metaOpt.has_value()) {
         YRLOG_ERROR("snapshot not found: {}", snapshotID);
-        SendSnapStartResponse({from, req->requestid(), common::ERR_INSTANCE_NOT_FOUND, "snapshot not found"});
+        CompleteSnapStart(ctx, {from, requestID, common::ERR_INSTANCE_NOT_FOUND, "snapshot not found"});
         return;
     }
 
@@ -787,46 +895,27 @@ void SnapManagerActor::MasterBusiness::HandleSnapStart(const litebus::AID &from,
     Status validationStatus = ValidateSnapshot(meta, currentTime);
     if (validationStatus.IsError()) {
         YRLOG_ERROR("snapshot validation failed: {}", validationStatus.GetMessage());
-        SendSnapStartResponse({from, req->requestid(), common::ERR_PARAM_INVALID, validationStatus.GetMessage()});
+        CompleteSnapStart(ctx, {from, requestID, common::ERR_PARAM_INVALID, validationStatus.GetMessage()});
         return;
     }
 
     // Build ScheduleRequest from snapshot metadata
     auto scheduleReq = member_->scheduler->BuildScheduleRequest(meta, *req);
 
-    // W10-2: dedupe by requestID. The local side's timeout retry re-SENDS the
-    // same RestoreSnapshotRequest while the original schedule is still in
-    // flight; every send mints a fresh synthetic "ckpt-" instance and restores
-    // a DUPLICATE sandbox whose loser fails with an identity/replay conflict
-    // (W9-2 v4: one noisy failure per successful restore). Same requestID is
-    // by definition the same logical restore: absorb the resend and let the
-    // first attempt's response answer it.
-    const auto &dedupeKey = req->requestid();
-    if (!dedupeKey.empty() && member_->inFlightSnapStarts.count(dedupeKey) > 0) {
-        YRLOG_WARN("snapstart requestID {} for snapshot {} resent while in flight, absorbing duplicate",
-                   dedupeKey, snapshotID);
-        return;
-    }
-    if (!dedupeKey.empty()) {
-        member_->inFlightSnapStarts.insert(dedupeKey);
-    }
-
-    // Invoke global scheduler
-    auto weakActor = actor_;
-    auto member = member_;
+    // Invoke global scheduler. Everything the response depends on (requester
+    // identity tuple, ledger ticket, requestID value, built schedule request,
+    // snapshot metadata) is captured here, before the async boundary: a later
+    // retry must never rebuild the stored response from fresh mutable request
+    // or instance state.
     member_->scheduler->Schedule(scheduleReq).OnComplete(
-        [weakActor, member, req, from, scheduleReq, meta, dedupeKey](const litebus::Future<Status> &future) {
+        [weakActor(actor_), ctx, from, requestID, scheduleReq, meta](const litebus::Future<Status> &future) {
             auto actor = weakActor.lock();
             if (!actor) {
-                return;
+                return;  // stale callback: fail closed, nothing is sent or stored
             }
-            // W10-2: settle the in-flight marker before responding (posted to
-            // the actor thread; the map is otherwise touched in HandleSnapStart)
-            if (!dedupeKey.empty()) {
-                litebus::Async(actor->GetAID(), [member, key(dedupeKey)]() {
-                    member->inFlightSnapStarts.erase(key);
-                });
-            }
+            // An unknown scheduling failure is cached as this request's
+            // terminal answer; this makes no claim about whether the restore
+            // physically executed on the node.
             auto code = future.IsError() ? future.GetErrorCode() : future.Get().StatusCode();
             auto message = future.IsError() ? "failed to schedule." : future.Get().RawMessage();
             ::core_service::SnapStartedInfo info;
@@ -841,8 +930,14 @@ void SnapManagerActor::MasterBusiness::HandleSnapStart(const litebus::AID &from,
             if (meta.has_functionkey() && !meta.functionkey().namespace_().empty()) {
                 info.set_namespace_(meta.functionkey().namespace_());
             }
-            litebus::Async(actor->GetAID(), &SnapManagerActor::SendSnapStartResponse,
-                           SnapStartResponse{from, req->requestid(), code, message, info});
+            // Single completion path, always posted to the actor thread (no
+            // raw cross-thread ledger mutation): the requester identity is
+            // re-validated against the captured context, and the exact wire
+            // response is stored in the ledger, ticket-validated, BEFORE it
+            // is sent.
+            litebus::Async(actor->GetAID(), &SnapManagerActor::CompleteSnapStart,
+                           ctx, SnapStartResponse{from, requestID, code, message,
+                                                  scheduleReq->instance().instanceid(), info});
         });
 }
 
@@ -1087,6 +1182,14 @@ void SnapManagerActor::MasterBusiness::SendSnapStartResponse(const SnapStartResp
 {
     if (auto actor = actor_.lock(); actor) {
         actor->SendSnapStartResponse(response);
+    }
+}
+
+void SnapManagerActor::MasterBusiness::CompleteSnapStart(const SnapStartLedgerContext &context,
+                                                         const SnapStartResponse &response) const
+{
+    if (auto actor = actor_.lock(); actor) {
+        actor->CompleteSnapStart(context, response);
     }
 }
 
