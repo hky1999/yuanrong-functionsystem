@@ -19,6 +19,8 @@
 
 #include <async/future.hpp>
 #include <string>
+#include <chrono>
+#include <cstdint>
 
 #include "common/logs/logging.h"
 #include "common/resource_view/resource_type.h"
@@ -76,6 +78,7 @@ struct Metrics {
     MetricsType metricsType;
     CollectorType collectorType;
     litebus::Option<DevClusterMetrics> devClusterMetrics;
+    int64_t collectionStartUnixMs = 0;
 };
 
 struct Metric {
@@ -83,6 +86,7 @@ struct Metric {
     litebus::Option<std::string> instanceID;
     litebus::Option<DevClusterMetrics> devClusterMetrics;
     litebus::Option<std::unordered_map<std::string, std::string>> initLabels;
+    int64_t sampleStartUnixMs = 0; // optional conservative start of a counter window
 };
 
 class BaseMetricsCollector {
@@ -102,12 +106,18 @@ public:
 
     litebus::Future<Metrics> GetMetrics() const
     {
+        const auto collectionStartUnixMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
         litebus::Promise<Metrics> promise;
         (void)GetUsage().OnComplete(
-            [promise, metricsType = metricsType_, collectorType = collectorType_,
+            [promise, collectionStartUnixMs, metricsType = metricsType_, collectorType = collectorType_,
              func = std::bind(&BaseMetricsCollector::GetLimit, this)](const litebus::Future<Metric> &future) {
                 Metrics metrics;
+                metrics.collectionStartUnixMs = collectionStartUnixMs;
                 auto usage = future.Get();
+                if (usage.sampleStartUnixMs > 0) {
+                    metrics.collectionStartUnixMs = usage.sampleStartUnixMs;
+                }
                 metrics.usage = usage.value;
                 metrics.devClusterMetrics = usage.devClusterMetrics;
                 auto limit = func();

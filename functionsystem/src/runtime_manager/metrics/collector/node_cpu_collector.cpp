@@ -16,11 +16,10 @@
 
 #include "node_cpu_collector.h"
 
-#include <regex>
+#include <unistd.h>
 
 #include "common/constants/constants.h"
 #include "common/logs/logging.h"
-#include "runtime_manager/utils/utils.h"
 
 namespace functionsystem::runtime_manager {
 constexpr double CPU_CALC_BASE = 1000.0;
@@ -36,37 +35,36 @@ NodeCPUCollector::NodeCPUCollector(const std::shared_ptr<ProcFSTools> procFSTool
 
 litebus::Future<Metric> NodeCPUCollector::GetUsage() const
 {
-    YRLOG_DEBUG_COUNT_60("system cpu collector get usage.");
-    litebus::Promise<Metric> promise;
+    std::lock_guard<std::mutex> lock(usageMutex_);
     Metric metric;
+    const auto sampleUnixMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto sampleNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const auto content = procFSTools_ ? procFSTools_->Read("/proc/stat") : litebus::Option<std::string>{};
+    if (content.IsNone()) {
+        usageWindow_.Reset();
+        return metric;
+    }
+    const auto sample = usageWindow_.Observe(content.Get(), sampleNs, sampleUnixMs, sysconf(_SC_CLK_TCK));
+    if (sample) {
+        metric.value = sample->millicores;
+        metric.sampleStartUnixMs = sample->startUnixMs;
+    }
     return metric;
 }
 
 Metric NodeCPUCollector::GetLimit() const
 {
-    YRLOG_DEBUG_COUNT_60("system cpu collector get limit.");
     Metric metric;
-
-    if (!procFSTools_) {
-        return metric;
-    }
-
-    auto cpuinfoOption = procFSTools_->Read("/proc/cpuinfo");
-    if (cpuinfoOption.IsNone()) {
-        return metric;
-    }
-
-    auto cpuinfo = cpuinfoOption.Get();
-    auto cpuinfos = Utils::SplitByFunc(cpuinfo, [](const char &ch) -> bool { return ch == '\n' || ch == '\r'; });
-
-    int cpuNum = 0;
-    const std::regex re(R"(^processor\s*:\s*\d+\s*$)");  // eg.processor    : 15
-    for (long unsigned int i = 0; i < cpuinfos.size(); i++) {
-        if (std::regex_match(cpuinfos[i], re)) {
-            cpuNum++;
-        }
-    }
-    metric.value = cpuNum * CPU_CALC_BASE - overheadCPU_;
+    if (!procFSTools_ || !std::isfinite(overheadCPU_) || overheadCPU_ < 0) { return metric; }
+    const auto online = procFSTools_->Read("/sys/devices/system/cpu/online");
+    if (online.IsNone()) { return metric; }
+    const auto count = CountOnlineCPUs(online.Get());
+    if (!count) { return metric; }
+    const double capacity = static_cast<double>(*count) * CPU_CALC_BASE - overheadCPU_;
+    if (capacity <= 0) { return metric; }
+    metric.value = capacity;
     return metric;
 }
 

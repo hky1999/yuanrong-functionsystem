@@ -18,6 +18,8 @@
 #define RUNTIME_MANAGER_METRICS_COLLECTOR_NODE_CPU_COLLECTOR_H
 
 #include "base_metrics_collector.h"
+#include "node_cpu_usage_window.h"
+#include <mutex>
 
 namespace functionsystem::runtime_manager {
 
@@ -31,6 +33,8 @@ public:
     std::string GenFilter() const override;
 private:
     double overheadCPU_;
+    mutable std::mutex usageMutex_;
+    mutable NodeCPUUsageWindow usageWindow_;
 };
 
 }
