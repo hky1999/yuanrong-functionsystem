@@ -18,6 +18,7 @@
 #define RUNTIME_MANAGER_EXECUTOR_SANDBOXD_SANDBOXD_EXECUTOR_H
 
 #include <chrono>
+#include "sandbox_memory_event_watcher.h"
 #include <functional>
 #include <memory>
 #include <set>
@@ -292,6 +293,8 @@ private:
     // ── Wait retry on sandboxd disconnection ─────────────────────────────────
     void DoWaitWithRetry(const std::string &sandboxID, const std::string &runtimeID, int retryCount);
 
+    void RefreshMemoryPressureStats(const SandboxMemoryEventWatcher::Identity &identity);
+    std::unique_ptr<SandboxMemoryEventWatcher> memoryEventWatcher_;
     void StartSandboxStatsCollection(const std::string &runtimeID, const std::string &sandboxID);
     void CollectSandboxStats(const std::string &runtimeID, const std::string &sandboxID, uint64_t ticket);
     void ScheduleSandboxStatsCollection(const std::string &runtimeID, const std::string &sandboxID,

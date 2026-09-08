@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "common/resource_view/resource_view.h"
+#include "memory_elasticity_policy.h"
 #include "common/resource_view/resource_sample_freshness.h"
 #include "common/state_machine/instance_control_view.h"
 #include "common/status/status.h"
@@ -262,6 +263,7 @@ private:
     std::unordered_map<std::string, resources::SandboxResourceSample> lastInstanceSamples_;
 
     // throttle event carried across the sampling chain (cleared once consumed)
+    std::unordered_map<std::string, MemoryElasticityPolicy> memoryPolicies_;
     PressureEventQueue pendingMemoryEvents_;
 
     // cpu throttle event carried across the sampling chain (W-CPUL)

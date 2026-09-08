@@ -16,7 +16,9 @@
 
 #include "node_cpu_utilization_collector.h"
 
-#include <numeric>
+#include <algorithm>
+#include <chrono>
+#include <unistd.h>
 
 #include "utils/utils.h"
 
@@ -34,40 +36,31 @@ NodeCPUUtilizationCollector::NodeCPUUtilizationCollector(const std::shared_ptr<P
 
 litebus::Future<Metric> NodeCPUUtilizationCollector::GetUsage() const
 {
-    YRLOG_DEBUG_COUNT_60("system cpu collector get usage.");
+    std::lock_guard<std::mutex> lock(usageMutex_);
     Metric metric;
     if (procFSTools_ == nullptr) {
-        YRLOG_ERROR("can not read content, procFSTool is nullptr.");
+        usageWindow_.Reset();
         return metric;
     }
-
-    auto startCpuTime = CalCPUTime(procFSTools_);
-
-    litebus::Promise<Metric> promise;
-    auto timerCallback = [promise, startCpuTime, procFSTools = procFSTools_, this]() {
-        auto endCpuTime = CalCPUTime(procFSTools);
-        if (endCpuTime.empty()) {
-            promise.SetValue(Metric{});
-            return;
-        }
-        Metric metric;
-        unsigned long startTotal = std::accumulate(startCpuTime.begin(), startCpuTime.end(), 0UL);
-        unsigned long startIdle = startCpuTime[3] + startCpuTime[4];  // idle + iowait
-        std::this_thread::sleep_for(std::chrono::milliseconds(UPDATE_CPU_INTERVAL_));
-        unsigned long endTotal = std::accumulate(endCpuTime.begin(), endCpuTime.end(), 0UL);
-        unsigned long endIdle = endCpuTime[3] + endCpuTime[4];  // idle + iowait
-        if (endTotal == startTotal) {
-            metric.value = 0.0;
-        } else {
-            metric.value =
-            100.0 * (1.0 - static_cast<double>(endIdle - startIdle) / static_cast<double>(endTotal - startTotal));
-        }
-        promise.SetValue(metric);
-    };
-
-    litebus::TimerTools::AddTimer(CPU_CAL_INTERVAL_, "TriggerCPUUtilization", timerCallback);
-
-    return promise.GetFuture();
+    const auto content = procFSTools_->Read("/proc/stat");
+    const auto online = procFSTools_->Read("/sys/devices/system/cpu/online");
+    const auto count = online.IsSome() ? CountOnlineCPUs(online.Get()) : std::optional<uint64_t>{};
+    if (content.IsNone() || !count) {
+        usageWindow_.Reset();
+        return metric;
+    }
+    const auto atNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const auto atMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto sample = usageWindow_.Observe(content.Get(), atNs, atMs, sysconf(_SC_CLK_TCK));
+    if (sample) {
+        // The generic monitor exports percent, whereas admission uses millicores.
+        metric.value = std::min(100.0, sample->millicores / (10.0 * static_cast<double>(*count)));
+        metric.sampleStartUnixMs = sample->startUnixMs;
+    }
+    // An initial/malformed/reset sample is unknown, never fabricated idle CPU.
+    return metric;
 }
 
 Metric NodeCPUUtilizationCollector::GetLimit() const

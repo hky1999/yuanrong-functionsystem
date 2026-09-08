@@ -110,6 +110,8 @@ public:
      * @param insts a group of instances
      * @return Return OK if successful, otherwise return the corresponding error code
      */
+    Status BindInstanceRuntime(const InstanceInfo &instance, const std::string &expectedRuntimeID);
+
     Status ReserveResize(const messages::ResizeSandboxRequest &request);
     Status ObserveResize(const messages::ResizeSandboxResponse &response);
     Status CancelResizeBeforeDispatch(const std::string &reservationID);
@@ -420,12 +422,56 @@ private:
         int64_t observedAtMs = 0;
         double peakCpuMillicores = 0;
         uint64_t peakMemoryBytes = 0;
+        // Bidirectional memory-elasticity contract (feature gated):
+        // true marks a ShrinkResources operation; it reserves no credit and
+        // only ever trims the caps of this instance's grow entries.
+        bool shrink = false;
+        // Synthetic restart-recovery commitment, never a dispatched operation.
+        bool baseline = false;
+        // Daemon operation fingerprint; empty only for baseline entries.
+        std::string operationId;
+        // Revision the daemon must observe for this CAS to apply (uint64 on
+        // the wire; UINT64_MAX can never advance to a next revision).
+        uint64_t expectedRevision = 0;
+        // Revision established by the settled operation (expectedRevision + 1).
+        uint64_t confirmedRevision = 0;
+        // Trimmable credit ceiling: initialized to the landed limit and only
+        // ever lowered by a confirmed shrink. Trims are permanent.
+        uint64_t capMemoryBytes = 0;
     };
     // Unknown writes remain reserved even after a logical instance deletion.
     // Physical retirement/restart recovery must settle them before activation.
     std::unordered_map<std::string, ResizeBudgetEntry> resizeBudget_;
     AdmissionReserve OutstandingResize(const std::string &unitID) const;
     void ReconcileResize(const ResourceUnit &unit);
+    // Restarts lose the grow ledger; hold the full current max as a baseline
+    // commitment until peaks or a confirmed shrink release it.
+    void EstablishRecoveryBaseline(const std::string &unitID, const InstanceInfo &instance,
+                                   const resources::SandboxResourceSample &sample);
+    // A revision newer than the stored one is only authoritative when it maps
+    // to an operation this view dispatched for the same incarnation.
+    bool MapsToDispatchedResize(const std::string &instanceID, const std::string &generation,
+                                uint64_t revision) const;
+    // Reconciling inventory gate: under the elasticity contract, a unit admits
+    // no new resource mutation while any managed instance on it lacks a fresh
+    // revision-known sample, is admission-pending, or shows a daemon-side
+    // pending operation. Returns the first blocking instance, empty if ready.
+    std::string UnitMutationBlocker(const ResourceUnit &unit, int64_t nowMs) const;
+    // Persist the confirmed revision/limits into both indexes so queued older
+    // Stats cannot roll a direct RPC readback back.
+    void ApplyConfirmedResizeState(const std::string &instanceID, const ResizeBudgetEntry &entry,
+                                   const runtime::v1::StatsResponse &actual, int64_t sampledAtMs);
+    // Cap-trim the instance's observed grow/baseline entries to a confirmed
+    // shrink landing; emits the ledger before/after/outstanding/released event.
+    void TrimInstanceGrowCredits(const std::string &instanceID, const std::string &generation,
+                                 const std::string &unitID, uint64_t landedMaxBytes,
+                                 const std::string &operationID, uint64_t revision);
+    void DropBaselineEntries(const std::string &instanceID);
+    // Per-entry outstanding credit: pending grow holds target-expected in full,
+    // observed entries hold cap - max(expected, own peak), shrink holds nothing.
+    static AdmissionReserve EntryOutstanding(const ResizeBudgetEntry &entry);
+    // Feature-gated admission of a reported sample against the confirmed one.
+    bool SampleUpdateAllowed(const InstanceInfo &allocated, const InstanceInfo &reported) const;
     std::unordered_map<std::string, int64_t> resourceAdmissionTimes_;
 
     void SimplifyInstanceInfo(const InstanceInfo &instance, InstanceInfo &simplifiedInstance) const;

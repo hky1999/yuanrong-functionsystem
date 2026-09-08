@@ -31,6 +31,7 @@
 #include "common/types/instance_state.h"
 #include "resource_tool.h"
 #include "resource_sample_freshness.h"
+#include "memory_elasticity_fence.h"
 #include "restore_admission.h"
 #include "scala_resource_tool.h"
 #include "usage_trend_tracker.h"
@@ -678,6 +679,49 @@ Status ResourceViewActor::UpdateUnitStatus(const std::string &unitID, UnitStatus
     StoreChange(view_->revision(), resourceUnitChange);
     MarkSnapshotUnitDirty(unitID);
     MarkSnapshotMetadataDirty();
+    return Status::OK();
+}
+
+Status ResourceViewActor::BindInstanceRuntime(const InstanceInfo &instance, const std::string &expectedRuntimeID)
+{
+    const auto unitID = instance.unitid().empty() ? instance.functionagentid() : instance.unitid();
+    if (!view_ || instance.instanceid().empty() || instance.requestid().empty()
+        || unitID.empty() || instance.runtimeid().empty()
+        || (!instance.functionagentid().empty() && instance.functionagentid() != unitID)) {
+        return Status(ERR_PARAM_INVALID, "runtime binding requires complete deployment identity");
+    }
+    auto top = view_->mutable_instances()->find(instance.instanceid());
+    auto unit = view_->mutable_fragment()->find(unitID);
+    if (top == view_->mutable_instances()->end() || unit == view_->mutable_fragment()->end()) {
+        return Status(ERR_PARAM_INVALID, "runtime binding allocation no longer exists");
+    }
+    auto leaf = unit->second.mutable_instances()->find(instance.instanceid());
+    const auto matches = [&](const InstanceInfo &allocated) {
+        return allocated.instanceid() == instance.instanceid() && allocated.requestid() == instance.requestid()
+            && allocated.unitid() == unitID
+            && (allocated.runtimeid() == expectedRuntimeID || allocated.runtimeid() == instance.runtimeid());
+    };
+    if (leaf == unit->second.mutable_instances()->end() || !matches(top->second) || !matches(leaf->second)
+        || top->second.runtimeid() != leaf->second.runtimeid()) {
+        return Status(ERR_PARAM_INVALID, "runtime binding belongs to a stale allocation or incarnation");
+    }
+    // Validate both indexes before changing either. This operation changes no
+    // resource booking and may not resurrect an instance removed during deploy.
+    for (auto *allocated : {&top->second, &leaf->second}) {
+        allocated->set_runtimeid(instance.runtimeid());
+        // Allocation precedes SetScheduleResult; bind its registered agent route as well.
+        allocated->set_functionagentid(unitID);
+        if (allocated->has_sandbox_resource_sample()
+            && allocated->sandbox_resource_sample().runtime_id() != instance.runtimeid()) {
+            allocated->clear_sandbox_resource_sample();
+            allocated->clear_actualuse();
+            // The retired incarnation's synthetic hold must not survive the
+            // rotation; the new incarnation re-establishes its own state.
+            DropBaselineEntries(instance.instanceid());
+        }
+    }
+    YRLOG_INFO("bind instance runtime instance={} request={} unit={} runtime={}", instance.instanceid(),
+               instance.requestid(), unitID, instance.runtimeid());
     return Status::OK();
 }
 
@@ -1400,6 +1444,9 @@ void ResourceViewActor::DeleteLabels(const InstanceInfo &instInfo)
 void ResourceViewActor::DeleteInstanceFromView(const InstanceInfo &instance)
 {
     resourceAdmissionTimes_.erase(instance.instanceid());
+    // A synthetic recovery hold belongs to this allocation only; dispatched
+    // operations keep their unresolved-write semantics across deletion.
+    DropBaselineEntries(instance.instanceid());
     ASSERT_IF_NULL(view_);
     auto nodeLabels = view_->mutable_nodelabels();
     DeleteLabel(instance, *nodeLabels);
@@ -1486,6 +1533,65 @@ void ResourceViewActor::UpdateResourceUnitDynamic(const std::shared_ptr<Resource
     StoreChange(view_->revision(), resourceUnitChange);
 }
 
+bool ResourceViewActor::SampleUpdateAllowed(const InstanceInfo &allocated, const InstanceInfo &reported) const
+{
+    if (!reported.has_sandbox_resource_sample()) { return true; }
+    const auto &incoming = reported.sandbox_resource_sample();
+    // Samples from revision-incapable sources (old daemons, pre-contract
+    // incarnations) must not change stored state while the feature is on.
+    if (!incoming.resource_revision_known()) {
+        YRLOG_DEBUG("resource sample without revision rejected instance={}", allocated.instanceid());
+        return false;
+    }
+    if (!allocated.has_sandbox_resource_sample()
+        || !allocated.sandbox_resource_sample().resource_revision_known()) {
+        // Recovery window: the first authoritative reading establishes the
+        // per-instance revision baseline.
+        return true;
+    }
+    const auto &stored = allocated.sandbox_resource_sample();
+    if (stored.resource_generation() != incoming.resource_generation()) {
+        YRLOG_WARN("resource sample generation conflict instance={} stored={} incoming={}",
+                   allocated.instanceid(), stored.resource_generation(), incoming.resource_generation());
+        return false;
+    }
+    if (incoming.resource_revision() < stored.resource_revision()) {
+        YRLOG_DEBUG("stale resource sample rejected instance={} revision={} confirmed={}",
+                    allocated.instanceid(), incoming.resource_revision(), stored.resource_revision());
+        return false;
+    }
+    if (incoming.resource_revision() == stored.resource_revision()) {
+        // Limits are fixed within a revision, and equality is only provable
+        // from the explicit known flags, never inferred from values. A
+        // contradiction keeps the confirmed value and asks for reconciliation
+        // instead of overwriting; operation-id/pending metadata may
+        // legitimately evolve in place.
+        if (!incoming.cpu_limits_known() || !incoming.memory_limit_known()) {
+            YRLOG_DEBUG("resource sample with unverifiable limits rejected instance={} revision={}",
+                        allocated.instanceid(), stored.resource_revision());
+            return false;
+        }
+        if (incoming.cpu_quota_usec() != stored.cpu_quota_usec()
+            || incoming.cpu_period_usec() != stored.cpu_period_usec()
+            || incoming.memory_limit_bytes() != stored.memory_limit_bytes()) {
+            YRLOG_WARN("contradictory limits at revision {} instance={} triggers reconcile",
+                       stored.resource_revision(), allocated.instanceid());
+            return false;
+        }
+        return true;
+    }
+    // A newer revision is only authoritative when it maps to an operation this
+    // view dispatched for the same incarnation; unauthorized telemetry cannot
+    // establish a revision on its own.
+    if (!MapsToDispatchedResize(allocated.instanceid(), incoming.resource_generation(),
+        incoming.resource_revision())) {
+        YRLOG_WARN("resource revision {} without a dispatched operation instance={}",
+                   incoming.resource_revision(), allocated.instanceid());
+        return false;
+    }
+    return true;
+}
+
 void ResourceViewActor::UpdateResourceUnitActual(const std::shared_ptr<ResourceUnit> &value)
 {
     ASSERT_IF_NULL(view_);
@@ -1536,10 +1642,16 @@ void ResourceViewActor::UpdateResourceUnitActual(const std::shared_ptr<ResourceU
                 <= viewInst->second.sandbox_resource_sample().sampled_at_unix_ms()) {
             continue;
         }
+        if (MemoryElasticityFenceEnabled() && !SampleUpdateAllowed(viewInst->second, reported)) {
+            // Revision/generation fenced telemetry must not change the
+            // confirmed state of this incarnation in either index.
+            continue;
+        }
         (*viewInst->second.mutable_actualuse()) = reported.actualuse();
         if (reported.has_sandbox_resource_sample()) {
             viewInst->second.mutable_sandbox_resource_sample()->CopyFrom(reported.sandbox_resource_sample());
-        } else {
+        } else if (!MemoryElasticityFenceEnabled() || !viewInst->second.has_sandbox_resource_sample()
+            || !viewInst->second.sandbox_resource_sample().resource_revision_known()) {
             viewInst->second.clear_sandbox_resource_sample();
         }
         const auto observationNowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1556,6 +1668,7 @@ void ResourceViewActor::UpdateResourceUnitActual(const std::shared_ptr<ResourceU
             const auto cpuObservedMs = UsableNodeCPUSampleTime(*value, observationNowMs, DEFAULT_RESOURCE_SAMPLE_MAX_AGE_MS);
             const auto memoryObservedMs = UsableNodeMemorySampleTime(*value, observationNowMs, DEFAULT_RESOURCE_SAMPLE_MAX_AGE_MS);
             if (!sample.resource_generation().empty() && !sample.runtime_id().empty()
+                && viewInst->second.runtimeid() == sample.runtime_id()
                 && reported.runtimeid() == sample.runtime_id() && !sample.sandbox_id().empty()
                 && sample.cpu_usage_known() && std::isfinite(sample.cpu_usage_cores()) && sample.cpu_usage_cores() >= 0
                 && sample.sampled_at_unix_ms() > admitted->second
@@ -1567,6 +1680,12 @@ void ResourceViewActor::UpdateResourceUnitActual(const std::shared_ptr<ResourceU
                 viewInst->second.clear_snapshotinfo();
                 viewInst->second.set_resource_admission_pending(false);
                 resourceAdmissionTimes_.erase(admitted);
+                if (MemoryElasticityFenceEnabled()) {
+                    // Restart recovery: the grow ledger is gone, so hold the
+                    // full current max as a conservative commitment instead of
+                    // re-issuing the headroom to other instances.
+                    EstablishRecoveryBaseline(value->id(), viewInst->second, sample);
+                }
             }
         }
         auto topInst = view_->mutable_instances()->find(reportedIt.first);

@@ -708,7 +708,13 @@ private:
 
     litebus::Future<Status> UpdateInstance(const messages::DeployInstanceResponse &response,
                                            const std::shared_ptr<messages::ScheduleRequest> &request,
-                                           uint32_t retriedTimes, bool isRecovering = false);
+                                           uint32_t retriedTimes, bool isRecovering = false,
+                                           const std::shared_ptr<InstanceStateMachine> &expectedMachine = nullptr,
+                                           const std::string &expectedRuntimeID = "");
+
+    litebus::Future<Status> ContinueAfterRuntimeBinding(const Status &bindingStatus,
+        const messages::DeployInstanceResponse &response, const std::shared_ptr<messages::ScheduleRequest> &request,
+        uint32_t retriedTimes, bool isRecovering, const std::shared_ptr<InstanceStateMachine> &expectedMachine);
 
     litebus::Future<ExitResponse> HandleNpuFault(const std::string &instanceID);
 

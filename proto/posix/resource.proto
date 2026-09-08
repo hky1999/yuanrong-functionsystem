@@ -328,6 +328,28 @@ message SandboxResourceSample {
     uint64 memory_oom_events = 21;
     uint64 memory_oom_kill_events = 22;
 
+    // Field 23 is reserved. The block below mirrors runtime.v1.StatsResponse
+    // fields 24-32 with identical numbers and names so collectors copy the
+    // daemon readings one-to-one.
+    reserved 23;
+    // Monotonic per-incarnation resource revision; see the runtime contract.
+    uint64 resource_revision = 24;
+    bool resource_revision_known = 25;
+    uint64 memory_high_bytes = 26;
+    bool memory_high_known = 27;
+    bool memory_high_unlimited = 28;
+    bool frozen = 29;
+    bool frozen_known = 30;
+    string resource_operation_id = 31;
+    bool resource_operation_pending = 32;
+    // Daemon-proven absolute cgroup v2 memory directory; empty = unavailable.
+    // Read-only positioning evidence for event watchers, never a write grant.
+    string memory_cgroup_path = 33;
+    // Explicit known flags mirrored from runtime.v1.StatsResponse 20-22 so the
+    // budget never infers knownness from the numeric fields.
+    bool memory_usage_known = 34;
+    bool memory_limit_known = 35;
+    bool memory_peak_known = 36;
 }
 
 message InstanceInfo {

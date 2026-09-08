@@ -5,10 +5,50 @@
 #include <cmath>
 #include <limits>
 #include <optional>
+#include "common/resource_view/memory_elasticity_config.h"
 #include "common/proto/pb/message_pb.h"
 #include "common/resource_view/resource_type.h"
 
 namespace functionsystem::local_scheduler {
+// A closed, fully verified failed shrink can give up its operation slot without
+// returning any growth credit. Exact original limits are required; partial
+// lowered limits remain unresolved until the daemon/controller reconciles them.
+template <typename Observation>
+inline bool MemoryShrinkFailedTerminal(const runtime::v1::ResizeResourcesRequest &command,
+                                       const Observation &sample)
+{
+    if (!command.has_expected() || command.operation_id().empty()
+        || command.expected_revision() == std::numeric_limits<uint64_t>::max()) { return false; }
+    const auto &expected = command.expected();
+    const auto high = static_cast<uint64_t>(std::floor(0.8 * expected.memory_limit_bytes() / 4096.0)) * 4096;
+    return sample.resource_generation() == command.resource_generation()
+        && sample.resource_revision_known() && sample.resource_revision() == command.expected_revision() + 1
+        && sample.resource_operation_id() == command.operation_id() && !sample.resource_operation_pending()
+        && sample.cpu_limits_known() && sample.cpu_quota_usec() == expected.cpu_quota_usec()
+        && sample.cpu_period_usec() == expected.cpu_period_usec()
+        && sample.memory_limit_known() && sample.memory_limit_bytes() == expected.memory_limit_bytes()
+        && sample.memory_high_known() && !sample.memory_high_unlimited() && sample.memory_high_bytes() == high
+        && sample.frozen_known() && !sample.frozen();
+}
+
+inline bool MemoryResizeNeverStarted(const runtime::v1::ResizeResourcesRequest &command,
+    const std::string &runtimeID, const resources::SandboxResourceSample &sample,
+    int64_t nowMs, int64_t maxAgeMs)
+{
+    return command.has_expected() && !command.operation_id().empty()
+        && !runtimeID.empty() && !command.sandbox_id().empty() && !command.resource_generation().empty()
+        && command.expected_revision() > 0 && maxAgeMs > 0
+        && command.deadline_unix_ms() > 0 && sample.sampled_at_unix_ms() > command.deadline_unix_ms()
+        && sample.sampled_at_unix_ms() <= nowMs && nowMs - sample.sampled_at_unix_ms() <= maxAgeMs
+        && sample.runtime_id() == runtimeID && sample.sandbox_id() == command.sandbox_id()
+        && sample.resource_generation() == command.resource_generation()
+        && sample.resource_revision_known() && sample.resource_revision() == command.expected_revision()
+        && !sample.resource_operation_pending() && sample.resource_operation_id() != command.operation_id()
+        && sample.memory_limit_known() && sample.memory_limit_bytes() == command.expected().memory_limit_bytes()
+        && sample.cpu_limits_known() && sample.cpu_quota_usec() == command.expected().cpu_quota_usec()
+        && sample.cpu_period_usec() == command.expected().cpu_period_usec();
+}
+
 // A post-deadline locked Stats read of the exact target can resolve the
 // monitor's unknown operation. It does not release the ResourceView budget.
 inline bool PressureResizeTargetObserved(const runtime::v1::ResizeResourcesRequest &command,
@@ -21,6 +61,17 @@ inline bool PressureResizeTargetObserved(const runtime::v1::ResizeResourcesReque
         || sample.sampled_at_unix_ms() <= command.deadline_unix_ms()
         || sample.sampled_at_unix_ms() > nowMs || nowMs - sample.sampled_at_unix_ms() > maxAgeMs) {
         return false;
+    }
+    if (resource_view::MemoryElasticityEnabled()) {
+        const auto targetHigh = static_cast<uint64_t>(std::floor(
+            0.8 * command.target().memory_limit_bytes() / 4096.0)) * 4096;
+        if (command.operation_id().empty() || command.expected_revision() == 0
+            || !sample.memory_limit_known()
+            || command.expected_revision() == std::numeric_limits<uint64_t>::max()
+            || !sample.resource_revision_known() || sample.resource_revision() != command.expected_revision() + 1
+            || sample.resource_operation_id() != command.operation_id() || sample.resource_operation_pending()
+            || !sample.frozen_known() || sample.frozen() || !sample.memory_high_known()
+            || sample.memory_high_unlimited() || sample.memory_high_bytes() != targetHigh) { return false; }
     }
     return sample.runtime_id() == runtimeID && sample.sandbox_id() == command.sandbox_id()
         && sample.resource_generation() == command.resource_generation() && sample.cpu_limits_known()

@@ -15,6 +15,7 @@
  */
 
 #include "common/resource_view/resource_view.h"
+#include "function_proxy/local_scheduler/pressure_monitor/pressure_resize_policy.h"
 
 #include <gtest/gtest.h>
 
@@ -25,6 +26,7 @@
 
 #include "common/constants/constants.h"
 #include "common/metrics/metrics_adapter.h"
+#include "common/resource_view/memory_elasticity_fence.h"
 #include "common/resource_view/resource_poller.h"
 #include "common/resource_view/resource_tool.h"
 #include "common/resource_view/usage_trend_tracker.h"
@@ -4157,6 +4159,1821 @@ TEST_F(ResourceViewTest, TryDelResourceUnitChange)
     EXPECT_TRUE(child->implActor_->versionChanges_.find(3) == child->implActor_->versionChanges_.end());
     EXPECT_TRUE(child->implActor_->versionChanges_.find(4) != child->implActor_->versionChanges_.end());
 
+}
+
+TEST_F(ResourceViewTest, BindInstanceRuntimeCompletesColdDeployWithoutPreseededRuntime)
+{
+    using schedule_plugin::filter::UsageAwareFilter;
+    struct ConfigGuard {
+        double safety = UsageAwareFilter::GetSafety();
+        double floor = UsageAwareFilter::GetFloorMb();
+        int32_t cap = UsageAwareFilter::GetMaxInstances();
+        ~ConfigGuard() { UsageAwareFilter::SetConfig(safety, floor, cap); }
+    } guard;
+    UsageAwareFilter::SetConfig(0.9, 2048, 0);
+    auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count(); };
+    for (const bool cpuBound : {false, true}) {
+        SCOPED_TRACE(cpuBound ? "bind cold CPU" : "bind cold Memory");
+        const std::string id = cpuBound ? "bind-cold-cpu" : "bind-cold-memory";
+        auto view = resource_view::ResourceView::CreateResourceView(id, CHILD_PARAM);
+        auto unit = Get1DResourceUnit(id + "-agent");
+        for (auto *resources : {unit.mutable_capacity(), unit.mutable_allocatable()}) {
+            (*resources->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(cpuBound ? 2000 : 32000);
+            (*resources->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(cpuBound ? 40000 : 4000);
+        }
+        (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+        (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(3000);
+        unit.set_memory_sample_unix_ms(nowMs());
+        unit.set_cpu_sample_unix_ms(nowMs());
+        auto added = view->AddResourceUnit(unit);
+        ASSERT_AWAIT_READY(added);
+        auto first = Get1DInstance();
+        first.set_instanceid("bind-cold-first");
+        first.set_requestid("request-bind-cold-first");
+        first.set_unitid(unit.id());
+        first.mutable_schedulerchain()->Clear();
+        *first.mutable_schedulerchain()->Add() = unit.id();
+        (*first.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+        auto *cpu = (*first.mutable_resources()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar();
+        cpu->set_value(500);
+        cpu->set_limit(8000);
+        auto *memory = (*first.mutable_resources()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar();
+        memory->set_value(512);
+        memory->set_limit(8192);
+        first.clear_runtimeid(); // elastic cold deploy starts with no runtime identity
+        auto allocate = [&](const resources::InstanceInfo &instance) {
+            auto promise = std::make_shared<litebus::Promise<Status>>();
+            (void)view->AddInstances({{instance.instanceid(), resource_view::InstanceAllocatedInfo{instance, promise}}});
+            return promise->GetFuture();
+        };
+        auto accepted = allocate(first);
+        ASSERT_AWAIT_READY(accepted);
+        ASSERT_TRUE(accepted.Get().IsOk()) << accepted.Get().ToString();
+        auto pending = view->GetResourceView();
+        ASSERT_AWAIT_READY(pending);
+        EXPECT_TRUE(pending.Get()->instances().at(first.instanceid()).runtimeid().empty());
+        EXPECT_TRUE(pending.Get()->instances().at(first.instanceid()).resource_admission_pending());
+        // Telemetry naming an unknown runtime must never select the incarnation.
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        auto ghost = std::make_shared<ResourceUnit>(unit);
+        ghost->set_memory_sample_unix_ms(nowMs());
+        ghost->set_cpu_sample_unix_ms(ghost->memory_sample_unix_ms());
+        auto &ghostObserved = (*ghost->mutable_instances())[first.instanceid()];
+        ghostObserved.set_runtimeid("runtime-bind-cold-ghost");
+        auto *ghostSample = ghostObserved.mutable_sandbox_resource_sample();
+        ghostSample->set_runtime_id(ghostObserved.runtimeid());
+        ghostSample->set_sandbox_id("bind-cold-ghost-sandbox");
+        ghostSample->set_resource_generation("bind-cold-ghost-generation");
+        ghostSample->set_sampled_at_unix_ms(ghost->memory_sample_unix_ms());
+        ghostSample->set_cpu_usage_known(true);
+        ghostSample->set_cpu_usage_cores(0.05);
+        ghostSample->set_cpu_limits_known(true);
+        ghostSample->set_cpu_period_usec(100000);
+        ghostSample->set_cpu_quota_usec(50000);
+        ghostSample->set_memory_limit_bytes(512ULL * 1024 * 1024);
+        ghostSample->set_memory_current_bytes(400ULL * 1024 * 1024);
+        auto ghostReport = view->UpdateResourceUnit(ghost, UpdateType::UPDATE_ACTUAL);
+        ASSERT_AWAIT_READY(ghostReport);
+        auto unbound = view->GetResourceView();
+        ASSERT_AWAIT_READY(unbound);
+        EXPECT_TRUE(unbound.Get()->instances().at(first.instanceid()).runtimeid().empty());
+        EXPECT_TRUE(unbound.Get()->instances().at(first.instanceid()).resource_admission_pending());
+        // Authoritative deployment completion binds the runtime allocated for this request.
+        auto deployed = first;
+        deployed.set_runtimeid("runtime-bind-cold-first");
+        EXPECT_TRUE(unbound.Get()->instances().at(first.instanceid()).functionagentid().empty());
+        deployed.set_functionagentid(unit.id());
+        auto bind = view->BindInstanceRuntime(deployed, "");
+        ASSERT_AWAIT_READY(bind);
+        EXPECT_TRUE(bind.Get().IsOk()) << bind.Get().ToString();
+        auto bound = view->GetResourceView();
+        ASSERT_AWAIT_READY(bound);
+        EXPECT_EQ(bound.Get()->instances().at(first.instanceid()).runtimeid(), deployed.runtimeid());
+        EXPECT_EQ(bound.Get()->fragment().at(unit.id()).instances().at(first.instanceid()).runtimeid(),
+            deployed.runtimeid());
+        EXPECT_EQ(bound.Get()->instances().at(first.instanceid()).functionagentid(), unit.id());
+        EXPECT_EQ(bound.Get()->fragment().at(unit.id()).instances().at(first.instanceid()).functionagentid(),
+            unit.id());
+        // The incompatible ghost sample is dropped; admission still needs fresh physical truth.
+        EXPECT_TRUE(bound.Get()->instances().at(first.instanceid()).sandbox_resource_sample().runtime_id().empty());
+        EXPECT_TRUE(bound.Get()->instances().at(first.instanceid()).resource_admission_pending());
+        // Re-binding the exact runtime that is already bound stays idempotent.
+        auto again = view->BindInstanceRuntime(deployed, "");
+        ASSERT_AWAIT_READY(again);
+        EXPECT_TRUE(again.Get().IsOk()) << again.Get().ToString();
+        again = view->BindInstanceRuntime(deployed, deployed.runtimeid());
+        ASSERT_AWAIT_READY(again);
+        EXPECT_TRUE(again.Get().IsOk()) << again.Get().ToString();
+        // Physical reconciliation of the bound runtime releases admission and feeds the resize budget.
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        // Keep node totals steady to isolate binding from the separate growth-forecast guard.
+        auto report = std::make_shared<ResourceUnit>(unit);
+        report->set_memory_sample_unix_ms(nowMs());
+        report->set_cpu_sample_unix_ms(report->memory_sample_unix_ms());
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(3000);
+        auto &observed = (*report->mutable_instances())[first.instanceid()];
+        observed.set_runtimeid(deployed.runtimeid());
+        auto *sample = observed.mutable_sandbox_resource_sample();
+        sample->set_runtime_id(deployed.runtimeid());
+        sample->set_sandbox_id("bind-cold-sandbox");
+        sample->set_resource_generation("bind-cold-generation");
+        sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
+        sample->set_cpu_usage_known(true);
+        sample->set_cpu_usage_cores(0.05);
+        sample->set_cpu_limits_known(true);
+        sample->set_cpu_period_usec(100000);
+        sample->set_cpu_quota_usec(50000);
+        sample->set_memory_limit_bytes(512ULL * 1024 * 1024);
+        sample->set_memory_current_bytes(430ULL * 1024 * 1024);
+        sample->set_elastic_policy(R"({"version":1,"CPU":{"initial":500,"ceiling":8000},"Memory":{"initial":512,"ceiling":8192}})");
+        auto refreshed = view->UpdateResourceUnit(report, UpdateType::UPDATE_ACTUAL);
+        ASSERT_AWAIT_READY(refreshed);
+        auto after = view->GetResourceView();
+        ASSERT_AWAIT_READY(after);
+        EXPECT_FALSE(after.Get()->instances().at(first.instanceid()).resource_admission_pending());
+        EXPECT_EQ(after.Get()->instances().at(first.instanceid()).runtimeid(), deployed.runtimeid());
+        EXPECT_EQ(after.Get()->fragment().at(unit.id()).instances().at(first.instanceid()).runtimeid(),
+            deployed.runtimeid());
+        EXPECT_EQ(after.Get()->instances().at(first.instanceid()).sandbox_resource_sample().runtime_id(),
+            deployed.runtimeid());
+        // The bound runtime can lease the policy target for resize.
+        messages::ResizeSandboxRequest request;
+        request.set_requestid("bind-cold-lease");
+        request.set_instanceid(first.instanceid());
+        request.set_runtimeid(deployed.runtimeid());
+        auto *resize = request.mutable_resize();
+        resize->set_sandbox_id("bind-cold-sandbox");
+        resize->set_resource_generation("bind-cold-generation");
+        resize->set_deadline_unix_ms(nowMs() + 30000);
+        resize->mutable_expected()->set_cpu_quota_usec(50000);
+        resize->mutable_expected()->set_cpu_period_usec(100000);
+        resize->mutable_expected()->set_memory_limit_bytes(512ULL * 1024 * 1024);
+        const auto &eligible = after.Get()->instances().at(first.instanceid());
+        auto target = local_scheduler::PressureResizeTarget(eligible, nullptr, nowMs(), 30000,
+            true, true, 256ULL * 1024 * 1024, 1.5, 4096ULL * 1024 * 1024, 200000);
+        ASSERT_TRUE(target.has_value());
+        EXPECT_EQ(target->memory_limit_bytes(), 768ULL * 1024 * 1024);
+        *resize->mutable_target() = *target;
+        auto unboundIdentity = eligible;
+        unboundIdentity.clear_runtimeid();
+        EXPECT_FALSE(local_scheduler::PressureResizeTarget(unboundIdentity, nullptr, nowMs(), 30000,
+            true, true, 256ULL * 1024 * 1024, 1.5).has_value());
+        auto reserved = view->ReserveResize(request);
+        ASSERT_AWAIT_READY(reserved);
+        EXPECT_TRUE(reserved.Get().IsOk()) << reserved.Get().ToString();
+    }
+}
+
+TEST_F(ResourceViewTest, BindInstanceRuntimeRejectsStaleIdentitiesAndConflictingExpectations)
+{
+    auto view = resource_view::ResourceView::CreateResourceView("bind-reject", CHILD_PARAM);
+    auto unit = Get1DResourceUnit("bind-reject-agent");
+    auto otherUnit = Get1DResourceUnit("bind-reject-other-agent");
+    for (auto *candidate : {&unit, &otherUnit}) {
+        for (auto *resources : {candidate->mutable_capacity(), candidate->mutable_allocatable()}) {
+            (*resources->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(32000);
+            (*resources->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(40000);
+        }
+    }
+    auto added = view->AddResourceUnit(unit);
+    ASSERT_AWAIT_READY(added);
+    added = view->AddResourceUnit(otherUnit);
+    ASSERT_AWAIT_READY(added);
+    auto target = Get1DInstance();
+    target.set_instanceid("bind-target");
+    target.set_requestid("request-bind-target");
+    target.set_unitid(unit.id());
+    target.mutable_schedulerchain()->Clear();
+    *target.mutable_schedulerchain()->Add() = unit.id();
+    target.clear_runtimeid();
+    auto allocate = [&](const resources::InstanceInfo &instance) {
+        auto promise = std::make_shared<litebus::Promise<Status>>();
+        (void)view->AddInstances({{instance.instanceid(), resource_view::InstanceAllocatedInfo{instance, promise}}});
+        return promise->GetFuture();
+    };
+    auto accepted = allocate(target);
+    ASSERT_AWAIT_READY(accepted);
+    ASSERT_TRUE(accepted.Get().IsOk()) << accepted.Get().ToString();
+    auto deployed = target;
+    deployed.set_runtimeid("runtime-bind-target");
+    auto bind = view->BindInstanceRuntime(deployed, "");
+    ASSERT_AWAIT_READY(bind);
+    EXPECT_TRUE(bind.Get().IsOk()) << bind.Get().ToString();
+    auto storedRuntime = [&](std::string &runtime) {
+        auto current = view->GetResourceView();
+        ASSERT_AWAIT_READY(current);
+        runtime = current.Get()->instances().at(target.instanceid()).runtimeid();
+    };
+    std::string runtime;
+    storedRuntime(runtime);
+    EXPECT_EQ(runtime, deployed.runtimeid());
+    // Unknown instance identity is refused.
+    auto unknown = deployed;
+    unknown.set_instanceid("bind-never-allocated");
+    auto refused = view->BindInstanceRuntime(unknown, "");
+    ASSERT_AWAIT_READY(refused);
+    EXPECT_FALSE(refused.Get().IsOk());
+    // A request other than the one that owns the allocation cannot bind.
+    auto staleRequest = deployed;
+    staleRequest.set_requestid("request-bind-stranger");
+    refused = view->BindInstanceRuntime(staleRequest, "");
+    ASSERT_AWAIT_READY(refused);
+    EXPECT_FALSE(refused.Get().IsOk());
+    // A unit other than the allocation's unit cannot bind.
+    auto staleUnit = deployed;
+    staleUnit.set_unitid(otherUnit.id());
+    staleUnit.mutable_schedulerchain()->Clear();
+    *staleUnit.mutable_schedulerchain()->Add() = otherUnit.id();
+    refused = view->BindInstanceRuntime(staleUnit, "");
+    ASSERT_AWAIT_READY(refused);
+    EXPECT_FALSE(refused.Get().IsOk());
+    auto staleRoute = deployed;
+    staleRoute.set_functionagentid(otherUnit.id());
+    refused = view->BindInstanceRuntime(staleRoute, "");
+    ASSERT_AWAIT_READY(refused);
+    EXPECT_FALSE(refused.Get().IsOk());
+    // A wrong previous-runtime expectation is a conflicting CAS, not an overwrite.
+    auto usurper = deployed;
+    usurper.set_runtimeid("runtime-bind-usurper");
+    refused = view->BindInstanceRuntime(usurper, "runtime-bind-wrong-previous");
+    ASSERT_AWAIT_READY(refused);
+    EXPECT_FALSE(refused.Get().IsOk());
+    storedRuntime(runtime);
+    EXPECT_EQ(runtime, deployed.runtimeid());
+    // Binding with the exact previous runtime rotates the incarnation.
+    auto rotated = usurper;
+    auto rotation = view->BindInstanceRuntime(rotated, deployed.runtimeid());
+    ASSERT_AWAIT_READY(rotation);
+    EXPECT_TRUE(rotation.Get().IsOk()) << rotation.Get().ToString();
+    storedRuntime(runtime);
+    EXPECT_EQ(runtime, rotated.runtimeid());
+    auto current = view->GetResourceView();
+    ASSERT_AWAIT_READY(current);
+    EXPECT_EQ(current.Get()->fragment().at(unit.id()).instances().at(target.instanceid()).runtimeid(),
+        rotated.runtimeid());
+    // Re-binding the rotated runtime stays idempotent under either expectation form.
+    auto again = view->BindInstanceRuntime(rotated, deployed.runtimeid());
+    ASSERT_AWAIT_READY(again);
+    EXPECT_TRUE(again.Get().IsOk()) << again.Get().ToString();
+    again = view->BindInstanceRuntime(rotated, rotated.runtimeid());
+    ASSERT_AWAIT_READY(again);
+    EXPECT_TRUE(again.Get().IsOk()) << again.Get().ToString();
+    // None of the refusals above disturbed the stored incarnation.
+    storedRuntime(runtime);
+    EXPECT_EQ(runtime, rotated.runtimeid());
+}
+
+TEST_F(ResourceViewTest, BindInstanceRuntimeSurvivesDeleteRecreateAndForeignTelemetry)
+{
+    auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count(); };
+    auto view = resource_view::ResourceView::CreateResourceView("bind-recreate", CHILD_PARAM);
+    auto unit = Get1DResourceUnit("bind-recreate-agent");
+    for (auto *resources : {unit.mutable_capacity(), unit.mutable_allocatable()}) {
+        (*resources->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(32000);
+        (*resources->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(40000);
+    }
+    unit.set_memory_sample_unix_ms(nowMs());
+    unit.set_cpu_sample_unix_ms(nowMs());
+    auto added = view->AddResourceUnit(unit);
+    ASSERT_AWAIT_READY(added);
+    auto makeInstance = [&](const std::string &request) {
+        auto instance = Get1DInstance();
+        instance.set_instanceid("bind-recreated");
+        instance.set_requestid(request);
+        instance.set_unitid(unit.id());
+        instance.mutable_schedulerchain()->Clear();
+        *instance.mutable_schedulerchain()->Add() = unit.id();
+        instance.clear_runtimeid();
+        return instance;
+    };
+    auto allocate = [&](const resources::InstanceInfo &instance) {
+        auto promise = std::make_shared<litebus::Promise<Status>>();
+        (void)view->AddInstances({{instance.instanceid(), resource_view::InstanceAllocatedInfo{instance, promise}}});
+        return promise->GetFuture();
+    };
+    auto publish = [&](const std::string &observedRuntime, const std::string &sandbox, const std::string &generation) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        auto report = std::make_shared<ResourceUnit>(unit);
+        report->set_memory_sample_unix_ms(nowMs());
+        report->set_cpu_sample_unix_ms(report->memory_sample_unix_ms());
+        auto &observed = (*report->mutable_instances())["bind-recreated"];
+        observed.set_runtimeid(observedRuntime);
+        auto *sample = observed.mutable_sandbox_resource_sample();
+        sample->set_runtime_id(observedRuntime);
+        sample->set_sandbox_id(sandbox);
+        sample->set_resource_generation(generation);
+        sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
+        sample->set_cpu_usage_known(true);
+        sample->set_cpu_usage_cores(0.05);
+        sample->set_cpu_limits_known(true);
+        sample->set_cpu_period_usec(100000);
+        sample->set_cpu_quota_usec(50000);
+        sample->set_memory_limit_bytes(512ULL * 1024 * 1024);
+        sample->set_memory_current_bytes(400ULL * 1024 * 1024);
+        return view->UpdateResourceUnit(report, UpdateType::UPDATE_ACTUAL);
+    };
+    const auto originalRequest = "request-bind-recreate-original";
+    auto first = makeInstance(originalRequest);
+    auto accepted = allocate(first);
+    ASSERT_AWAIT_READY(accepted);
+    ASSERT_TRUE(accepted.Get().IsOk()) << accepted.Get().ToString();
+    auto deployedFirst = first;
+    deployedFirst.set_runtimeid("runtime-recreate-first");
+    auto bind = view->BindInstanceRuntime(deployedFirst, "");
+    ASSERT_AWAIT_READY(bind);
+    EXPECT_TRUE(bind.Get().IsOk()) << bind.Get().ToString();
+    auto reconciled = publish(deployedFirst.runtimeid(), "recreate-sandbox", "recreate-generation");
+    ASSERT_AWAIT_READY(reconciled);
+    // Delete the incarnation and recreate the same instance identity for a new request.
+    auto removed = view->DeleteInstances({"bind-recreated"});
+    ASSERT_AWAIT_READY(removed);
+    EXPECT_TRUE(removed.Get().IsOk());
+    auto recreated = makeInstance("request-bind-recreate-second");
+    accepted = allocate(recreated);
+    ASSERT_AWAIT_READY(accepted);
+    ASSERT_TRUE(accepted.Get().IsOk()) << accepted.Get().ToString();
+    // The retired incarnation's bind must not touch the fresh allocation.
+    auto stale = view->BindInstanceRuntime(deployedFirst, "");
+    ASSERT_AWAIT_READY(stale);
+    EXPECT_FALSE(stale.Get().IsOk());
+    stale = view->BindInstanceRuntime(deployedFirst, deployedFirst.runtimeid());
+    ASSERT_AWAIT_READY(stale);
+    EXPECT_FALSE(stale.Get().IsOk());
+    auto current = view->GetResourceView();
+    ASSERT_AWAIT_READY(current);
+    EXPECT_TRUE(current.Get()->instances().at("bind-recreated").runtimeid().empty());
+    // The new request binds its own runtime.
+    auto deployedSecond = recreated;
+    deployedSecond.set_runtimeid("runtime-recreate-second");
+    bind = view->BindInstanceRuntime(deployedSecond, "");
+    ASSERT_AWAIT_READY(bind);
+    EXPECT_TRUE(bind.Get().IsOk()) << bind.Get().ToString();
+    current = view->GetResourceView();
+    ASSERT_AWAIT_READY(current);
+    EXPECT_EQ(current.Get()->instances().at("bind-recreated").runtimeid(), deployedSecond.runtimeid());
+    EXPECT_EQ(current.Get()->fragment().at(unit.id()).instances().at("bind-recreated").runtimeid(),
+        deployedSecond.runtimeid());
+    reconciled = publish(deployedSecond.runtimeid(), "recreate-sandbox", "recreate-generation");
+    ASSERT_AWAIT_READY(reconciled);
+    // Foreign telemetry cannot overwrite the bound incarnation or its physical sample.
+    auto foreign = publish("runtime-recreate-foreign", "foreign-sandbox", "foreign-generation");
+    ASSERT_AWAIT_READY(foreign);
+    current = view->GetResourceView();
+    ASSERT_AWAIT_READY(current);
+    const auto &stored = current.Get()->instances().at("bind-recreated");
+    EXPECT_EQ(stored.runtimeid(), deployedSecond.runtimeid());
+    EXPECT_EQ(stored.sandbox_resource_sample().runtime_id(), deployedSecond.runtimeid());
+    EXPECT_EQ(stored.sandbox_resource_sample().sandbox_id(), "recreate-sandbox");
+    const auto &storedFragment = current.Get()->fragment().at(unit.id()).instances().at("bind-recreated");
+    EXPECT_EQ(storedFragment.runtimeid(), deployedSecond.runtimeid());
+}
+
+// ---------------------------------------------------------------------------
+// M2 bidirectional memory-elasticity budget and sample fences. These tests run
+// with the in-process fence override; production keeps the env opt-in. All
+// assertions go through public admission behaviour and stored view state.
+// ---------------------------------------------------------------------------
+
+namespace {
+// MiB helpers keep the credit arithmetic readable against the plan sample.
+constexpr uint64_t MiB(uint64_t value) { return value * 1024ULL * 1024ULL; }
+// The daemon's fixed soft-limit derivation: floor(0.8 * max / 4096) * 4096.
+constexpr uint64_t HighBytes(uint64_t maxBytes) { return (maxBytes * 4 / 5 / 4096) * 4096; }
+}  // namespace
+
+TEST_F(ResourceViewTest, ShrinkBudgetTrimsGrowCreditsOnlyAfterConfirmedContract)
+{
+    using schedule_plugin::filter::UsageAwareFilter;
+    struct ConfigGuard {
+        double safety = UsageAwareFilter::GetSafety();
+        double floor = UsageAwareFilter::GetFloorMb();
+        int32_t cap = UsageAwareFilter::GetMaxInstances();
+        ~ConfigGuard() { UsageAwareFilter::SetConfig(safety, floor, cap); }
+    } guard;
+    UsageAwareFilter::SetConfig(0.9, 2048, 0);
+    struct FenceGuard {
+        FenceGuard() { SetMemoryElasticityFenceForTest(true); }
+        ~FenceGuard() { SetMemoryElasticityFenceForTest(false); }
+    } fenceGuard;
+    auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count(); };
+    auto view = resource_view::ResourceView::CreateResourceView("shrink-budget", CHILD_PARAM);
+    auto unit = Get1DResourceUnit("shrink-budget-agent");
+    for (auto *resources : {unit.mutable_capacity(), unit.mutable_allocatable()}) {
+        (*resources->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(32000);
+        (*resources->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(4096);
+    }
+    (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+    (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(2800);
+    unit.set_cpu_sample_unix_ms(nowMs());
+    unit.set_memory_sample_unix_ms(nowMs());
+    auto added = view->AddResourceUnit(unit);
+    ASSERT_AWAIT_READY(added);
+    auto owner = Get1DInstance();
+    owner.set_instanceid("ledger-owner");
+    owner.set_requestid("request-ledger-owner");
+    owner.set_unitid(unit.id());
+    owner.set_runtimeid("runtime-ledger-owner");
+    owner.mutable_schedulerchain()->Clear();
+    *owner.mutable_schedulerchain()->Add() = unit.id();
+    (*owner.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+    auto *ownerCpu = (*owner.mutable_resources()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar();
+    ownerCpu->set_value(500);
+    ownerCpu->set_limit(8000);
+    auto *ownerMem = (*owner.mutable_resources()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar();
+    ownerMem->set_value(128);
+    ownerMem->set_limit(8192);
+    auto allocate = [&](const resources::InstanceInfo &instance) {
+        auto promise = std::make_shared<litebus::Promise<Status>>();
+        (void)view->AddInstances({{instance.instanceid(), resource_view::InstanceAllocatedInfo{instance, promise}}});
+        return promise->GetFuture();
+    };
+    auto accepted = allocate(owner);
+    ASSERT_AWAIT_READY(accepted);
+    ASSERT_TRUE(accepted.Get().IsOk()) << accepted.Get().ToString();
+    // One physical Stats shape for the whole test; only the contract fields vary.
+    auto publish = [&](uint64_t maxBytes, uint64_t currentBytes, uint64_t revision, const std::string &operationId,
+                       bool operationPending, bool frozen, const std::string &sandbox = "ledger-sandbox",
+                       const std::string &generation = "ledger-generation") {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        auto report = std::make_shared<ResourceUnit>(unit);
+        report->set_memory_sample_unix_ms(nowMs());
+        report->set_cpu_sample_unix_ms(report->memory_sample_unix_ms());
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(2800);
+        auto &observed = (*report->mutable_instances())[owner.instanceid()];
+        observed.set_runtimeid(owner.runtimeid());
+        auto *sample = observed.mutable_sandbox_resource_sample();
+        sample->set_runtime_id(owner.runtimeid());
+        sample->set_sandbox_id(sandbox);
+        sample->set_resource_generation(generation);
+        sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
+        sample->set_cpu_usage_known(true);
+        sample->set_cpu_usage_cores(0.05);
+        sample->set_cpu_limits_known(true);
+        sample->set_cpu_period_usec(100000);
+        sample->set_cpu_quota_usec(50000);
+        sample->set_memory_limit_bytes(maxBytes);
+        sample->set_memory_limit_known(true);
+        sample->set_memory_usage_known(true);
+        sample->set_memory_current_bytes(currentBytes);
+        sample->set_resource_revision(revision);
+        sample->set_resource_revision_known(true);
+        sample->set_memory_high_bytes(HighBytes(maxBytes));
+        sample->set_memory_high_known(true);
+        sample->set_memory_high_unlimited(false);
+        sample->set_frozen(frozen);
+        sample->set_frozen_known(true);
+        sample->set_resource_operation_id(operationId);
+        sample->set_resource_operation_pending(operationPending);
+        return view->UpdateResourceUnit(report, UpdateType::UPDATE_ACTUAL);
+    };
+    auto reserve = [&](const std::string &requestID, const std::string &operationID, uint64_t expectedBytes,
+                       uint64_t targetBytes, uint64_t expectedRevision, bool shrink) {
+        messages::ResizeSandboxRequest request;
+        request.set_requestid(requestID);
+        request.set_instanceid(owner.instanceid());
+        request.set_runtimeid(owner.runtimeid());
+        request.set_shrink(shrink);
+        auto *resize = request.mutable_resize();
+        resize->set_sandbox_id("ledger-sandbox");
+        resize->set_resource_generation("ledger-generation");
+        resize->set_operation_id(operationID);
+        resize->set_expected_revision(expectedRevision);
+        resize->set_deadline_unix_ms(nowMs() + 30000);
+        resize->mutable_expected()->set_cpu_quota_usec(50000);
+        resize->mutable_expected()->set_cpu_period_usec(100000);
+        resize->mutable_expected()->set_memory_limit_bytes(expectedBytes);
+        resize->mutable_target()->set_cpu_quota_usec(50000);
+        resize->mutable_target()->set_cpu_period_usec(100000);
+        resize->mutable_target()->set_memory_limit_bytes(targetBytes);
+        return view->ReserveResize(request);
+    };
+    auto observe = [&](const std::string &requestID, const std::string &operationID, uint64_t revision,
+                       uint64_t actualBytes, bool complete, bool operationPending, bool frozen,
+                       messages::ResizeSandboxResponse::Outcome outcome) {
+        messages::ResizeSandboxResponse response;
+        response.set_requestid(requestID);
+        response.set_instanceid(owner.instanceid());
+        response.set_runtimeid(owner.runtimeid());
+        response.set_sandboxid("ledger-sandbox");
+        response.set_resourcegeneration("ledger-generation");
+        response.set_outcome(outcome);
+        auto *result = response.mutable_result();
+        result->set_complete(complete);
+        auto *actual = result->mutable_actual();
+        actual->set_resource_generation("ledger-generation");
+        actual->set_cpu_limits_known(true);
+        actual->set_cpu_quota_usec(50000);
+        actual->set_cpu_period_usec(100000);
+        actual->set_memory_limit_bytes(actualBytes);
+        actual->set_memory_limit_known(true);
+        actual->set_resource_revision(revision);
+        actual->set_resource_revision_known(true);
+        actual->set_resource_operation_id(operationID);
+        actual->set_resource_operation_pending(operationPending);
+        actual->set_frozen(frozen);
+        actual->set_frozen_known(true);
+        actual->set_memory_high_bytes(HighBytes(actualBytes));
+        actual->set_memory_high_known(true);
+        return view->ObserveResize(response);
+    };
+    auto probeStatus = [&](const std::string &name, double memoryMb) -> Status {
+        auto instance = Get1DInstance();
+        instance.set_instanceid(name);
+        instance.set_requestid("request-" + name);
+        instance.set_unitid(unit.id());
+        instance.set_runtimeid("runtime-" + name);
+        instance.mutable_schedulerchain()->Clear();
+        *instance.mutable_schedulerchain()->Add() = unit.id();
+        (*instance.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+        auto *cpu = (*instance.mutable_resources()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar();
+        cpu->set_value(500);
+        cpu->set_limit(8000);
+        auto *memory = (*instance.mutable_resources()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar();
+        memory->set_value(memoryMb);
+        memory->set_limit(8192);
+        auto future = allocate(instance);
+        if (!future.WaitFor(TEST_AWAIT_TIMEOUT).IsOK()) {
+            return Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "probe future did not resolve");
+        }
+        return future.Get();
+    };
+    auto probeRejected = [&](const std::string &name, double memoryMb) {
+        EXPECT_FALSE(probeStatus(name, memoryMb).IsOk()) << "probe " << name << " must be rejected";
+    };
+    auto probeAdmitted = [&](const std::string &name, double memoryMb) {
+        const auto status = probeStatus(name, memoryMb);
+        EXPECT_TRUE(status.IsOk()) << "probe " << name << " must be admitted: " << status.ToString();
+        auto removed = view->DeleteInstances({name});
+        ASSERT_AWAIT_READY(removed);
+    };
+
+    // Birth state: revision 1 at the 128MiB request; no grow ledger, no baseline.
+    auto physical = publish(MiB(128), MiB(100), 1, "", false, false);
+    ASSERT_AWAIT_READY(physical);
+    probeAdmitted("probe-fresh", 600); // 2800 + 0 held
+
+    // grow 128->256 then 256->512; each settle holds landed - expected.
+    auto reserved = reserve("ledger-grow-1", "op-grow-1", MiB(128), MiB(256), 1, false);
+    ASSERT_AWAIT_READY(reserved);
+    EXPECT_TRUE(reserved.Get().IsOk()) << reserved.Get().ToString();
+    auto observed = observe("ledger-grow-1", "op-grow-1", 2, MiB(256), true, false, false,
+        messages::ResizeSandboxResponse::OBSERVED);
+    ASSERT_AWAIT_READY(observed);
+    EXPECT_TRUE(observed.Get().IsOk()) << observed.Get().ToString();
+    reserved = reserve("ledger-grow-2", "op-grow-2", MiB(256), MiB(512), 2, false);
+    ASSERT_AWAIT_READY(reserved);
+    EXPECT_TRUE(reserved.Get().IsOk()) << reserved.Get().ToString();
+    observed = observe("ledger-grow-2", "op-grow-2", 3, MiB(512), true, false, false,
+        messages::ResizeSandboxResponse::OBSERVED);
+    ASSERT_AWAIT_READY(observed);
+    EXPECT_TRUE(observed.Get().IsOk()) << observed.Get().ToString();
+    probeRejected("probe-two-grows", 600);  // 2800 + 384 held
+    probeAdmitted("probe-two-grows-fit", 400);
+
+    // Own peak 269MiB consumes the first entry and most of the second.
+    physical = publish(MiB(512), MiB(269), 3, "op-grow-2", false, false);
+    ASSERT_AWAIT_READY(physical);
+    probeRejected("probe-after-peak", 700); // 2800 + 243 held
+    probeAdmitted("probe-after-peak-fit", 600);
+
+    // A pending shrink never pre-releases the remaining 243MiB.
+    reserved = reserve("ledger-shrink-1", "op-shrink-1", MiB(512), MiB(256), 3, true);
+    ASSERT_AWAIT_READY(reserved);
+    EXPECT_TRUE(reserved.Get().IsOk()) << reserved.Get().ToString();
+    observed = observe("ledger-shrink-1", "op-shrink-1", 0, 0, false, false, false,
+        messages::ResizeSandboxResponse::UNKNOWN);
+    ASSERT_AWAIT_READY(observed);
+    EXPECT_TRUE(observed.Get().IsOk()) << observed.Get().ToString();
+    probeRejected("probe-pending-shrink", 700);
+    // Same-revision contradictory limits and a frozen mid-operation terminal
+    // state must not close the operation by numeric equality.
+    physical = publish(MiB(256), MiB(269), 3, "op-grow-2", false, false);
+    ASSERT_AWAIT_READY(physical);
+    probeRejected("probe-numeric-close", 700);
+    physical = publish(MiB(256), MiB(269), 4, "op-shrink-1", true, true);
+    ASSERT_AWAIT_READY(physical);
+    probeRejected("probe-frozen-close", 700);
+
+    // Complete, unfrozen, matched op/revision readback trims the cap and
+    // releases the credit; a later identical shrink cannot release again.
+    observed = observe("ledger-shrink-1", "op-shrink-1", 4, MiB(256), true, false, false,
+        messages::ResizeSandboxResponse::OBSERVED);
+    ASSERT_AWAIT_READY(observed);
+    EXPECT_TRUE(observed.Get().IsOk()) << observed.Get().ToString();
+    probeAdmitted("probe-after-shrink", 700); // 2800 + 0 held
+    reserved = reserve("ledger-shrink-2", "op-shrink-2", MiB(256), MiB(128), 4, true);
+    ASSERT_AWAIT_READY(reserved);
+    EXPECT_TRUE(reserved.Get().IsOk()) << reserved.Get().ToString();
+    observed = observe("ledger-shrink-2", "op-shrink-2", 5, MiB(128), true, false, false,
+        messages::ResizeSandboxResponse::OBSERVED);
+    ASSERT_AWAIT_READY(observed);
+    EXPECT_TRUE(observed.Get().IsOk()) << observed.Get().ToString();
+    probeAdmitted("probe-after-second-shrink", 700);
+
+    // Regrow builds a new entry; replays with a stale revision or a reused
+    // operation id are refused even when the numbers match.
+    reserved = reserve("ledger-grow-3", "op-grow-3", MiB(128), MiB(512), 5, false);
+    ASSERT_AWAIT_READY(reserved);
+    EXPECT_TRUE(reserved.Get().IsOk()) << reserved.Get().ToString();
+    probeRejected("probe-after-regrow", 700); // 2800 + 384 held
+    auto replayed = reserve("ledger-grow-replay", "op-grow-replay", MiB(256), MiB(512), 2, false);
+    ASSERT_AWAIT_READY(replayed);
+    EXPECT_FALSE(replayed.Get().IsOk());
+    replayed = reserve("ledger-op-reuse", "op-grow-3", MiB(128), MiB(256), 5, false);
+    ASSERT_AWAIT_READY(replayed);
+    EXPECT_FALSE(replayed.Get().IsOk());
+}
+
+TEST_F(ResourceViewTest, SampleFenceRejectsStaleAndUnauthorizedReadingsInBothIndexes)
+{
+    struct FenceGuard {
+        FenceGuard() { SetMemoryElasticityFenceForTest(true); }
+        ~FenceGuard() { SetMemoryElasticityFenceForTest(false); }
+    } fenceGuard;
+    auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count(); };
+    auto view = resource_view::ResourceView::CreateResourceView("sample-fence", CHILD_PARAM);
+    auto unit = Get1DResourceUnit("sample-fence-agent");
+    for (auto *resources : {unit.mutable_capacity(), unit.mutable_allocatable()}) {
+        (*resources->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(32000);
+        (*resources->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(4096);
+    }
+    (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+    (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(2800);
+    unit.set_cpu_sample_unix_ms(nowMs());
+    unit.set_memory_sample_unix_ms(nowMs());
+    auto added = view->AddResourceUnit(unit);
+    ASSERT_AWAIT_READY(added);
+    auto instance = Get1DInstance();
+    instance.set_instanceid("fence-instance");
+    instance.set_requestid("request-fence-instance");
+    instance.set_unitid(unit.id());
+    instance.set_runtimeid("runtime-fence-instance");
+    instance.mutable_schedulerchain()->Clear();
+    *instance.mutable_schedulerchain()->Add() = unit.id();
+    (*instance.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+    auto *cpu = (*instance.mutable_resources()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar();
+    cpu->set_value(500);
+    cpu->set_limit(8000);
+    auto *memory = (*instance.mutable_resources()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar();
+    memory->set_value(128);
+    memory->set_limit(8192);
+    auto promise = std::make_shared<litebus::Promise<Status>>();
+    (void)view->AddInstances({{instance.instanceid(), resource_view::InstanceAllocatedInfo{instance, promise}}});
+    auto accepted = promise->GetFuture();
+    ASSERT_AWAIT_READY(accepted);
+    ASSERT_TRUE(accepted.Get().IsOk()) << accepted.Get().ToString();
+    // reportedUsageMB doubles as the per-instance actualuse marker: a rejected
+    // report must not change it, an accepted one must.
+    auto publish = [&](uint64_t revision, bool revisionKnown, uint64_t limitBytes, uint64_t currentBytes,
+                       double reportedUsageMb, const std::string &generation = "fence-generation") {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        auto report = std::make_shared<ResourceUnit>(unit);
+        report->set_memory_sample_unix_ms(nowMs());
+        report->set_cpu_sample_unix_ms(report->memory_sample_unix_ms());
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(2800);
+        auto &observed = (*report->mutable_instances())[instance.instanceid()];
+        observed.set_runtimeid(instance.runtimeid());
+        (*observed.mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(50);
+        (*observed.mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(
+            reportedUsageMb);
+        auto *sample = observed.mutable_sandbox_resource_sample();
+        sample->set_runtime_id(instance.runtimeid());
+        sample->set_sandbox_id("fence-sandbox");
+        sample->set_resource_generation(generation);
+        sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
+        sample->set_cpu_usage_known(true);
+        sample->set_cpu_usage_cores(0.05);
+        sample->set_cpu_limits_known(true);
+        sample->set_cpu_period_usec(100000);
+        sample->set_cpu_quota_usec(50000);
+        sample->set_memory_limit_bytes(limitBytes);
+        sample->set_memory_limit_known(true);
+        sample->set_memory_usage_known(true);
+        sample->set_memory_current_bytes(currentBytes);
+        sample->set_resource_revision(revision);
+        sample->set_resource_revision_known(revisionKnown);
+        sample->set_memory_high_bytes(HighBytes(limitBytes));
+        sample->set_memory_high_known(true);
+        sample->set_memory_high_unlimited(false);
+        sample->set_frozen(false);
+        sample->set_frozen_known(true);
+        sample->set_resource_operation_id("");
+        sample->set_resource_operation_pending(false);
+        return view->UpdateResourceUnit(report, UpdateType::UPDATE_ACTUAL);
+    };
+    auto storedSample = [&](resources::SandboxResourceSample &top, resources::SandboxResourceSample &leaf) {
+        auto current = view->GetResourceView();
+        ASSERT_AWAIT_READY(current);
+        top = current.Get()->instances().at(instance.instanceid()).sandbox_resource_sample();
+        leaf = current.Get()->fragment().at(unit.id()).instances().at(instance.instanceid()).sandbox_resource_sample();
+    };
+    auto storedUsageMb = [&](double &topUsage, double &leafUsage) {
+        auto current = view->GetResourceView();
+        ASSERT_AWAIT_READY(current);
+        topUsage = current.Get()->instances().at(instance.instanceid())
+            .actualuse().resources().at(RESOURCE_MEM_NAME).scalar().value();
+        leafUsage = current.Get()->fragment().at(unit.id()).instances().at(instance.instanceid())
+            .actualuse().resources().at(RESOURCE_MEM_NAME).scalar().value();
+    };
+
+    // Recovery window: the first revision-known reading is adopted as baseline.
+    auto physical = publish(3, true, MiB(400), MiB(100), 111);
+    ASSERT_AWAIT_READY(physical);
+    resources::SandboxResourceSample top;
+    resources::SandboxResourceSample leaf;
+    ASSERT_NO_FATAL_FAILURE(storedSample(top, leaf));
+    EXPECT_EQ(top.resource_revision(), 3);
+    EXPECT_EQ(top.memory_limit_bytes(), MiB(400));
+    EXPECT_EQ(leaf.resource_revision(), 3);
+    EXPECT_EQ(leaf.memory_limit_bytes(), MiB(400));
+
+    // Older revision, even with a fresh timestamp.
+    physical = publish(2, true, MiB(400), MiB(90), 222);
+    ASSERT_AWAIT_READY(physical);
+    // Unauthorized newer revision: no dispatched operation owns revision 6.
+    physical = publish(6, true, MiB(400), MiB(90), 222);
+    ASSERT_AWAIT_READY(physical);
+    // Same revision with contradictory limits: keep the confirmed value.
+    physical = publish(3, true, MiB(512), MiB(90), 222);
+    ASSERT_AWAIT_READY(physical);
+    // Same revision but a foreign generation.
+    physical = publish(3, true, MiB(400), MiB(90), 222, "fence-foreign-generation");
+    ASSERT_AWAIT_READY(physical);
+    // Revision-less sample from a pre-contract source.
+    physical = publish(0, false, MiB(400), MiB(90), 222);
+    ASSERT_AWAIT_READY(physical);
+    ASSERT_NO_FATAL_FAILURE(storedSample(top, leaf));
+    EXPECT_EQ(top.resource_revision(), 3);
+    EXPECT_EQ(top.memory_limit_bytes(), MiB(400));
+    EXPECT_EQ(top.memory_current_bytes(), MiB(100));
+    EXPECT_EQ(top.resource_generation(), "fence-generation");
+    EXPECT_EQ(leaf.resource_revision(), 3);
+    EXPECT_EQ(leaf.memory_limit_bytes(), MiB(400));
+    EXPECT_EQ(leaf.memory_current_bytes(), MiB(100));
+    double topUsage = 0;
+    double leafUsage = 0;
+    ASSERT_NO_FATAL_FAILURE(storedUsageMb(topUsage, leafUsage));
+    EXPECT_DOUBLE_EQ(topUsage, 111);
+    EXPECT_DOUBLE_EQ(leafUsage, 111);
+
+    // A legitimate same-revision reading refreshes usage and metadata only.
+    physical = publish(3, true, MiB(400), MiB(150), 333);
+    ASSERT_AWAIT_READY(physical);
+    ASSERT_NO_FATAL_FAILURE(storedSample(top, leaf));
+    EXPECT_EQ(top.resource_revision(), 3);
+    EXPECT_EQ(top.memory_limit_bytes(), MiB(400));
+    EXPECT_EQ(top.memory_current_bytes(), MiB(150));
+    EXPECT_EQ(leaf.memory_current_bytes(), MiB(150));
+    ASSERT_NO_FATAL_FAILURE(storedUsageMb(topUsage, leafUsage));
+    EXPECT_DOUBLE_EQ(topUsage, 333);
+    EXPECT_DOUBLE_EQ(leafUsage, 333);
+}
+
+TEST_F(ResourceViewTest, RestartRecoveryHoldsFullCurrentMaxUntilShrinkTrimsIt)
+{
+    using schedule_plugin::filter::UsageAwareFilter;
+    struct ConfigGuard {
+        double safety = UsageAwareFilter::GetSafety();
+        double floor = UsageAwareFilter::GetFloorMb();
+        int32_t cap = UsageAwareFilter::GetMaxInstances();
+        ~ConfigGuard() { UsageAwareFilter::SetConfig(safety, floor, cap); }
+    } guard;
+    UsageAwareFilter::SetConfig(0.9, 2048, 0);
+    struct FenceGuard {
+        FenceGuard() { SetMemoryElasticityFenceForTest(true); }
+        ~FenceGuard() { SetMemoryElasticityFenceForTest(false); }
+    } fenceGuard;
+    auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count(); };
+    // A fresh view stands in for the restarted process: the grow ledger is gone.
+    auto view = resource_view::ResourceView::CreateResourceView("recovery-budget", CHILD_PARAM);
+    auto unit = Get1DResourceUnit("recovery-budget-agent");
+    for (auto *resources : {unit.mutable_capacity(), unit.mutable_allocatable()}) {
+        (*resources->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(32000);
+        (*resources->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(4096);
+    }
+    (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+    (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(2800);
+    unit.set_cpu_sample_unix_ms(nowMs());
+    unit.set_memory_sample_unix_ms(nowMs());
+    auto added = view->AddResourceUnit(unit);
+    ASSERT_AWAIT_READY(added);
+    auto makeOwner = [&](const std::string &request) {
+        auto owner = Get1DInstance();
+        owner.set_instanceid("recovery-owner");
+        owner.set_requestid(request);
+        owner.set_unitid(unit.id());
+        owner.set_runtimeid("runtime-recovery-owner");
+        owner.mutable_schedulerchain()->Clear();
+        *owner.mutable_schedulerchain()->Add() = unit.id();
+        (*owner.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+        auto *cpu = (*owner.mutable_resources()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar();
+        cpu->set_value(500);
+        cpu->set_limit(8000);
+        auto *memory = (*owner.mutable_resources()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar();
+        memory->set_value(128);
+        memory->set_limit(8192);
+        return owner;
+    };
+    auto allocate = [&](const resources::InstanceInfo &instance) {
+        auto promise = std::make_shared<litebus::Promise<Status>>();
+        (void)view->AddInstances({{instance.instanceid(), resource_view::InstanceAllocatedInfo{instance, promise}}});
+        return promise->GetFuture();
+    };
+    auto owner = makeOwner("request-recovery-owner");
+    auto accepted = allocate(owner);
+    ASSERT_AWAIT_READY(accepted);
+    ASSERT_TRUE(accepted.Get().IsOk()) << accepted.Get().ToString();
+    auto publish = [&](uint64_t revision, bool revisionKnown, uint64_t maxBytes, uint64_t currentBytes) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        auto report = std::make_shared<ResourceUnit>(unit);
+        report->set_memory_sample_unix_ms(nowMs());
+        report->set_cpu_sample_unix_ms(report->memory_sample_unix_ms());
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(2800);
+        auto &observed = (*report->mutable_instances())[owner.instanceid()];
+        observed.set_runtimeid(owner.runtimeid());
+        auto *sample = observed.mutable_sandbox_resource_sample();
+        sample->set_runtime_id(owner.runtimeid());
+        sample->set_sandbox_id("recovery-sandbox");
+        sample->set_resource_generation("recovery-generation");
+        sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
+        sample->set_cpu_usage_known(true);
+        sample->set_cpu_usage_cores(0.05);
+        sample->set_cpu_limits_known(true);
+        sample->set_cpu_period_usec(100000);
+        sample->set_cpu_quota_usec(50000);
+        sample->set_memory_limit_bytes(maxBytes);
+        sample->set_memory_limit_known(true);
+        sample->set_memory_usage_known(true);
+        sample->set_memory_current_bytes(currentBytes);
+        sample->set_resource_revision(revision);
+        sample->set_resource_revision_known(revisionKnown);
+        sample->set_memory_high_bytes(HighBytes(maxBytes));
+        sample->set_memory_high_known(true);
+        sample->set_memory_high_unlimited(false);
+        sample->set_frozen(false);
+        sample->set_frozen_known(true);
+        sample->set_resource_operation_id("op-prior-grow");
+        sample->set_resource_operation_pending(false);
+        return view->UpdateResourceUnit(report, UpdateType::UPDATE_ACTUAL);
+    };
+    auto probeStatus = [&](const std::string &name, double memoryMb) -> Status {
+        auto instance = Get1DInstance();
+        instance.set_instanceid(name);
+        instance.set_requestid("request-" + name);
+        instance.set_unitid(unit.id());
+        instance.set_runtimeid("runtime-" + name);
+        instance.mutable_schedulerchain()->Clear();
+        *instance.mutable_schedulerchain()->Add() = unit.id();
+        (*instance.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+        auto *cpu = (*instance.mutable_resources()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar();
+        cpu->set_value(500);
+        cpu->set_limit(8000);
+        auto *memory = (*instance.mutable_resources()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar();
+        memory->set_value(memoryMb);
+        memory->set_limit(8192);
+        auto future = allocate(instance);
+        if (!future.WaitFor(TEST_AWAIT_TIMEOUT).IsOK()) {
+            return Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "probe future did not resolve");
+        }
+        return future.Get();
+    };
+
+    // Revision-less telemetry must not clear admission or seed state.
+    auto physical = publish(0, false, MiB(512), MiB(269));
+    ASSERT_AWAIT_READY(physical);
+    auto current = view->GetResourceView();
+    ASSERT_AWAIT_READY(current);
+    EXPECT_TRUE(current.Get()->instances().at(owner.instanceid()).resource_admission_pending());
+    EXPECT_FALSE(current.Get()->instances().at(owner.instanceid()).has_sandbox_resource_sample());
+
+    // The authoritative post-restart reading clears admission and holds the
+    // full current max: 512 - 269 = 243MiB stay committed.
+    physical = publish(5, true, MiB(512), MiB(269));
+    ASSERT_AWAIT_READY(physical);
+    current = view->GetResourceView();
+    ASSERT_AWAIT_READY(current);
+    EXPECT_FALSE(current.Get()->instances().at(owner.instanceid()).resource_admission_pending());
+    EXPECT_EQ(current.Get()->instances().at(owner.instanceid()).sandbox_resource_sample().resource_revision(), 5);
+    const auto heldRejected = probeStatus("probe-held", 700);
+    EXPECT_FALSE(heldRejected.IsOk()) << heldRejected.ToString(); // 2800 + 243 held
+    const auto heldAdmitted = probeStatus("probe-held-fit", 600);
+    EXPECT_TRUE(heldAdmitted.IsOk()) << heldAdmitted.ToString();
+    auto removed = view->DeleteInstances({"probe-held-fit"});
+    ASSERT_AWAIT_READY(removed);
+
+    // A confirmed shrink trims the baseline cap to 256 and drops the hold.
+    messages::ResizeSandboxRequest shrink;
+    shrink.set_requestid("recovery-shrink");
+    shrink.set_instanceid(owner.instanceid());
+    shrink.set_runtimeid(owner.runtimeid());
+    shrink.set_shrink(true);
+    auto *resize = shrink.mutable_resize();
+    resize->set_sandbox_id("recovery-sandbox");
+    resize->set_resource_generation("recovery-generation");
+    resize->set_operation_id("op-recovery-shrink");
+    resize->set_expected_revision(5);
+    resize->set_deadline_unix_ms(nowMs() + 30000);
+    resize->mutable_expected()->set_cpu_quota_usec(50000);
+    resize->mutable_expected()->set_cpu_period_usec(100000);
+    resize->mutable_expected()->set_memory_limit_bytes(MiB(512));
+    resize->mutable_target()->set_cpu_quota_usec(50000);
+    resize->mutable_target()->set_cpu_period_usec(100000);
+    resize->mutable_target()->set_memory_limit_bytes(MiB(256));
+    auto reserved = view->ReserveResize(shrink);
+    ASSERT_AWAIT_READY(reserved);
+    EXPECT_TRUE(reserved.Get().IsOk()) << reserved.Get().ToString();
+    messages::ResizeSandboxResponse response;
+    response.set_requestid(shrink.requestid());
+    response.set_instanceid(owner.instanceid());
+    response.set_runtimeid(owner.runtimeid());
+    response.set_sandboxid("recovery-sandbox");
+    response.set_resourcegeneration("recovery-generation");
+    response.set_outcome(messages::ResizeSandboxResponse::OBSERVED);
+    response.mutable_result()->set_complete(true);
+    auto *actual = response.mutable_result()->mutable_actual();
+    actual->set_resource_generation("recovery-generation");
+    actual->set_cpu_limits_known(true);
+    actual->set_cpu_quota_usec(50000);
+    actual->set_cpu_period_usec(100000);
+    actual->set_memory_limit_bytes(MiB(256));
+    actual->set_memory_limit_known(true);
+    actual->set_resource_revision(6);
+    actual->set_resource_revision_known(true);
+    actual->set_resource_operation_id("op-recovery-shrink");
+    actual->set_resource_operation_pending(false);
+    actual->set_frozen(false);
+    actual->set_frozen_known(true);
+    actual->set_memory_high_bytes(HighBytes(MiB(256)));
+    actual->set_memory_high_known(true);
+    auto observed = view->ObserveResize(response);
+    ASSERT_AWAIT_READY(observed);
+    EXPECT_TRUE(observed.Get().IsOk()) << observed.Get().ToString();
+    const auto released = probeStatus("probe-released", 700);
+    EXPECT_TRUE(released.IsOk()) << released.ToString(); // 2800 + 0 held
+    removed = view->DeleteInstances({"probe-released"});
+    ASSERT_AWAIT_READY(removed);
+
+    // Retirement drops the synthetic hold; a recreated allocation rebuilds it.
+    removed = view->DeleteInstances({owner.instanceid()});
+    ASSERT_AWAIT_READY(removed);
+    const auto afterDelete = probeStatus("probe-after-retire", 700);
+    EXPECT_TRUE(afterDelete.IsOk()) << afterDelete.ToString();
+    removed = view->DeleteInstances({"probe-after-retire"});
+    ASSERT_AWAIT_READY(removed);
+    owner = makeOwner("request-recovery-owner-2");
+    accepted = allocate(owner);
+    ASSERT_AWAIT_READY(accepted);
+    ASSERT_TRUE(accepted.Get().IsOk()) << accepted.Get().ToString();
+    physical = publish(7, true, MiB(512), MiB(269));
+    ASSERT_AWAIT_READY(physical);
+    const auto reheld = probeStatus("probe-reheld", 700);
+    EXPECT_FALSE(reheld.IsOk()) << reheld.ToString();
+}
+
+TEST_F(ResourceViewTest, ShrinkReserveRejectsContractViolationsBeforeAnyHeadroomMath)
+{
+    struct FenceGuard {
+        FenceGuard() { SetMemoryElasticityFenceForTest(true); }
+        ~FenceGuard() { SetMemoryElasticityFenceForTest(false); }
+    } fenceGuard;
+    auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count(); };
+    auto view = resource_view::ResourceView::CreateResourceView("shrink-reject", CHILD_PARAM);
+    auto unit = Get1DResourceUnit("shrink-reject-agent");
+    for (auto *resources : {unit.mutable_capacity(), unit.mutable_allocatable()}) {
+        (*resources->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(32000);
+        (*resources->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(4096);
+    }
+    (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+    (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(2800);
+    unit.set_cpu_sample_unix_ms(nowMs());
+    unit.set_memory_sample_unix_ms(nowMs());
+    auto added = view->AddResourceUnit(unit);
+    ASSERT_AWAIT_READY(added);
+    auto instance = Get1DInstance();
+    instance.set_instanceid("shrink-reject-instance");
+    instance.set_requestid("request-shrink-reject");
+    instance.set_unitid(unit.id());
+    instance.set_runtimeid("runtime-shrink-reject");
+    instance.mutable_schedulerchain()->Clear();
+    *instance.mutable_schedulerchain()->Add() = unit.id();
+    (*instance.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+    auto *cpu = (*instance.mutable_resources()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar();
+    cpu->set_value(500);
+    cpu->set_limit(8000);
+    auto *memory = (*instance.mutable_resources()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar();
+    memory->set_value(128);
+    memory->set_limit(8192);
+    auto promise = std::make_shared<litebus::Promise<Status>>();
+    (void)view->AddInstances({{instance.instanceid(), resource_view::InstanceAllocatedInfo{instance, promise}}});
+    auto accepted = promise->GetFuture();
+    ASSERT_AWAIT_READY(accepted);
+    ASSERT_TRUE(accepted.Get().IsOk()) << accepted.Get().ToString();
+    auto publish = [&](bool frozen, bool operationPending) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        auto report = std::make_shared<ResourceUnit>(unit);
+        report->set_memory_sample_unix_ms(nowMs());
+        report->set_cpu_sample_unix_ms(report->memory_sample_unix_ms());
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(2800);
+        auto &observed = (*report->mutable_instances())[instance.instanceid()];
+        observed.set_runtimeid(instance.runtimeid());
+        auto *sample = observed.mutable_sandbox_resource_sample();
+        sample->set_runtime_id(instance.runtimeid());
+        sample->set_sandbox_id("reject-sandbox");
+        sample->set_resource_generation("reject-generation");
+        sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
+        sample->set_cpu_usage_known(true);
+        sample->set_cpu_usage_cores(0.05);
+        sample->set_cpu_limits_known(true);
+        sample->set_cpu_period_usec(100000);
+        sample->set_cpu_quota_usec(50000);
+        sample->set_memory_limit_bytes(MiB(512));
+        sample->set_memory_limit_known(true);
+        sample->set_memory_usage_known(true);
+        sample->set_memory_current_bytes(MiB(64));
+        sample->set_resource_revision(2);
+        sample->set_resource_revision_known(true);
+        sample->set_memory_high_bytes(MiB(410));
+        sample->set_memory_high_known(true);
+        sample->set_memory_high_unlimited(false);
+        sample->set_frozen(frozen);
+        sample->set_frozen_known(true);
+        sample->set_resource_operation_id("op-previous");
+        sample->set_resource_operation_pending(operationPending);
+        return view->UpdateResourceUnit(report, UpdateType::UPDATE_ACTUAL);
+    };
+    auto physical = publish(false, false);
+    ASSERT_AWAIT_READY(physical);
+    auto buildShrink = [&](const std::string &requestID, const std::string &operationID, uint64_t expectedRevision,
+                           uint64_t expectedBytes, uint64_t targetBytes, int64_t targetCpuQuota) {
+        messages::ResizeSandboxRequest request;
+        request.set_requestid(requestID);
+        request.set_instanceid(instance.instanceid());
+        request.set_runtimeid(instance.runtimeid());
+        request.set_shrink(true);
+        auto *resize = request.mutable_resize();
+        resize->set_sandbox_id("reject-sandbox");
+        resize->set_resource_generation("reject-generation");
+        resize->set_operation_id(operationID);
+        resize->set_expected_revision(expectedRevision);
+        resize->set_deadline_unix_ms(nowMs() + 30000);
+        resize->mutable_expected()->set_cpu_quota_usec(50000);
+        resize->mutable_expected()->set_cpu_period_usec(100000);
+        resize->mutable_expected()->set_memory_limit_bytes(expectedBytes);
+        resize->mutable_target()->set_cpu_quota_usec(targetCpuQuota);
+        resize->mutable_target()->set_cpu_period_usec(100000);
+        resize->mutable_target()->set_memory_limit_bytes(targetBytes);
+        return request;
+    };
+    auto reserveStatus = [&](const messages::ResizeSandboxRequest &request) {
+        auto future = view->ReserveResize(request);
+        if (!future.WaitFor(TEST_AWAIT_TIMEOUT).IsOK()) {
+            return Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "reserve future did not resolve");
+        }
+        return future.Get();
+    };
+    // CPU must not move in either direction.
+    auto refused = reserveStatus(buildShrink("reject-cpu-up", "op-cpu-up", 2, MiB(512), MiB(256), 60000));
+    EXPECT_FALSE(refused.IsOk()) << refused.ToString();
+    refused = reserveStatus(buildShrink("reject-cpu-down", "op-cpu-down", 2, MiB(512), MiB(256), 40000));
+    EXPECT_FALSE(refused.IsOk()) << refused.ToString();
+    // Floor gate: 64MiB is below the 128MiB birth request.
+    refused = reserveStatus(buildShrink("reject-floor", "op-floor", 2, MiB(512), MiB(64), 50000));
+    EXPECT_FALSE(refused.IsOk()) << refused.ToString();
+    // A grow disguised as shrink, and a target above the expected limit.
+    refused = reserveStatus(buildShrink("reject-increase", "op-increase", 2, MiB(512), MiB(768), 50000));
+    EXPECT_FALSE(refused.IsOk()) << refused.ToString();
+    // Stale revision (ABA replay) and missing operation identity.
+    refused = reserveStatus(buildShrink("reject-stale-revision", "op-stale", 1, MiB(512), MiB(256), 50000));
+    EXPECT_FALSE(refused.IsOk()) << refused.ToString();
+    refused = reserveStatus(buildShrink("reject-no-op-id", "", 2, MiB(512), MiB(256), 50000));
+    EXPECT_FALSE(refused.IsOk()) << refused.ToString();
+    // Expected limits must match the confirmed sample.
+    refused = reserveStatus(buildShrink("reject-wrong-expected", "op-wrong-expected", 2, MiB(256), MiB(128), 50000));
+    EXPECT_FALSE(refused.IsOk()) << refused.ToString();
+    // A daemon-side unfinished operation or a frozen sandbox blocks new work.
+    physical = publish(false, true);
+    ASSERT_AWAIT_READY(physical);
+    refused = reserveStatus(buildShrink("reject-daemon-pending", "op-daemon-pending", 2, MiB(512), MiB(256), 50000));
+    EXPECT_FALSE(refused.IsOk()) << refused.ToString();
+    physical = publish(true, false);
+    ASSERT_AWAIT_READY(physical);
+    refused = reserveStatus(buildShrink("reject-frozen", "op-frozen", 2, MiB(512), MiB(256), 50000));
+    EXPECT_FALSE(refused.IsOk()) << refused.ToString();
+    // Shrink is not reachable with the feature disabled.
+    SetMemoryElasticityFenceForTest(false);
+    refused = reserveStatus(buildShrink("reject-feature-off", "op-feature-off", 2, MiB(512), MiB(256), 50000));
+    EXPECT_FALSE(refused.IsOk()) << refused.ToString();
+    SetMemoryElasticityFenceForTest(true);
+    // The well-formed shrink leases without consuming headroom.
+    physical = publish(false, false);
+    ASSERT_AWAIT_READY(physical);
+    const auto valid = reserveStatus(buildShrink("reject-valid", "op-valid", 2, MiB(512), MiB(256), 50000));
+    EXPECT_TRUE(valid.IsOk()) << valid.ToString();
+    // And the instance stays single-operation until it settles.
+    refused = reserveStatus(buildShrink("reject-second-op", "op-second", 2, MiB(512), MiB(256), 50000));
+    EXPECT_FALSE(refused.IsOk()) << refused.ToString();
+}
+
+TEST_F(ResourceViewTest, UnknownGrowHoldsSingleOperationUntilContractCloses)
+{
+    struct FenceGuard {
+        FenceGuard() { SetMemoryElasticityFenceForTest(true); }
+        ~FenceGuard() { SetMemoryElasticityFenceForTest(false); }
+    } fenceGuard;
+    auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count(); };
+    auto view = resource_view::ResourceView::CreateResourceView("unknown-grow", CHILD_PARAM);
+    auto unit = Get1DResourceUnit("unknown-grow-agent");
+    for (auto *resources : {unit.mutable_capacity(), unit.mutable_allocatable()}) {
+        (*resources->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(32000);
+        (*resources->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(4096);
+    }
+    (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+    (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(2800);
+    unit.set_cpu_sample_unix_ms(nowMs());
+    unit.set_memory_sample_unix_ms(nowMs());
+    auto added = view->AddResourceUnit(unit);
+    ASSERT_AWAIT_READY(added);
+    auto instance = Get1DInstance();
+    instance.set_instanceid("unknown-grow-instance");
+    instance.set_requestid("request-unknown-grow");
+    instance.set_unitid(unit.id());
+    instance.set_runtimeid("runtime-unknown-grow");
+    instance.mutable_schedulerchain()->Clear();
+    *instance.mutable_schedulerchain()->Add() = unit.id();
+    (*instance.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+    auto *cpu = (*instance.mutable_resources()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar();
+    cpu->set_value(500);
+    cpu->set_limit(8000);
+    auto *memory = (*instance.mutable_resources()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar();
+    memory->set_value(128);
+    memory->set_limit(8192);
+    auto promise = std::make_shared<litebus::Promise<Status>>();
+    (void)view->AddInstances({{instance.instanceid(), resource_view::InstanceAllocatedInfo{instance, promise}}});
+    auto accepted = promise->GetFuture();
+    ASSERT_AWAIT_READY(accepted);
+    ASSERT_TRUE(accepted.Get().IsOk()) << accepted.Get().ToString();
+    auto publish = [&](uint64_t limitBytes, uint64_t revision, const std::string &operationId, bool operationPending,
+                       bool frozen, bool highKnown) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        auto report = std::make_shared<ResourceUnit>(unit);
+        report->set_memory_sample_unix_ms(nowMs());
+        report->set_cpu_sample_unix_ms(report->memory_sample_unix_ms());
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(2800);
+        auto &observed = (*report->mutable_instances())[instance.instanceid()];
+        observed.set_runtimeid(instance.runtimeid());
+        auto *sample = observed.mutable_sandbox_resource_sample();
+        sample->set_runtime_id(instance.runtimeid());
+        sample->set_sandbox_id("unknown-sandbox");
+        sample->set_resource_generation("unknown-generation");
+        sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
+        sample->set_cpu_usage_known(true);
+        sample->set_cpu_usage_cores(0.05);
+        sample->set_cpu_limits_known(true);
+        sample->set_cpu_period_usec(100000);
+        sample->set_cpu_quota_usec(50000);
+        sample->set_memory_limit_bytes(limitBytes);
+        sample->set_memory_limit_known(true);
+        sample->set_memory_usage_known(true);
+        sample->set_memory_current_bytes(MiB(100));
+        sample->set_resource_revision(revision);
+        sample->set_resource_revision_known(true);
+        if (highKnown) {
+            sample->set_memory_high_bytes(HighBytes(limitBytes));
+            sample->set_memory_high_known(true);
+            sample->set_memory_high_unlimited(false);
+        }
+        sample->set_frozen(frozen);
+        sample->set_frozen_known(true);
+        sample->set_resource_operation_id(operationId);
+        sample->set_resource_operation_pending(operationPending);
+        return view->UpdateResourceUnit(report, UpdateType::UPDATE_ACTUAL);
+    };
+    auto buildGrow = [&](const std::string &requestID, const std::string &operationID, uint64_t expectedRevision,
+                         uint64_t expectedBytes, uint64_t targetBytes) {
+        messages::ResizeSandboxRequest request;
+        request.set_requestid(requestID);
+        request.set_instanceid(instance.instanceid());
+        request.set_runtimeid(instance.runtimeid());
+        request.set_shrink(false);
+        auto *resize = request.mutable_resize();
+        resize->set_sandbox_id("unknown-sandbox");
+        resize->set_resource_generation("unknown-generation");
+        resize->set_operation_id(operationID);
+        resize->set_expected_revision(expectedRevision);
+        resize->set_deadline_unix_ms(nowMs() + 30000);
+        resize->mutable_expected()->set_cpu_quota_usec(50000);
+        resize->mutable_expected()->set_cpu_period_usec(100000);
+        resize->mutable_expected()->set_memory_limit_bytes(expectedBytes);
+        resize->mutable_target()->set_cpu_quota_usec(50000);
+        resize->mutable_target()->set_cpu_period_usec(100000);
+        resize->mutable_target()->set_memory_limit_bytes(targetBytes);
+        return request;
+    };
+    auto reserveStatus = [&](const messages::ResizeSandboxRequest &request) {
+        auto future = view->ReserveResize(request);
+        if (!future.WaitFor(TEST_AWAIT_TIMEOUT).IsOK()) {
+            return Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "reserve future did not resolve");
+        }
+        return future.Get();
+    };
+    auto physical = publish(MiB(128), 1, "", false, false, true);
+    ASSERT_AWAIT_READY(physical);
+    const auto reserved = reserveStatus(buildGrow("unknown-grow-1", "op-unknown-grow", 1, MiB(128), MiB(256)));
+    EXPECT_TRUE(reserved.IsOk()) << reserved.ToString();
+    // The instance is single-operation while the outcome is unresolved.
+    auto blocked = reserveStatus(buildGrow("unknown-grow-2", "op-unknown-grow-2", 1, MiB(256), MiB(512)));
+    EXPECT_FALSE(blocked.IsOk()) << blocked.ToString();
+    messages::ResizeSandboxResponse response;
+    response.set_requestid("unknown-grow-1");
+    response.set_instanceid(instance.instanceid());
+    response.set_runtimeid(instance.runtimeid());
+    response.set_sandboxid("unknown-sandbox");
+    response.set_resourcegeneration("unknown-generation");
+    response.set_outcome(messages::ResizeSandboxResponse::UNKNOWN);
+    auto observed = view->ObserveResize(response);
+    ASSERT_AWAIT_READY(observed);
+    blocked = reserveStatus(buildGrow("unknown-grow-2", "op-unknown-grow-2", 1, MiB(256), MiB(512)));
+    EXPECT_FALSE(blocked.IsOk()) << blocked.ToString();
+    // Numeric target equality at the right revision but the wrong operation,
+    // or a partial readback, does not close the UNKNOWN.
+    physical = publish(MiB(256), 2, "op-someone-else", false, false, true);
+    ASSERT_AWAIT_READY(physical);
+    blocked = reserveStatus(buildGrow("unknown-grow-2", "op-unknown-grow-2", 1, MiB(256), MiB(512)));
+    EXPECT_FALSE(blocked.IsOk()) << blocked.ToString();
+    physical = publish(MiB(256), 2, "op-unknown-grow", false, false, false); // high unknown
+    ASSERT_AWAIT_READY(physical);
+    blocked = reserveStatus(buildGrow("unknown-grow-2", "op-unknown-grow-2", 1, MiB(256), MiB(512)));
+    EXPECT_FALSE(blocked.IsOk()) << blocked.ToString();
+    // The matched terminal state closes the operation and frees the slot.
+    physical = publish(MiB(256), 2, "op-unknown-grow", false, false, true);
+    ASSERT_AWAIT_READY(physical);
+    // Refresh the stored reading time so the closure runs on a newer sample.
+    physical = publish(MiB(256), 2, "op-unknown-grow", false, false, true);
+    ASSERT_AWAIT_READY(physical);
+    const auto followUp = reserveStatus(buildGrow("unknown-grow-2", "op-unknown-grow-2", 2, MiB(256), MiB(512)));
+    EXPECT_TRUE(followUp.IsOk()) << followUp.ToString();
+}
+
+TEST_F(ResourceViewTest, LateStatsCannotRollBackConfirmedRpcReadback)
+{
+    struct FenceGuard {
+        FenceGuard() { SetMemoryElasticityFenceForTest(true); }
+        ~FenceGuard() { SetMemoryElasticityFenceForTest(false); }
+    } fenceGuard;
+    auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count(); };
+    auto view = resource_view::ResourceView::CreateResourceView("late-stats", CHILD_PARAM);
+    auto unit = Get1DResourceUnit("late-stats-agent");
+    for (auto *resources : {unit.mutable_capacity(), unit.mutable_allocatable()}) {
+        (*resources->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(32000);
+        (*resources->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(4096);
+    }
+    (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+    (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(2800);
+    unit.set_cpu_sample_unix_ms(nowMs());
+    unit.set_memory_sample_unix_ms(nowMs());
+    auto added = view->AddResourceUnit(unit);
+    ASSERT_AWAIT_READY(added);
+    auto instance = Get1DInstance();
+    instance.set_instanceid("late-stats-instance");
+    instance.set_requestid("request-late-stats");
+    instance.set_unitid(unit.id());
+    instance.set_runtimeid("runtime-late-stats");
+    instance.mutable_schedulerchain()->Clear();
+    *instance.mutable_schedulerchain()->Add() = unit.id();
+    (*instance.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+    auto *cpu = (*instance.mutable_resources()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar();
+    cpu->set_value(500);
+    cpu->set_limit(8000);
+    auto *memory = (*instance.mutable_resources()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar();
+    memory->set_value(128);
+    memory->set_limit(8192);
+    auto promise = std::make_shared<litebus::Promise<Status>>();
+    (void)view->AddInstances({{instance.instanceid(), resource_view::InstanceAllocatedInfo{instance, promise}}});
+    auto accepted = promise->GetFuture();
+    ASSERT_AWAIT_READY(accepted);
+    ASSERT_TRUE(accepted.Get().IsOk()) << accepted.Get().ToString();
+    auto publish = [&](uint64_t limitBytes, uint64_t currentBytes, uint64_t revision, bool revisionKnown) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        auto report = std::make_shared<ResourceUnit>(unit);
+        report->set_memory_sample_unix_ms(nowMs());
+        report->set_cpu_sample_unix_ms(report->memory_sample_unix_ms());
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(2800);
+        auto &observed = (*report->mutable_instances())[instance.instanceid()];
+        observed.set_runtimeid(instance.runtimeid());
+        auto *sample = observed.mutable_sandbox_resource_sample();
+        sample->set_runtime_id(instance.runtimeid());
+        sample->set_sandbox_id("late-sandbox");
+        sample->set_resource_generation("late-generation");
+        sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
+        sample->set_cpu_usage_known(true);
+        sample->set_cpu_usage_cores(0.05);
+        sample->set_cpu_limits_known(true);
+        sample->set_cpu_period_usec(100000);
+        sample->set_cpu_quota_usec(50000);
+        sample->set_memory_limit_bytes(limitBytes);
+        sample->set_memory_limit_known(true);
+        sample->set_memory_usage_known(true);
+        sample->set_memory_current_bytes(currentBytes);
+        sample->set_resource_revision(revision);
+        sample->set_resource_revision_known(revisionKnown);
+        sample->set_memory_high_bytes(HighBytes(limitBytes));
+        sample->set_memory_high_known(true);
+        sample->set_memory_high_unlimited(false);
+        sample->set_frozen(false);
+        sample->set_frozen_known(true);
+        sample->set_resource_operation_id(revision == 1 ? "" : "op-late-grow");
+        sample->set_resource_operation_pending(false);
+        return view->UpdateResourceUnit(report, UpdateType::UPDATE_ACTUAL);
+    };
+    auto physical = publish(MiB(128), MiB(100), 1, true);
+    ASSERT_AWAIT_READY(physical);
+    messages::ResizeSandboxRequest request;
+    request.set_requestid("late-grow");
+    request.set_instanceid(instance.instanceid());
+    request.set_runtimeid(instance.runtimeid());
+    auto *resize = request.mutable_resize();
+    resize->set_sandbox_id("late-sandbox");
+    resize->set_resource_generation("late-generation");
+    resize->set_operation_id("op-late-grow");
+    resize->set_expected_revision(1);
+    resize->set_deadline_unix_ms(nowMs() + 30000);
+    resize->mutable_expected()->set_cpu_quota_usec(50000);
+    resize->mutable_expected()->set_cpu_period_usec(100000);
+    resize->mutable_expected()->set_memory_limit_bytes(MiB(128));
+    resize->mutable_target()->set_cpu_quota_usec(50000);
+    resize->mutable_target()->set_cpu_period_usec(100000);
+    resize->mutable_target()->set_memory_limit_bytes(MiB(256));
+    auto reserved = view->ReserveResize(request);
+    ASSERT_AWAIT_READY(reserved);
+    EXPECT_TRUE(reserved.Get().IsOk()) << reserved.Get().ToString();
+    const auto reservationFinishedAt = nowMs();
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    messages::ResizeSandboxResponse response;
+    response.set_requestid(request.requestid());
+    response.set_instanceid(instance.instanceid());
+    response.set_runtimeid(instance.runtimeid());
+    response.set_sandboxid("late-sandbox");
+    response.set_resourcegeneration("late-generation");
+    response.set_outcome(messages::ResizeSandboxResponse::OBSERVED);
+    response.mutable_result()->set_complete(true);
+    auto *actual = response.mutable_result()->mutable_actual();
+    actual->set_resource_generation("late-generation");
+    actual->set_cpu_limits_known(true);
+    actual->set_cpu_quota_usec(50000);
+    actual->set_cpu_period_usec(100000);
+    actual->set_memory_limit_bytes(MiB(256));
+    actual->set_memory_limit_known(true);
+    actual->set_memory_usage_known(true);
+    actual->set_memory_usage_bytes(MiB(120));
+    actual->set_memory_peak_known(true);
+    actual->set_memory_max_usage_bytes(MiB(130));
+    actual->set_cpu_usage_known(true);
+    actual->set_cpu_usage_ns(123000000);
+    actual->set_resource_revision(2);
+    actual->set_resource_revision_known(true);
+    actual->set_resource_operation_id("op-late-grow");
+    actual->set_resource_operation_pending(false);
+    actual->set_frozen(false);
+    actual->set_frozen_known(true);
+    actual->set_memory_high_bytes(HighBytes(MiB(256)));
+    actual->set_memory_high_known(true);
+    auto observed = view->ObserveResize(response);
+    ASSERT_AWAIT_READY(observed);
+    EXPECT_TRUE(observed.Get().IsOk()) << observed.Get().ToString();
+    // A queued pre-operation Stats reading (revision 1, old limits) arrives
+    // with a fresh collection clock; the revision fence keeps the readback.
+    physical = publish(MiB(128), MiB(100), 1, true);
+    ASSERT_AWAIT_READY(physical);
+    auto current = view->GetResourceView();
+    ASSERT_AWAIT_READY(current);
+    const auto &top = current.Get()->instances().at(instance.instanceid()).sandbox_resource_sample();
+    const auto &leaf = current.Get()->fragment().at(unit.id()).instances().at(instance.instanceid())
+        .sandbox_resource_sample();
+    EXPECT_EQ(top.resource_revision(), 2);
+    EXPECT_EQ(top.memory_limit_bytes(), MiB(256));
+    EXPECT_EQ(leaf.resource_revision(), 2);
+    EXPECT_EQ(leaf.memory_limit_bytes(), MiB(256));
+    EXPECT_EQ(top.memory_current_bytes(), MiB(120));
+    EXPECT_EQ(leaf.memory_current_bytes(), MiB(120));
+    EXPECT_TRUE(top.memory_usage_known());
+    EXPECT_EQ(top.memory_peak_bytes(), MiB(130));
+    EXPECT_FALSE(top.cpu_usage_known()); // cumulative RPC usage is not a CPU rate
+    EXPECT_LE(top.sampled_at_unix_ms(), reservationFinishedAt);
+    // Same-revision telemetry keeps flowing normally afterwards.
+    physical = publish(MiB(256), MiB(150), 2, true);
+    ASSERT_AWAIT_READY(physical);
+    current = view->GetResourceView();
+    ASSERT_AWAIT_READY(current);
+    EXPECT_EQ(current.Get()->instances().at(instance.instanceid()).sandbox_resource_sample()
+        .memory_current_bytes(), MiB(150));
+}
+
+TEST_F(ResourceViewTest, ShrinkTerminalContractRequiresExactHighAndCoversFailedTerminal)
+{
+    using schedule_plugin::filter::UsageAwareFilter;
+    struct ConfigGuard {
+        double safety = UsageAwareFilter::GetSafety();
+        double floor = UsageAwareFilter::GetFloorMb();
+        int32_t cap = UsageAwareFilter::GetMaxInstances();
+        ~ConfigGuard() { UsageAwareFilter::SetConfig(safety, floor, cap); }
+    } guard;
+    UsageAwareFilter::SetConfig(0.9, 2048, 0);
+    struct FenceGuard {
+        FenceGuard() { SetMemoryElasticityFenceForTest(true); }
+        ~FenceGuard() { SetMemoryElasticityFenceForTest(false); }
+    } fenceGuard;
+    auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count(); };
+    auto view = resource_view::ResourceView::CreateResourceView("shrink-terminal", CHILD_PARAM);
+    auto unit = Get1DResourceUnit("shrink-terminal-agent");
+    for (auto *resources : {unit.mutable_capacity(), unit.mutable_allocatable()}) {
+        (*resources->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(32000);
+        (*resources->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(4096);
+    }
+    (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+    (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(2800);
+    unit.set_cpu_sample_unix_ms(nowMs());
+    unit.set_memory_sample_unix_ms(nowMs());
+    auto added = view->AddResourceUnit(unit);
+    ASSERT_AWAIT_READY(added);
+    auto instance = Get1DInstance();
+    instance.set_instanceid("terminal-instance");
+    instance.set_requestid("request-terminal-instance");
+    instance.set_unitid(unit.id());
+    instance.set_runtimeid("runtime-terminal-instance");
+    instance.mutable_schedulerchain()->Clear();
+    *instance.mutable_schedulerchain()->Add() = unit.id();
+    (*instance.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+    auto *cpu = (*instance.mutable_resources()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar();
+    cpu->set_value(500);
+    cpu->set_limit(8000);
+    auto *memory = (*instance.mutable_resources()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar();
+    memory->set_value(128);
+    memory->set_limit(8192);
+    auto promise = std::make_shared<litebus::Promise<Status>>();
+    (void)view->AddInstances({{instance.instanceid(), resource_view::InstanceAllocatedInfo{instance, promise}}});
+    auto accepted = promise->GetFuture();
+    ASSERT_AWAIT_READY(accepted);
+    ASSERT_TRUE(accepted.Get().IsOk()) << accepted.Get().ToString();
+    auto publish = [&](uint64_t maxBytes, uint64_t currentBytes, uint64_t revision) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        auto report = std::make_shared<ResourceUnit>(unit);
+        report->set_memory_sample_unix_ms(nowMs());
+        report->set_cpu_sample_unix_ms(report->memory_sample_unix_ms());
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(2800);
+        auto &observed = (*report->mutable_instances())[instance.instanceid()];
+        observed.set_runtimeid(instance.runtimeid());
+        auto *sample = observed.mutable_sandbox_resource_sample();
+        sample->set_runtime_id(instance.runtimeid());
+        sample->set_sandbox_id("terminal-sandbox");
+        sample->set_resource_generation("terminal-generation");
+        sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
+        sample->set_cpu_usage_known(true);
+        sample->set_cpu_usage_cores(0.05);
+        sample->set_cpu_limits_known(true);
+        sample->set_cpu_period_usec(100000);
+        sample->set_cpu_quota_usec(50000);
+        sample->set_memory_limit_bytes(maxBytes);
+        sample->set_memory_limit_known(true);
+        sample->set_memory_usage_known(true);
+        sample->set_memory_current_bytes(currentBytes);
+        sample->set_resource_revision(revision);
+        sample->set_resource_revision_known(true);
+        sample->set_memory_high_bytes(HighBytes(maxBytes));
+        sample->set_memory_high_known(true);
+        sample->set_memory_high_unlimited(false);
+        sample->set_frozen(false);
+        sample->set_frozen_known(true);
+        sample->set_resource_operation_id("");
+        sample->set_resource_operation_pending(false);
+        return view->UpdateResourceUnit(report, UpdateType::UPDATE_ACTUAL);
+    };
+    auto buildRequest = [&](const std::string &requestID, const std::string &operationID, uint64_t expectedRevision,
+                            uint64_t expectedBytes, uint64_t targetBytes, bool shrink) {
+        messages::ResizeSandboxRequest request;
+        request.set_requestid(requestID);
+        request.set_instanceid(instance.instanceid());
+        request.set_runtimeid(instance.runtimeid());
+        request.set_shrink(shrink);
+        auto *resize = request.mutable_resize();
+        resize->set_sandbox_id("terminal-sandbox");
+        resize->set_resource_generation("terminal-generation");
+        resize->set_operation_id(operationID);
+        resize->set_expected_revision(expectedRevision);
+        resize->set_deadline_unix_ms(nowMs() + 30000);
+        resize->mutable_expected()->set_cpu_quota_usec(50000);
+        resize->mutable_expected()->set_cpu_period_usec(100000);
+        resize->mutable_expected()->set_memory_limit_bytes(expectedBytes);
+        resize->mutable_target()->set_cpu_quota_usec(50000);
+        resize->mutable_target()->set_cpu_period_usec(100000);
+        resize->mutable_target()->set_memory_limit_bytes(targetBytes);
+        return request;
+    };
+    auto reserveStatus = [&](const messages::ResizeSandboxRequest &request) {
+        auto future = view->ReserveResize(request);
+        if (!future.WaitFor(TEST_AWAIT_TIMEOUT).IsOK()) {
+            return Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "reserve future did not resolve");
+        }
+        return future.Get();
+    };
+    auto observeStatus = [&](const std::string &requestID, const messages::ResizeSandboxRequest &request,
+                             uint64_t revision, uint64_t actualBytes, uint64_t highBytes, bool complete) {
+        messages::ResizeSandboxResponse response;
+        response.set_requestid(requestID);
+        response.set_instanceid(request.instanceid());
+        response.set_runtimeid(request.runtimeid());
+        response.set_sandboxid(request.resize().sandbox_id());
+        response.set_resourcegeneration(request.resize().resource_generation());
+        response.set_outcome(messages::ResizeSandboxResponse::OBSERVED);
+        response.mutable_result()->set_complete(complete);
+        auto *actual = response.mutable_result()->mutable_actual();
+        actual->set_resource_generation(request.resize().resource_generation());
+        actual->set_cpu_limits_known(true);
+        actual->set_cpu_quota_usec(50000);
+        actual->set_cpu_period_usec(100000);
+        actual->set_memory_limit_bytes(actualBytes);
+        actual->set_memory_limit_known(true);
+        actual->set_resource_revision(revision);
+        actual->set_resource_revision_known(true);
+        actual->set_resource_operation_id(request.resize().operation_id());
+        actual->set_resource_operation_pending(false);
+        actual->set_frozen(false);
+        actual->set_frozen_known(true);
+        actual->set_memory_high_bytes(highBytes);
+        actual->set_memory_high_known(true);
+        auto future = view->ObserveResize(response);
+        if (!future.WaitFor(TEST_AWAIT_TIMEOUT).IsOK()) {
+            return Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "observe future did not resolve");
+        }
+        return future.Get();
+    };
+    auto probeRejected = [&](const std::string &name, double memoryMb) {
+        auto probe = Get1DInstance();
+        probe.set_instanceid(name);
+        probe.set_requestid("request-" + name);
+        probe.set_unitid(unit.id());
+        probe.set_runtimeid("runtime-" + name);
+        probe.mutable_schedulerchain()->Clear();
+        *probe.mutable_schedulerchain()->Add() = unit.id();
+        (*probe.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+        auto *probeCpu = (*probe.mutable_resources()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar();
+        probeCpu->set_value(500);
+        probeCpu->set_limit(8000);
+        auto *probeMem = (*probe.mutable_resources()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar();
+        probeMem->set_value(memoryMb);
+        probeMem->set_limit(8192);
+        auto probePromise = std::make_shared<litebus::Promise<Status>>();
+        (void)view->AddInstances({{probe.instanceid(), resource_view::InstanceAllocatedInfo{probe, probePromise}}});
+        auto future = probePromise->GetFuture();
+        ASSERT_TRUE(future.WaitFor(TEST_AWAIT_TIMEOUT).IsOK());
+        EXPECT_FALSE(future.Get().IsOk()) << "probe " << name << " must be rejected: " << future.Get().ToString();
+    };
+
+    auto physical = publish(MiB(128), MiB(100), 1);
+    ASSERT_AWAIT_READY(physical);
+    // One settled grow entry holds 128MiB of credit for the whole test.
+    auto grow = buildRequest("terminal-grow-1", "op-terminal-grow-1", 1, MiB(128), MiB(256), false);
+    EXPECT_TRUE(reserveStatus(grow).IsOk());
+    EXPECT_TRUE(observeStatus(grow.requestid(), grow, 2, MiB(256), HighBytes(MiB(256)), true).IsOk());
+    probeRejected("terminal-held", 800); // 2800 + 128 held
+
+    // A complete readback whose high misses the fixed 0.8 page-aligned value
+    // does not close the shrink, even with every other field matching.
+    auto shrink = buildRequest("terminal-shrink-1", "op-terminal-shrink-1", 2, MiB(256), MiB(128), true);
+    EXPECT_TRUE(reserveStatus(shrink).IsOk());
+    const auto wrongHigh = observeStatus(shrink.requestid(), shrink, 3, MiB(128), HighBytes(MiB(128)) + 4096, true);
+    EXPECT_FALSE(wrongHigh.IsOk()) << wrongHigh.ToString();
+    probeRejected("terminal-wrong-high", 800);
+
+    // A shrink that provably terminated with the original limits restored
+    // closes its slot and adopts the new revision, yet returns no grow credit.
+    const auto failedTerminal = observeStatus(shrink.requestid(), shrink, 3, MiB(256), HighBytes(MiB(256)), false);
+    EXPECT_TRUE(failedTerminal.IsOk()) << failedTerminal.ToString();
+    probeRejected("terminal-failed-terminal", 800); // still 2800 + 128 held
+
+    // The slot is free again: a retry at the new revision is accepted, and its
+    // confirmed completion finally trims and releases the grow credit.
+    auto retry = buildRequest("terminal-shrink-2", "op-terminal-shrink-2", 3, MiB(256), MiB(128), true);
+    EXPECT_TRUE(reserveStatus(retry).IsOk());
+    EXPECT_TRUE(observeStatus(retry.requestid(), retry, 4, MiB(128), HighBytes(MiB(128)), true).IsOk());
+    auto admitted = Get1DInstance();
+    admitted.set_instanceid("terminal-released");
+    admitted.set_requestid("request-terminal-released");
+    admitted.set_unitid(unit.id());
+    admitted.set_runtimeid("runtime-terminal-released");
+    admitted.mutable_schedulerchain()->Clear();
+    *admitted.mutable_schedulerchain()->Add() = unit.id();
+    (*admitted.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+    auto *admittedCpu = (*admitted.mutable_resources()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar();
+    admittedCpu->set_value(500);
+    admittedCpu->set_limit(8000);
+    auto *admittedMem = (*admitted.mutable_resources()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar();
+    admittedMem->set_value(800);
+    admittedMem->set_limit(8192);
+    auto admittedPromise = std::make_shared<litebus::Promise<Status>>();
+    (void)view->AddInstances(
+        {{admitted.instanceid(), resource_view::InstanceAllocatedInfo{admitted, admittedPromise}}});
+    auto admittedFuture = admittedPromise->GetFuture();
+    ASSERT_AWAIT_READY(admittedFuture);
+    EXPECT_TRUE(admittedFuture.Get().IsOk()) << admittedFuture.Get().ToString(); // 2800 + 0 held
+    auto removed = view->DeleteInstances({"terminal-released"});
+    ASSERT_AWAIT_READY(removed);
+
+    // A surviving trimmed entry (landed above the current limit) must not
+    // block the next shrink at the confirmed revision.
+    auto regrow = buildRequest("terminal-grow-3", "op-terminal-grow-3", 4, MiB(128), MiB(512), false);
+    EXPECT_TRUE(reserveStatus(regrow).IsOk());
+    EXPECT_TRUE(observeStatus(regrow.requestid(), regrow, 5, MiB(512), HighBytes(MiB(512)), true).IsOk());
+    auto partial = buildRequest("terminal-shrink-3", "op-terminal-shrink-3", 5, MiB(512), MiB(384), true);
+    EXPECT_TRUE(reserveStatus(partial).IsOk());
+    EXPECT_TRUE(observeStatus(partial.requestid(), partial, 6, MiB(384), HighBytes(MiB(384)), true).IsOk());
+    auto followUp = buildRequest("terminal-shrink-4", "op-terminal-shrink-4", 6, MiB(384), MiB(256), true);
+    const auto followUpStatus = reserveStatus(followUp);
+    EXPECT_TRUE(followUpStatus.IsOk()) << followUpStatus.ToString(); // landed 512 > expected 384 must not block
+}
+
+TEST_F(ResourceViewTest, UnitMutationGateBlocksUntilEveryManagedInstanceReconciled)
+{
+    struct FenceGuard {
+        FenceGuard() { SetMemoryElasticityFenceForTest(true); }
+        ~FenceGuard() { SetMemoryElasticityFenceForTest(false); }
+    } fenceGuard;
+    auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count(); };
+    auto view = resource_view::ResourceView::CreateResourceView("mutation-gate", CHILD_PARAM);
+    auto unit = Get1DResourceUnit("mutation-gate-agent");
+    for (auto *resources : {unit.mutable_capacity(), unit.mutable_allocatable()}) {
+        (*resources->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(32000);
+        (*resources->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(4096);
+    }
+    (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+    (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(2800);
+    unit.set_cpu_sample_unix_ms(nowMs());
+    unit.set_memory_sample_unix_ms(nowMs());
+    auto added = view->AddResourceUnit(unit);
+    ASSERT_AWAIT_READY(added);
+    auto makeInstance = [&](const std::string &name, double memoryMb) {
+        auto instance = Get1DInstance();
+        instance.set_instanceid(name);
+        instance.set_requestid("request-" + name);
+        instance.set_unitid(unit.id());
+        instance.set_runtimeid("runtime-" + name);
+        instance.mutable_schedulerchain()->Clear();
+        *instance.mutable_schedulerchain()->Add() = unit.id();
+        (*instance.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+        auto *cpu = (*instance.mutable_resources()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar();
+        cpu->set_value(500);
+        cpu->set_limit(8000);
+        auto *memory = (*instance.mutable_resources()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar();
+        memory->set_value(memoryMb);
+        memory->set_limit(8192);
+        return instance;
+    };
+    auto allocate = [&](const resources::InstanceInfo &instance) {
+        auto promise = std::make_shared<litebus::Promise<Status>>();
+        (void)view->AddInstances({{instance.instanceid(), resource_view::InstanceAllocatedInfo{instance, promise}}});
+        return promise->GetFuture();
+    };
+    auto owner = makeInstance("gate-owner", 128);
+    auto cold = makeInstance("gate-cold", 256);
+    auto accepted = allocate(owner);
+    ASSERT_AWAIT_READY(accepted);
+    ASSERT_TRUE(accepted.Get().IsOk()) << accepted.Get().ToString();
+    accepted = allocate(cold);
+    ASSERT_AWAIT_READY(accepted);
+    ASSERT_TRUE(accepted.Get().IsOk()) << accepted.Get().ToString();
+    auto publishCold = [&](bool operationPending) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        auto report = std::make_shared<ResourceUnit>(unit);
+        report->set_memory_sample_unix_ms(nowMs());
+        report->set_cpu_sample_unix_ms(report->memory_sample_unix_ms());
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(2800);
+        auto &observed = (*report->mutable_instances())[cold.instanceid()];
+        observed.set_runtimeid(cold.runtimeid());
+        auto *sample = observed.mutable_sandbox_resource_sample();
+        sample->set_runtime_id(cold.runtimeid());
+        sample->set_sandbox_id("gate-cold-sandbox");
+        sample->set_resource_generation("gate-cold-generation");
+        sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
+        sample->set_cpu_usage_known(true);
+        sample->set_cpu_usage_cores(0.05);
+        sample->set_cpu_limits_known(true);
+        sample->set_cpu_period_usec(100000);
+        sample->set_cpu_quota_usec(50000);
+        sample->set_memory_limit_bytes(MiB(256));
+        sample->set_memory_limit_known(true);
+        sample->set_memory_usage_known(true);
+        sample->set_memory_current_bytes(MiB(64));
+        sample->set_resource_revision(1);
+        sample->set_resource_revision_known(true);
+        sample->set_memory_high_bytes(HighBytes(MiB(256)));
+        sample->set_memory_high_known(true);
+        sample->set_memory_high_unlimited(false);
+        sample->set_frozen(false);
+        sample->set_frozen_known(true);
+        sample->set_resource_operation_id(operationPending ? "op-foreign" : "");
+        sample->set_resource_operation_pending(operationPending);
+        return view->UpdateResourceUnit(report, UpdateType::UPDATE_ACTUAL);
+    };
+    auto publishOwner = [&]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        auto report = std::make_shared<ResourceUnit>(unit);
+        report->set_memory_sample_unix_ms(nowMs());
+        report->set_cpu_sample_unix_ms(report->memory_sample_unix_ms());
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(2800);
+        auto &observed = (*report->mutable_instances())[owner.instanceid()];
+        observed.set_runtimeid(owner.runtimeid());
+        auto *sample = observed.mutable_sandbox_resource_sample();
+        sample->set_runtime_id(owner.runtimeid());
+        sample->set_sandbox_id("gate-owner-sandbox");
+        sample->set_resource_generation("gate-owner-generation");
+        sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
+        sample->set_cpu_usage_known(true);
+        sample->set_cpu_usage_cores(0.05);
+        sample->set_cpu_limits_known(true);
+        sample->set_cpu_period_usec(100000);
+        sample->set_cpu_quota_usec(50000);
+        sample->set_memory_limit_bytes(MiB(128));
+        sample->set_memory_limit_known(true);
+        sample->set_memory_usage_known(true);
+        sample->set_memory_current_bytes(MiB(64));
+        sample->set_resource_revision(2);
+        sample->set_resource_revision_known(true);
+        sample->set_memory_high_bytes(HighBytes(MiB(128)));
+        sample->set_memory_high_known(true);
+        sample->set_memory_high_unlimited(false);
+        sample->set_frozen(false);
+        sample->set_frozen_known(true);
+        sample->set_resource_operation_id("");
+        sample->set_resource_operation_pending(false);
+        return view->UpdateResourceUnit(report, UpdateType::UPDATE_ACTUAL);
+    };
+    auto reserveGrow = [&](const std::string &requestID) {
+        messages::ResizeSandboxRequest request;
+        request.set_requestid(requestID);
+        request.set_instanceid(owner.instanceid());
+        request.set_runtimeid(owner.runtimeid());
+        auto *resize = request.mutable_resize();
+        resize->set_sandbox_id("gate-owner-sandbox");
+        resize->set_resource_generation("gate-owner-generation");
+        resize->set_operation_id("op-" + requestID);
+        resize->set_expected_revision(2);
+        resize->set_deadline_unix_ms(nowMs() + 30000);
+        resize->mutable_expected()->set_cpu_quota_usec(50000);
+        resize->mutable_expected()->set_cpu_period_usec(100000);
+        resize->mutable_expected()->set_memory_limit_bytes(MiB(128));
+        resize->mutable_target()->set_cpu_quota_usec(50000);
+        resize->mutable_target()->set_cpu_period_usec(100000);
+        resize->mutable_target()->set_memory_limit_bytes(MiB(256));
+        auto future = view->ReserveResize(request);
+        if (!future.WaitFor(TEST_AWAIT_TIMEOUT).IsOK()) {
+            return Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "reserve future did not resolve");
+        }
+        return future.Get();
+    };
+
+    // The reconciled owner alone is not enough: a managed instance that never
+    // produced a revision-known sample keeps the whole unit closed.
+    auto physical = publishOwner();
+    ASSERT_AWAIT_READY(physical);
+    auto blocked = reserveGrow("gate-blocked-cold");
+    EXPECT_FALSE(blocked.IsOk()) << blocked.ToString();
+    // The birth sample of the new instance reopens the unit.
+    physical = publishCold(false);
+    ASSERT_AWAIT_READY(physical);
+    auto admitted = reserveGrow("gate-open");
+    EXPECT_TRUE(admitted.IsOk()) << admitted.ToString();
+    auto cancelled = view->CancelResizeBeforeDispatch("gate-open");
+    ASSERT_AWAIT_READY(cancelled);
+    // A daemon-side pending operation on any managed instance closes it again.
+    physical = publishCold(true);
+    ASSERT_AWAIT_READY(physical);
+    blocked = reserveGrow("gate-blocked-pending");
+    EXPECT_FALSE(blocked.IsOk()) << blocked.ToString();
+    physical = publishCold(false);
+    ASSERT_AWAIT_READY(physical);
+    admitted = reserveGrow("gate-reopen");
+    EXPECT_TRUE(admitted.IsOk()) << admitted.ToString();
+    cancelled = view->CancelResizeBeforeDispatch("gate-reopen");
+    ASSERT_AWAIT_READY(cancelled);
 }
 
 }  // namespace functionsystem::test

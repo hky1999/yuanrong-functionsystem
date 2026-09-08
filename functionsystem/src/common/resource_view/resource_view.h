@@ -98,6 +98,10 @@ public:
      * @param insts a group of instances
      * @return Return OK if successful, otherwise return the corresponding error code
      */
+    // Authoritative deployment completion; metrics must never select an incarnation.
+    virtual litebus::Future<Status> BindInstanceRuntime(const InstanceInfo &instance,
+                                                       const std::string &expectedRuntimeID);
+
     virtual litebus::Future<Status> ReserveResize(const messages::ResizeSandboxRequest &request);
     virtual litebus::Future<Status> ObserveResize(const messages::ResizeSandboxResponse &response);
     virtual litebus::Future<Status> CancelResizeBeforeDispatch(const std::string &reservationID);

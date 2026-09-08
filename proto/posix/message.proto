@@ -33,6 +33,11 @@ message ResizeSandboxRequest {
   string instanceID = 2;
   string runtimeID = 3;
   runtime.v1.ResizeResourcesRequest resize = 4;
+  // Explicit operation type carried through every forwarding layer: false is a
+  // grow dispatched as ResizeResources, true is a shrink dispatched as the
+  // separate ShrinkResources RPC. The embedded command payload is shared
+  // because both external requests use the same fields 1-7.
+  bool shrink = 5;
 }
 
 message ResizeSandboxResponse {

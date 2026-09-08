@@ -19,6 +19,7 @@
 #include <cmath>
 
 #include <async/async.hpp>
+#include <async/collect.hpp>
 #include <async/asyncafter.hpp>
 #include <async/defer.hpp>
 #include <nlohmann/json.hpp>
@@ -46,6 +47,7 @@
 #include "common/proto/pb/message_pb.h"
 #include "common/proto/pb/posix/resource.pb.h"
 #include "common/resource_view/resource_tool.h"
+#include "common/resource_view/memory_elasticity_config.h"
 #include "common/utils/exec_utils.h"
 #include "manager/runtime_manager.h"
 
@@ -99,6 +101,7 @@ void MetricsActor::Init()
 
 void MetricsActor::Finalize()
 {
+    StopUpdateMetrics();
     YRLOG_INFO("finalize MetricsActor {}", ActorBase::GetAID().Name());
 }
 
@@ -312,36 +315,121 @@ void MetricsActor::UpdateInstanceMemoryUsage(const std::string &instanceID, doub
     instanceMemoryUsageMb_[instanceID] = memoryMb;
 }
 
+namespace {
+std::vector<litebus::Future<Metrics>> ReadyMetrics(const std::list<Metrics> &values)
+{
+    std::vector<litebus::Future<Metrics>> ready;
+    ready.reserve(values.size());
+    for (const auto &value : values) { ready.emplace_back(value); }
+    return ready;
+}
+}
+
+namespace {
+std::list<Metrics> CurrentCollectorValues(const std::list<Metrics> &values,
+    const std::vector<std::shared_ptr<BaseMetricsCollector>> &owners,
+    const std::unordered_map<std::string, std::shared_ptr<BaseMetricsCollector>> &current)
+{
+    std::list<Metrics> result;
+    auto value = values.begin();
+    for (const auto &owner : owners) {
+        if (value == values.end()) { break; }
+        const auto found = current.find(owner->GenFilter());
+        // A deleted/replaced instance must not be resurrected by a late batch.
+        if (found != current.end() && found->second == owner) { result.push_back(*value); }
+        ++value;
+    }
+    return result;
+}
+}
+
+void MetricsActor::CollectAndPublish(bool resources)
+{
+    auto &inFlight = resources ? resourceCollectionInFlight_ : monitorCollectionInFlight_;
+    if (inFlight) { return; } // A stuck collector cannot create unbounded batches.
+    inFlight = true;
+    const auto &filter = resources ? filter_ : metricsFilter_;
+    std::vector<std::shared_ptr<BaseMetricsCollector>> owners;
+    std::list<litebus::Future<Metrics>> futures;
+    for (const auto &entry : filter) {
+        owners.push_back(entry.second);
+        futures.push_back(entry.second->GetMetrics());
+    }
+    // Keep collectors alive across instance deletion until their callbacks finish.
+    // The callback never dereferences the actor and all actor state stays serialized.
+    (void)litebus::Collect(futures).OnComplete(
+        [aid(GetAID()), epoch(collectionEpoch_), resources, owners = std::move(owners)](
+            const litebus::Future<std::list<Metrics>> &result) {
+            const bool success = result.IsOK();
+            const auto values = success ? result.Get() : std::list<Metrics>{};
+            litebus::Async(aid, &MetricsActor::OnMetricsCollected, resources, epoch, values, success, owners);
+        });
+}
+
+void MetricsActor::OnMetricsCollected(bool resources, uint64_t epoch,
+                                     const std::list<Metrics> &values, bool success,
+    const std::vector<std::shared_ptr<BaseMetricsCollector>> &owners)
+{
+    if (epoch != collectionEpoch_) { return; }
+    (resources ? resourceCollectionInFlight_ : monitorCollectionInFlight_) = false;
+    if (!success) {
+        YRLOG_WARN("metrics collection failed; keeping resource truth unknown rather than reporting zero");
+        return;
+    }
+    (void)Send(agentAid_, resources ? "UpdateResources" : "UpdateMetrics",
+               BuildUpdateMetricsRequest(ReadyMetrics(CurrentCollectorValues(
+                   values, owners, resources ? filter_ : metricsFilter_))));
+}
+
 void MetricsActor::StartUpdateMetrics()
 {
-    YRLOG_DEBUG_COUNT_60("update metrics.");
-    auto allMetrics = GenAllMetrics();
-    (void)Send(agentAid_, "UpdateResources", BuildUpdateMetricsRequest(allMetrics));
-    // UPDATE_METRICS_DURATION should be configurable
-    updateMetricsTimer_ = litebus::AsyncAfter(UPDATE_METRICS_DURATION, GetAID(), &MetricsActor::StartUpdateMetrics);
+    (void)litebus::TimerTools::Cancel(updateMetricsTimer_);
+    CollectAndPublish(true);
+    const auto interval = resource_view::MemoryElasticityEnabled()
+        ? resource_view::MEMORY_ELASTIC_STATS_INTERVAL_MS : UPDATE_METRICS_DURATION;
+    updateMetricsTimer_ = litebus::AsyncAfter(interval, GetAID(), &MetricsActor::StartUpdateMetrics);
 }
 
 void MetricsActor::BeginUpdateMetrics()
 {
-    YRLOG_DEBUG_COUNT_60("push metrics.");
-    auto allMetrics = GenTotalMetrics();
-    (void)Send(agentAid_, "UpdateMetrics", BuildUpdateMetricsRequest(allMetrics));
-    // UPDATE_METRICS_DURATION should be configurable
+    (void)litebus::TimerTools::Cancel(pushMetricsTimer_);
+    CollectAndPublish(false);
     pushMetricsTimer_ = litebus::AsyncAfter(UPDATE_METRICS_DURATION, GetAID(), &MetricsActor::BeginUpdateMetrics);
 }
 
 void MetricsActor::StopUpdateMetrics()
 {
+    ++collectionEpoch_; // Late batches cannot publish after stop/configuration changes.
+    resourceCollectionInFlight_ = false;
+    monitorCollectionInFlight_ = false;
     (void)litebus::TimerTools::Cancel(updateMetricsTimer_);
+    (void)litebus::TimerTools::Cancel(pushMetricsTimer_);
 }
 
-resources::ResourceUnit MetricsActor::GetResourceUnit()
+resources::ResourceUnit MetricsActor::BuildCollectedResourceUnit(uint64_t epoch, const std::list<Metrics> &values,
+    const std::vector<std::shared_ptr<BaseMetricsCollector>> &owners)
 {
-    return BuildResourceUnit(GenAllMetrics());
+    if (epoch != collectionEpoch_) { return {}; }
+    return BuildResourceUnit(ReadyMetrics(CurrentCollectorValues(values, owners, filter_)));
+}
+
+litebus::Future<resources::ResourceUnit> MetricsActor::GetResourceUnit()
+{
+    std::vector<std::shared_ptr<BaseMetricsCollector>> owners;
+    std::list<litebus::Future<Metrics>> futures;
+    for (const auto &entry : filter_) {
+        owners.push_back(entry.second);
+        futures.push_back(entry.second->GetMetrics());
+    }
+    return litebus::Collect(futures).Then(
+        [aid(GetAID()), epoch(collectionEpoch_), owners = std::move(owners)](const std::list<Metrics> &values) {
+            return litebus::Async(aid, &MetricsActor::BuildCollectedResourceUnit, epoch, values, owners);
+        });
 }
 
 void MetricsActor::SetConfig(const Flags &flags)
 {
+    StopUpdateMetrics();
     metricsConfig_.metricsCollectorType = flags.GetMetricsCollectorType();
     metricsConfig_.procMetricsCPU = flags.GetProcMetricsCPU();
     metricsConfig_.procMetricsMemory = flags.GetProcMetricsMemory();

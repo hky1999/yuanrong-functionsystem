@@ -112,6 +112,10 @@ public:
         (void)GetUsage().OnComplete(
             [promise, collectionStartUnixMs, metricsType = metricsType_, collectorType = collectorType_,
              func = std::bind(&BaseMetricsCollector::GetLimit, this)](const litebus::Future<Metric> &future) {
+                if (!future.IsOK()) {
+                    promise.SetFailed(future.GetErrorCode());
+                    return;
+                }
                 Metrics metrics;
                 metrics.collectionStartUnixMs = collectionStartUnixMs;
                 auto usage = future.Get();

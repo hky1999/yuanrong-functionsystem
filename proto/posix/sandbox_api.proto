@@ -34,6 +34,10 @@ service SandboxService {
   rpc Stats(StatsRequest) returns (StatsResponse) {}
   // Apply a scheduler-approved monotonic increase with incarnation and limit checks.
   rpc ResizeResources(ResizeResourcesRequest) returns (ResizeResourcesResponse) {}
+  // Lower memory limits under a short freeze. A separate RPC keeps shrink an
+  // explicit operation; CPU values must not change. Field-compatible with
+  // ResizeResourcesRequest and answered with the same response type.
+  rpc ShrinkResources(ShrinkResourcesRequest) returns (ResizeResourcesResponse) {}
 
   // Register registers reusable sandbox templates.
   rpc Register(RegisterRequest) returns (NormalResponse) {}
@@ -555,6 +559,28 @@ message StatsResponse {
   bool memory_limit_known = 22;
   bool memory_peak_known = 23;
 
+  // Monotonic per-incarnation resource revision. Every accepted resource
+  // operation intent persists the next revision before side effects. Old
+  // instances that predate revision tracking report known = false.
+  uint64 resource_revision = 24;
+  bool resource_revision_known = 25;
+  // Effective memory.high soft limit. Unlimited is expressed by its own flag,
+  // never disguised as a finite zero.
+  uint64 memory_high_bytes = 26;
+  bool memory_high_known = 27;
+  bool memory_high_unlimited = 28;
+  // cgroup.freeze observation at read time.
+  bool frozen = 29;
+  bool frozen_known = 30;
+  // Identity and terminal state of the last resource operation. A pending
+  // flag of true means an operation is unfinished; callers must not treat a
+  // numerically matching target as closed while pending is true.
+  string resource_operation_id = 31;
+  bool resource_operation_pending = 32;
+  // Daemon-proven absolute cgroup v2 directory of the memory controller.
+  // Empty means unavailable. Read-only positioning evidence for event
+  // watchers; it never authorizes any resource write.
+  string memory_cgroup_path = 33;
 }
 
 // ListAvailableRuntimesRequest requests the runtime classes currently available
@@ -606,6 +632,26 @@ message ResizeResourcesRequest {
   ResourceLimits target = 4;
   // Required absolute command expiry, checked again under the resource lock.
   int64 deadline_unix_ms = 5;
+  // Unique per attempt; the daemon binds it to the full request fingerprint
+  // (generation, expected_revision, values, deadline, direction) and rejects
+  // a reused ID with a different fingerprint.
+  string operation_id = 6;
+  // CAS against the incarnation's current resource revision.
+  uint64 expected_revision = 7;
+}
+
+// Field-identical to ResizeResourcesRequest. Kept as an independent message so
+// the wire contract records shrink as its own operation type.
+message ShrinkResourcesRequest {
+  string sandbox_id = 1;
+  string resource_generation = 2;
+  ResourceLimits expected = 3;
+  // target memory must be below expected; CPU values must be equal.
+  ResourceLimits target = 4;
+  // Required absolute command expiry, checked again under the resource lock.
+  int64 deadline_unix_ms = 5;
+  string operation_id = 6;
+  uint64 expected_revision = 7;
 }
 
 message ResizeResourcesResponse {

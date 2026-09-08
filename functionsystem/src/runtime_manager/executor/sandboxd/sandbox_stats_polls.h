@@ -56,6 +56,15 @@ public:
         return next;
     }
 
+    // Reuse the waiting ticket; an in-flight RPC already supplies the fresh
+    // observation. Competing scheduled/event starts are fenced by Begin.
+    std::optional<uint64_t> RefreshTicket(const std::string &runtimeID) const
+    {
+        const auto it = polls_.find(runtimeID);
+        if (it == polls_.end() || it->second.inFlight) { return {}; }
+        return it->second.ticket;
+    }
+
     void Stop(const std::string &runtimeID)
     {
         polls_.erase(runtimeID);

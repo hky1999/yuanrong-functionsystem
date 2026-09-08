@@ -21,6 +21,7 @@
 #include <async/future.hpp>
 
 #include <set>
+#include <list>
 
 #include "collector/base_metrics_collector.h"
 #include "collector/heterogeneous_collector/topo_info.h"
@@ -125,7 +126,7 @@ public:
      *
      * @return
      */
-    resources::ResourceUnit GetResourceUnit();
+    litebus::Future<resources::ResourceUnit> GetResourceUnit();
 
     // Initializes the process-lifetime sandbox runtime capability snapshot.
     // Repeating the same snapshot is idempotent; changing it is rejected.
@@ -162,6 +163,11 @@ protected:
     resources::ResourceUnit BuildResourceUnitWithInstance(const std::vector<litebus::Future<Metrics>> &metricses);
     resources::ResourceUnit BuildResourceUnitWithSystem(const std::vector<litebus::Future<Metrics>> &metricses);
 private:
+    void CollectAndPublish(bool resources);
+    void OnMetricsCollected(bool resources, uint64_t epoch, const std::list<Metrics> &values, bool success,
+                            const std::vector<std::shared_ptr<BaseMetricsCollector>> &owners);
+    resources::ResourceUnit BuildCollectedResourceUnit(uint64_t epoch, const std::list<Metrics> &values,
+        const std::vector<std::shared_ptr<BaseMetricsCollector>> &owners);
     void AddSystemMetricsCollector(const Flags &flags);
     void AddCpuMemoryAndLabelCollectors(const Flags &flags);
     void AddGpuNumaNpuCollectors(const Flags &flags);
@@ -194,6 +200,9 @@ private:
     litebus::Timer updateMetricsTimer_;
     litebus::Timer pushMetricsTimer_;
     MetricsConfig metricsConfig_;
+    uint64_t collectionEpoch_{1};
+    bool resourceCollectionInFlight_{false};
+    bool monitorCollectionInFlight_{false};
 
     litebus::AID agentAid_;
     litebus::AID runtimeManagerAID_;

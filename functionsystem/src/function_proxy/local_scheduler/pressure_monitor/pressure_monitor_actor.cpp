@@ -19,6 +19,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <nlohmann/json.hpp>
+#include "common/resource_view/memory_elasticity_config.h"
 
 #include "common/logs/logging.h"
 #include "common/resource_view/restore_admission.h"
@@ -170,6 +172,7 @@ void PressureMonitorActor::ResizeUnderPressure(const resource_view::ResourceUnit
     for (auto it = resizeSamples_.begin(); it != resizeSamples_.end();) {
         if (view.instances().find(it->first) == view.instances().end()) {
             resizeAfterMs_.erase(it->first);
+            memoryPolicies_.erase(it->first);
             it = resizeSamples_.erase(it);
         }
         else { ++it; }
@@ -186,17 +189,35 @@ void PressureMonitorActor::ResizeUnderPressure(const resource_view::ResourceUnit
             || !resource_view::UsesElasticAdmission(info)) { continue; }
         const auto &sample = info.sandbox_resource_sample();
         const auto previous = resizeSamples_.find(entry.first);
+        bool shrink = false;
         auto target = PressureResizeTarget(info, previous == resizeSamples_.end() ? nullptr : &previous->second,
             nowMs, config_.resourceSampleMaxAgeMs, config_.upgradeLadder.enabled,
             config_.cpuUpgradeLadder.enabled, config_.upgradeLadder.stepBytes, config_.cpuUpgradeLadder.stepRatio,
             config_.upgradeLadder.capBytes, config_.cpuUpgradeLadder.capQuotaUsec);
         const auto pending = pressureResizes_.find(entry.first);
         if (pending != pressureResizes_.end()) {
-            if (!pending->second.unknown || !PressureResizeTargetObserved(pending->second.request.resize(),
-                    pending->second.request.runtimeid(), sample,
-                    nowMs, config_.resourceSampleMaxAgeMs)) { continue; }
-            YRLOG_INFO("pressure resize instance={} request={} target reconciled from post-deadline Stats",
-                       entry.first, pending->second.requestID);
+            const auto &pendingCommand = pending->second.request.resize();
+            const bool failedTerminal = resource_view::MemoryElasticityEnabled() && pending->second.request.shrink()
+                && sample.runtime_id() == pending->second.request.runtimeid()
+                && sample.sandbox_id() == pendingCommand.sandbox_id()
+                && sample.sampled_at_unix_ms() > pendingCommand.deadline_unix_ms()
+                && sample.sampled_at_unix_ms() <= nowMs
+                && nowMs - sample.sampled_at_unix_ms() <= config_.resourceSampleMaxAgeMs
+                && MemoryShrinkFailedTerminal(pendingCommand, sample);
+            const bool neverStarted = resource_view::MemoryElasticityEnabled()
+                && MemoryResizeNeverStarted(pendingCommand, pending->second.request.runtimeid(), sample,
+                                            nowMs, config_.resourceSampleMaxAgeMs);
+            if (!pending->second.unknown || (!failedTerminal && !neverStarted
+                && !PressureResizeTargetObserved(pendingCommand, pending->second.request.runtimeid(), sample,
+                    nowMs, config_.resourceSampleMaxAgeMs))) { continue; }
+            if (neverStarted) { memoryPolicies_.erase(entry.first); }
+            if (failedTerminal) {
+                memoryPolicies_.erase(entry.first);
+                YRLOG_WARN("memory shrink failed terminal reconciled instance={} operation={}; no credit release",
+                           entry.first, pendingCommand.operation_id());
+            }
+            YRLOG_INFO("pressure resize instance={} request={} reconciled from post-deadline Stats failedTerminal={} neverStarted={}",
+                       entry.first, pending->second.requestID, failedTerminal, neverStarted);
             pressureResizes_.erase(pending);
             // Only this monitor's operation gate is cleared; the ResourceView
             // owns the existing reservation and reconciles it independently.
@@ -208,15 +229,64 @@ void PressureMonitorActor::ResizeUnderPressure(const resource_view::ResourceUnit
             && previous->second.sampled_at_unix_ms() >= sample.sampled_at_unix_ms()) { continue; }
         if (resizeSamples_.size() >= 4096 && previous == resizeSamples_.end()) { continue; }
         resizeSamples_[entry.first] = sample;
+        if (resource_view::MemoryElasticityEnabled()) {
+            target.reset();
+            const auto policy = nlohmann::json::parse(sample.elastic_policy(), nullptr, false);
+            const auto key = resource_view::MEMORY_RESOURCE_NAME;
+            if (!policy.is_object() || !policy.contains(key) || !policy[key].is_object()
+                || !policy[key].contains("initial") || !policy[key]["initial"].is_number()
+                || !policy[key].contains("ceiling") || !policy[key]["ceiling"].is_number()) { continue; }
+            const double floorMb = policy[key]["initial"].get<double>();
+            const double ceilingMb = policy[key]["ceiling"].get<double>();
+            if (!std::isfinite(floorMb) || !std::isfinite(ceilingMb) || floorMb <= 0
+                || ceilingMb < floorMb || ceilingMb > 1048576 || std::floor(floorMb) != floorMb
+                || std::floor(ceilingMb) != ceilingMb) { continue; }
+            MemoryElasticityPolicy::Sample memory;
+            memory.generation = sample.resource_generation();
+            memory.revision = sample.resource_revision();
+            memory.revisionKnown = sample.resource_revision_known();
+            memory.sampledMs = sample.sampled_at_unix_ms();
+            memory.current = sample.memory_current_bytes();
+            memory.high = sample.memory_high_bytes();
+            memory.maximum = sample.memory_limit_bytes();
+            memory.floor = static_cast<uint64_t>(floorMb * 1048576.0);
+            memory.ceiling = std::min(static_cast<uint64_t>(ceilingMb * 1048576.0), config_.upgradeLadder.capBytes);
+            memory.highEvents = sample.memory_high_events();
+            memory.oomEvents = sample.memory_oom_events();
+            memory.oomKills = sample.memory_oom_kill_events();
+            memory.cpuCores = sample.cpu_usage_cores();
+            memory.cpuKnown = sample.cpu_usage_known();
+            memory.eventsKnown = sample.memory_pressure_known();
+            memory.memoryKnown = sample.memory_usage_known() && sample.memory_limit_known()
+                && sample.memory_high_known() && !sample.memory_high_unlimited()
+                && sample.cpu_limits_known() && sample.cpu_quota_usec() > 0 && sample.cpu_period_usec() > 0
+                && sample.runtime_id() == info.runtimeid() && !sample.sandbox_id().empty();
+            memory.frozenKnown = sample.frozen_known();
+            memory.frozen = sample.frozen();
+            memory.pending = sample.resource_operation_pending();
+            auto decision = memoryPolicies_[entry.first].Observe(memory, nowMs);
+            if (decision) {
+                target.emplace();
+                target->set_cpu_quota_usec(sample.cpu_quota_usec());
+                target->set_cpu_period_usec(sample.cpu_period_usec());
+                target->set_memory_limit_bytes(decision->target);
+                shrink = decision->shrink;
+            }
+        }
         if (!target || pressureResizes_.size() >= 1024) { continue; }
         auto request = std::make_shared<messages::ResizeSandboxRequest>();
         request->set_requestid(litebus::uuid_generator::UUID::GetRandomUUID().ToString());
         request->set_instanceid(entry.first);
         request->set_runtimeid(info.runtimeid());
+        request->set_shrink(shrink);
         auto *command = request->mutable_resize();
         command->set_sandbox_id(sample.sandbox_id());
         command->set_resource_generation(sample.resource_generation());
-        command->set_deadline_unix_ms(nowMs + 15000);
+        command->set_deadline_unix_ms(nowMs + (resource_view::MemoryElasticityEnabled() ? 2000 : 15000));
+        if (resource_view::MemoryElasticityEnabled()) {
+            command->set_operation_id(request->requestid());
+            command->set_expected_revision(sample.resource_revision());
+        }
         command->mutable_expected()->set_cpu_quota_usec(sample.cpu_quota_usec());
         command->mutable_expected()->set_cpu_period_usec(sample.cpu_period_usec());
         command->mutable_expected()->set_memory_limit_bytes(sample.memory_limit_bytes());
@@ -241,6 +311,34 @@ void PressureMonitorActor::OnPressureResize(const std::string &instanceID, const
         pending->second.unknown = true;
         YRLOG_WARN("pressure resize instance={} request={} remains unknown; reconciliation required", instanceID, requestID);
         return;
+    }
+    if (resource_view::MemoryElasticityEnabled()
+        && result.Get().outcome() == messages::ResizeSandboxResponse::OBSERVED) {
+        const auto &reply = result.Get().result();
+        const auto &actual = reply.actual();
+        const auto &command = pending->second.request.resize();
+        const auto targetHigh = static_cast<uint64_t>(std::floor(
+            0.8 * command.target().memory_limit_bytes() / 4096.0)) * 4096;
+        const bool failedTerminal = pending->second.request.shrink() && !reply.complete()
+            && reply.has_actual() && MemoryShrinkFailedTerminal(command, actual);
+        if (!failedTerminal && (command.expected_revision() == std::numeric_limits<uint64_t>::max()
+            || !reply.complete() || !reply.has_actual() || !actual.resource_revision_known()
+            || actual.resource_revision() != command.expected_revision() + 1
+            || actual.resource_operation_id() != command.operation_id() || actual.resource_operation_pending()
+            || !actual.frozen_known() || actual.frozen() || !actual.memory_high_known()
+            || actual.memory_high_unlimited() || actual.memory_high_bytes() != targetHigh
+            || actual.memory_limit_bytes() != command.target().memory_limit_bytes()
+            || !actual.memory_limit_known() || actual.resource_generation() != command.resource_generation()
+            || !actual.cpu_limits_known() || actual.cpu_quota_usec() != command.target().cpu_quota_usec()
+            || actual.cpu_period_usec() != command.target().cpu_period_usec())) {
+            pending->second.unknown = true;
+            return;
+        }
+        if (failedTerminal) {
+            memoryPolicies_.erase(instanceID);
+            YRLOG_WARN("memory shrink failed terminal instance={} operation={}; no credit release",
+                       instanceID, command.operation_id());
+        }
     }
     // Require a sample newer than dispatch before another proposal. Shared
     // ResourceView keeps its own reservation until authoritative readback.

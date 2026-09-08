@@ -1802,6 +1802,9 @@ litebus::Future<messages::ResizeSandboxResponse> FunctionAgentMgrActor::ResizeSa
         || request->resize().resource_generation().empty()
         || request->resize().resource_generation() != sample.resource_generation()
         || budgetView == nullptr || agent == funcAgentTable_.end() || resizePending_.size() >= 1024) {
+        YRLOG_WARN("resize preflight rejected instance={} runtime={} agent={} budgetBound={} routeFound={} pending={}",
+                   instanceInfo.instanceid(), instanceInfo.runtimeid(), instanceInfo.functionagentid(),
+                   budgetView != nullptr, agent != funcAgentTable_.end(), resizePending_.size());
         return ResizeTransportResult(*request, messages::ResizeSandboxResponse::REJECTED_BEFORE_DISPATCH,
                                      "resize identity, deadline, registered route or pending capacity unavailable");
     }

@@ -48,6 +48,7 @@
 #include "common/proto/pb/posix/common.pb.h"
 #include "common/proto/pb/posix_pb.h"
 #include "common/resource_view/resource_type.h"
+#include "common/resource_view/restore_admission.h"
 #include "common/resource_view/scala_resource_tool.h"
 #include "common/scheduler_framework/utils/label_affinity_selector.h"
 #include "common/state_handler/state_handler.h"
@@ -3012,6 +3013,7 @@ litebus::Future<Status> InstanceCtrlActor::DeployInstance(const std::shared_ptr<
     }
     auto deployInstanceRequest = GetDeployInstanceReq(funcMetaMap_.at(request->instance().function()), request);
     auto funcAgentID = request->instance().functionagentid();
+    const auto expectedRuntimeID = request->instance().runtimeid();
 
     AddDsAuthToDeployInstanceReq(request, deployInstanceRequest);
 
@@ -3047,7 +3049,8 @@ litebus::Future<Status> InstanceCtrlActor::DeployInstance(const std::shared_ptr<
                        deployInstanceRequest->requestid(), deployInstanceRequest->instanceid());
             return functionAgentMgr->DeployInstance(deployInstanceRequest, funcAgentID);
         })
-        .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::UpdateInstance, _1, request, retriedTimes, isRecovering));
+        .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::UpdateInstance, _1, request, retriedTimes,
+                            isRecovering, stateMachine, expectedRuntimeID));
 }
 
 void InstanceCtrlActor::AsyncDeployInstance(const std::shared_ptr<litebus::Promise<Status>> &promise,
@@ -3059,7 +3062,9 @@ void InstanceCtrlActor::AsyncDeployInstance(const std::shared_ptr<litebus::Promi
 
 litebus::Future<Status> InstanceCtrlActor::UpdateInstance(const DeployInstanceResponse &response,
                                                           const std::shared_ptr<ScheduleRequest> &request,
-                                                          uint32_t retriedTimes, bool isRecovering)
+                                                          uint32_t retriedTimes, bool isRecovering,
+                                                          const std::shared_ptr<InstanceStateMachine> &expectedMachine,
+                                                          const std::string &expectedRuntimeID)
 {
     ASSERT_IF_NULL(instanceControlView_);
     auto stateMachine = instanceControlView_->GetInstance(request->instance().instanceid());
@@ -3067,6 +3072,14 @@ litebus::Future<Status> InstanceCtrlActor::UpdateInstance(const DeployInstanceRe
         YRLOG_ERROR("{}|failed to update instance, failed to find state machine of instance({})", request->requestid(),
                     request->instance().instanceid());
         return Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "failed to update instance");
+    }
+    const bool elastic = resource_view::UsesElasticAdmission(request->instance());
+    const auto currentRuntimeID = stateMachine->GetInstanceInfo().runtimeid();
+    if (elastic && (!expectedMachine || stateMachine != expectedMachine || request->instance().requestid().empty()
+        || stateMachine->GetRequestID() != request->instance().requestid()
+        || (currentRuntimeID != expectedRuntimeID && currentRuntimeID != response.runtimeid())
+        || stateMachine->GetCancelFuture().IsOK())) {
+        return Status(ERR_SCHEDULE_CANCELED, "deployment completion belongs to a stale or canceled instance");
     }
     if (response.code() != 0) {
         YRLOG_ERROR("{}|{}|failed to deploy instance({}), code: {}, message: {}", request->traceid(),
@@ -3121,6 +3134,35 @@ litebus::Future<Status> InstanceCtrlActor::UpdateInstance(const DeployInstanceRe
     }
     SetBillingMetrics(request, response);
 
+    if (elastic) {
+        if (!resourceViewMgr_ || !resourceViewMgr_->GetInf(resource_view::ResourceType::PRIMARY)) {
+            return Status(ERR_INNER_SYSTEM_ERROR, "elastic deployment has no authoritative resource view");
+        }
+        return resourceViewMgr_->GetInf(resource_view::ResourceType::PRIMARY)
+            ->BindInstanceRuntime(request->instance(), expectedRuntimeID)
+            .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::ContinueAfterRuntimeBinding, _1, response,
+                                request, retriedTimes, isRecovering, stateMachine));
+    }
+    return ContinueAfterRuntimeBinding(Status::OK(), response, request, retriedTimes, isRecovering, stateMachine);
+}
+
+litebus::Future<Status> InstanceCtrlActor::ContinueAfterRuntimeBinding(const Status &bindingStatus,
+    const DeployInstanceResponse &response, const std::shared_ptr<ScheduleRequest> &request,
+    uint32_t retriedTimes, bool isRecovering, const std::shared_ptr<InstanceStateMachine> &expectedMachine)
+{
+    if (bindingStatus.IsError()) {
+        YRLOG_ERROR("elastic runtime binding failed instance={} request={} reason={}", request->instance().instanceid(),
+                    request->instance().requestid(), bindingStatus.GetMessage());
+        return bindingStatus;
+    }
+    if (resource_view::UsesElasticAdmission(request->instance())) {
+        const auto current = instanceControlView_->GetInstance(request->instance().instanceid());
+        if (!current || current != expectedMachine || current->GetRequestID() != request->instance().requestid()
+            || response.runtimeid().empty() || request->instance().runtimeid() != response.runtimeid()
+            || current->GetCancelFuture().IsOK()) {
+            return Status(ERR_SCHEDULE_CANCELED, "instance changed while binding deployment runtime");
+        }
+    }
     // when instance is an app driver, no connection built from proxy to app driver
     if (IsAppDriver(request->instance().createoptions())) {
         return OnAppDriverDeployed(request);

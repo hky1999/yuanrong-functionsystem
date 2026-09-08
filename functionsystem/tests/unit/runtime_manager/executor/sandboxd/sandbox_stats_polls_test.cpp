@@ -80,3 +80,18 @@ TEST(SandboxStatsPollsTest, CadenceAccountsForRpcTimeWithoutCatchupBursts)
     EXPECT_EQ(SandboxStatsPolls::NextDelayMs(std::numeric_limits<int64_t>::max(), 1000), 100);
 }
 }  // namespace functionsystem::test
+
+namespace functionsystem::test {
+TEST(SandboxStatsPollsTest, EventRefreshUsesSameTicketAndCoalescesInFlight) {
+    SandboxStatsPolls polls;
+    const auto first = polls.Start("runtime");
+    ASSERT_TRUE(polls.RefreshTicket("runtime"));
+    EXPECT_EQ(*polls.RefreshTicket("runtime"), first);
+    EXPECT_TRUE(polls.Begin("runtime", first));
+    EXPECT_FALSE(polls.RefreshTicket("runtime"));
+    const auto next = polls.Complete("runtime", first);
+    ASSERT_TRUE(next); EXPECT_EQ(polls.RefreshTicket("runtime"), next);
+    EXPECT_FALSE(polls.Begin("runtime", first));
+    polls.Stop("runtime"); EXPECT_FALSE(polls.RefreshTicket("runtime"));
+}
+}

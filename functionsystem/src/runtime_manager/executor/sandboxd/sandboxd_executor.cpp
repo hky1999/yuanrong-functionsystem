@@ -15,6 +15,7 @@
  */
 
 #include "sandboxd_executor.h"
+#include "common/resource_view/memory_elasticity_config.h"
 #include "sandbox_cpu_sample.h"
 
 #include <algorithm>
@@ -344,6 +345,15 @@ void SandboxdExecutor::InitConfig()
             availableRuntimesCallback_(false, {});
         }
     }
+    if (resource_view::MemoryElasticityEnabled() && !memoryEventWatcher_) {
+        memoryEventWatcher_ = std::make_unique<SandboxMemoryEventWatcher>(
+            [aid(GetAID())](const SandboxMemoryEventWatcher::Identity &identity) {
+                litebus::Async(aid, &SandboxdExecutor::RefreshMemoryPressureStats, identity);
+            });
+        if (!memoryEventWatcher_->Start()) {
+            YRLOG_WARN("memory event watcher unavailable; periodic Stats remains enabled");
+        }
+    }
     // ckptOrch_ MUST be created after sandboxd_ is set. Sync() runs after.
     ckptOrch_ = std::make_shared<SandboxdCheckpointOrchestrator>(GetAID(), sandboxd_, ckptFileManager_, stateManager_,
                                                                 checkpointDir_);
@@ -357,6 +367,7 @@ void SandboxdExecutor::Init()
 
 void SandboxdExecutor::Finalize()
 {
+    memoryEventWatcher_.reset(); // wake/join before the actor can be destroyed
     Executor::Finalize();
 }
 
@@ -1648,12 +1659,32 @@ litebus::Future<messages::ResizeSandboxResponse> SandboxdExecutor::ResizeSandbox
         return response;
     }
 
+    if ((request->shrink() && !resource_view::MemoryElasticityEnabled())
+        || (resource_view::MemoryElasticityEnabled()
+            && (request->resize().expected_revision() == 0 || request->resize().operation_id().empty()))) {
+        response.set_message("memory elasticity requires enabled feature and revision/operation identity");
+        return response;
+    }
     auto actual = std::make_shared<runtime::v1::ResizeResourcesResponse>();
-    // Keep both protobuf objects alive until gRPC completes. Never automatically
-    // retry a relative increase: the caller owns the fixed target and budget.
-    return sandboxd_->CallAsyncX("ResizeResources", request->resize(), actual.get(),
-        &runtime::v1::SandboxService::Stub::AsyncResizeResources, 5)
-        .Then([request, actual, response](const Status &status) mutable {
+    auto shrink = std::make_shared<runtime::v1::ShrinkResourcesRequest>();
+    litebus::Future<Status> dispatched;
+    if (request->shrink()) {
+        const auto &command = request->resize();
+        shrink->set_sandbox_id(command.sandbox_id());
+        shrink->set_resource_generation(command.resource_generation());
+        *shrink->mutable_expected() = command.expected();
+        *shrink->mutable_target() = command.target();
+        shrink->set_deadline_unix_ms(command.deadline_unix_ms());
+        shrink->set_operation_id(command.operation_id());
+        shrink->set_expected_revision(command.expected_revision());
+        dispatched = sandboxd_->CallAsyncX("ShrinkResources", *shrink, actual.get(),
+            &runtime::v1::SandboxService::Stub::AsyncShrinkResources, 5);
+    } else {
+        dispatched = sandboxd_->CallAsyncX("ResizeResources", request->resize(), actual.get(),
+            &runtime::v1::SandboxService::Stub::AsyncResizeResources, 5);
+    }
+    // Both operation payloads and the response remain alive through gRPC completion.
+    return dispatched.Then([request, actual, shrink, response](const Status &status) mutable {
             response.set_outcome(messages::ResizeSandboxResponse::UNKNOWN);
             response.set_code(static_cast<int32_t>(status.StatusCode()));
             response.set_message(status.RawMessage());
@@ -1679,6 +1710,18 @@ litebus::Future<messages::ResizeSandboxResponse> SandboxdExecutor::ResizeSandbox
         });
 }
 
+void SandboxdExecutor::RefreshMemoryPressureStats(const SandboxMemoryEventWatcher::Identity &identity)
+{
+    const auto info = stateManager_.Find(identity.runtimeID);
+    if (!resource_view::MemoryElasticityEnabled() || !info || !stateManager_.IsActive(identity.runtimeID)
+        || info->sandboxID != identity.sandboxID || info->resourceGeneration != identity.resourceGeneration) { return; }
+    const auto ticket = sandboxStatsPolls_.RefreshTicket(identity.runtimeID);
+    if (!ticket) { return; } // coalesce with the already in-flight Stats RPC
+    YRLOG_INFO("memory event refresh instance={} sandbox={} generation={}",
+                info->instanceInfo.instanceid(), identity.sandboxID, identity.resourceGeneration);
+    CollectSandboxStats(identity.runtimeID, identity.sandboxID, *ticket);
+}
+
 void SandboxdExecutor::StartSandboxStatsCollection(const std::string &runtimeID, const std::string &sandboxID)
 {
     sandboxStatsSnapshots_.erase(runtimeID);
@@ -1693,7 +1736,16 @@ void SandboxdExecutor::ScheduleSandboxStatsCollection(const std::string &runtime
     // up missed ticks in a burst. Slow calls remain visible as wider windows.
     const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - collectedAt).count();
-    const auto delayMs = SandboxStatsPolls::NextDelayMs(elapsedMs, SANDBOX_STATS_COLLECT_INTERVAL_MS);
+    const auto info = stateManager_.Find(runtimeID);
+    bool elastic = false;
+    if (info && resource_view::MemoryElasticityEnabled()) {
+        const auto &options = info->instanceInfo.deploymentconfig().deployoptions();
+        const auto enabled = options.find(SCHEDULER_ELASTIC_RESOURCES);
+        elastic = enabled != options.end() && enabled->second == "true";
+    }
+    const auto interval = elastic ? resource_view::MEMORY_ELASTIC_STATS_INTERVAL_MS
+                                  : SANDBOX_STATS_COLLECT_INTERVAL_MS;
+    const auto delayMs = SandboxStatsPolls::NextDelayMs(elapsedMs, interval);
     (void)litebus::AsyncAfter(delayMs, GetAID(), &SandboxdExecutor::CollectSandboxStats,
                               runtimeID, sandboxID, ticket);
 }
@@ -2033,6 +2085,24 @@ void SandboxdExecutor::ReportSandboxUsageMetrics(const messages::RuntimeInstance
     std::chrono::steady_clock::time_point collectedAt)
 {
     const auto sandboxID = stateManager_.GetSandboxID(runtimeID);
+    const auto physical = stateManager_.Find(runtimeID);
+    if (resource_view::MemoryElasticityEnabled()
+        && (!physical || physical->resourceGeneration.empty()
+            || physical->resourceGeneration != response.resource_generation())) {
+        sandboxStatsSnapshots_.erase(runtimeID);
+        return;
+    }
+    if (memoryEventWatcher_ && response.resource_revision_known() && !response.memory_cgroup_path().empty()) {
+        const auto &options = info.deploymentconfig().deployoptions();
+        const auto enabled = options.find(SCHEDULER_ELASTIC_RESOURCES);
+        if (enabled != options.end() && enabled->second == "true") {
+            const SandboxMemoryEventWatcher::Identity identity{
+                runtimeID, sandboxID, response.resource_generation(), response.memory_cgroup_path()};
+            if (!memoryEventWatcher_->Watch(identity)) {
+                YRLOG_WARN("memory event registration failed instance={}; periodic Stats remains enabled", info.instanceid());
+            }
+        }
+    }
 
     // A server that cannot read a usage field returns the protobuf zero
     // default, which is indistinguishable from a genuine idle/empty reading.
@@ -2150,6 +2220,20 @@ void SandboxdExecutor::ReportSandboxUsageMetrics(const messages::RuntimeInstance
         observation.set_memory_limit_bytes(response.memory_limit_bytes());
         observation.set_memory_peak_bytes(response.memory_max_usage_bytes());
         observation.set_elastic_policy(response.elastic_policy());
+        observation.set_resource_revision(response.resource_revision());
+        observation.set_resource_revision_known(response.resource_revision_known());
+        observation.set_memory_high_bytes(response.memory_high_bytes());
+        observation.set_memory_high_known(response.memory_high_known());
+        observation.set_memory_high_unlimited(response.memory_high_unlimited());
+        observation.set_frozen(response.frozen());
+        observation.set_frozen_known(response.frozen_known());
+        observation.set_resource_operation_id(response.resource_operation_id());
+        observation.set_resource_operation_pending(response.resource_operation_pending());
+        observation.set_memory_cgroup_path(response.memory_cgroup_path());
+        observation.set_memory_usage_known(response.memory_usage_known());
+        observation.set_memory_limit_known(response.memory_limit_known());
+        observation.set_memory_peak_known(response.memory_peak_known());
+
         observation.set_cpu_pressure_known(response.cpu_pressure_known());
         observation.set_cpu_periods(response.cpu_periods());
         observation.set_cpu_throttled_periods(response.cpu_throttled_periods());
@@ -2172,6 +2256,7 @@ void SandboxdExecutor::ClearSandboxMetricsState(const std::string &runtimeID)
 {
     sandboxStatsSnapshots_.erase(runtimeID);
     sandboxStatsPolls_.Stop(runtimeID);
+    if (memoryEventWatcher_) { memoryEventWatcher_->Unwatch(runtimeID); }
     userInitiatedTerminateRuntimes_.erase(runtimeID);
     sandboxRunningStartTimes_.erase(runtimeID);
 }

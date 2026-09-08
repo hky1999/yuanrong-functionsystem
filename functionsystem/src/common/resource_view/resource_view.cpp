@@ -82,6 +82,12 @@ litebus::Future<Status> ResourceView::UpdateResourceUnitDelta(const std::shared_
     return litebus::Async(implActor_->GetAID(), &ResourceViewActor::UpdateResourceUnitDelta, changes);
 }
 
+litebus::Future<Status> ResourceView::BindInstanceRuntime(const InstanceInfo &instance,
+                                                         const std::string &expectedRuntimeID)
+{
+    return litebus::Async(implActor_->GetAID(), &ResourceViewActor::BindInstanceRuntime, instance, expectedRuntimeID);
+}
+
 litebus::Future<Status> ResourceView::ReserveResize(const messages::ResizeSandboxRequest &request)
 {
     return litebus::Async(implActor_->GetAID(), &ResourceViewActor::ReserveResize, request);

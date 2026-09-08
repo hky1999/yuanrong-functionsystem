@@ -19,6 +19,8 @@
 #define NODE_CPU_UTILIZATION_RATE_H
 
 #include "base_metrics_collector.h"
+#include "node_cpu_usage_window.h"
+#include <mutex>
 
 namespace functionsystem::runtime_manager {
 class NodeCPUUtilizationCollector : public BaseMetricsCollector {
@@ -30,8 +32,8 @@ public:
     Metric GetLimit() const override;
     std::string GenFilter() const override;
 private:
-    const uint64_t CPU_CAL_INTERVAL_ = 4000;
-    const uint64_t UPDATE_CPU_INTERVAL_ = 10;
+    mutable std::mutex usageMutex_;
+    mutable NodeCPUUsageWindow usageWindow_;
     const std::size_t MIN_VALID_TIME_ITEM_ = 5;
 };
 };
