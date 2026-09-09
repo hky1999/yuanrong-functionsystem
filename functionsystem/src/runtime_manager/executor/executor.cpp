@@ -196,6 +196,15 @@ void Executor::Finalize()
     ActorBase::Finalize();
 }
 
+litebus::Future<StopInstanceOutcome> Executor::StopInstanceWithOutcome(
+    const std::shared_ptr<messages::StopInstanceRequest> &request, bool oomKilled)
+{
+    // Legacy executors produce no durable retirement receipt. Callers holding
+    // an expected physical identity must treat this outcome as UNKNOWN.
+    return StopInstance(request, oomKilled)
+        .Then([](const Status &status) { return StopInstanceOutcome{status, PhysicalRetirementProof{}}; });
+}
+
 std::map<std::string, ::messages::RuntimeInstanceInfo> Executor::GetRuntimeInstanceInfos()
 {
     return std::map<std::string, messages::RuntimeInstanceInfo>();

@@ -380,13 +380,19 @@ message KillInstanceRequest {
   string storageType = 5;
   bool isMonopoly = 6;
   int32 executorType = 7;
-  string checkpointID = 8;
-  string sourceSandboxID = 9;
-  uint64 checkpointSize = 10;
-  string checkpointSha256 = 11;
-  string tenantID = 12;
-  string checkpointStorage = 13;
-  bool deleteInstanceSnapshots = 14;
+  // v3 physical-retirement clearing: the scheduler's last trusted observation of
+  // the incarnation being retired. Both fields must be set together or left
+  // empty together; only sandboxd executors interpret them.
+  string expected_sandbox_id = 8;
+  string expected_resource_generation = 9;
+// Upstream snapshot-stop fields, renumbered (our v3 wire pins 8-9):
+  string checkpointID = 16;
+  string sourceSandboxID = 15;
+  uint64 checkpointSize = 16;
+  string checkpointSha256 = 15;
+  string tenantID = 16;
+  string checkpointStorage = 15;
+  bool deleteInstanceSnapshots = 16;
 }
 
 message KillInstanceResponse {
@@ -394,6 +400,13 @@ message KillInstanceResponse {
   string message = 2;
   string requestID = 3;
   string instanceID = 4;
+  // True only when sandboxd returned a durable DeleteIfGeneration receipt whose
+  // retired_generation equals the request's expected_resource_generation. When
+  // false the retired fields must stay empty; consumers must treat the
+  // retirement as UNKNOWN, never as success.
+  bool physical_retirement_confirmed = 5;
+  string retired_sandbox_id = 6;
+  string retired_resource_generation = 7;
 }
 
 message UpdateCredRequest {
@@ -624,13 +637,20 @@ message StopInstanceRequest {
   string traceID = 3;
   int32 type = 4;
   int32 executorType = 5;
-  string checkpointID = 6;
-  string sourceSandboxID = 7;
-  uint64 checkpointSize = 8;
-  string checkpointSha256 = 9;
-  string instanceID = 10;
-  string tenantID = 11;
-  string checkpointStorage = 12;
+  // v3 physical-retirement clearing: copied from KillInstanceRequest by the
+  // function agent so the runtime manager can fence and, when its local state
+  // is already gone, replay DeleteIfGeneration with the same identity.
+  string instanceID = 6;
+  string expected_sandbox_id = 7;
+  string expected_resource_generation = 8;
+// Upstream snapshot-stop fields, renumbered (our v3 wire pins 6-8):
+  string checkpointID = 15;
+  string sourceSandboxID = 13;
+  uint64 checkpointSize = 14;
+  string checkpointSha256 = 15;
+  string instanceID = 13;
+  string tenantID = 14;
+  string checkpointStorage = 15;
 }
 
 message StopInstanceResponse {
@@ -640,6 +660,12 @@ message StopInstanceResponse {
   string requestID = 4;
   string traceID = 5;
   string instanceID = 6;
+  // Carries the sandboxd retirement receipt upward. Same contract as
+  // KillInstanceResponse: confirmed=true requires both retired fields to equal
+  // the request's expected identity; confirmed=false means UNKNOWN.
+  bool physical_retirement_confirmed = 7;
+  string retired_sandbox_id = 8;
+  string retired_resource_generation = 9;
 }
 
 message SchedulerNode {

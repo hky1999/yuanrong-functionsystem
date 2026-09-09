@@ -106,6 +106,14 @@ public:
     virtual litebus::Future<Status> ObserveResize(const messages::ResizeSandboxResponse &response);
     virtual litebus::Future<Status> CancelResizeBeforeDispatch(const std::string &reservationID);
 
+    /**
+     * @brief Settle one physically retired incarnation in a single actor turn:
+     * erase every resizeBudget entry whose five-tuple identity matches the
+     * receipt, and remove the logical allocation only when it is still bound to
+     * that same incarnation. Zero-match replays are idempotent successes.
+     */
+    virtual litebus::Future<Status> ApplyPhysicalRetirement(const PhysicalRetirementReceipt &receipt);
+
     virtual litebus::Future<Status> AddInstances(const std::map<std::string, InstanceAllocatedInfo> &insts);
 
     /**
@@ -217,6 +225,12 @@ public:
 
     // for test
     void SetLatestReportChanges(const std::string& localId,  ResourceUnitChanges changes);
+
+    // for test: read-only ledger inspection mirroring the actor helpers.
+    AdmissionReserve GetOutstandingResizeForTest(const std::string &unitID);
+
+    // for test: total ledger population (all entry kinds).
+    size_t GetResizeBudgetEntryCountForTest();
 
     // for test
     void SetEnableTenantAffinity(bool enable);

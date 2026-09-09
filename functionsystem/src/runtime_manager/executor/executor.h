@@ -32,6 +32,23 @@
 
 namespace functionsystem::runtime_manager {
 
+// Durable proof that sandboxd retired one exact physical incarnation: the
+// DeleteIfGeneration response returned retired_generation == the generation the
+// caller expected. confirmed=false means UNKNOWN, never "not retired" and never
+// success: credit and logical identity must be retained until a later replay.
+struct PhysicalRetirementProof {
+    bool confirmed = false;
+    std::string sandboxID;
+    std::string resourceGeneration;
+};
+
+// In-process stop result: the legacy Status plus, for sandboxd executors, the
+// retirement receipt that authorizes ResourceView ledger settlement.
+struct StopInstanceOutcome {
+    Status status;
+    PhysicalRetirementProof retirement;
+};
+
 const std::string NODE_JS = "nodejs";
 const std::string NODE_JS_CMD = "nodejs18.14";
 const std::string JAVA_LANGUAGE_PREFIX = "java";
@@ -168,6 +185,18 @@ public:
      */
     virtual litebus::Future<Status> StopInstance(const std::shared_ptr<messages::StopInstanceRequest> &request,
                                                  bool oomKilled = false) = 0;
+
+    /**
+     * Stop Instance, additionally surfacing a sandboxd physical-retirement
+     * receipt when the request carried a complete expected identity and the
+     * daemon confirmed DeleteIfGeneration for exactly that sandbox/generation.
+     * The default keeps legacy semantics: an ordinary Status with no proof, so
+     * callers must treat the retirement as UNKNOWN and reconcile. Only the
+     * sandboxd executor ever confirms; warm-up Unregister and other executors
+     * must not fake a proof.
+     */
+    virtual litebus::Future<StopInstanceOutcome> StopInstanceWithOutcome(
+        const std::shared_ptr<messages::StopInstanceRequest> &request, bool oomKilled = false);
 
     /**
      * Snapshot Runtime when receive message from function agent.
@@ -322,6 +351,16 @@ public:
      */
     virtual litebus::Future<Status> StopInstance(const std::shared_ptr<messages::StopInstanceRequest> &request,
                                                  bool oomKilled = false) = 0;
+
+    /**
+     * Actor-routed StopInstanceWithOutcome: the outcome (including any
+     * physical-retirement receipt) is produced on the executor actor.
+     */
+    virtual litebus::Future<StopInstanceOutcome> StopInstanceWithOutcome(
+        const std::shared_ptr<messages::StopInstanceRequest> &request, bool oomKilled = false)
+    {
+        return litebus::Async(executor_->GetAID(), &Executor::StopInstanceWithOutcome, request, oomKilled);
+    }
 
     /**
      * Snapshot Runtime when receive message from function agent.

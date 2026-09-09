@@ -755,17 +755,117 @@ litebus::Future<messages::StartInstanceResponse> SandboxdExecutor::OnStartDone(
 litebus::Future<Status> SandboxdExecutor::StopInstance(const std::shared_ptr<messages::StopInstanceRequest> &request,
                                                        bool oomKilled)
 {
+    return StopInstanceWithOutcome(request, oomKilled)
+        .Then([](const StopInstanceOutcome &outcome) { return outcome.status; });
+}
+
+litebus::Future<StopInstanceOutcome> SandboxdExecutor::StopInstanceWithOutcome(
+    const std::shared_ptr<messages::StopInstanceRequest> &request, bool oomKilled)
+{
     const std::string &runtimeID = request->runtimeid();
     const std::string &requestID = request->requestid();
+    const std::string &expectedSandboxID = request->expected_sandbox_id();
+    const std::string &expectedGeneration = request->expected_resource_generation();
+    const auto noProof = [](const Status &status) {
+        return StopInstanceOutcome{status, PhysicalRetirementProof{}};
+    };
+    // Identity must arrive complete or absent; a single field can never fence
+    // a physical generation, so reject before any dispatch.
+    if (expectedSandboxID.empty() != expectedGeneration.empty()) {
+        return StopInstanceOutcome{Status(StatusCode::ERR_INSTANCE_BUSY,
+            "stop requires both expected sandbox and generation or neither"), PhysicalRetirementProof{}};
+    }
+    const bool requireProof = !expectedSandboxID.empty();
 
     if (auto pending = deferredStops_.find(runtimeID); pending != deferredStops_.end()) {
-        return pending->second.completion->GetFuture();
+        // Joining a deferred attempt cannot hand over a first-hand receipt;
+        // the caller retries with the same identity and replays the durable
+        // completion once the deferred delete has unregistered the state.
+        return pending->second.completion->GetFuture().Then(noProof);
     }
     // Warm-up runtimes are teardown via the Unregister RPC, not Delete.
     if (warmupRuntimes_.count(runtimeID) > 0) {
-        return UnregisterWarmUp(runtimeID, requestID);
+        return UnregisterWarmUp(runtimeID, requestID).Then(noProof);
     }
-    return StopSandbox(runtimeID, requestID, oomKilled);
+    if (stateManager_.GetInProgressFuture(runtimeID)) {
+        // Stop races an in-progress start: StopSandbox defers the delete and
+        // the deferred completion carries no receipt. UNKNOWN for proof
+        // purposes; a retry replays the durable receipt.
+        return StopSandbox(runtimeID, requestID, oomKilled).Then(noProof);
+    }
+    const auto source = stateManager_.Find(runtimeID);
+    if (!source) {
+        if (!requireProof) {
+            return StopInstanceOutcome{Status(StatusCode::ERR_INSTANCE_BUSY,
+                "physical retirement unknown for missing runtime"), PhysicalRetirementProof{}};
+        }
+        return ReplayPhysicalRetirement(runtimeID, requestID, expectedSandboxID, expectedGeneration);
+    }
+    if (requireProof) {
+        // First-hand delete: the caller's expected identity must equal the
+        // locally registered incarnation before anything reaches sandboxd.
+        if (source->sandboxID != expectedSandboxID || source->resourceGeneration != expectedGeneration
+            || source->registrationID.empty()) {
+            return StopInstanceOutcome{Status(StatusCode::ERR_INSTANCE_BUSY,
+                "expected physical identity does not match the local runtime"), PhysicalRetirementProof{}};
+        }
+        return TerminateSandbox(runtimeID, requestID, source->sandboxID, oomKilled)
+            .Then(litebus::Defer(GetAID(), &SandboxdExecutor::OnOutcomeStopDone, runtimeID, requestID,
+                                 expectedSandboxID, expectedGeneration, std::placeholders::_1));
+    }
+    return StopSandbox(runtimeID, requestID, oomKilled).Then(noProof);
+}
+
+StopInstanceOutcome SandboxdExecutor::OnOutcomeStopDone(const std::string &runtimeID,
+    const std::string &requestID, const std::string &sandboxID, const std::string &resourceGeneration,
+    const Status &status)
+{
+    if (status.IsError()) { return StopInstanceOutcome{status, PhysicalRetirementProof{}}; }
+    // TerminateSandbox fenced dispatch on exactly this identity, and DoDelete
+    // only resolves OK when retired_generation equals the fenced generation.
+    // The daemon receipt is durable, so this proof survives replays.
+    YRLOG_INFO("{}|physical retirement proven sandbox({}) generation({}) runtime({})", requestID, sandboxID,
+               resourceGeneration, runtimeID);
+    return StopInstanceOutcome{Status::OK(), PhysicalRetirementProof{true, sandboxID, resourceGeneration}};
+}
+
+litebus::Future<StopInstanceOutcome> SandboxdExecutor::ReplayPhysicalRetirement(const std::string &runtimeID,
+    const std::string &requestID, const std::string &sandboxID, const std::string &resourceGeneration)
+{
+    // Local state is already unregistered: a previous attempt finished the
+    // delete, or the runtime manager restarted. Only sandboxd's durable
+    // complete receipt may authorize settlement; keep everything else UNKNOWN.
+    auto command = std::make_shared<runtime::v1::DeleteIfGenerationRequest>();
+    command->set_id(sandboxID);
+    command->set_expected_generation(resourceGeneration);
+    YRLOG_INFO("{}|replaying physical retirement for sandbox({}) generation({}) runtime({})", requestID, sandboxID,
+               resourceGeneration, runtimeID);
+    ASSERT_IF_NULL(sandboxd_);
+    return sandboxd_->CallAsync("DeleteIfGeneration", *command,
+        static_cast<runtime::v1::DeleteIfGenerationResponse *>(nullptr),
+        &runtime::v1::SandboxService::Stub::AsyncDeleteIfGeneration)
+        .Then(litebus::Defer(GetAID(), &SandboxdExecutor::OnReplayRetirementDone, sandboxID, resourceGeneration,
+                             runtimeID, requestID, std::placeholders::_1));
+}
+
+StopInstanceOutcome SandboxdExecutor::OnReplayRetirementDone(const std::string &sandboxID,
+    const std::string &resourceGeneration, const std::string &runtimeID, const std::string &requestID,
+    litebus::Try<runtime::v1::DeleteIfGenerationResponse> response)
+{
+    if (response.IsOK() && response.Get().retired_generation() == resourceGeneration) {
+        // Idempotent: the receipt names the exact generation; nothing local
+        // remains registered for this incarnation.
+        YRLOG_INFO("{}|replayed physical retirement confirmed sandbox({}) generation({}) runtime({})", requestID,
+                   sandboxID, resourceGeneration, runtimeID);
+        return StopInstanceOutcome{Status::OK(), PhysicalRetirementProof{true, sandboxID, resourceGeneration}};
+    }
+    // A missing sandbox without a complete receipt, a transport failure or a
+    // different retired generation all stay UNKNOWN; credit is retained.
+    const auto grpcCode = response.IsOK() ? -1 : response.GetErrorCode();
+    YRLOG_WARN("{}|replayed physical retirement unconfirmed sandbox({}) generation({}) runtime({}) grpcCode({})",
+               requestID, sandboxID, resourceGeneration, runtimeID, grpcCode);
+    return StopInstanceOutcome{Status(StatusCode::ERR_INSTANCE_BUSY,
+        "physical retirement replay unconfirmed"), PhysicalRetirementProof{}};
 }
 
 litebus::Future<Status> SandboxdExecutor::StopSandbox(const std::string &runtimeID, const std::string &requestID,

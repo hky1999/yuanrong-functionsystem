@@ -237,6 +237,11 @@ private:
     void StopInstanceResponse(const litebus::AID &from, const litebus::Future<Status> &status,
                               const std::shared_ptr<messages::StopInstanceRequest> &request);
 
+    // Receipt-bearing completion: keeps the physical-retirement proof until the
+    // runtime exit observation succeeds, then copies it into the response.
+    void StopInstanceOutcomeComplete(const litebus::AID &from, const litebus::Future<StopInstanceOutcome> &result,
+                                     const std::shared_ptr<messages::StopInstanceRequest> &request);
+
     void SendStopInstanceResponse(const litebus::AID &from, const std::string &runtimeID,
                                   const std::shared_ptr<messages::StopInstanceResponse> &response);
 

@@ -2080,6 +2080,82 @@ TEST(FrontendKillEvidenceTest, FailedKillCannotBecomeSuccessfulRetirement)
     EXPECT_EQ(cleanup.Get().RawMessage(), "physical kill rejected");
 }
 
+// An elastic incarnation whose last trusted physical sample is bound to the
+// current runtime expects a confirmed receipt on every successful kill.
+static InstanceInfo MakeElasticRetireInstance()
+{
+    InstanceInfo info;
+    info.set_instanceid("elastic-retire-instance");
+    info.set_requestid("request-elastic-retire");
+    info.set_runtimeid("runtime-elastic-retire");
+    (*info.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+    auto *sample = info.mutable_sandbox_resource_sample();
+    sample->set_runtime_id("runtime-elastic-retire");
+    sample->set_sandbox_id("sandbox-elastic-retire");
+    sample->set_resource_generation("generation-elastic-retire");
+    return info;
+}
+
+TEST(FrontendKillEvidenceTest, ElasticRetirementWithoutReceiptStaysUnknown)
+{
+    auto actor = std::make_shared<InstanceCtrlActor>("elastic-unknown", "nodeID", instanceCtrlConfig);
+    auto info = MakeElasticRetireInstance();
+    // Ordinary SUCCESS without a receipt (agent-disabled shortcut or a
+    // mixed-version hop) must not publish retirement.
+    messages::KillInstanceResponse successOnly;
+    successOnly.set_code(static_cast<int32_t>(StatusCode::SUCCESS));
+    // Identity is captured from the resource view by the kill chain and passed
+    // down explicitly (the control-view copy never carries samples).
+    auto result = actor->RecordFrontendKillRuntimeResult(info, successOnly, "sandbox-elastic-retire",
+        "generation-elastic-retire");
+    ASSERT_AWAIT_READY(result);
+    EXPECT_EQ(result.Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY);
+}
+
+TEST(FrontendKillEvidenceTest, ElasticRetirementReceiptMismatchStaysUnknown)
+{
+    auto actor = std::make_shared<InstanceCtrlActor>("elastic-mismatch", "nodeID", instanceCtrlConfig);
+    auto info = MakeElasticRetireInstance();
+    messages::KillInstanceResponse mismatched;
+    mismatched.set_code(static_cast<int32_t>(StatusCode::SUCCESS));
+    mismatched.set_physical_retirement_confirmed(true);
+    mismatched.set_retired_sandbox_id("somebody-elses-sandbox");
+    mismatched.set_retired_resource_generation("somebody-elses-generation");
+    auto result = actor->RecordFrontendKillRuntimeResult(info, mismatched, "sandbox-elastic-retire",
+        "generation-elastic-retire");
+    ASSERT_AWAIT_READY(result);
+    EXPECT_EQ(result.Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY);
+}
+
+TEST(FrontendKillEvidenceTest, ElasticSampleWithoutTrustedRuntimeBindingUsesLegacyPath)
+{
+    auto actor = std::make_shared<InstanceCtrlActor>("elastic-unbound", "nodeID", instanceCtrlConfig);
+    // The sample names a different runtime than the instance's current one:
+    // it is not a trusted observation of THIS incarnation, so a plain success
+    // keeps its legacy meaning instead of failing closed.
+    auto info = MakeElasticRetireInstance();
+    info.set_runtimeid("runtime-replaced");
+    messages::KillInstanceResponse legacy;
+    legacy.set_code(static_cast<int32_t>(StatusCode::SUCCESS));
+    auto result = actor->RecordFrontendKillRuntimeResult(info, legacy);
+    ASSERT_AWAIT_READY(result);
+    EXPECT_EQ(result.Get().StatusCode(), StatusCode::SUCCESS);
+}
+
+TEST(FrontendKillEvidenceTest, NonElasticSuccessKeepsLegacyMeaning)
+{
+    auto actor = std::make_shared<InstanceCtrlActor>("non-elastic-legacy", "nodeID", instanceCtrlConfig);
+    InstanceInfo info;
+    info.set_instanceid("plain-instance");
+    info.set_requestid("request-plain");
+    info.set_runtimeid("runtime-plain");
+    messages::KillInstanceResponse success;
+    success.set_code(static_cast<int32_t>(StatusCode::SUCCESS));
+    auto result = actor->RecordFrontendKillRuntimeResult(info, success);
+    ASSERT_AWAIT_READY(result);
+    EXPECT_EQ(result.Get().StatusCode(), StatusCode::SUCCESS);
+}
+
 TEST(FrontendKillEvidenceTest, OlderKillResultCannotOverwriteNewerRequestEvidence)
 {
     auto actor = std::make_shared<InstanceCtrlActor>("InstanceCtrlActor", "nodeID", instanceCtrlConfig);

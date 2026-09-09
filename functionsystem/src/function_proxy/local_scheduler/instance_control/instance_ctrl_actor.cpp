@@ -85,6 +85,32 @@ static const uint32_t HEARTBEAT_INTERVAL_MS = 3000;
 
 static const uint32_t MILLISECONDS_PRE_SECOND = 1000;
 static const uint32_t FRONTEND_KILL_EVIDENCE_TTL_MS = 60000;
+
+// The scheduler's last trusted physical observation of an elastic incarnation:
+// only a sandbox sample bound to the instance's current runtime with a complete
+// sandbox/generation identity may fence a physical retirement. Elastic
+// instances without such a sample never reached the physical layer and keep
+// their legacy lifecycle.
+static bool TrustedPhysicalIdentity(const InstanceInfo &instance, std::string *sandboxID,
+                                    std::string *resourceGeneration)
+{
+    if (!resource_view::UsesElasticAdmission(instance) || instance.runtimeid().empty()
+        || !instance.has_sandbox_resource_sample()) {
+        return false;
+    }
+    const auto &sample = instance.sandbox_resource_sample();
+    if (sample.runtime_id() != instance.runtimeid() || sample.sandbox_id().empty()
+        || sample.resource_generation().empty()) {
+        return false;
+    }
+    if (sandboxID != nullptr) {
+        *sandboxID = sample.sandbox_id();
+    }
+    if (resourceGeneration != nullptr) {
+        *resourceGeneration = sample.resource_generation();
+    }
+    return true;
+}
 static const uint32_t RETRY_CHECK_CLIENT_CONNECT_TIME = 1000;
 static const uint32_t INSTANCE_BUSY_SUSPEND_RETRY_MS = 300;
 static const int64_t DEFAULT_TENANT_COOLDOWN_MS = 10000;
@@ -505,7 +531,29 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInResourceView(const St
     if (status.IsError()) { return status; }
     ASSERT_IF_NULL(resourceViewMgr_);
     auto type = resource_view::GetResourceType(instanceInfo);
-    return resourceViewMgr_->GetInf(type)->DeleteInstances({ instanceInfo.instanceid() });
+    auto view = resourceViewMgr_->GetInf(type);
+    ASSERT_IF_NULL(view);
+    // An elastic kill chain settles through ApplyPhysicalRetirement: the atomic
+    // settlement already removed the allocation, so verify absence instead of
+    // issuing a generic delete. The control-view copy never carries sandbox
+    // samples, so consult the authoritative view allocation; a surviving
+    // sampled allocation means the settlement never ran — fail closed.
+    if (resource_view::UsesElasticAdmission(instanceInfo)) {
+        const std::string instanceID = instanceInfo.instanceid();
+        return view->GetResourceView().Then([instanceID, view](const std::shared_ptr<ResourceUnit> &current)
+                -> litebus::Future<Status> {
+            const auto allocated = current->instances().find(instanceID);
+            if (allocated == current->instances().end()) { return Status::OK(); }
+            if (allocated->second.has_sandbox_resource_sample()) {
+                return Status(StatusCode::ERR_INSTANCE_BUSY,
+                    "elastic instance " + instanceID + " still allocated; physical retirement settlement missing");
+            }
+            // Never deployed to the physical layer (no sample): the view's own
+            // guardrail still refuses if any ledger entry exists.
+            return view->DeleteInstances({ instanceID });
+        });
+    }
+    return view->DeleteInstances({ instanceInfo.instanceid() });
 }
 
 litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Status &status,
@@ -1461,7 +1509,8 @@ litebus::Future<KillResponse> InstanceCtrlActor::ForwardSubscriptionEvent(const 
 }
 
 litebus::Future<messages::KillInstanceResponse> InstanceCtrlActor::SendKillRequestToAgent(
-    const InstanceInfo &instanceInfo, bool isRecovering, bool forRedeploy)
+    const InstanceInfo &instanceInfo, bool isRecovering, bool forRedeploy, const std::string &expectedSandboxID,
+    const std::string &expectedGeneration)
 {
     RemoveInternalTokenReference(instanceInfo.instanceid());
     if (config_.enableServerMode) {
@@ -1483,6 +1532,16 @@ litebus::Future<messages::KillInstanceResponse> InstanceCtrlActor::SendKillReque
         GenKillInstanceRequest(requestID, instanceInfo.instanceid(), traceID, instanceInfo.storagetype(), isMonopoly);
     killInstanceReq->set_runtimeid(instanceInfo.runtimeid());
     killInstanceReq->set_executortype(instanceInfo.executortype());
+    // Elastic incarnations retire against their last trusted physical identity
+    // (captured from the resource view by the caller): the daemon receipt for
+    // exactly this sandbox/generation is the only thing that may later release
+    // the instance's resize-budget credit.
+    if (!expectedSandboxID.empty() && !expectedGeneration.empty()) {
+        killInstanceReq->set_expected_sandbox_id(expectedSandboxID);
+        killInstanceReq->set_expected_resource_generation(expectedGeneration);
+        YRLOG_INFO("{}|kill instance({}) carries expected physical identity sandbox({}) generation({})", requestID,
+                   instanceInfo.instanceid(), expectedSandboxID, expectedGeneration);
+    }
 
     ASSERT_IF_NULL(clientManager_);
     ASSERT_IF_NULL(functionAgentMgr_);
@@ -1602,13 +1661,41 @@ litebus::Future<Status> InstanceCtrlActor::KillRuntime(const InstanceInfo &insta
         evidence->second.state = "terminating";
         frontendKillRequestID = evidence->second.killRequestID;
     }
+    // Elastic incarnations retire against the resource view's authoritative
+    // physical sample: the control-view copy never carries sandbox samples, so
+    // deriving the expected identity from it would silently downgrade the kill
+    // to a receipt-less legacy stop.
+    if (resource_view::UsesElasticAdmission(instanceInfo)) {
+        auto view = resourceViewMgr_ ? resourceViewMgr_->GetInf(resource_view::GetResourceType(instanceInfo)) : nullptr;
+        if (view != nullptr) {
+            return view->GetResourceView().Then(litebus::Defer(GetAID(), &InstanceCtrlActor::KillRuntimeWithIdentity,
+                instanceInfo, isRecovering, std::placeholders::_1));
+        }
+    }
     return SendKillRequestToAgent(instanceInfo, isRecovering)
-        .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::RecordFrontendKillRuntimeResult, instanceInfo, _1));
+        .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::RecordFrontendKillRuntimeResult, instanceInfo, _1,
+                             std::string{}, std::string{}));
+}
+
+litebus::Future<Status> InstanceCtrlActor::KillRuntimeWithIdentity(const InstanceInfo &instanceInfo,
+    bool isRecovering, const std::shared_ptr<resource_view::ResourceUnit> &current)
+{
+    std::string expectedSandboxID;
+    std::string expectedGeneration;
+    if (current != nullptr) {
+        const auto allocated = current->instances().find(instanceInfo.instanceid());
+        if (allocated != current->instances().end()) {
+            TrustedPhysicalIdentity(allocated->second, &expectedSandboxID, &expectedGeneration);
+        }
+    }
+    return SendKillRequestToAgent(instanceInfo, isRecovering, false, expectedSandboxID, expectedGeneration)
+        .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::RecordFrontendKillRuntimeResult, instanceInfo, _1,
+                             expectedSandboxID, expectedGeneration));
 }
 
 litebus::Future<Status> InstanceCtrlActor::RecordFrontendKillRuntimeResult(
-    const InstanceInfo &instanceInfo, const std::string &frontendKillRequestID,
-    const messages::KillInstanceResponse &response)
+    const InstanceInfo &instanceInfo, const messages::KillInstanceResponse &response,
+    const std::string &expectedSandboxID, const std::string &expectedGeneration)
 {
     auto evidence = frontendKillRuntimeEvidence_.find(instanceInfo.instanceid());
     if (response.code() != static_cast<int32_t>(StatusCode::SUCCESS)) {
@@ -1618,14 +1705,44 @@ litebus::Future<Status> InstanceCtrlActor::RecordFrontendKillRuntimeResult(
             && evidence->second.killRequestID == frontendKillRequestID) {
             evidence->second.state = "failed-" + std::to_string(response.code());
         }
-    } else {
-        YRLOG_INFO("{}|succeed to kill instance({})", instanceInfo.requestid(), instanceInfo.instanceid());
-        if (!frontendKillRequestID.empty() && evidence != frontendKillRuntimeEvidence_.end()
-            && evidence->second.killRequestID == frontendKillRequestID) {
-            evidence->second.state = "terminated";
-        }
+        // Callers must retain failed/unknown retirement instead of publishing success.
+        return Status(static_cast<StatusCode>(response.code()), response.message());
     }
-    // Callers must retain failed/unknown retirement instead of publishing success.
+    // Elastic incarnations settle only on a confirmed receipt naming exactly
+    // the expected identity the kill carried (an ordinary SUCCESS — an
+    // agent-disabled shortcut or a mixed-version hop — is an UNKNOWN
+    // retirement and keeps the allocation).
+    if (!expectedSandboxID.empty() && !expectedGeneration.empty()) {
+        if (!response.physical_retirement_confirmed()
+            || response.retired_sandbox_id() != expectedSandboxID
+            || response.retired_resource_generation() != expectedGeneration) {
+            YRLOG_WARN("{}|kill instance({}) succeeded without a matching retirement receipt; allocation retained",
+                       instanceInfo.requestid(), instanceInfo.instanceid());
+            if (evidence != frontendKillRuntimeEvidence_.end() && evidence->second.first == instanceInfo.requestid()) {
+                evidence->second.second = "retirement-unknown";
+            }
+            return Status(StatusCode::ERR_INSTANCE_BUSY,
+                "physical retirement unconfirmed; allocation and budget retained for retry");
+        }
+        resource_view::PhysicalRetirementReceipt receipt;
+        receipt.requestID = response.requestid();
+        receipt.unitID = instanceInfo.unitid().empty() ? instanceInfo.functionagentid() : instanceInfo.unitid();
+        receipt.instanceID = instanceInfo.instanceid();
+        receipt.runtimeID = instanceInfo.runtimeid();
+        receipt.sandboxID = expectedSandboxID;
+        receipt.resourceGeneration = expectedGeneration;
+        ASSERT_IF_NULL(resourceViewMgr_);
+        auto view = resourceViewMgr_->GetInf(resource_view::GetResourceType(instanceInfo));
+        ASSERT_IF_NULL(view);
+        // One atomic actor turn settles the ledger and removes the allocation.
+        // A failure keeps both for reconciliation; the caller retries the kill
+        // and replays the same durable receipt.
+        return view->ApplyPhysicalRetirement(receipt);
+    }
+    YRLOG_INFO("{}|succeed to kill instance({})", instanceInfo.requestid(), instanceInfo.instanceid());
+    if (evidence != frontendKillRuntimeEvidence_.end() && evidence->second.first == instanceInfo.requestid()) {
+        evidence->second.second = "terminated";
+    }
     return Status(static_cast<StatusCode>(response.code()), response.message());
 }
 
@@ -5285,7 +5402,8 @@ litebus::Future<Status> InstanceCtrlActor::RescheduleAfterJudgeRecoverable(const
             return result;
         })
         .Then([aid(GetAID()), instanceInfo](const TransitionResult &result) {
-            (void)litebus::Async(aid, &InstanceCtrlActor::SendKillRequestToAgent, instanceInfo, false, false);
+            (void)litebus::Async(aid, &InstanceCtrlActor::SendKillRequestToAgent, instanceInfo, false, false,
+                                 std::string{}, std::string{});
             return result;
         });
     return Status::OK();

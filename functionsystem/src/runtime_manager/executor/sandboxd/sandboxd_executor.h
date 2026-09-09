@@ -141,6 +141,14 @@ public:
     litebus::Future<Status> StopInstance(const std::shared_ptr<messages::StopInstanceRequest> &request,
                                          bool oomKilled = false) override;
 
+    // Retirement-receipt variant: when the request carries a complete expected
+    // sandbox/generation, the first-hand delete is fenced on it and a matching
+    // durable DeleteIfGeneration receipt is returned as proof. With local state
+    // already unregistered the same identity is replayed against the daemon's
+    // durable receipt. Anything else resolves confirmed=false (UNKNOWN).
+    litebus::Future<StopInstanceOutcome> StopInstanceWithOutcome(
+        const std::shared_ptr<messages::StopInstanceRequest> &request, bool oomKilled = false) override;
+
     // Snapshot is not exposed by the sandboxd SandboxService.
     litebus::Future<messages::SnapshotRuntimeResponse> SnapshotRuntime(
         const std::shared_ptr<messages::SnapshotRuntimeRequest> &request) override;
@@ -264,6 +272,15 @@ private:
     litebus::Future<Status> OnDeleteDone(const std::string &runtimeID, const std::string &requestID,
                                          const std::string &sandboxID, const runtime::v1::DeleteResponse &response,
                                          const std::string &registrationID);
+    // Receipt-bearing stop internals: post-TerminateSandbox proof assembly and
+    // the stateless DeleteIfGeneration replay for already-unregistered runtimes.
+    StopInstanceOutcome OnOutcomeStopDone(const std::string &runtimeID, const std::string &requestID,
+        const std::string &sandboxID, const std::string &resourceGeneration, const Status &status);
+    litebus::Future<StopInstanceOutcome> ReplayPhysicalRetirement(const std::string &runtimeID,
+        const std::string &requestID, const std::string &sandboxID, const std::string &resourceGeneration);
+    StopInstanceOutcome OnReplayRetirementDone(const std::string &sandboxID, const std::string &resourceGeneration,
+        const std::string &runtimeID, const std::string &requestID,
+        litebus::Try<runtime::v1::DeleteIfGenerationResponse> response);
     // Warm-up teardown via the Unregister RPC.
     litebus::Future<Status> UnregisterWarmUp(const std::string &runtimeID, const std::string &requestID);
     litebus::Future<Status> OnWarmUpUnregistered(const runtime::v1::NormalResponse &response,

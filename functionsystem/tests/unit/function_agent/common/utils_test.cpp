@@ -455,6 +455,26 @@ TEST_F(FunctionAgentUtilsTest, SetStopRuntimeInstanceRequestSuccess)
 
     function_agent::SetStopRuntimeInstanceRequest(stopInstanceRequest, req);
     EXPECT_EQ(stopInstanceRequest.runtimeid(), runtimeID);
+    // Expected physical identity travels verbatim, including absence: the
+    // runtime manager rejects incomplete identity before any dispatch.
+    EXPECT_EQ(stopInstanceRequest.instanceid(), "");
+    EXPECT_EQ(stopInstanceRequest.expected_sandbox_id(), "");
+    EXPECT_EQ(stopInstanceRequest.expected_resource_generation(), "");
+}
+
+TEST_F(FunctionAgentUtilsTest, SetStopRuntimeInstanceRequestCopiesExpectedIdentity)
+{
+    messages::StopInstanceRequest stopInstanceRequest;
+    auto req = std::make_shared<messages::KillInstanceRequest>();
+    req->set_runtimeid("identity-runtime");
+    req->set_instanceid("identity-instance");
+    req->set_expected_sandbox_id("identity-sandbox");
+    req->set_expected_resource_generation("identity-generation");
+
+    function_agent::SetStopRuntimeInstanceRequest(stopInstanceRequest, req);
+    EXPECT_EQ(stopInstanceRequest.instanceid(), "identity-instance");
+    EXPECT_EQ(stopInstanceRequest.expected_sandbox_id(), "identity-sandbox");
+    EXPECT_EQ(stopInstanceRequest.expected_resource_generation(), "identity-generation");
 }
 
 /**

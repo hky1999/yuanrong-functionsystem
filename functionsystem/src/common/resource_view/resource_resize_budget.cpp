@@ -536,15 +536,92 @@ void ResourceViewActor::EstablishRecoveryBaseline(const std::string &unitID, con
                sample.memory_limit_bytes(), sample.memory_current_bytes(), heldMb);
 }
 
-void ResourceViewActor::DropBaselineEntries(const std::string &instanceID)
+bool ResourceViewActor::HasResizeBudgetEntries(const std::string &instanceID) const
 {
+    for (const auto &item : resizeBudget_) {
+        if (item.second.request.instanceid() == instanceID) { return true; }
+    }
+    return false;
+}
+
+bool ResourceViewActor::RequiresPhysicalRetirement(const InstanceInfo &instance) const
+{
+    // Non-elastic instances and elastic allocations that never reached the
+    // physical layer keep the generic rollback path. Everything else must
+    // settle through a sandboxd retirement receipt.
+    return UsesElasticAdmission(instance)
+        && (instance.has_sandbox_resource_sample() || HasResizeBudgetEntries(instance.instanceid()));
+}
+
+Status ResourceViewActor::ApplyPhysicalRetirement(const PhysicalRetirementReceipt &receipt)
+{
+    if (!view_ || receipt.unitID.empty() || receipt.instanceID.empty() || receipt.runtimeID.empty()
+        || receipt.sandboxID.empty() || receipt.resourceGeneration.empty() || receipt.requestID.size() > 256) {
+        return Status(ERR_PARAM_INVALID, "physical retirement receipt requires a complete bounded identity");
+    }
+    const AdmissionReserve before = OutstandingResize(receipt.unitID);
+    // Single-generation settlement: only entries whose full physical identity
+    // (unit, instance, runtime, sandbox, generation) equals the receipt may be
+    // erased — observed, pending, UNKNOWN, baseline and shrink entries alike.
+    // Other instances and other incarnations of this instance keep everything.
+    size_t settledEntries = 0;
+    double releasedMemoryMb = 0;
+    double releasedCpuMillicores = 0;
     for (auto it = resizeBudget_.begin(); it != resizeBudget_.end();) {
-        if (it->second.baseline && it->second.request.instanceid() == instanceID) {
+        const auto &entry = it->second;
+        if (entry.unitID == receipt.unitID && entry.request.instanceid() == receipt.instanceID
+            && entry.request.runtimeid() == receipt.runtimeID
+            && entry.request.resize().sandbox_id() == receipt.sandboxID
+            && entry.request.resize().resource_generation() == receipt.resourceGeneration) {
+            const auto outstanding = EntryOutstanding(entry);
+            releasedMemoryMb += outstanding.memoryMb;
+            releasedCpuMillicores += outstanding.cpuMillicores;
+            YRLOG_INFO("physical retirement settles entry instance={} runtime={} sandbox={} generation={} "
+                       "request={} operationId={} observed={} shrink={} baseline={} confirmedRevision={} "
+                       "entryCpuMillicores={:.3f} entryMemoryMb={:.3f}",
+                       receipt.instanceID, receipt.runtimeID, receipt.sandboxID, receipt.resourceGeneration,
+                       it->first, entry.operationId, entry.observed, entry.shrink, entry.baseline,
+                       entry.confirmedRevision, outstanding.cpuMillicores, outstanding.memoryMb);
             it = resizeBudget_.erase(it);
+            ++settledEntries;
         } else {
             ++it;
         }
     }
+    const AdmissionReserve after = OutstandingResize(receipt.unitID);
+    // Logical allocation: remove only when still bound to this exact
+    // incarnation. A replacement generation or a different runtime keeps its
+    // allocation; the erased entries above were already retired regardless.
+    bool allocationDeleted = false;
+    auto top = view_->mutable_instances()->find(receipt.instanceID);
+    if (top != view_->mutable_instances()->end()) {
+        const auto &allocated = top->second;
+        const auto &sample = allocated.sandbox_resource_sample();
+        if (allocated.unitid() == receipt.unitID && allocated.runtimeid() == receipt.runtimeID
+            && sample.runtime_id() == receipt.runtimeID && sample.sandbox_id() == receipt.sandboxID
+            && sample.resource_generation() == receipt.resourceGeneration) {
+            // Same actor turn as the settlement above: no resize registration
+            // can interleave between ledger erase and allocation delete.
+            view_->set_revision(view_->revision() + 1);
+            DeleteInstance(receipt.instanceID, false);
+            allocationDeleted = true;
+        } else {
+            YRLOG_WARN("physical retirement keeps rebound allocation instance={} unit={} currentRuntime={} "
+                       "currentSandbox={} currentGeneration={} receiptRuntime={} receiptSandbox={} "
+                       "receiptGeneration={}",
+                       receipt.instanceID, allocated.unitid(), allocated.runtimeid(), sample.sandbox_id(),
+                       sample.resource_generation(), receipt.runtimeID, receipt.sandboxID,
+                       receipt.resourceGeneration);
+        }
+    }
+    YRLOG_INFO("physical retirement applied instance={} unit={} runtime={} sandbox={} generation={} "
+               "auditRequest={} settledEntries={} releasedCpuMillicores={:.3f} releasedMemoryMb={:.3f} "
+               "unitOutstandingBeforeMb={:.3f} unitOutstandingAfterMb={:.3f} allocationDeleted={} idempotent={}",
+               receipt.instanceID, receipt.unitID, receipt.runtimeID, receipt.sandboxID,
+               receipt.resourceGeneration, receipt.requestID, settledEntries, releasedCpuMillicores,
+               releasedMemoryMb, before.memoryMb, after.memoryMb, allocationDeleted,
+               settledEntries == 0 && !allocationDeleted);
+    return Status::OK();
 }
 
 bool ResourceViewActor::MapsToDispatchedResize(const std::string &instanceID, const std::string &generation,

@@ -5123,8 +5123,18 @@ TEST_F(ResourceViewTest, RestartRecoveryHoldsFullCurrentMaxUntilShrinkTrimsIt)
     ASSERT_AWAIT_READY(removed);
 
     // Retirement drops the synthetic hold; a recreated allocation rebuilds it.
-    removed = view->DeleteInstances({owner.instanceid()});
-    ASSERT_AWAIT_READY(removed);
+    // v3: an elastic incarnation that reached the physical layer leaves only
+    // through a matching physical-retirement receipt, never a generic delete.
+    resource_view::PhysicalRetirementReceipt ownerReceipt;
+    ownerReceipt.requestID = owner.requestid();
+    ownerReceipt.unitID = unit.id();
+    ownerReceipt.instanceID = owner.instanceid();
+    ownerReceipt.runtimeID = owner.runtimeid();
+    ownerReceipt.sandboxID = "recovery-sandbox";
+    ownerReceipt.resourceGeneration = "recovery-generation";
+    auto retired = view->ApplyPhysicalRetirement(ownerReceipt);
+    ASSERT_AWAIT_READY(retired);
+    EXPECT_TRUE(retired.Get().IsOk()) << retired.Get().ToString();
     const auto afterDelete = probeStatus("probe-after-retire", 700);
     EXPECT_TRUE(afterDelete.IsOk()) << afterDelete.ToString();
     removed = view->DeleteInstances({"probe-after-retire"});
@@ -5974,6 +5984,375 @@ TEST_F(ResourceViewTest, UnitMutationGateBlocksUntilEveryManagedInstanceReconcil
     EXPECT_TRUE(admitted.IsOk()) << admitted.ToString();
     cancelled = view->CancelResizeBeforeDispatch("gate-reopen");
     ASSERT_AWAIT_READY(cancelled);
+}
+
+// ── Physical retirement settlement (v3 resizeBudget clearing) ────────────────
+
+// Shared fixture for receipt tests: one unit, N elastic owners with publishable
+// revision-known physical samples; a published max above the birth floor holds
+// a recovery-baseline credit that only a matching retirement receipt releases.
+class PhysicalRetirementTest : public ResourceViewTest {
+protected:
+    struct Guards {
+        using UsageAwareFilter = schedule_plugin::filter::UsageAwareFilter;
+        double safety = UsageAwareFilter::GetSafety();
+        double floor = UsageAwareFilter::GetFloorMb();
+        int32_t cap = UsageAwareFilter::GetMaxInstances();
+        bool fence = false;
+        ~Guards()
+        {
+            UsageAwareFilter::SetConfig(safety, floor, cap);
+            SetMemoryElasticityFenceForTest(fence);
+        }
+    };
+    static int64_t NowMs()
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+    struct Owner {
+        std::string instanceID;
+        std::string requestID;
+        std::string runtimeID;
+        std::string sandboxID;
+        std::string generation;
+    };
+    // Builds the view/unit and allocates the given elastic owners at a 128 MiB
+    // birth floor with an 8 GiB ceiling.
+    void Setup(const std::string &name, const std::vector<Owner> &owners, bool fence)
+    {
+        SetMemoryElasticityFenceForTest(fence);
+        schedule_plugin::filter::UsageAwareFilter::SetConfig(0.9, 2048, 0);
+        view = resource_view::ResourceView::CreateResourceView(name, CHILD_PARAM);
+        unit = Get1DResourceUnit(name + "-agent");
+        for (auto *resources : {unit.mutable_capacity(), unit.mutable_allocatable()}) {
+            (*resources->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(32000);
+            (*resources->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(32768);
+        }
+        (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+        (*unit.mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(512);
+        unit.set_cpu_sample_unix_ms(NowMs());
+        unit.set_memory_sample_unix_ms(NowMs());
+        auto added = view->AddResourceUnit(unit);
+        ASSERT_AWAIT_READY(added);
+        for (const auto &owner : owners) {
+            auto instance = Get1DInstance();
+            instance.set_instanceid(owner.instanceID);
+            instance.set_requestid(owner.requestID);
+            instance.set_unitid(unit.id());
+            instance.set_runtimeid(owner.runtimeID);
+            instance.mutable_schedulerchain()->Clear();
+            *instance.mutable_schedulerchain()->Add() = unit.id();
+            (*instance.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+            auto *cpu = (*instance.mutable_resources()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar();
+            cpu->set_value(500);
+            cpu->set_limit(8000);
+            auto *memory = (*instance.mutable_resources()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar();
+            memory->set_value(128);
+            memory->set_limit(8192);
+            auto promise = std::make_shared<litebus::Promise<Status>>();
+            (void)view->AddInstances({{instance.instanceid(), resource_view::InstanceAllocatedInfo{instance, promise}}});
+            auto future = promise->GetFuture();
+            ASSERT_AWAIT_READY(future);
+            ASSERT_TRUE(future.Get().IsOk()) << future.Get().ToString();
+        }
+    }
+    // Publishes a revision-known sample; a max above the floor creates the
+    // recovery baseline credit (max - current) held under the exact identity.
+    void Publish(const Owner &owner, uint64_t maxBytes, uint64_t currentBytes, uint64_t revision = 5,
+                 const std::string &operationId = "op-prior", bool pending = false)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        auto report = std::make_shared<ResourceUnit>(unit);
+        report->set_memory_sample_unix_ms(NowMs());
+        report->set_cpu_sample_unix_ms(report->memory_sample_unix_ms());
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+        (*report->mutable_actualuse()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar()->set_value(512);
+        auto &observed = (*report->mutable_instances())[owner.instanceID];
+        observed.set_runtimeid(owner.runtimeID);
+        auto *sample = observed.mutable_sandbox_resource_sample();
+        sample->set_runtime_id(owner.runtimeID);
+        sample->set_sandbox_id(owner.sandboxID);
+        sample->set_resource_generation(owner.generation);
+        sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
+        sample->set_cpu_usage_known(true);
+        sample->set_cpu_usage_cores(0.05);
+        sample->set_cpu_limits_known(true);
+        sample->set_cpu_period_usec(100000);
+        sample->set_cpu_quota_usec(50000);
+        sample->set_memory_limit_bytes(maxBytes);
+        sample->set_memory_limit_known(true);
+        sample->set_memory_usage_known(true);
+        sample->set_memory_current_bytes(currentBytes);
+        sample->set_resource_revision(revision);
+        sample->set_resource_revision_known(true);
+        sample->set_memory_high_bytes(HighBytes(maxBytes));
+        sample->set_memory_high_known(true);
+        sample->set_memory_high_unlimited(false);
+        sample->set_frozen(false);
+        sample->set_frozen_known(true);
+        sample->set_resource_operation_id(operationId);
+        sample->set_resource_operation_pending(pending);
+        auto updated = view->UpdateResourceUnit(report, UpdateType::UPDATE_ACTUAL);
+        ASSERT_AWAIT_READY(updated);
+    }
+    static resource_view::PhysicalRetirementReceipt ReceiptFor(const Owner &owner, const std::string &unitID,
+                                                               const std::string &requestID = "receipt-audit")
+    {
+        resource_view::PhysicalRetirementReceipt receipt;
+        receipt.requestID = requestID;
+        receipt.unitID = unitID;
+        receipt.instanceID = owner.instanceID;
+        receipt.runtimeID = owner.runtimeID;
+        receipt.sandboxID = owner.sandboxID;
+        receipt.resourceGeneration = owner.generation;
+        return receipt;
+    }
+    bool Allocated(const std::string &instanceID)
+    {
+        auto current = view->GetResourceView();
+        EXPECT_AWAIT_READY(current);
+        return current.Get()->instances().count(instanceID) == 1;
+    }
+    std::shared_ptr<resource_view::ResourceView> view;
+    ResourceUnit unit;
+};
+
+TEST_F(PhysicalRetirementTest, SettlesOnlyTheReceiptIdentityAndKeepsNeighbours)
+{
+    Guards guards;
+    const Owner a{"retire-a", "request-a", "runtime-a", "sandbox-a", "generation-a"};
+    const Owner b{"retire-b", "request-b", "runtime-b", "sandbox-b", "generation-b"};
+    Setup("retire-exact", {a, b}, true);
+    Publish(a, MiB(512), MiB(269));  // holds 512-269 = 243 MiB
+    Publish(b, MiB(384), MiB(269));  // holds 384-269 = 115 MiB
+    const auto before = view->GetOutstandingResizeForTest(unit.id());
+    EXPECT_NEAR(before.memoryMb, 243.0 + 115.0, 0.01);
+    EXPECT_EQ(view->GetResizeBudgetEntryCountForTest(), size_t{2});
+    // Mismatching receipts must clear nothing (each flips one identity field).
+    resource_view::PhysicalRetirementReceipt drift = ReceiptFor(a, unit.id());
+    drift.sandboxID = "sandbox-b";
+    auto settled = view->ApplyPhysicalRetirement(drift);
+    ASSERT_AWAIT_READY(settled);
+    EXPECT_TRUE(settled.Get().IsOk());
+    drift = ReceiptFor(a, unit.id());
+    drift.resourceGeneration = "generation-b";
+    settled = view->ApplyPhysicalRetirement(drift);
+    ASSERT_AWAIT_READY(settled);
+    drift = ReceiptFor(a, unit.id());
+    drift.runtimeID = "runtime-b";
+    settled = view->ApplyPhysicalRetirement(drift);
+    ASSERT_AWAIT_READY(settled);
+    drift = ReceiptFor(a, unit.id());
+    drift.unitID = "some-other-unit";
+    settled = view->ApplyPhysicalRetirement(drift);
+    ASSERT_AWAIT_READY(settled);
+    drift = ReceiptFor(a, unit.id());
+    drift.instanceID = "retire-b";
+    settled = view->ApplyPhysicalRetirement(drift);
+    ASSERT_AWAIT_READY(settled);
+    EXPECT_NEAR(view->GetOutstandingResizeForTest(unit.id()).memoryMb, before.memoryMb, 0.01);
+    EXPECT_EQ(view->GetResizeBudgetEntryCountForTest(), size_t{2});
+    EXPECT_TRUE(Allocated(a.instanceID));
+    EXPECT_TRUE(Allocated(b.instanceID));
+    // Incomplete identity is rejected outright.
+    resource_view::PhysicalRetirementReceipt empty;
+    auto rejected = view->ApplyPhysicalRetirement(empty);
+    ASSERT_AWAIT_READY(rejected);
+    EXPECT_FALSE(rejected.Get().IsOk());
+    // The exact receipt clears A only: 243 MiB released, B untouched.
+    auto exact = view->ApplyPhysicalRetirement(ReceiptFor(a, unit.id()));
+    ASSERT_AWAIT_READY(exact);
+    EXPECT_TRUE(exact.Get().IsOk());
+    const auto after = view->GetOutstandingResizeForTest(unit.id());
+    EXPECT_NEAR(after.memoryMb, 115.0, 0.01);
+    EXPECT_EQ(view->GetResizeBudgetEntryCountForTest(), size_t{1});
+    EXPECT_FALSE(Allocated(a.instanceID));
+    EXPECT_TRUE(Allocated(b.instanceID));
+    // Replay of the same receipt is idempotent: nothing further released.
+    auto replay = view->ApplyPhysicalRetirement(ReceiptFor(a, unit.id(), "receipt-audit-2"));
+    ASSERT_AWAIT_READY(replay);
+    EXPECT_TRUE(replay.Get().IsOk());
+    EXPECT_NEAR(view->GetOutstandingResizeForTest(unit.id()).memoryMb, 115.0, 0.01);
+    EXPECT_EQ(view->GetResizeBudgetEntryCountForTest(), size_t{1});
+    // Retiring B empties the ledger exactly.
+    auto final = view->ApplyPhysicalRetirement(ReceiptFor(b, unit.id()));
+    ASSERT_AWAIT_READY(final);
+    EXPECT_TRUE(final.Get().IsOk());
+    EXPECT_NEAR(view->GetOutstandingResizeForTest(unit.id()).memoryMb, 0.0, 0.001);
+    EXPECT_EQ(view->GetResizeBudgetEntryCountForTest(), size_t{0});
+    EXPECT_FALSE(Allocated(b.instanceID));
+}
+
+TEST_F(PhysicalRetirementTest, GenericDeletionRequiresReceiptForPhysicalElastic)
+{
+    Guards guards;
+    const Owner a{"guard-a", "request-guard-a", "runtime-a", "sandbox-a", "generation-a"};
+    const Owner cold{"guard-cold", "request-guard-cold", "runtime-cold", "sandbox-cold", "generation-cold"};
+    Setup("retire-guard", {a, cold}, true);
+    Publish(a, MiB(512), MiB(269));
+    // Elastic with a physical sample: generic deletion fails closed.
+    auto refused = view->DeleteInstances({a.instanceID});
+    ASSERT_AWAIT_READY(refused);
+    EXPECT_FALSE(refused.Get().IsOk());
+    EXPECT_TRUE(Allocated(a.instanceID));
+    EXPECT_EQ(view->GetResizeBudgetEntryCountForTest(), size_t{1});
+    // An elastic allocation that never reached the physical layer rolls back.
+    auto coldDeleted = view->DeleteInstances({cold.instanceID});
+    ASSERT_AWAIT_READY(coldDeleted);
+    EXPECT_TRUE(coldDeleted.Get().IsOk());
+    EXPECT_FALSE(Allocated(cold.instanceID));
+    // After the receipt settles, the allocation is already gone.
+    auto settled = view->ApplyPhysicalRetirement(ReceiptFor(a, unit.id()));
+    ASSERT_AWAIT_READY(settled);
+    EXPECT_TRUE(settled.Get().IsOk());
+    EXPECT_FALSE(Allocated(a.instanceID));
+    EXPECT_EQ(view->GetResizeBudgetEntryCountForTest(), size_t{0});
+}
+
+TEST_F(PhysicalRetirementTest, OldReceiptNeverTouchesReplacementGeneration)
+{
+    Guards guards;
+    const Owner first{"aba-instance", "request-aba-1", "runtime-1", "sandbox-1", "generation-1"};
+    Setup("retire-aba", {first}, true);
+    Publish(first, MiB(512), MiB(269));
+    EXPECT_NEAR(view->GetOutstandingResizeForTest(unit.id()).memoryMb, 243.0, 0.01);
+    auto settled = view->ApplyPhysicalRetirement(ReceiptFor(first, unit.id()));
+    ASSERT_AWAIT_READY(settled);
+    EXPECT_TRUE(settled.Get().IsOk());
+    // The logical ID returns as a replacement incarnation.
+    const Owner second{"aba-instance", "request-aba-2", "runtime-2", "sandbox-2", "generation-2"};
+    auto instance = Get1DInstance();
+    instance.set_instanceid(second.instanceID);
+    instance.set_requestid(second.requestID);
+    instance.set_unitid(unit.id());
+    instance.set_runtimeid(second.runtimeID);
+    instance.mutable_schedulerchain()->Clear();
+    *instance.mutable_schedulerchain()->Add() = unit.id();
+    (*instance.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+    auto *memory = (*instance.mutable_resources()->mutable_resources())[RESOURCE_MEM_NAME].mutable_scalar();
+    memory->set_value(128);
+    memory->set_limit(8192);
+    auto *cpu = (*instance.mutable_resources()->mutable_resources())[RESOURCE_CPU_NAME].mutable_scalar();
+    cpu->set_value(500);
+    cpu->set_limit(8000);
+    auto promise = std::make_shared<litebus::Promise<Status>>();
+    (void)view->AddInstances({{instance.instanceid(), resource_view::InstanceAllocatedInfo{instance, promise}}});
+    auto allocated = promise->GetFuture();
+    ASSERT_AWAIT_READY(allocated);
+    ASSERT_TRUE(allocated.Get().IsOk()) << allocated.Get().ToString();
+    Publish(second, MiB(640), MiB(269));  // replacement holds 371 MiB
+    EXPECT_NEAR(view->GetOutstandingResizeForTest(unit.id()).memoryMb, 371.0, 0.01);
+    // The stale generation-1 receipt replay must clear nothing and keep the
+    // replacement allocation and its credit.
+    auto staleReplay = view->ApplyPhysicalRetirement(ReceiptFor(first, unit.id()));
+    ASSERT_AWAIT_READY(staleReplay);
+    EXPECT_TRUE(staleReplay.Get().IsOk());
+    EXPECT_NEAR(view->GetOutstandingResizeForTest(unit.id()).memoryMb, 371.0, 0.01);
+    EXPECT_EQ(view->GetResizeBudgetEntryCountForTest(), size_t{1});
+    EXPECT_TRUE(Allocated(second.instanceID));
+    // The replacement's own receipt settles it in full.
+    auto secondSettled = view->ApplyPhysicalRetirement(ReceiptFor(second, unit.id()));
+    ASSERT_AWAIT_READY(secondSettled);
+    EXPECT_TRUE(secondSettled.Get().IsOk());
+    EXPECT_NEAR(view->GetOutstandingResizeForTest(unit.id()).memoryMb, 0.0, 0.001);
+    EXPECT_FALSE(Allocated(second.instanceID));
+}
+
+TEST_F(PhysicalRetirementTest, FailedRebindKeepsPriorIncarnationLedger)
+{
+    Guards guards;
+    const Owner a{"rebind-instance", "request-rebind", "runtime-1", "sandbox-1", "generation-1"};
+    Setup("retire-rebind", {a}, true);
+    Publish(a, MiB(512), MiB(269));
+    const size_t entriesBefore = view->GetResizeBudgetEntryCountForTest();
+    ASSERT_EQ(entriesBefore, size_t{1});
+    // A rebind onto a different runtime is refused as a stale incarnation; it
+    // must not drop the prior incarnation's ledger hold on its way out.
+    auto rebound = Get1DInstance();
+    rebound.set_instanceid(a.instanceID);
+    rebound.set_requestid(a.requestID);
+    rebound.set_unitid(unit.id());
+    rebound.set_runtimeid("runtime-2");
+    auto bind = view->BindInstanceRuntime(rebound, "runtime-2");
+    ASSERT_AWAIT_READY(bind);
+    EXPECT_FALSE(bind.Get().IsOk());
+    EXPECT_EQ(view->GetResizeBudgetEntryCountForTest(), entriesBefore);
+    EXPECT_NEAR(view->GetOutstandingResizeForTest(unit.id()).memoryMb, 243.0, 0.01);
+    // Only the receipt releases the hold; after settlement the allocation is
+    // gone and a fresh deployment binds cleanly.
+    auto settled = view->ApplyPhysicalRetirement(ReceiptFor(a, unit.id()));
+    ASSERT_AWAIT_READY(settled);
+    EXPECT_TRUE(settled.Get().IsOk());
+    EXPECT_EQ(view->GetResizeBudgetEntryCountForTest(), size_t{0});
+}
+
+TEST_F(PhysicalRetirementTest, SettledPendingReservationCannotBeResurrected)
+{
+    Guards guards;
+    const Owner a{"resurrect-instance", "request-resurrect", "runtime-a", "sandbox-a", "generation-a"};
+    Setup("retire-resurrect", {a}, true);
+    Publish(a, MiB(256), MiB(269), 5, "op-birth");
+    messages::ResizeSandboxRequest reserve;
+    reserve.set_requestid("grow-pending");
+    reserve.set_instanceid(a.instanceID);
+    reserve.set_runtimeid(a.runtimeID);
+    auto *resize = reserve.mutable_resize();
+    resize->set_sandbox_id(a.sandboxID);
+    resize->set_resource_generation(a.generation);
+    resize->set_operation_id("op-grow-1");
+    resize->set_expected_revision(5);
+    resize->set_deadline_unix_ms(NowMs() + 30000);
+    resize->mutable_expected()->set_cpu_quota_usec(50000);
+    resize->mutable_expected()->set_cpu_period_usec(100000);
+    resize->mutable_expected()->set_memory_limit_bytes(MiB(256));
+    resize->mutable_target()->set_cpu_quota_usec(50000);
+    resize->mutable_target()->set_cpu_period_usec(100000);
+    resize->mutable_target()->set_memory_limit_bytes(MiB(384));
+    auto reserved = view->ReserveResize(reserve);
+    ASSERT_AWAIT_READY(reserved);
+    EXPECT_TRUE(reserved.Get().IsOk()) << reserved.Get().ToString();
+    // The reservation holds 128 MiB on top of any baseline state.
+    const auto held = view->GetOutstandingResizeForTest(unit.id());
+    EXPECT_NEAR(held.memoryMb, 128.0, 0.01);
+    // Retire the incarnation while the operation is still UNKNOWN.
+    auto settled = view->ApplyPhysicalRetirement(ReceiptFor(a, unit.id()));
+    ASSERT_AWAIT_READY(settled);
+    EXPECT_TRUE(settled.Get().IsOk());
+    EXPECT_NEAR(view->GetOutstandingResizeForTest(unit.id()).memoryMb, 0.0, 0.001);
+    EXPECT_EQ(view->GetResizeBudgetEntryCountForTest(), size_t{0});
+    EXPECT_FALSE(Allocated(a.instanceID));
+    // A late OBSERVED completion for the settled request cannot resurrect the
+    // entry or its credit.
+    messages::ResizeSandboxResponse late;
+    late.set_requestid("grow-pending");
+    late.set_instanceid(a.instanceID);
+    late.set_runtimeid(a.runtimeID);
+    late.set_sandboxid(a.sandboxID);
+    late.set_resourcegeneration(a.generation);
+    late.set_outcome(messages::ResizeSandboxResponse::OBSERVED);
+    auto *result = late.mutable_result();
+    result->set_complete(true);
+    auto *actual = result->mutable_actual();
+    actual->set_resource_generation(a.generation);
+    actual->set_cpu_limits_known(true);
+    actual->set_cpu_quota_usec(50000);
+    actual->set_cpu_period_usec(100000);
+    actual->set_memory_limit_bytes(MiB(384));
+    actual->set_memory_limit_known(true);
+    actual->set_resource_revision(6);
+    actual->set_resource_revision_known(true);
+    actual->set_resource_operation_id("op-grow-1");
+    actual->set_resource_operation_pending(false);
+    actual->set_frozen(false);
+    actual->set_frozen_known(true);
+    actual->set_memory_high_bytes(HighBytes(MiB(384)));
+    actual->set_memory_high_known(true);
+    auto observed = view->ObserveResize(late);
+    ASSERT_AWAIT_READY(observed);
+    EXPECT_TRUE(observed.Get().IsOk());
+    EXPECT_NEAR(view->GetOutstandingResizeForTest(unit.id()).memoryMb, 0.0, 0.001);
+    EXPECT_EQ(view->GetResizeBudgetEntryCountForTest(), size_t{0});
 }
 
 }  // namespace functionsystem::test

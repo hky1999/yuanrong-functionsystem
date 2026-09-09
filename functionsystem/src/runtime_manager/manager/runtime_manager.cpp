@@ -471,11 +471,55 @@ void RuntimeManager::StopInstance(const litebus::AID &from, std::string && /* na
     YRLOG_INFO("{}|{}|begin to stop runtime({}).", request->traceid(), request->requestid(), request->runtimeid());
     executor->GetExecByRuntimeID(request->runtimeid())
         .Then([healthCheckClient(healthCheckClient_)](const std::shared_ptr<litebus::Exec> &exePtr) {
+            // A replayed retirement carries no exec (state already unregistered);
+            // the null stop must not block the durable-receipt lookup below.
             return healthCheckClient->StopHeathCheckByPID(exePtr);
         })
-        .Then([executor, request]() { return executor->StopInstance(request, false); })
-        .OnComplete(
-            litebus::Defer(GetAID(), &RuntimeManager::StopInstanceResponse, from, std::placeholders::_1, request));
+        .Then([executor, request]() { return executor->StopInstanceWithOutcome(request, false); })
+        .OnComplete(litebus::Defer(GetAID(), &RuntimeManager::StopInstanceOutcomeComplete, from,
+                                   std::placeholders::_1, request));
+}
+
+void RuntimeManager::StopInstanceOutcomeComplete(const litebus::AID &from,
+                                                 const litebus::Future<StopInstanceOutcome> &result,
+                                                 const std::shared_ptr<messages::StopInstanceRequest> &request)
+{
+    auto response = std::make_shared<messages::StopInstanceResponse>();
+    response->set_runtimeid(request->runtimeid());
+    response->set_requestid(request->requestid());
+    response->set_traceid(request->traceid());
+    response->set_instanceid(request->instanceid());
+    if (result.IsError() || result.Get().status.IsError()) {
+        const auto code = result.IsError()
+            ? static_cast<int32_t>(RUNTIME_MANAGER_STOP_INSTANCE_FAILED)
+            : static_cast<int32_t>(result.Get().status.StatusCode());
+        YRLOG_ERROR("{}|{}|failed to stop runtime({}).", request->traceid(), request->requestid(),
+                    request->runtimeid());
+        response->set_code(code);
+        response->set_message("stop instance failed");
+        SendStopInstanceResponse(from, request->runtimeid(), response);
+        return;
+    }
+    const auto &proof = result.Get().retirement;
+    if (proof.confirmed) {
+        // The receipt must name exactly the incarnation the scheduler asked to
+        // retire; anything else is fail-closed, never a proof.
+        if (proof.sandboxID != request->expected_sandbox_id()
+            || proof.resourceGeneration != request->expected_resource_generation()) {
+            YRLOG_ERROR("{}|{}|retirement receipt identity mismatch for runtime({}).", request->traceid(),
+                        request->requestid(), request->runtimeid());
+            response->set_code(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY));
+            response->set_message("retirement receipt identity mismatch");
+            SendStopInstanceResponse(from, request->runtimeid(), response);
+            return;
+        }
+        response->set_physical_retirement_confirmed(true);
+        response->set_retired_sandbox_id(proof.sandboxID);
+        response->set_retired_resource_generation(proof.resourceGeneration);
+    }
+    healthCheckClient_->GetRuntimeStatus(request->runtimeid())
+        .OnComplete(litebus::Defer(GetAID(), &RuntimeManager::OnGetRuntimeStatus, from, request, response,
+                                   std::placeholders::_1));
 }
 
 void RuntimeManager::ResizeSandbox(const litebus::AID &from, std::string &&, std::string &&msg)
@@ -1093,6 +1137,12 @@ void RuntimeManager::OnGetRuntimeStatus(const litebus::AID &from,
                     request->runtimeid(), reason);
         response->set_code(static_cast<int32_t>(RUNTIME_MANAGER_STOP_INSTANCE_FAILED));
         response->set_message(reason);
+        // A failed exit observation is not a complete logical stop: the proof
+        // stays internal (retry re-obtains the idempotent receipt) and must
+        // not travel upward on a failure response.
+        response->set_physical_retirement_confirmed(false);
+        response->clear_retired_sandbox_id();
+        response->clear_retired_resource_generation();
     } else {
         YRLOG_INFO("{}|{}|success to stop runtime({}).", request->traceid(), request->requestid(),
                    request->runtimeid());

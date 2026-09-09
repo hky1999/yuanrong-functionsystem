@@ -1390,6 +1390,25 @@ void AgentServiceActor::StopInstanceResponse(const litebus::AID &from, std::stri
     auto killInstanceRequest = pending.request;
     auto killInstanceResponse = BuildKillInstanceResponse(stopInstanceResponse.code(), stopInstanceResponse.message(),
                                                           killInstanceRequest->requestid(), killInstanceRequest->instanceid());
+    // Copy the physical-retirement receipt upward only under the full strict
+    // chain: a successful stop code, a confirmed receipt naming exactly the
+    // incarnation this kill asked to retire. Anything else leaves the fields
+    // empty, which consumers must read as UNKNOWN, never as success.
+    if (stopInstanceResponse.code() == static_cast<int32_t>(StatusCode::SUCCESS)
+        && stopInstanceResponse.physical_retirement_confirmed()
+        && !stopInstanceResponse.retired_sandbox_id().empty()
+        && !stopInstanceResponse.retired_resource_generation().empty()
+        && stopInstanceResponse.retired_sandbox_id() == killInstanceRequest->expected_sandbox_id()
+        && stopInstanceResponse.retired_resource_generation() == killInstanceRequest->expected_resource_generation()) {
+        killInstanceResponse->set_physical_retirement_confirmed(true);
+        killInstanceResponse->set_retired_sandbox_id(stopInstanceResponse.retired_sandbox_id());
+        killInstanceResponse->set_retired_resource_generation(stopInstanceResponse.retired_resource_generation());
+    } else if (stopInstanceResponse.physical_retirement_confirmed()) {
+        // A receipt that does not match the pending kill's expected identity is
+        // dropped and audited: it can never authorize settling this kill.
+        YRLOG_WARN("{}|drop unmatched retirement receipt for kill of instance({}) runtime({})", requestID,
+                   killInstanceRequest->instanceid(), killInstanceRequest->runtimeid());
+    }
     YRLOG_DEBUG("{}|AgentServiceActor send KillInstanceResponse back to {}", requestID,
                 std::string(request->second.from));
     Send(request->second.from, "KillInstanceResponse", killInstanceResponse->SerializeAsString());

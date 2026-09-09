@@ -707,6 +707,17 @@ Status ResourceViewActor::BindInstanceRuntime(const InstanceInfo &instance, cons
     }
     // Validate both indexes before changing either. This operation changes no
     // resource booking and may not resurrect an instance removed during deploy.
+    // A runtime rebind across incarnations must not silently drop the prior
+    // incarnation's ledger holds: without a physical-retirement receipt the old
+    // generation's credit survives into reconciliation and the rebind refuses.
+    for (const auto *allocated : {&top->second, &leaf->second}) {
+        if (allocated->has_sandbox_resource_sample()
+            && allocated->sandbox_resource_sample().runtime_id() != instance.runtimeid()
+            && HasResizeBudgetEntries(instance.instanceid())) {
+            return Status(ERR_INSTANCE_BUSY,
+                "runtime rebind requires physical retirement of the prior incarnation");
+        }
+    }
     for (auto *allocated : {&top->second, &leaf->second}) {
         allocated->set_runtimeid(instance.runtimeid());
         // Allocation precedes SetScheduleResult; bind its registered agent route as well.
@@ -715,9 +726,8 @@ Status ResourceViewActor::BindInstanceRuntime(const InstanceInfo &instance, cons
             && allocated->sandbox_resource_sample().runtime_id() != instance.runtimeid()) {
             allocated->clear_sandbox_resource_sample();
             allocated->clear_actualuse();
-            // The retired incarnation's synthetic hold must not survive the
-            // rotation; the new incarnation re-establishes its own state.
-            DropBaselineEntries(instance.instanceid());
+            // The retired incarnation's ledger entries (if any) are NOT
+            // dropped here: only ApplyPhysicalRetirement may settle them.
         }
     }
     YRLOG_INFO("bind instance runtime instance={} request={} unit={} runtime={}", instance.instanceid(),
@@ -878,13 +888,25 @@ Status ResourceViewActor::DeleteInstances(const std::vector<std::string> &instID
         return Status(PARAMETER_ERROR, "instance ids is empty, deletion failed");
     }
     ASSERT_IF_NULL(view_);
-    view_->set_revision(view_->revision() + 1);
     for (auto &id : instIDs) {
         if (!IsInstanceInResourceView(id)) {
             YRLOG_ERROR("failed to delete instance({}) in resource unit, not found", id);
             return Status(PARAMETER_ERROR, "failed to delete instance in resource unit, not found " + id);
         }
-        const auto unitID = view_->instances().at(id).unitid();
+        // Final guardrail for every generic deletion path: an elastic
+        // incarnation that reached the physical layer, or owns any ledger
+        // entry, may only leave through ApplyPhysicalRetirement with a
+        // sandboxd receipt. Missing call sites fail closed here instead of
+        // releasing credit early.
+        if (RequiresPhysicalRetirement(view_->instances().at(id))) {
+            YRLOG_WARN("generic deletion refused for elastic instance({}); physical retirement receipt required",
+                       id);
+            return Status(ERR_INSTANCE_BUSY,
+                "elastic instance " + id + " requires a physical retirement receipt before deletion");
+        }
+    }
+    view_->set_revision(view_->revision() + 1);
+    for (auto &id : instIDs) {
         DeleteInstance(id, isVirtualInstance);
         MarkSnapshotUnitDirty(unitID);
         MarkSnapshotIndexesDirty(true, true);
@@ -1444,9 +1466,8 @@ void ResourceViewActor::DeleteLabels(const InstanceInfo &instInfo)
 void ResourceViewActor::DeleteInstanceFromView(const InstanceInfo &instance)
 {
     resourceAdmissionTimes_.erase(instance.instanceid());
-    // A synthetic recovery hold belongs to this allocation only; dispatched
-    // operations keep their unresolved-write semantics across deletion.
-    DropBaselineEntries(instance.instanceid());
+    // Ledger entries (baselines included) never follow a generic logical
+    // deletion: only a matching physical-retirement receipt may settle them.
     ASSERT_IF_NULL(view_);
     auto nodeLabels = view_->mutable_nodelabels();
     DeleteLabel(instance, *nodeLabels);

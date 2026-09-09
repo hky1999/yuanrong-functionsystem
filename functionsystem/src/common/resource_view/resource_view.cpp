@@ -101,6 +101,25 @@ litebus::Future<Status> ResourceView::CancelResizeBeforeDispatch(const std::stri
     return litebus::Async(implActor_->GetAID(), &ResourceViewActor::CancelResizeBeforeDispatch, reservationID);
 }
 
+litebus::Future<Status> ResourceView::ApplyPhysicalRetirement(const PhysicalRetirementReceipt &receipt)
+{
+    // One actor hop: budget settlement and any logical deletion happen inside a
+    // single ResourceViewActor turn with no interleaved resize registration.
+    return litebus::Async(implActor_->GetAID(), &ResourceViewActor::ApplyPhysicalRetirement, receipt);
+}
+
+AdmissionReserve ResourceView::GetOutstandingResizeForTest(const std::string &unitID)
+{
+    ASSERT_IF_NULL(implActor_);
+    return implActor_->GetOutstandingResizeForTest(unitID);
+}
+
+size_t ResourceView::GetResizeBudgetEntryCountForTest()
+{
+    ASSERT_IF_NULL(implActor_);
+    return implActor_->GetResizeBudgetEntryCountForTest();
+}
+
 litebus::Future<Status> ResourceView::AddInstances(const std::map<std::string, InstanceAllocatedInfo> &insts)
 {
     ASSERT_IF_NULL(implActor_);

@@ -50,6 +50,19 @@ struct LocalResourceViewInfo {
     std::string localViewInitTime;
 };
 
+// Authorization to settle one exact physical incarnation: it may only be built
+// from a sandboxd DeleteIfGeneration response whose retired_generation matched
+// the scheduler's expected identity for the same sandbox. requestID is
+// correlation/audit only and never authorizes anything by itself.
+struct PhysicalRetirementReceipt {
+    std::string requestID;
+    std::string unitID;
+    std::string instanceID;
+    std::string runtimeID;
+    std::string sandboxID;
+    std::string resourceGeneration;
+};
+
 class ResourceViewActor : public BasisActor {
 public:
     struct Param {
@@ -115,6 +128,16 @@ public:
     Status ReserveResize(const messages::ResizeSandboxRequest &request);
     Status ObserveResize(const messages::ResizeSandboxResponse &response);
     Status CancelResizeBeforeDispatch(const std::string &reservationID);
+
+    /**
+     * @brief Settle one physically retired incarnation atomically: erase every
+     * resizeBudget entry (observed/pending/UNKNOWN/baseline/shrink alike) whose
+     * (unit, instance, runtime, sandbox, generation) identity equals the
+     * receipt, and delete the logical allocation in the same actor turn only
+     * when it is still bound to that exact incarnation. A logical ID already
+     * rebound to a replacement generation keeps its allocation (ABA guard).
+     */
+    Status ApplyPhysicalRetirement(const PhysicalRetirementReceipt &receipt);
 
     Status AddInstances(const std::map<std::string, InstanceAllocatedInfo> &insts);
 
@@ -274,6 +297,18 @@ public:
     [[maybe_unused]] void SetLatestReportChanges(const std::string& localId, ResourceUnitChanges changes)
     {
         latestReportedResourceViewChanges_[localId] = std::make_shared<ResourceUnitChanges>(changes);
+    }
+
+    // for test: read-only ledger inspection; never expose a production writer.
+    [[maybe_unused]] AdmissionReserve GetOutstandingResizeForTest(const std::string &unitID) const
+    {
+        return OutstandingResize(unitID);
+    }
+
+    // for test: total ledger population (all entry kinds).
+    [[maybe_unused]] size_t GetResizeBudgetEntryCountForTest() const
+    {
+        return resizeBudget_.size();
     }
 
     // for test
@@ -466,7 +501,12 @@ private:
     void TrimInstanceGrowCredits(const std::string &instanceID, const std::string &generation,
                                  const std::string &unitID, uint64_t landedMaxBytes,
                                  const std::string &operationID, uint64_t revision);
-    void DropBaselineEntries(const std::string &instanceID);
+    // True when the elastic instance already reached the physical layer (has a
+    // sandbox sample) or owns any ledger entry: generic deletion must then fail
+    // closed and the caller must go through ApplyPhysicalRetirement instead.
+    bool RequiresPhysicalRetirement(const InstanceInfo &instance) const;
+    // Any unresolved or observed ledger entry for this logical instance.
+    bool HasResizeBudgetEntries(const std::string &instanceID) const;
     // Per-entry outstanding credit: pending grow holds target-expected in full,
     // observed entries hold cap - max(expected, own peak), shrink holds nothing.
     static AdmissionReserve EntryOutstanding(const ResizeBudgetEntry &entry);

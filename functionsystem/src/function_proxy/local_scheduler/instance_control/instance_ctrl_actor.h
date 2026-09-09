@@ -754,7 +754,9 @@ private:
      */
     litebus::Future<messages::KillInstanceResponse> SendKillRequestToAgent(const InstanceInfo &instanceInfo,
                                                                            bool isRecovering = false,
-                                                                           bool forRedeploy = false);
+                                                                           bool forRedeploy = false,
+                                                                           const std::string &expectedSandboxID = {},
+                                                                           const std::string &expectedGeneration = {});
 
     litebus::Future<Status> DoSync(const litebus::Option<function_proxy::InstanceInfoMap> &instanceInfo,
                                    const std::string &funcAgentID);
@@ -825,10 +827,13 @@ private:
                                                           const std::string &requestID, const std::string &instanceID);
 
     litebus::Future<Status> KillRuntime(const InstanceInfo &instanceInfo, bool isRecovering = false);
-
+    // Kill continuation once the resource view's authoritative physical sample
+    // is available; the control-view copy never carries sandbox samples.
+    litebus::Future<Status> KillRuntimeWithIdentity(const InstanceInfo &instanceInfo, bool isRecovering,
+                                                    const std::shared_ptr<resource_view::ResourceUnit> &current);
     litebus::Future<Status> RecordFrontendKillRuntimeResult(
-        const InstanceInfo &instanceInfo, const std::string &frontendKillRequestID,
-        const messages::KillInstanceResponse &response);
+        const InstanceInfo &instanceInfo, const messages::KillInstanceResponse &response,
+        const std::string &expectedSandboxID = {}, const std::string &expectedGeneration = {});
     void ExpireFrontendKillRuntimeEvidence(const std::string &instanceID, const std::string &requestID);
     inline bool IsValidKillParam(
         const Status &status, std::shared_ptr<KillContext> &killCtx, const std::shared_ptr<KillRequest> &killReq,

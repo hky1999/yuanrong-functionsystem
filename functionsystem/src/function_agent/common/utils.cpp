@@ -922,6 +922,13 @@ void SetStopRuntimeInstanceRequest(messages::StopInstanceRequest &stopInstanceRe
     stopInstanceRequest.set_instanceid(req->instanceid());
     stopInstanceRequest.set_tenantid(req->tenantid());
     stopInstanceRequest.set_checkpointstorage(req->checkpointstorage());
+    // The scheduler's expected physical identity travels with the stop so the
+    // runtime manager can fence the delete and replay the durable receipt.
+    // Copy verbatim, including a one-sided value: the runtime manager rejects
+    // incomplete identity before any dispatch (fail closed).
+    stopInstanceRequest.set_instanceid(req->instanceid());
+    stopInstanceRequest.set_expected_sandbox_id(req->expected_sandbox_id());
+    stopInstanceRequest.set_expected_resource_generation(req->expected_resource_generation());
 }
 
 std::unordered_map<std::string, std::shared_ptr<messages::Layer>> SetDeployingRequestLayers(

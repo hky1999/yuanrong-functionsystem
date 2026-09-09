@@ -17,6 +17,7 @@
 #include "runtime_manager/executor/sandboxd/sandboxd_executor.h"
 #include "common/status/status.h"
 #include "runtime_manager/port/port_manager.h"
+#include "utils/future_test_helper.h"
 
 #include <gtest/gtest.h>
 
@@ -546,6 +547,130 @@ TEST(SandboxdExecutorTest, ReportSandboxUsageMetricsAcceptsKnownZeroMemorySample
     ASSERT_EQ(reported.size(), 1u);
     EXPECT_EQ(reported[0].memory_current_bytes(), 0u);
     EXPECT_EQ(reported[0].memory_limit_bytes(), 2u * 1024u * 1024u * 1024u);
+}
+
+// ── StopInstanceWithOutcome retirement-receipt semantics (v3) ────────────────
+
+TEST(SandboxdExecutorTest, OutcomeRejectsOneSidedIdentityBeforeAnyDispatch)
+{
+    SandboxdExecutor executor("outcome-one-sided", litebus::AID(), "/tmp/outcome-one-sided");
+    messages::RuntimeInstanceInfo info;
+    info.set_instanceid("one-sided-instance");
+    info.set_runtimeid("one-sided-runtime");
+    SandboxInfo registered;
+    registered.runtimeID = "one-sided-runtime";
+    registered.sandboxID = "one-sided-sandbox";
+    registered.resourceGeneration = "one-sided-generation";
+    registered.instanceInfo = info;
+    executor.stateManager_.Register(registered);
+
+    auto request = std::make_shared<messages::StopInstanceRequest>();
+    request->set_runtimeid("one-sided-runtime");
+    request->set_requestid("one-sided-stop");
+    request->set_expected_sandbox_id("one-sided-sandbox");  // generation missing
+
+    auto outcome = executor.StopInstanceWithOutcome(request, false);
+    ASSERT_AWAIT_READY(outcome);
+    EXPECT_TRUE(outcome.Get().status.IsError());
+    EXPECT_EQ(outcome.Get().status.StatusCode(), StatusCode::ERR_INSTANCE_BUSY);
+    EXPECT_FALSE(outcome.Get().retirement.confirmed);
+    // Nothing was dispatched, so the runtime must still be locally active.
+    EXPECT_TRUE(executor.stateManager_.IsActive("one-sided-runtime"));
+}
+
+TEST(SandboxdExecutorTest, OutcomeRejectsForeignExpectedIdentityBeforeDispatch)
+{
+    SandboxdExecutor executor("outcome-foreign", litebus::AID(), "/tmp/outcome-foreign");
+    messages::RuntimeInstanceInfo info;
+    info.set_instanceid("foreign-instance");
+    info.set_runtimeid("foreign-runtime");
+    SandboxInfo foreignState;
+    foreignState.runtimeID = "foreign-runtime";
+    foreignState.sandboxID = "foreign-sandbox";
+    foreignState.resourceGeneration = "foreign-generation";
+    foreignState.instanceInfo = info;
+    executor.stateManager_.Register(foreignState);
+
+    auto request = std::make_shared<messages::StopInstanceRequest>();
+    request->set_runtimeid("foreign-runtime");
+    request->set_requestid("foreign-stop");
+    request->set_expected_sandbox_id("somebody-elses-sandbox");
+    request->set_expected_resource_generation("somebody-elses-generation");
+
+    auto outcome = executor.StopInstanceWithOutcome(request, false);
+    ASSERT_AWAIT_READY(outcome);
+    EXPECT_TRUE(outcome.Get().status.IsError());
+    EXPECT_EQ(outcome.Get().status.StatusCode(), StatusCode::ERR_INSTANCE_BUSY);
+    EXPECT_FALSE(outcome.Get().retirement.confirmed);
+    EXPECT_TRUE(executor.stateManager_.IsActive("foreign-runtime"));
+}
+
+TEST(SandboxdExecutorTest, OutcomeProofOnlyFollowsFencedSuccessfulTerminate)
+{
+    SandboxdExecutor executor("outcome-proof", litebus::AID(), "/tmp/outcome-proof");
+    // OnOutcomeStopDone is the post-TerminateSandbox continuation: a fenced
+    // success yields the durable receipt, any failure stays UNKNOWN.
+    auto failure = executor.OnOutcomeStopDone("proof-runtime", "proof-request", "proof-sandbox",
+        "proof-generation", Status(StatusCode::ERR_INNER_COMMUNICATION, "grpc failed"));
+    EXPECT_TRUE(failure.status.IsError());
+    EXPECT_FALSE(failure.retirement.confirmed);
+
+    auto success = executor.OnOutcomeStopDone("proof-runtime", "proof-request", "proof-sandbox",
+        "proof-generation", Status::OK());
+    EXPECT_TRUE(success.status.IsOk());
+    ASSERT_TRUE(success.retirement.confirmed);
+    EXPECT_EQ(success.retirement.sandboxID, "proof-sandbox");
+    EXPECT_EQ(success.retirement.resourceGeneration, "proof-generation");
+}
+
+TEST(SandboxdExecutorTest, ReplayConfirmedOnlyOnExactRetiredGeneration)
+{
+    SandboxdExecutor executor("replay-receipt", litebus::AID(), "/tmp/replay-receipt");
+    // Durable complete receipt naming the exact generation authorizes the
+    // idempotent proof even with local state already unregistered.
+    runtime::v1::DeleteIfGenerationResponse confirmed;
+    confirmed.set_retired_generation("replay-generation");
+    auto ok = executor.OnReplayRetirementDone("replay-sandbox", "replay-generation", "replay-runtime",
+        "replay-request", litebus::Try<runtime::v1::DeleteIfGenerationResponse>(confirmed));
+    EXPECT_TRUE(ok.status.IsOk());
+    ASSERT_TRUE(ok.retirement.confirmed);
+    EXPECT_EQ(ok.retirement.sandboxID, "replay-sandbox");
+    EXPECT_EQ(ok.retirement.resourceGeneration, "replay-generation");
+
+    // A receipt naming a different generation is not this retirement.
+    runtime::v1::DeleteIfGenerationResponse foreign;
+    foreign.set_retired_generation("another-generation");
+    auto mismatch = executor.OnReplayRetirementDone("replay-sandbox", "replay-generation", "replay-runtime",
+        "replay-request", litebus::Try<runtime::v1::DeleteIfGenerationResponse>(foreign));
+    EXPECT_TRUE(mismatch.status.IsError());
+    EXPECT_FALSE(mismatch.retirement.confirmed);
+
+    // Transport failure: UNKNOWN, credit retained.
+    auto unavailable = executor.OnReplayRetirementDone("replay-sandbox", "replay-generation", "replay-runtime",
+        "replay-request",
+        litebus::Try<runtime::v1::DeleteIfGenerationResponse>(static_cast<int32_t>(GRPC_UNAVAILABLE)));
+    EXPECT_TRUE(unavailable.status.IsError());
+    EXPECT_FALSE(unavailable.retirement.confirmed);
+
+    // Missing sandbox without a complete receipt: still UNKNOWN.
+    auto missing = executor.OnReplayRetirementDone("replay-sandbox", "replay-generation", "replay-runtime",
+        "replay-request",
+        litebus::Try<runtime::v1::DeleteIfGenerationResponse>(static_cast<int32_t>(GRPC_NOT_FOUND)));
+    EXPECT_TRUE(missing.status.IsError());
+    EXPECT_FALSE(missing.retirement.confirmed);
+}
+
+TEST(SandboxdExecutorTest, LegacyStopWithoutExpectedIdentityReturnsNoProof)
+{
+    SandboxdExecutor executor("legacy-stop", litebus::AID(), "/tmp/legacy-stop");
+    // Missing runtime without expected identity: legacy UNKNOWN retirement.
+    auto request = std::make_shared<messages::StopInstanceRequest>();
+    request->set_runtimeid("ghost-runtime");
+    request->set_requestid("ghost-stop");
+    auto outcome = executor.StopInstanceWithOutcome(request, false);
+    ASSERT_AWAIT_READY(outcome);
+    EXPECT_TRUE(outcome.Get().status.IsError());
+    EXPECT_FALSE(outcome.Get().retirement.confirmed);
 }
 
 }  // namespace functionsystem::test
