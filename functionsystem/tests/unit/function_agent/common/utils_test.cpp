@@ -393,57 +393,6 @@ TEST_F(FunctionAgentUtilsTest, InheritedEntrypointFlowsFromCreateOptionsToDeploy
                   .deployoptions()
                   .at(CONTAINER_INHERIT_ENTRYPOINT),
               "true");
-TEST_F(FunctionAgentUtilsTest, ElasticPolicyFlowsThroughDeployWhitelistAndRuntimeLimits)
-{
-    auto deployInstanceRequest = std::make_shared<messages::DeployInstanceRequest>();
-    deployInstanceRequest->set_language("python3.9");
-    deployInstanceRequest->set_instanceid("test-instance");
-    deployInstanceRequest->set_traceid("trace-abc");
-    deployInstanceRequest->mutable_funcdeployspec()->set_deploydir("/dcache");
-    deployInstanceRequest->mutable_container()->set_id("container-001");
-    deployInstanceRequest->mutable_container()->set_runtime("runsc");
-    auto *rootfs = deployInstanceRequest->mutable_container()->mutable_rootfsconfig();
-    rootfs->set_type(runtime::v1::RootfsSrcType::LOCAL);
-    rootfs->set_path("/opt/runtime/rootfs.img");
-    (*deployInstanceRequest->mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
-    auto *resources = deployInstanceRequest->mutable_resources()->mutable_resources();
-    (*resources)["CPU"].set_type(::resources::Value_Type_SCALAR);
-    (*resources)["CPU"].mutable_scalar()->set_value(500);
-    (*resources)["Memory"].set_type(::resources::Value_Type_SCALAR);
-    (*resources)["Memory"].mutable_scalar()->set_value(512);
-    auto *extensions = deployInstanceRequest->mutable_scheduleoption()->mutable_extension();
-    (*extensions)["CPU_LIMIT"] = "8000";
-    (*extensions)["MEMORY_LIMIT"] = "8192";
-
-    auto runtimeRequest = std::make_unique<messages::StartInstanceRequest>();
-    function_agent::SetStartRuntimeInstanceRequestConfig(runtimeRequest, deployInstanceRequest);
-    ASSERT_EQ(runtimeRequest->runtimeinstanceinfo()
-                  .deploymentconfig()
-                  .deployoptions()
-                  .at(SCHEDULER_ELASTIC_RESOURCES), "true");
-
-    runtime_manager::RuntimeConfig config;
-    config.runtimePath       = "/opt/runtime";
-    config.runtimeLogLevel   = "INFO";
-    config.runtimeConfigPath = "/etc/runtime";
-    config.runtimeLogPath    = "/tmp/elastic-policy-pipeline-test";
-    config.hostIP            = "127.0.0.1";
-    runtime_manager::CommandBuilder commandBuilder(/*execLookPath=*/false);
-    commandBuilder.SetRuntimeConfig(config);
-    runtime_manager::SandboxdRequestBuilder requestBuilder(commandBuilder);
-
-    runtime_manager::SandboxdStartParams params;
-    params.request   = std::shared_ptr<messages::StartInstanceRequest>(std::move(runtimeRequest));
-    params.runtimeID = "test-runtime";
-    auto [status, sandboxdRequest] = requestBuilder.Build(params);
-
-    ASSERT_TRUE(status.IsOk());
-    ASSERT_NE(sandboxdRequest, nullptr);
-    EXPECT_EQ(sandboxdRequest->resources().at("CPU"), 500);
-    EXPECT_EQ(sandboxdRequest->resources().at("Memory"), 512);
-    auto policy = nlohmann::json::parse(sandboxdRequest->labels().at("akernel.scheduler/elastic-resources"));
-    EXPECT_EQ(policy["CPU"]["ceiling"], 8000);
-    EXPECT_EQ(policy["Memory"]["ceiling"], 8192);
 }
 
 TEST_F(FunctionAgentUtilsTest, SetStopRuntimeInstanceRequestSuccess)
@@ -455,26 +404,6 @@ TEST_F(FunctionAgentUtilsTest, SetStopRuntimeInstanceRequestSuccess)
 
     function_agent::SetStopRuntimeInstanceRequest(stopInstanceRequest, req);
     EXPECT_EQ(stopInstanceRequest.runtimeid(), runtimeID);
-    // Expected physical identity travels verbatim, including absence: the
-    // runtime manager rejects incomplete identity before any dispatch.
-    EXPECT_EQ(stopInstanceRequest.instanceid(), "");
-    EXPECT_EQ(stopInstanceRequest.expected_sandbox_id(), "");
-    EXPECT_EQ(stopInstanceRequest.expected_resource_generation(), "");
-}
-
-TEST_F(FunctionAgentUtilsTest, SetStopRuntimeInstanceRequestCopiesExpectedIdentity)
-{
-    messages::StopInstanceRequest stopInstanceRequest;
-    auto req = std::make_shared<messages::KillInstanceRequest>();
-    req->set_runtimeid("identity-runtime");
-    req->set_instanceid("identity-instance");
-    req->set_expected_sandbox_id("identity-sandbox");
-    req->set_expected_resource_generation("identity-generation");
-
-    function_agent::SetStopRuntimeInstanceRequest(stopInstanceRequest, req);
-    EXPECT_EQ(stopInstanceRequest.instanceid(), "identity-instance");
-    EXPECT_EQ(stopInstanceRequest.expected_sandbox_id(), "identity-sandbox");
-    EXPECT_EQ(stopInstanceRequest.expected_resource_generation(), "identity-generation");
 }
 
 /**

@@ -386,11 +386,12 @@ message KillInstanceRequest {
   string expected_sandbox_id = 8;
   string expected_resource_generation = 9;
 // Upstream snapshot-stop fields, renumbered (our v3 wire pins 8-9):
-  string checkpointID = 16;
-  string sourceSandboxID = 15;
-  uint64 checkpointSize = 16;
-  string checkpointSha256 = 15;
-  string tenantID = 16;
+  // Upstream checkpoint-stop extras, renumbered (our wire pins 1-9).
+  string checkpointID = 10;
+  string sourceSandboxID = 11;
+  uint64 checkpointSize = 12;
+  string checkpointSha256 = 13;
+  string tenantID = 14;
   string checkpointStorage = 15;
   bool deleteInstanceSnapshots = 16;
 }
@@ -644,13 +645,14 @@ message StopInstanceRequest {
   string expected_sandbox_id = 7;
   string expected_resource_generation = 8;
 // Upstream snapshot-stop fields, renumbered (our v3 wire pins 6-8):
-  string checkpointID = 15;
-  string sourceSandboxID = 13;
-  uint64 checkpointSize = 14;
-  string checkpointSha256 = 15;
-  string instanceID = 13;
-  string tenantID = 14;
-  string checkpointStorage = 15;
+  // Upstream snapshot-stop extras, renumbered (our wire pins 1-8);
+  // upstream's duplicate instanceID is dropped in favor of ours at 6.
+  string checkpointID = 9;
+  string sourceSandboxID = 10;
+  uint64 checkpointSize = 11;
+  string checkpointSha256 = 12;
+  string tenantID = 13;
+  string checkpointStorage = 14;
 }
 
 message StopInstanceResponse {
@@ -1424,12 +1426,14 @@ message SnapshotRuntimeRequest {
   string containerID = 4;
   int32 ttl = 5;
   common.SnapType type = 6;  // interpreted by FunctionProxy only
-  string snapshotID = 7;
-  string checkpointDir = 8;
-  string tenantID = 10;
-  int64 sourceVersion = 11;
-  bool leaveRunning = 12;
-  bool localRecoveryCandidate = 13;
+  // Upstream snapshot-family fields, renumbered during the 2026-09-11
+  // scheduler-line rebase: our v3 identity pins 7/8.
+  string snapshotID = 19;
+  string checkpointDir = 20;
+  string tenantID = 21;
+  int64 sourceVersion = 22;
+  bool leaveRunning = 23;
+  bool localRecoveryCandidate = 24;
   // FunctionProxy resolves business-specific keys. FunctionAgent treats both
   // keys as opaque storage instructions.
   string artifactObjectKey = 14;
@@ -1439,6 +1443,9 @@ message SnapshotRuntimeRequest {
   // Internal checkpoints are retained only as node-local recovery candidates.
   // They never enter the compression or distributed publication phase.
   bool internalCheckpoint = 18;
+  // v3 generation-fenced snapshot identity (scheduler line wire pins 7/8).
+  string expected_sandbox_id = 7;
+  string expected_resource_generation = 8;
 }
 
 // Starts the storage phase for a checkpoint that has already reached
@@ -1493,12 +1500,12 @@ message RestoreSnapshotRequest {
 }
 
 message RestoreSnapshotResponse {
-  reserved 4;
-  reserved "instanceID";
-
   int32 code = 1;
   string message = 2;
   string requestID = 3;
+  // Scheduler-line wire (the upstream rebase briefly reserved this number;
+  // our deployed park path reads it).
+  string instanceID = 4;
   core_service.SnapStartedInfo snapstartInfo = 5;
 }
 
@@ -1600,7 +1607,6 @@ message RuntimeReconcileEntry {
   string instanceID   = 3;
   string portMappings = 4;  // persisted host-port ownership JSON
 
-  string portMappings = 4;  // persisted JSON port mappings for runtime-manager reconstruction
 }
 
 message ReconcileRuntimesRequest {

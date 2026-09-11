@@ -108,20 +108,6 @@ litebus::Future<messages::SnapshotRuntimeResponse> FunctionAgentMgr::SnapshotRun
     const std::string &requestID,
     const resource_view::InstanceInfo &instanceInfo,
     int32_t ttl,
-    bool leaveRunning)
-{
-    ASSERT_IF_NULL(actor_);
-    return litebus::Async(actor_->GetAID(),
-                          static_cast<litebus::Future<messages::SnapshotRuntimeResponse> (FunctionAgentMgrActor::*)(
-                              const std::string &, const resource_view::InstanceInfo &, int32_t)>(
-                              &FunctionAgentMgrActor::SnapshotRuntime),
-                          requestID, instanceInfo, ttl);
-}
-
-litebus::Future<messages::SnapshotRuntimeResponse> FunctionAgentMgr::SnapshotRuntime(
-    const std::string &requestID,
-    const resource_view::InstanceInfo &instanceInfo,
-    int32_t ttl,
     common::SnapType type,
     const std::string &snapshotID,
     const std::string &checkpointDir)
@@ -178,8 +164,20 @@ litebus::Future<std::optional<messages::LocalSnapshotMetadata>> FunctionAgentMgr
     ASSERT_IF_NULL(actor_);
     return litebus::Async(actor_->GetAID(), &FunctionAgentMgrActor::LatestAnonymousSnapshot,
                           instanceID);
-    return litebus::Async(actor_->GetAID(), &FunctionAgentMgrActor::SnapshotRuntime, requestID, instanceInfo, ttl,
-                          leaveRunning);
+}
+
+litebus::Future<messages::SnapshotRuntimeResponse> FunctionAgentMgr::SnapshotRuntime(
+    const std::string &requestID,
+    const resource_view::InstanceInfo &instanceInfo,
+    int32_t ttl,
+    bool leaveRunning)
+{
+    ASSERT_IF_NULL(actor_);
+    return litebus::Async(actor_->GetAID(),
+                          static_cast<litebus::Future<messages::SnapshotRuntimeResponse> (FunctionAgentMgrActor::*)(
+                              const std::string &, const resource_view::InstanceInfo &, int32_t, bool)>(
+                              &FunctionAgentMgrActor::SnapshotRuntime),
+                          requestID, instanceInfo, ttl, leaveRunning);
 }
 
 litebus::Future<messages::SnapshotRuntimeResponse> FunctionAgentMgr::SnapshotRuntimeIfGeneration(

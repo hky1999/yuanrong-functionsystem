@@ -68,6 +68,21 @@ public:
      * @param scheduleReq
      * @return
      */
+    // Upstream pause-fence query hook: the pause-gate feature was retired in
+    // favor of the scheduler line's park semantics during the 2026-09-11
+    // rebase, so nothing is ever fenced; callers proceed immediately.
+    virtual litebus::Future<FrontendCreateFailureSnapshot> TakeFrontendCreateFailureSnapshot(
+        const std::string &requestID);
+    virtual void EraseFrontendCreateFailure(const std::string &requestID);
+    // Upstream local-snapshot failover hook, retired in the 2026-09-11
+    // scheduler-line rebase: always reports failure so callers fall back to
+    // their conservative reconciliation paths.
+    virtual litebus::Future<Status> TryLocalSnapshotFailover(const std::string &instanceID,
+                                                             const std::string &sourceRuntimeID);
+
+    virtual litebus::Future<bool> IsPauseRuntimeFenced(const std::string &instanceID,
+                                                       const std::string &runtimeID);
+
     virtual litebus::Future<messages::ScheduleResponse> Schedule(
         const std::shared_ptr<messages::ScheduleRequest> &scheduleReq,
         const std::shared_ptr<litebus::Promise<messages::ScheduleResponse>> &runtimePromise);

@@ -445,7 +445,7 @@ TEST_F(RestoreReplayActorTest, MismatchedCompletionCannotPoisonLedger)
     SnapManagerActor::SnapStartLedgerContext stale{};
     stale.key = key;
     stale.ticket = 0xDEADBEEFULL;
-    SnapManagerActor::SnapStartResponse wrongTicket{reply_->GetAID(), "req-poison", 0, "poison", "inst-bad", {}};
+    SnapManagerActor::SnapStartResponse wrongTicket{reply_->GetAID(), "req-poison", 0, "poison", {}};
     litebus::Async(actor_->GetAID(),
                    [this, stale, wrongTicket]() { actor_->CompleteSnapStart(stale, wrongTicket); });
 
@@ -454,7 +454,7 @@ TEST_F(RestoreReplayActorTest, MismatchedCompletionCannotPoisonLedger)
     stranger.key = key;
     stranger.ticket = 1;
     SnapManagerActor::SnapStartResponse wrongDestination{litebus::AID("Stranger", "tcp://127.0.0.1:1"),
-                                                         "req-poison", 0, "poison", "inst-bad", {}};
+                                                         "req-poison", 0, "poison", {}};
     litebus::Async(actor_->GetAID(),
                    [this, stranger, wrongDestination]() { actor_->CompleteSnapStart(stranger, wrongDestination); });
 
@@ -462,7 +462,7 @@ TEST_F(RestoreReplayActorTest, MismatchedCompletionCannotPoisonLedger)
     SnapManagerActor::SnapStartLedgerContext otherRequest{};
     otherRequest.key = key;
     otherRequest.ticket = 1;
-    SnapManagerActor::SnapStartResponse wrongRequestID{reply_->GetAID(), "req-other", 0, "poison", "inst-bad", {}};
+    SnapManagerActor::SnapStartResponse wrongRequestID{reply_->GetAID(), "req-other", 0, "poison", {}};
     litebus::Async(actor_->GetAID(),
                    [this, otherRequest, wrongRequestID]() { actor_->CompleteSnapStart(otherRequest, wrongRequestID); });
 

@@ -1123,6 +1123,7 @@ void RuntimeManager::SendStopInstanceResponse(const litebus::AID &from, const st
     }
     Send(from, "StopInstanceResponse", response->SerializeAsString());
 }
+}
 
 void RuntimeManager::OnGetRuntimeStatus(const litebus::AID &from,
                                         const std::shared_ptr<messages::StopInstanceRequest> &request,

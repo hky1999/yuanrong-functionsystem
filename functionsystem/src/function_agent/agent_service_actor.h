@@ -653,8 +653,8 @@ private:
     };
     /** <requestID : pending SnapshotRuntime request> for response forwarding */
     std::unordered_map<std::string, PendingSnapshotRequest> snapshotRequests_;
-    /** <requestID : caller's AID> for snapshot response forwarding */
-    std::unordered_map<std::string, litebus::AID> snapshotRequests_;
+    /** <requestID : caller's AID> scheduler-line fenced snapshot forwarding */
+    std::unordered_map<std::string, litebus::AID> snapshotCallers_;
     struct ResizePending {
         litebus::AID requester;
         litebus::AID runtimeManager;

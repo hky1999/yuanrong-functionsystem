@@ -22,6 +22,7 @@
 #include <unordered_set>
 #include <chrono>
 
+#include "local_scheduler/instance_control/frontend_create_failure_snapshot.h"
 #include "common/proto/pb/message_pb.h"
 #include "common/proto/pb/posix/data_plane_gateway_activity.pb.h"
 #include "common/proto/pb/posix_pb.h"
@@ -1162,6 +1163,15 @@ private:
     std::unordered_map<std::string, litebus::Promise<Status>> instanceStatusPromises_;
     std::unordered_map<std::string, InstanceReadyCallBack> instanceRegisteredReadyCallback_;
     std::unordered_map<std::string, InstanceReadyCallResultCallBack> instanceRegisteredReadyCallResultCallback_;
+    // Last deploy failure for pending frontend create requests (key=requestID).
+    // Written by RecordFrontendCreateFailure on frontend-create failures, read
+    // and erased by TakeFrontendCreateFailureSnapshot on ready timeout.
+    std::unordered_map<std::string, FrontendCreateFailureSnapshot> frontendCreateFailures_;
+public:
+    void RecordFrontendCreateFailure(const std::string &requestID, int32_t code, const std::string &message,
+                                     const std::string &instanceID, const InstanceInfo &instance);
+    FrontendCreateFailureSnapshot TakeFrontendCreateFailureSnapshot(const std::string &requestID);
+    void EraseFrontendCreateFailure(const std::string &requestID);
     std::unordered_map<std::string, InstanceReadyCallResultCallBack> instanceReadyCallResultCallbackByInstanceID_;
     std::unordered_map<std::string, std::string> instanceReadyCallResultInstanceIDByRequestID_;
     std::unordered_map<std::string, std::string> instanceReadyCallResultRequestIDByInstanceID_;

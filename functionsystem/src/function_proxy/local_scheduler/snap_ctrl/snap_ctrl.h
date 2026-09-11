@@ -82,6 +82,12 @@ public:
      * @param clientManager: The client manager
      */
     void BindClientManager(const std::shared_ptr<ControlInterfaceClientManagerProxy> &clientManager);
+    // Upstream reusable-snapshot tunnel gate hook. The scheduler line's park
+    // path owns tunnel gating; the hook stays as a no-op sink so the driver's
+    // wiring compiles unmodified.
+    void BindReusableSnapshotTunnelGate(std::function<bool(const std::string &)>, std::function<void(const std::string &)>)
+    {
+    }
 
     /**
      * Handle INSTANCE_SNAPSHOT_SIGNAL

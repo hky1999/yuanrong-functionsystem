@@ -22,6 +22,8 @@ option go_package = "runtime-launcher/api/proto/runtime/v1;runtimev1";
 service SandboxService {
   // Start creates and starts a sandbox.
   rpc Start(StartRequest) returns (StartResponse) {}
+  // Restore creates a sandbox from a checkpoint.
+  rpc Restore(RestoreRequest) returns (RestoreResponse) {}
   // Delete stops and deletes a sandbox.
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}
   // Fails on old servers instead of silently ignoring a generation precondition.
@@ -51,7 +53,6 @@ service SandboxService {
   rpc CheckpointIfGeneration(CheckpointIfGenerationRequest) returns (CheckpointResponse) {}
   // ListAvailableRuntimes lists runtime classes whose handlers are ready.
   rpc ListAvailableRuntimes(ListAvailableRuntimesRequest) returns (ListAvailableRuntimesResponse) {}
-  // SetNetworkPolicy atomically replaces a running sandbox's complete policy.
   rpc SetNetworkPolicy(SetNetworkPolicyRequest) returns (SetNetworkPolicyResponse) {}
 }
 
@@ -79,8 +80,7 @@ enum NetworkProtocol {
   NETWORK_PROTOCOL_ICMP        = 4;
 }
 
-// TrafficPolicyMode selects whether replies are evaluated independently or
-// are admitted from connection state created by an allowed new flow.
+// TrafficPolicyMode selects stateless rules or connection-aware replies.
 enum TrafficPolicyMode {
   TRAFFIC_POLICY_MODE_UNSPECIFIED = 0;
   TRAFFIC_POLICY_MODE_STATELESS   = 1;
@@ -89,49 +89,37 @@ enum TrafficPolicyMode {
 
 // NetworkEndpoint identifies the remote peer matched by a traffic rule.
 message NetworkEndpoint {
-  // Address is an exact IPv4 address in v1.
   string address = 1;
-  // Port is an exact TCP or UDP port. Zero matches any port.
   uint32 port = 2;
-  // Cidr is an IPv4 address or CIDR prefix in network policy schema v2.
+  // Schema v2 peers: CIDR, DNS-name wildcard, remote port range.
   string cidr = 3;
-  // Domain is an exact DNS name or a leading "*." suffix pattern in schema
-  // v2. Domain peers are valid only for egress rules.
   string domain = 4;
-  // PortRange selects a contiguous remote TCP or UDP port range in schema v2.
   PortRange port_range = 5;
 }
 
-// PortRange is an inclusive TCP or UDP port interval.
+// TrafficRule describes one ingress or egress packet rule.
+// PortRange is an inclusive TCP or UDP port interval (schema v2).
 message PortRange {
   uint32 first = 1;
   uint32 last  = 2;
 }
 
-// TrafficRule describes one ingress or egress packet rule.
 message TrafficRule {
   NetworkPolicyAction action = 1;
   NetworkDirection direction = 2;
   NetworkProtocol protocol   = 3;
   NetworkEndpoint peer       = 4;
-  // SandboxPort is the destination port on ingress and source port on
-  // egress. Zero matches any sandbox port. An omitted peer matches any
-  // remote address and port.
-  uint32 sandbox_port = 5;
-  // SandboxPortRange selects an inclusive local port interval in schema v2.
+  // Destination port on ingress and source port on egress. Zero matches any.
+  uint32 sandbox_port        = 5;
   PortRange sandbox_port_range = 6;
-  // Priority orders schema v2 rules. Higher values win and DENY wins a tie.
-  // Zero selects the default user priority of 100.
   uint32 priority = 7;
 }
 
 // TrafficPolicy controls IPv4 packets crossing a sandbox's host veth.
 message TrafficPolicy {
-  // DefaultAction is the shared ingress and egress default in schema v1.
   NetworkPolicyAction default_action = 1;
   repeated TrafficRule rules         = 2;
   TrafficPolicyMode mode             = 3;
-  // IngressDefaultAction and EgressDefaultAction are required by schema v2.
   NetworkPolicyAction ingress_default_action = 4;
   NetworkPolicyAction egress_default_action  = 5;
 }
@@ -152,20 +140,9 @@ message DNSPolicy {
 message NetworkPolicy {
   TrafficPolicy traffic = 1;
   DNSPolicy dns         = 2;
-  // SchemaVersion is omitted for the legacy exact-address schema. Version 2
-  // enables CIDRs, domain peers, port ranges, priorities, and independent
-  // ingress and egress defaults.
   uint32 schema_version = 3;
 }
 
-// SetNetworkPolicyRequest replaces a running sandbox's complete policy.
-message SetNetworkPolicyRequest {
-  string sandbox_id            = 1;
-  NetworkPolicy network_policy = 2;
-}
-
-// SetNetworkPolicyResponse is empty after a successful replacement.
-message SetNetworkPolicyResponse {}
 // RootfsSrcType identifies the root filesystem source type.
 enum RootfsSrcType {
   S3    = 0;
@@ -221,16 +198,10 @@ message Mount {
 
 // XpuAllocation describes physical devices already selected by FunctionSystem.
 message XpuAllocation {
-  // Type is the normalized XPU type, such as gpu or npu.
+  // Type is the normalized XPU type, such as gpu.
   string type = 1;
   // DeviceIDs contains node-local physical device IDs.
   repeated uint32 device_ids = 2;
-}
-
-// CheckpointInfo selects checkpoint restore mode for Start.
-message CheckpointInfo {
-  // CheckpointDir is the caller-owned directory containing runtime artifacts.
-  string checkpoint_dir = 1;
 }
 
 // StartRequest describes a sandbox start request.
@@ -272,16 +243,12 @@ message StartRequest {
   map<string, string> metric_labels = 17;
   // XpuAllocations contains physical XPU devices selected by FunctionSystem.
   repeated XpuAllocation xpu_allocations = 18;
-  // WritableLayerLimitBytes is the hard quota for the writable root filesystem
-  // layer. Zero preserves the node-configured default for older clients.
-y is the sandbox's initial packet and DNS policy. Field 20
+  // Canonical sandboxd writable-layer hard quota.
+  uint64 writable_layer_limit_bytes = 19;
+  // NetworkPolicy is the sandbox's initial packet and DNS policy. Field 20
   // matches the sandboxd SandboxService wire contract.
   NetworkPolicy network_policy = 20;
-  // CheckpointInfo restores the new sandbox from caller-owned runtime artifacts.
   CheckpointInfo checkpoint_info = 21;
-  // InjectEntrypoint is the absolute in-sandbox path where sandboxd injects
-  // the effective Entrypoint/Cmd configuration from an OCI or Nydus image
-  // rootfs. Empty disables injection and does not replace command.
   string inject_entrypoint = 22;
 }
 
@@ -297,17 +264,16 @@ message StartResponse {
   string resource_generation = 5;
   // SandboxIP (upstream contract), renumbered: our wire pins 4-5.
   string sandbox_ip = 6;
-elds and
-// adds the immutable identity required by deterministic cross-node resume.
+}
+
+// RestoreRequest describes a sandbox restore request.
 message RestoreRequest {
-  StartRequest config = 1;
+  // Sandbox contains the sandbox spec to create from a checkpoint.
+  StartRequest sandbox = 1;
+  // CheckpointDir is the directory containing checkpoint artifacts.
   string checkpoint_dir = 2;
-  // CheckpointID identifies the immutable logical snapshot. When set, all
-  // deterministic identity fields are required.
   string checkpoint_id = 3;
-  // ExpectedSHA256 binds the caller-owned artifact to SnapshotInfo.
   string expected_sha256 = 4;
-  // ExpectedSize binds the caller-owned artifact to SnapshotInfo.
   int64 expected_size = 5;
 }
 
@@ -321,7 +287,23 @@ message RestoreResponse {
   string id = 3;
   repeated string ports = 4;
   string resource_generation = 5;
-tring id = 1;
+}
+
+// DeleteRequest describes a sandbox delete request.
+message DeleteRequest {
+  // ID is the sandbox ID.
+  string id = 1;
+  // Timeout is the number of seconds to wait for graceful stop before force delete.
+  int64 timeout = 2;
+}
+
+// DeleteResponse is returned after sandbox delete.
+message DeleteResponse {}
+
+// WaitRequest describes a sandbox wait request.
+message WaitRequest {
+  // ID is the sandbox ID.
+  string id = 1;
 }
 
 // WaitResponse is returned after waiting for a sandbox.
@@ -381,11 +363,11 @@ message GetRegisteredResponse {
   repeated SandboxTemplate templates = 1;
 }
 
-// CheckpointRequest describes a synchronous checkpoint operation.
+// CheckpointRequest describes a sandbox checkpoint request.
 message CheckpointRequest {
-  // ID is the source sandbox ID.
+  // ID is the sandbox ID.
   string id = 1;
-  // CheckpointDir is an absolute caller-owned output directory.
+  // CheckpointDir is the output directory for checkpoint artifacts.
   string checkpoint_dir = 2;
   // Timeout is the checkpoint deadline duration in nanoseconds.
   int64 timeout = 3;
@@ -399,7 +381,6 @@ message CheckpointRequest {
   // Upstream checkpoint contract, renumbered: our wire pins 3-8.
   uint32 timeout_seconds = 9;
   string snapshot_type = 10;
-
 }
 
 // CheckpointResponse is returned after sandbox checkpoint.
@@ -417,7 +398,29 @@ message CheckpointResponse {
   // Physical lifetime bound to the published source manifest; empty for legacy artifacts.
   string source_generation = 6;
 }
-a of a sandbox.
+
+// ListSandboxesRequest describes a sandbox list request.
+message ListSandboxesRequest {
+  // ID filters by sandbox ID when set.
+  string id = 1;
+  // Selector filters sandboxes by labels. Empty selector lists all sandboxes.
+  map<string, string> selector = 10;
+}
+
+// ListSandboxesResponse contains sandbox list results.
+message ListSandboxesResponse {
+  // Sandboxes contains matching sandbox statuses.
+  repeated SandboxStatus sandboxes = 1;
+}
+
+// SandboxState is the persisted lifecycle state of a sandbox.
+enum SandboxState {
+  SANDBOX_STATE_RUNNING = 0;
+  SANDBOX_STATE_EXITED  = 1;
+  SANDBOX_STATE_UNKNOWN = 2;
+}
+
+// SandboxStatus describes the current status and metadata of a sandbox.
 message SandboxStatus {
   // ID is the sandbox ID.
   string id = 1;
@@ -452,7 +455,12 @@ message SandboxStatus {
   repeated string ports = 16;
   // Bridge IP returned by the scheduler-owned sandboxd.
   string ip = 17;
- 1;
+}
+
+// KeyValue represents a string key-value pair.
+message KeyValue {
+  // Key is the entry key.
+  string key   = 1;
   // Value is the entry value.
   string value = 2;
 }
@@ -587,33 +595,12 @@ message StatsResponse {
 // for new sandbox creation.
 message ListAvailableRuntimesRequest {}
 
-// RuntimeInfo describes one initialized runtime handler and its optional
-// checkpoint/restore application handoff interface.
-message RuntimeInfo {
-  string runtime_class = 1;
-  bool supports_checkpoint_restore = 2;
-  string checkpoint_handoff_path = 3;
-  string restore_env_path = 4;
-}
-
 // ListAvailableRuntimesResponse contains the available runtime class snapshot.
 message ListAvailableRuntimesResponse {
   // RuntimeClasses contains the sorted handler names accepted by sandbox start requests.
   // Configured runtime classes whose handlers failed to initialize are excluded.
   repeated string runtime_classes = 1;
-  repeated RuntimeInfo runtimes = 2;
 }
-
-// DeleteCheckpointRequest identifies one exact sandboxd-owned artifact.
-message DeleteCheckpointRequest {
-  string checkpoint_dir = 1;
-  string checkpoint_id = 2;
-  string source_sandbox_id = 3;
-  int64 expected_size = 4;
-  string expected_sha256 = 5;
-}
-
-message DeleteCheckpointResponse {}
 
 // ResourceLimits uses kernel cgroup units and finite, positive limits only.
 message ResourceLimits {
@@ -669,4 +656,18 @@ message DeleteIfGenerationRequest {
 }
 message DeleteIfGenerationResponse {
   string retired_generation = 1;
+}
+
+// SetNetworkPolicy replaces the network policy of one running sandbox.
+message SetNetworkPolicyRequest {
+  string sandbox_id            = 1;
+  NetworkPolicy network_policy = 2;
+}
+
+message SetNetworkPolicyResponse {}
+
+// CheckpointInfo references a previously published checkpoint for a
+// cooperative restore during Start (upstream contract).
+message CheckpointInfo {
+  string checkpoint_dir = 1;
 }

@@ -71,15 +71,16 @@ void IdleMgr::SessionCountDelta(const std::string &instanceID, int delta)
 
 void IdleMgr::OnInstanceRunning(const resources::InstanceInfo &identity)
 {
-    litebus::Async(idleActor_->GetAID(), &IdleActor::OnInstanceRunning, identity);
+    litebus::Async(idleActor_->GetAID(),
+                   static_cast<void (IdleActor::*)(const resources::InstanceInfo &)>(&IdleActor::OnInstanceRunning),
+                   identity);
 }
 
-litebus::Future<Status> IdleMgr::SetPauseGated(const resources::InstanceInfo &identity, uint64_t token, bool gated)
+void IdleMgr::OnInstanceRunning(const std::string &instanceID)
 {
-    if (idleActor_ == nullptr) {
-        return Status(StatusCode::FAILED, "idle actor is not available");
-    }
-    return litebus::Async(idleActor_->GetAID(), &IdleActor::SetPauseGated, identity, token, gated);
+    litebus::Async(idleActor_->GetAID(),
+                   static_cast<void (IdleActor::*)(const std::string &)>(&IdleActor::OnInstanceRunning),
+                   instanceID);
 }
 
 void IdleMgr::MarkInstanceUsed(const std::string &instanceID)

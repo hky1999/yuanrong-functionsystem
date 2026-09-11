@@ -1069,8 +1069,6 @@ void SandboxdRequestBuilder::ApplyResources(const std::shared_ptr<messages::Star
         (memIt != res.end()) ? getEffectiveValue(memIt->second, DEFAULT_MEMORY_MB) : DEFAULT_MEMORY_MB;
 }
 
-Status SandboxdRequestBuilder::ApplyWritableLayerSize(const std::shared_ptr<messages::StartInstanceRequest> &request,
-                                                      runtime::v1::StartRequest *start) const
 Status SandboxdRequestBuilder::ApplyElasticResources(
     const std::shared_ptr<messages::StartInstanceRequest> &request, runtime::v1::StartRequest *start) const
 {

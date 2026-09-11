@@ -467,4 +467,28 @@ void InstanceCtrl::TriggerToWarmUpFunction(const std::string &agentID)
 {
     return litebus::Async(aid_, &InstanceCtrlActor::TriggerToWarmUpFunction, agentID);
 }
+litebus::Future<FrontendCreateFailureSnapshot> InstanceCtrl::TakeFrontendCreateFailureSnapshot(
+    const std::string &requestID)
+{
+    return litebus::Async(aid_, &InstanceCtrlActor::TakeFrontendCreateFailureSnapshot, requestID);
+}
+
+void InstanceCtrl::EraseFrontendCreateFailure(const std::string &requestID)
+{
+    (void)litebus::Async(aid_, &InstanceCtrlActor::EraseFrontendCreateFailure, requestID);
+}
+
+litebus::Future<Status> InstanceCtrl::TryLocalSnapshotFailover(const std::string &,
+                                                                const std::string &)
+{
+    // Retired local-snapshot failover (2026-09-11 rebase): never succeeds.
+    return litebus::Future<Status>(Status(StatusCode::FAILED, "local snapshot failover retired"));
+}
+
+litebus::Future<bool> InstanceCtrl::IsPauseRuntimeFenced(const std::string &, const std::string &)
+{
+    // Retired pause-gate contract (2026-09-11 scheduler-line rebase): never fenced.
+    return litebus::Future<bool>(false);
+}
+
 }  // namespace functionsystem::local_scheduler

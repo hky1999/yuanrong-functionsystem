@@ -615,8 +615,6 @@ TEST_F(SharedPosixClientTest, RecoverTest)
 
     (void)controlInterface->DeleteClient(instanceID);
 }
-}  // namespace functionsystem::test
-
 /**
  * Description: client PrepareSnapForRuntime Test (runtime-pinned transport binding)
  * Steps:
@@ -796,4 +794,5 @@ TEST_F(SharedPosixClientTest, SameRuntimeReconnectSendsOnNewTransport)
 
     (void)controlInterface->DeleteClient(instanceID);
 }
+
 }  // namespace functionsystem::test

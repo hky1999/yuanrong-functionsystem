@@ -158,7 +158,9 @@ TEST_F(IdleActorTest, RunningTransition_ReconcilesLostInitialIdleReport)
     ASSERT_AWAIT_TRUE([&]() { return sawCreatingFetch.load(); });
 
     running.store(true);
-    litebus::Async(idleActor_->GetAID(), &IdleActor::OnInstanceRunning, runningSm->GetInstanceInfo());
+    litebus::Async(idleActor_->GetAID(),
+                   static_cast<void (IdleActor::*)(const resources::InstanceInfo &)>(&IdleActor::OnInstanceRunning),
+                   runningSm->GetInstanceInfo());
 
     ASSERT_AWAIT_TRUE([&]() { return callCount > 0; });
 }
@@ -512,7 +514,9 @@ TEST_F(IdleActorTest, Orphan_NoTrafficReport_RunningStartsTimer_Evicts)
             return nullptr;
         }));
 
-    litebus::Async(idleActor_->GetAID(), &IdleActor::OnInstanceRunning, std::string(INST_ID));
+    litebus::Async(idleActor_->GetAID(),
+                   static_cast<void (IdleActor::*)(const std::string &)>(&IdleActor::OnInstanceRunning),
+                   std::string(INST_ID));
 
     ASSERT_AWAIT_TRUE([&]() { return callCount > 0; });
 }
@@ -538,7 +542,9 @@ TEST_F(IdleActorTest, OrphanGrace_ShorterThanIdleTimeout_EvictsEarly)
         }));
 
     auto start = std::chrono::steady_clock::now();
-    litebus::Async(idleActor_->GetAID(), &IdleActor::OnInstanceRunning, std::string(INST_ID));
+    litebus::Async(idleActor_->GetAID(),
+                   static_cast<void (IdleActor::*)(const std::string &)>(&IdleActor::OnInstanceRunning),
+                   std::string(INST_ID));
 
     ASSERT_AWAIT_TRUE([&]() { return callCount > 0; });
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
@@ -592,7 +598,9 @@ TEST_F(IdleActorTest, GraceDisabled_NoIdleTimeout_RunningStillNoTimer)
 
     EXPECT_CALL(*facadeViewMock_, GetInstance(INST_ID)).Times(0);
 
-    litebus::Async(idleActor_->GetAID(), &IdleActor::OnInstanceRunning, std::string(INST_ID));
+    litebus::Async(idleActor_->GetAID(),
+                   static_cast<void (IdleActor::*)(const std::string &)>(&IdleActor::OnInstanceRunning),
+                   std::string(INST_ID));
 
     std::this_thread::sleep_for(std::chrono::seconds(3));
 }
@@ -728,7 +736,9 @@ TEST_F(IdleActorTest, OnInstanceParked_ClearsState_RestoreLifecycleIsFresh)
     EXPECT_EQ(callCount.load(), 0);  // stale timer dead (would fire ~1.2s)
 
     // restore complete: fresh RUNNING lifecycle, eviction works again
-    litebus::Async(idleActor_->GetAID(), &IdleActor::OnInstanceRunning, std::string(INST_ID));
+    litebus::Async(idleActor_->GetAID(),
+                   static_cast<void (IdleActor::*)(const std::string &)>(&IdleActor::OnInstanceRunning),
+                   std::string(INST_ID));
     ASSERT_AWAIT_TRUE([&]() { return callCount > 0; });
 }
 

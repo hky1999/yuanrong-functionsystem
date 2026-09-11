@@ -55,8 +55,8 @@ public:
     void SessionCountDelta(const std::string &instanceID, int delta);
 
     void OnInstanceRunning(const resources::InstanceInfo &identity);
+    void OnInstanceRunning(const std::string &instanceID);
 
-    litebus::Future<Status> SetPauseGated(const resources::InstanceInfo &identity, uint64_t token, bool gated);
 
     /**
      * Client data-plane action (exec/fs/pty via the Invoke channel) claimed

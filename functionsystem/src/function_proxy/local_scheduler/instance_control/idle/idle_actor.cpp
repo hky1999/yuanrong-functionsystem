@@ -118,9 +118,7 @@ void IdleActor::TrafficReport(const std::string &instanceID, const size_t &proce
         // cycle simply re-arms the (short) orphan timer, so an abandoned create
         // whose frontend went silent is reclaimed one grace window later.
         instanceTrafficIdle_.erase(instanceID);
-        if (pauseGatedInstances_.find(instanceID) == pauseGatedInstances_.end()) {
-            CancelIdleTimer(instanceID);
-        }
+        CancelIdleTimer(instanceID);
         return;
     }
 
@@ -232,9 +230,6 @@ void IdleActor::SessionAlive(const std::string &instanceID, bool hasActiveSessio
 
     if (hasActiveSessions) {
         instanceActiveSessions_[instanceID] = true;
-        if (pauseGatedInstances_.find(instanceID) != pauseGatedInstances_.end()) {
-            return;
-        }
         // Cancel idle timer when sessions become active
         CancelIdleTimer(instanceID);
     } else {
@@ -243,7 +238,6 @@ void IdleActor::SessionAlive(const std::string &instanceID, bool hasActiveSessio
     }
 }
 
-void IdleActor::OnInstanceRunning(const resources::InstanceInfo &identity)
 void IdleActor::MarkInstanceUsed(const std::string &instanceID)
 {
     if (instanceID.empty()) {
@@ -269,10 +263,14 @@ void IdleActor::MarkInstanceUsed(const std::string &instanceID)
     }
 }
 
+void IdleActor::OnInstanceRunning(const resources::InstanceInfo &identity)
+{
+    OnInstanceRunning(identity.instanceid());
+}
+
 void IdleActor::OnInstanceRunning(const std::string &instanceID)
 {
-    const auto &instanceID = identity.instanceid();
-    if (instanceID.empty() || instanceControlView_ == nullptr) {
+    if (instanceID.empty()) {
         return;
     }
     auto stateMachine = instanceControlView_->GetInstance(instanceID);
@@ -351,9 +349,6 @@ void IdleActor::OnInstanceParked(const std::string &instanceID)
 
 void IdleActor::StartIdleTimer(const std::string &instanceID)
 {
-    if (pauseGatedInstances_.find(instanceID) != pauseGatedInstances_.end()) {
-        return;
-    }
     if (idleTimers_.find(instanceID) != idleTimers_.end()) {
         return;
     }
@@ -445,9 +440,6 @@ void IdleActor::HandleIdleTimeout(const std::string &instanceID, uint64_t genera
     }
 
     idleTimers_.erase(instanceID);
-    if (pauseGatedInstances_.find(instanceID) != pauseGatedInstances_.end()) {
-        return;
-    }
     ASSERT_IF_NULL(instanceControlView_);
     auto stateMachine = instanceControlView_->GetInstance(instanceID);
     if (stateMachine == nullptr) {

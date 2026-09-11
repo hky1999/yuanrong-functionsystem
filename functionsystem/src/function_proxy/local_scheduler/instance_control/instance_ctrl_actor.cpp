@@ -8808,4 +8808,40 @@ litebus::Future<Status> InstanceCtrlActor::DoLocalResumeInstance(const std::stri
                 });
         });
 }
+
+// Upstream frontend-create failure snapshots, ported during the 2026-09-11
+// scheduler-line rebase (last_failure_on_timeout create policy).
+void InstanceCtrlActor::RecordFrontendCreateFailure(const std::string &requestID, int32_t code,
+                                                    const std::string &message, const std::string &instanceID,
+                                                    const InstanceInfo &instance)
+{
+    if (requestID.empty() || instanceRegisteredReadyCallResultCallback_.find(requestID)
+                                == instanceRegisteredReadyCallResultCallback_.end()) {
+        return;
+    }
+    if (!IsLastFailureOnTimeoutPolicy(instance.createoptions())) {
+        return;
+    }
+    frontendCreateFailures_[requestID] = { true, code, message, instanceID };
+}
+
+FrontendCreateFailureSnapshot InstanceCtrlActor::TakeFrontendCreateFailureSnapshot(const std::string &requestID)
+{
+    auto it = frontendCreateFailures_.find(requestID);
+    if (it == frontendCreateFailures_.end()) {
+        return FrontendCreateFailureSnapshot{};
+    }
+    FrontendCreateFailureSnapshot snapshot = it->second;
+    frontendCreateFailures_.erase(it);
+    return snapshot;
+}
+
+void InstanceCtrlActor::EraseFrontendCreateFailure(const std::string &requestID)
+{
+    if (requestID.empty()) {
+        return;
+    }
+    (void)frontendCreateFailures_.erase(requestID);
+}
+
 }  // namespace functionsystem::local_scheduler

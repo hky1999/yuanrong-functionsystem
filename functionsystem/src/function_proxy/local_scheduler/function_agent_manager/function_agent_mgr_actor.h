@@ -278,6 +278,9 @@ public:
         const std::string &requestID,
         const resource_view::InstanceInfo &instanceInfo,
         const std::string &snapshotID);
+    // Scheduler-line plain snapshot (park path): fixed ttl + leaveRunning pair.
+    litebus::Future<messages::SnapshotRuntimeResponse> SnapshotRuntime(const std::string &requestID,
+                                                     const resource_view::InstanceInfo &instanceInfo,
                                                      int32_t ttl,
                                                      bool leaveRunning);
     void SnapshotRuntimeResponse(const litebus::AID &from, std::string &&name, std::string &&msg);

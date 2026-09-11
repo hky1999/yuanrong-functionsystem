@@ -99,9 +99,10 @@ public:
      *
      * @param instanceID  Instance identifier
      */
+    // Upstream pause-gate entry (identity-checked): delegates to the string
+    // flavor; the pause-gate itself was retired in the 2026-09-11 rebase.
     void OnInstanceRunning(const resources::InstanceInfo &identity);
-
-    Status SetPauseGated(const resources::InstanceInfo &identity, uint64_t token, bool gated);
+    void OnInstanceRunning(const std::string &instanceID);
 
     /**
      * Mark an instance as ever-used because a client-originated data-plane

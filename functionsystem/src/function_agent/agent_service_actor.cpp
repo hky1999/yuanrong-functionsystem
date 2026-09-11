@@ -921,66 +921,6 @@ void AgentServiceActor::ResizeSandboxTimeout(const std::string &forwardID)
     resizeRequests_.erase(it);
 }
 
-void AgentServiceActor::SnapshotRuntime(const litebus::AID &from, std::string &&name, std::string &&msg)
-{
-    auto request = std::make_shared<messages::SnapshotRuntimeRequest>();
-    if (!request->ParseFromString(msg)) {
-        YRLOG_ERROR("failed to parse SnapshotRuntimeRequest");
-        return;
-    }
-
-    const std::string &instanceID = request->instanceid();
-    const std::string &runtimeID = request->runtimeid();
-    YRLOG_INFO("{}|received SnapshotRuntime request for instance({}), runtime({})",
-               request->requestid(), instanceID, runtimeID);
-
-    // Prepare response
-    messages::SnapshotRuntimeResponse response;
-    response.set_requestid(request->requestid());
-
-    // Check if agent is registered
-    if (!registerRuntimeMgr_.registered || !isRegisterCompleted_) {
-        response.set_code(static_cast<int32_t>(StatusCode::FUNC_AGENT_NOT_REGISTERED));
-        response.set_message("function agent is not registered");
-        YRLOG_ERROR("{}|registration is not complete, ignore snapshot request for instance({})",
-                    request->requestid(), instanceID);
-        Send(from, "SnapshotRuntimeResponse", response.SerializeAsString());
-        return;
-    }
-
-    // Forward snapshot request to RuntimeManager
-    YRLOG_INFO("{}|forward SnapshotRuntime request to RuntimeManager({}-{}) for instance({}), runtime({})",
-               request->requestid(), registerRuntimeMgr_.name, registerRuntimeMgr_.address, instanceID, runtimeID);
-
-    // Store the caller's AID to send response back later
-    snapshotRequests_[request->requestid()] = from;
-
-    Send(litebus::AID(registerRuntimeMgr_.name, registerRuntimeMgr_.address), "SnapshotRuntime", std::move(msg));
-}
-
-void AgentServiceActor::SnapshotRuntimeResponse(const litebus::AID &from, std::string &&, std::string &&msg)
-{
-    messages::SnapshotRuntimeResponse response;
-    if (!response.ParseFromString(msg)) {
-        YRLOG_ERROR("failed to parse SnapshotRuntimeResponse");
-        return;
-    }
-
-    const std::string &requestID = response.requestid();
-    auto iter = snapshotRequests_.find(requestID);
-    if (iter == snapshotRequests_.end()) {
-        YRLOG_WARN("{}|snapshot request not found in snapshotRequests_", requestID);
-        return;
-    }
-
-    YRLOG_INFO("{}|received SnapshotRuntimeResponse from RuntimeManager, code: {}",
-               requestID, response.code());
-
-    // Forward response back to the original caller (FunctionAgentMgrActor)
-    Send(iter->second, "SnapshotRuntimeResponse", std::move(msg));
-    snapshotRequests_.erase(iter);
-}
-
 void AgentServiceActor::SnapshotRuntimeIfGeneration(const litebus::AID &from, std::string &&, std::string &&msg)
 {
     // Generation-fenced snapshot relay. This channel never sends the legacy
@@ -1387,9 +1327,6 @@ void AgentServiceActor::StopInstanceResponse(const litebus::AID &from, std::stri
         YRLOG_WARN("ignore stop response with mismatched manager or runtime for request {}", requestID);
         return;
     }
-    auto killInstanceRequest = pending.request;
-    auto killInstanceResponse = BuildKillInstanceResponse(stopInstanceResponse.code(), stopInstanceResponse.message(),
-                                                          killInstanceRequest->requestid(), killInstanceRequest->instanceid());
     // Copy the physical-retirement receipt upward only under the full strict
     // chain: a successful stop code, a confirmed receipt naming exactly the
     // incarnation this kill asked to retire. Anything else leaves the fields

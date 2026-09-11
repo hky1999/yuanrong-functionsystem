@@ -860,8 +860,6 @@ TEST_F(FuncAgentMgrActorTest, ReusableDeleteGatewaySelectsOnlyHealthyInitialized
     litebus::Terminate(disabledAgent->GetAID());
     litebus::Await(disabledAgent->GetAID());
 }
-
-}  // namespace functionsystem::test
 TEST_F(FuncAgentMgrActorTest, ResizeDuplicateJoinsButConflictingReservationStaysUnknown)
 {
     auto request = std::make_shared<messages::ResizeSandboxRequest>();

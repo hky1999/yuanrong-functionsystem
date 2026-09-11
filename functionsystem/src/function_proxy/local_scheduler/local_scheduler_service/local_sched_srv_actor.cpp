@@ -1240,6 +1240,8 @@ void LocalSchedSrvActor::OnResolveReusableSnapshotForCreateResponse(
     if (response.ParseFromString(msg)) {
         (void)resolveReusableSnapshotForCreateSync_.Synchronized(response.requestid(), response);
     }
+}
+
 // Serialized-payload reservation accounting for the restore relay: adds one
 // component with wraparound checking instead of letting the accounting itself
 // wrap under pathological bounds.

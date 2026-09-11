@@ -1749,6 +1749,8 @@ void FunctionAgentMgrActor::UpdateNetworkPolicyResponse(
     YRLOG_INFO("{}|network policy update completed with code({})",
                response.requestid(), response.code());
     (void)updateNetworkPolicySync_.Synchronized(response.requestid(), response);
+}
+
 namespace {
 messages::ResizeSandboxResponse ResizeTransportResult(const messages::ResizeSandboxRequest &request,
     messages::ResizeSandboxResponse::Outcome outcome, const std::string &reason)
@@ -2033,13 +2035,11 @@ litebus::Future<messages::SnapshotRuntimeResponse> FunctionAgentMgrActor::Snapsh
             snapshot_storage::BuildPauseSnapshotTemporaryKey(
                 tenantHash, instanceID, resolvedSnapshotID, requestID));
     }
-    auto future = snapshotRuntimeSync_.AddSynchronizer(
-        requestID, static_cast<uint32_t>(timeoutMs));
     const auto targetAgent = funcAgentTable_[funcAgentID].aid;
     snapshotRuntimeExpectedAgent_[requestID] = targetAgent;
     request->set_ttl(ttl);  // Set TTL from parameter
-    request->set_leaverunning(leaveRunning);  // sandboxd PR#16 physical mode
-    auto future = snapshotRuntimeSync_.AddSynchronizer(requestID);
+    auto future = snapshotRuntimeSync_.AddSynchronizer(
+        requestID, static_cast<uint32_t>(timeoutMs));
 
     YRLOG_INFO("{}|send SnapshotRuntime request to agent({}) for instance({}), ttl: {}",
                requestID, funcAgentID, instanceID, ttl);
@@ -2488,6 +2488,8 @@ void FunctionAgentMgrActor::DeleteReusableSnapshotArtifactResponse(
     }
     reusableSnapshotDeleteExpectedAgent_.erase(expected);
     (void)reusableSnapshotDeleteSync_.Synchronized(response.requestid(), response);
+}
+
 namespace {
 bool InvalidSnapshotIdentityField(const std::string &value)
 {

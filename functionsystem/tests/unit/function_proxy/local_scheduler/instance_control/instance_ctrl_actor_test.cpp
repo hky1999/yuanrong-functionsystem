@@ -727,21 +727,21 @@ TEST_F(DISABLED_InstanceCtrlActorTest, TryDispatchOnLocal)
 
     // test instance parentfunctionproxyaid is empty
     auto future = instanceCtrlActor_->TryDispatchOnLocal(status, scheduleRequest, scheduleResult,
-                                                         InstanceState::SCHEDULING, mockInstanceStateMachine, nullptr);
+                                                         InstanceState::SCHEDULING, mockInstanceStateMachine);
     ASSERT_AWAIT_READY(future);
     EXPECT_EQ(future.Get().code(), StatusCode::INSTANCE_TRANSACTION_WRONG_VERSION);
 
     // test instance parentfunctionproxyaid is same as instance owner
     scheduleRequest->mutable_instance()->set_parentfunctionproxyaid("proxy1-LocalSchedInstanceCtrlActor@127.0.0.1:22772");
     future = instanceCtrlActor_->TryDispatchOnLocal(status, scheduleRequest, scheduleResult,
-                                                    InstanceState::SCHEDULING, mockInstanceStateMachine, nullptr);
+                                                    InstanceState::SCHEDULING, mockInstanceStateMachine);
     ASSERT_AWAIT_READY(future);
     EXPECT_EQ(future.Get().code(), StatusCode::INSTANCE_TRANSACTION_WRONG_VERSION);
 
     // test instance parentfunctionproxyaid is different from instance owner
     scheduleRequest->mutable_instance()->set_parentfunctionproxyaid("proxy2-LocalSchedInstanceCtrlActor@127.0.0.1:22772");
     future = instanceCtrlActor_->TryDispatchOnLocal(status, scheduleRequest, scheduleResult,
-                                                    InstanceState::SCHEDULING, mockInstanceStateMachine, nullptr);
+                                                    InstanceState::SCHEDULING, mockInstanceStateMachine);
     ASSERT_AWAIT_READY(future);
     EXPECT_EQ(future.Get().code(), StatusCode::SUCCESS);
     ASSERT_AWAIT_TRUE([&]() { return isCalled; });

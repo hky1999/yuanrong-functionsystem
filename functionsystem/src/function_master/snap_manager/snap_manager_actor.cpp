@@ -935,9 +935,10 @@ void SnapManagerActor::MasterBusiness::HandleSnapStart(const litebus::AID &from,
             // re-validated against the captured context, and the exact wire
             // response is stored in the ledger, ticket-validated, BEFORE it
             // is sent.
+            ::core_service::SnapStartedInfo startedInfo = info;
+            startedInfo.set_instanceid(scheduleReq->instance().instanceid());
             litebus::Async(actor->GetAID(), &SnapManagerActor::CompleteSnapStart,
-                           ctx, SnapStartResponse{from, requestID, code, message,
-                                                  scheduleReq->instance().instanceid(), info});
+                           ctx, SnapStartResponse{from, requestID, code, message, startedInfo});
         });
 }
 

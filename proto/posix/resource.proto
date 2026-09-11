@@ -282,15 +282,6 @@ enum SnapshotStatus {
 }
 
 message SnapshotInfo {
-    string checkpointID = 1;
-    string storage = 2;
-    int64 size = 3;
-    string createTime = 4;
-    int32 ttlSeconds = 5;
-    SnapshotStatus status = 6;
-    string sourceNodeID = 7;
-    string sha256 = 8;
-
   string checkpointID = 1;
   string storage = 2;
   int64  size = 3;
@@ -300,6 +291,9 @@ message SnapshotInfo {
   string sandbox_id = 7; // source sandbox identity bound to the checkpoint
   string source_generation = 8; // physical source lifetime from sandboxd manifest
   string source_runtime_id = 9; // runtime mapped to the source sandbox by executor
+  // Upstream snapshot-lifecycle fields, renumbered (our wire pins 6-9).
+  SnapshotStatus status = 10;
+  string sourceNodeID = 11;
 }
 
 // A physical sandbox observation. Missing generation/known flags are not zero usage.
