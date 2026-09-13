@@ -732,22 +732,10 @@ bool LocalSchedDriver::CreatePosixAndDriverServer()
         }
     };
 
-    if (param_.enableFrontendProxyService) {
-        auto frontendServiceParam = BuildFrontendProxyServiceParam(param_.nodeID, bindings);
-        frontendServiceParam.endpointAddress = componentEndpoint.Address();
-        frontendServiceParam.requireAuthenticatedPeer = param_.enableSSL;
-        frontendServiceParam.invokeTenantAuthorizer =
-            [instanceView(instanceCtrl_->GetInstanceControlView())](const std::string &tenantID,
-                                                                    const std::string &instanceID) {
-                if (tenantID.empty() || instanceView == nullptr) {
-                    return false;
-                }
-                auto stateMachine = instanceView->GetInstance(instanceID);
-                return stateMachine != nullptr && stateMachine->GetInstanceInfo().tenantid() == tenantID;
-            };
-        registerService(std::make_shared<FrontendProxyService>(std::move(frontendServiceParam)));
-        YRLOG_INFO("FrontendProxyService registered at {}", componentEndpoint.Address());
-    }
+    // The scheduler line registers FrontendProxyService ONCE, on the POSIX
+    // port the deployed Go frontend dials; registering on the component gRPC
+    // server as well double-registers the same methods (frontend CrashLoop,
+    // 2026-09-12). Upstream's error-code tenant authorizer is kept.
     auto frontendServiceParam = BuildFrontendProxyServiceParam(param_.nodeID, bindings);
     frontendServiceParam.endpointAddress = param_.ip + ":" + param_.posixPort;
     frontendServiceParam.requireAuthenticatedPeer = param_.enableSSL;
@@ -755,10 +743,14 @@ bool LocalSchedDriver::CreatePosixAndDriverServer()
         [instanceView(instanceCtrl_->GetInstanceControlView())](const std::string &tenantID,
                                                                 const std::string &instanceID) {
             if (tenantID.empty() || instanceView == nullptr) {
-                return false;
+                return common::ERR_AUTHORIZE_FAILED;
             }
             auto stateMachine = instanceView->GetInstance(instanceID);
-            return stateMachine != nullptr && stateMachine->GetInstanceInfo().tenantid() == tenantID;
+            if (stateMachine == nullptr) {
+                return common::ERR_INSTANCE_NOT_FOUND;
+            }
+            return stateMachine->GetInstanceInfo().tenantid() == tenantID ? common::ERR_NONE
+                                                                         : common::ERR_AUTHORIZE_FAILED;
         };
     // Lifecycle create/kill use reviewed ready dispatcher seams. Legacy stream dispatchers remain
     // disallowed.
