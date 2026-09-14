@@ -908,7 +908,7 @@ Status ResourceViewActor::DeleteInstances(const std::vector<std::string> &instID
     view_->set_revision(view_->revision() + 1);
     for (auto &id : instIDs) {
         DeleteInstance(id, isVirtualInstance);
-        MarkSnapshotUnitDirty(unitID);
+        MarkSnapshotUnitDirty(unitID_);
         MarkSnapshotIndexesDirty(true, true);
         MarkSnapshotMonopolyIndexDirty();
     }

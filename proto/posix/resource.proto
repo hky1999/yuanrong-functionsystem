@@ -452,6 +452,11 @@ message InstanceInfo {
     // Renumbered from upstream 42: our wire pins 42-43 for the resource
     // admission contract; see the v3 identity adjudication.
     bool failover = 44;
+    // Upstream 0.10.3-line fields, renumbered from their 43/44/45 collision:
+    // physical sandbox handle, owning node proxy, and sandbox network address.
+    string sandboxID = 46;
+    string nodeProxyAddress = 47;
+    string sandboxIP = 48;
 
     SandboxResourceSample sandbox_resource_sample = 42;
     // Resource-view-owned reservation until physical and node observations reconcile admission.
