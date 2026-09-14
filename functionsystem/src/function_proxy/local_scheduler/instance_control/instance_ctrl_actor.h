@@ -1229,7 +1229,19 @@ public:
         std::string killRequestID;
         std::string instanceRequestID;
         std::string state;
-    };
+    
+    void ResolveFrontendKillCleanupProbe(
+        const std::string &requestID, const std::string &instanceID,
+        const std::shared_ptr<litebus::Promise<FrontendKillCleanupSnapshot>> &promise);
+    litebus::Future<Status> BeginInstanceDelete(const InstanceInfo &instanceInfo);
+    litebus::Future<Status> KillRuntimeForInstanceDelete(const InstanceInfo &instanceInfo);
+    litebus::Future<Status> KillRuntimeWithSnapshotCleanup(
+        const InstanceInfo &instanceInfo, bool isRecovering, bool deleteInstanceSnapshots,
+        bool routeAlreadyRetired = false);
+    Status SetDataPlaneRoute(const InstanceInfo &instanceInfo,
+                             data_plane_gateway_activity::DataPlaneGatewayRouteState state);
+
+};
     std::unordered_map<std::string, FrontendKillRuntimeEvidence> frontendKillRuntimeEvidence_;
 
     BACK_OFF_RETRY_HELPER(InstanceCtrlActor, litebus::Option<InstanceState>, checkStateHelper_);

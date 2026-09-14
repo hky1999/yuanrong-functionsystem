@@ -145,6 +145,8 @@ public:
     static void SetOrphanGraceSec(int64_t graceSec);
     static int64_t GetOrphanGraceSec();
 
+    Status SetPauseGated(const resources::InstanceInfo &identity, uint64_t token, bool gated);
+
 private:
     void SessionAlive(const std::string &instanceID, bool hasActiveSessions);
     void TryStartIdleTimer(const std::string &instanceID);
