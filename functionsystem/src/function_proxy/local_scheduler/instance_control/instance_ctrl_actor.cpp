@@ -1701,8 +1701,8 @@ litebus::Future<Status> InstanceCtrlActor::RecordFrontendKillRuntimeResult(
     if (response.code() != static_cast<int32_t>(StatusCode::SUCCESS)) {
         YRLOG_WARN("{}|kill instance({}), errCode {}", instanceInfo.requestid(), instanceInfo.instanceid(),
                    response.code());
-        if (!frontendKillRequestID.empty() && evidence != frontendKillRuntimeEvidence_.end()
-            && evidence->second.killRequestID == frontendKillRequestID) {
+        if (evidence != frontendKillRuntimeEvidence_.end()
+            && evidence->second.killRequestID == instanceInfo.requestid()) {
             evidence->second.state = "failed-" + std::to_string(response.code());
         }
         // Callers must retain failed/unknown retirement instead of publishing success.
@@ -1718,8 +1718,9 @@ litebus::Future<Status> InstanceCtrlActor::RecordFrontendKillRuntimeResult(
             || response.retired_resource_generation() != expectedGeneration) {
             YRLOG_WARN("{}|kill instance({}) succeeded without a matching retirement receipt; allocation retained",
                        instanceInfo.requestid(), instanceInfo.instanceid());
-            if (evidence != frontendKillRuntimeEvidence_.end() && evidence->second.first == instanceInfo.requestid()) {
-                evidence->second.second = "retirement-unknown";
+            if (evidence != frontendKillRuntimeEvidence_.end()
+                && evidence->second.instanceRequestID == instanceInfo.requestid()) {
+                evidence->second.state = "retirement-unknown";
             }
             return Status(StatusCode::ERR_INSTANCE_BUSY,
                 "physical retirement unconfirmed; allocation and budget retained for retry");
@@ -1740,8 +1741,9 @@ litebus::Future<Status> InstanceCtrlActor::RecordFrontendKillRuntimeResult(
         return view->ApplyPhysicalRetirement(receipt);
     }
     YRLOG_INFO("{}|succeed to kill instance({})", instanceInfo.requestid(), instanceInfo.instanceid());
-    if (evidence != frontendKillRuntimeEvidence_.end() && evidence->second.first == instanceInfo.requestid()) {
-        evidence->second.second = "terminated";
+    if (evidence != frontendKillRuntimeEvidence_.end()
+        && evidence->second.instanceRequestID == instanceInfo.requestid()) {
+        evidence->second.state = "terminated";
     }
     return Status(static_cast<StatusCode>(response.code()), response.message());
 }
