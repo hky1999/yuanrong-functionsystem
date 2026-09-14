@@ -1538,7 +1538,8 @@ litebus::Future<Status> InstanceCtrlActor::KillRuntimeWithSnapshotCleanup(
     // Scheduler-line retirement: the physical receipt travels in the kill's
     // expected identity; Record settles the ledger on a matching confirmation.
     return SendKillRequestToAgent(instanceInfo, isRecovering, false, std::string{}, std::string{})
-        .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::RecordFrontendKillRuntimeResult, instanceInfo, _1));
+        .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::RecordFrontendKillRuntimeResult, instanceInfo, _1,
+                             std::string{}, std::string{}));
 }
 
 litebus::Future<messages::KillInstanceResponse> InstanceCtrlActor::SendKillRequestToAgent(
