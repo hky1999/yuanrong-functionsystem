@@ -30,21 +30,6 @@ namespace functionsystem::local_scheduler {
 
 namespace {
 constexpr int64_t SECONDS_TO_MILLISECONDS = 1000;
-}
-
-std::atomic<int64_t> IdleActor::orphanGraceSec_{0};
-
-void IdleActor::SetOrphanGraceSec(int64_t graceSec)
-{
-    orphanGraceSec_.store(graceSec);
-}
-
-int64_t IdleActor::GetOrphanGraceSec()
-{
-    return orphanGraceSec_.load();
-}
-
-constexpr int64_t SECONDS_TO_MILLISECONDS = 1000;
 constexpr int64_t DEFAULT_COMMAND_ACTIVITY_TIMEOUT_SECONDS = 30;
 
 int64_t PositiveEnvSeconds(const char *name, int64_t fallback)
@@ -61,6 +46,18 @@ int64_t PositiveEnvSeconds(const char *name, int64_t fallback)
     }
 }
 }  // namespace
+
+std::atomic<int64_t> IdleActor::orphanGraceSec_{0};
+
+void IdleActor::SetOrphanGraceSec(int64_t graceSec)
+{
+    orphanGraceSec_.store(graceSec);
+}
+
+int64_t IdleActor::GetOrphanGraceSec()
+{
+    return orphanGraceSec_.load();
+}
 
 IdleActor::IdleActor(const std::string &name,
                      const std::string &nodeID,
