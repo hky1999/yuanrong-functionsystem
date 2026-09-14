@@ -29,6 +29,21 @@
 namespace functionsystem::local_scheduler {
 
 namespace {
+bool IsSamePauseGateIdentity(const resources::InstanceInfo &left, const resources::InstanceInfo &right)
+{
+    return left.instanceid() == right.instanceid()
+        && left.requestid() == right.requestid()
+        && left.version() == right.version()
+        && left.functionproxyid() == right.functionproxyid()
+        && left.runtimeid() == right.runtimeid()
+        && left.functionagentid() == right.functionagentid()
+        && left.containerid() == right.containerid()
+        && left.unitid() == right.unitid()
+        && left.tenantid() == right.tenantid()
+        && left.runtimeaddress() == right.runtimeaddress()
+        && left.instancestatus().code() == right.instancestatus().code();
+}
+
 constexpr int64_t SECONDS_TO_MILLISECONDS = 1000;
 constexpr int64_t DEFAULT_COMMAND_ACTIVITY_TIMEOUT_SECONDS = 30;
 
