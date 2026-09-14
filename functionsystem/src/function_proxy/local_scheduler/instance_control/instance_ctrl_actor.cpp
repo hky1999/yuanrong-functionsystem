@@ -1508,6 +1508,39 @@ litebus::Future<KillResponse> InstanceCtrlActor::ForwardSubscriptionEvent(const 
                              ctx->killRequest, instanceInfo.requestid(), false));
 }
 
+litebus::Future<Status> InstanceCtrlActor::KillRuntimeForInstanceDelete(const InstanceInfo &instanceInfo)
+{
+    // BeginInstanceDelete already acknowledged retirement before releasing resources.
+    return KillRuntimeWithSnapshotCleanup(instanceInfo, false, true, true);
+}
+
+litebus::Future<Status> InstanceCtrlActor::KillRuntimeWithSnapshotCleanup(
+    const InstanceInfo &instanceInfo, bool isRecovering, bool deleteInstanceSnapshots, bool routeAlreadyRetired)
+{
+    if (!routeAlreadyRetired) {
+        auto routeStatus = SetDataPlaneRoute(
+            instanceInfo, data_plane_gateway_activity::DATA_PLANE_GATEWAY_ROUTE_STATE_RETIRED);
+        if (routeStatus.IsError()) {
+            return litebus::Future<Status>(routeStatus);
+        }
+    }
+    // stop wait for update status when kill runtime
+    auto iter = instanceStatusPromises_.find(instanceInfo.instanceid());
+    if (iter != instanceStatusPromises_.end()) {
+        iter->second.SetValue(Status::OK());
+        (void)instanceStatusPromises_.erase(instanceInfo.instanceid());
+    }
+    auto evidence = frontendKillRuntimeEvidence_.find(instanceInfo.instanceid());
+    if (evidence != frontendKillRuntimeEvidence_.end()
+        && evidence->second.instanceRequestID == instanceInfo.requestid()) {
+        evidence->second.state = "terminating";
+    }
+    // Scheduler-line retirement: the physical receipt travels in the kill's
+    // expected identity; Record settles the ledger on a matching confirmation.
+    return SendKillRequestToAgent(instanceInfo, isRecovering, false, std::string{}, std::string{})
+        .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::RecordFrontendKillRuntimeResult, instanceInfo, _1));
+}
+
 litebus::Future<messages::KillInstanceResponse> InstanceCtrlActor::SendKillRequestToAgent(
     const InstanceInfo &instanceInfo, bool isRecovering, bool forRedeploy, const std::string &expectedSandboxID,
     const std::string &expectedGeneration)
