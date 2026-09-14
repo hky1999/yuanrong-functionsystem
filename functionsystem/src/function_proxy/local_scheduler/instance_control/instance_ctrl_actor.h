@@ -1229,7 +1229,9 @@ public:
         std::string killRequestID;
         std::string instanceRequestID;
         std::string state;
-    
+    };
+    std::unordered_map<std::string, FrontendKillRuntimeEvidence> frontendKillRuntimeEvidence_;
+
     void ResolveFrontendKillCleanupProbe(
         const std::string &requestID, const std::string &instanceID,
         const std::shared_ptr<litebus::Promise<FrontendKillCleanupSnapshot>> &promise);
@@ -1240,9 +1242,6 @@ public:
         bool routeAlreadyRetired = false);
     Status SetDataPlaneRoute(const InstanceInfo &instanceInfo,
                              data_plane_gateway_activity::DataPlaneGatewayRouteState state);
-
-};
-    std::unordered_map<std::string, FrontendKillRuntimeEvidence> frontendKillRuntimeEvidence_;
 
     BACK_OFF_RETRY_HELPER(InstanceCtrlActor, litebus::Option<InstanceState>, checkStateHelper_);
 
