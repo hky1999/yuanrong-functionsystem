@@ -70,13 +70,15 @@ func (s *LauncherService) Start(
 }
 
 // Restore reports that runtime-launcher does not implement sandbox restore.
+// The v3 wire contract routes Restore through RestoreResponse; the stub keeps
+// that return type instead of the legacy StartResponse shape.
 func (s *LauncherService) Restore(
 	ctx context.Context,
 	req *runtimev1.RestoreRequest,
-) (*runtimev1.StartResponse, error) {
+) (*runtimev1.RestoreResponse, error) {
 	_ = ctx
 	_ = req
-	return &runtimev1.StartResponse{
+	return &runtimev1.RestoreResponse{
 		Code:    1,
 		Message: "restore is not supported by runtime-launcher SandboxService backend",
 	}, nil
