@@ -459,6 +459,42 @@ std::vector<std::string> IdleActor::GetIdleInstances()
         if (!entry.second) {
             continue;
         }
+        auto it = instanceActiveSessions_.find(entry.first);
+        if (it != instanceActiveSessions_.end() && it->second) {
+            continue;
+        }
+        out.push_back(entry.first);
+    }
+    return out;
+}
+
+Status IdleActor::SetPauseGated(const resources::InstanceInfo &identity, uint64_t token, bool gated)
+{
+    const auto &instanceID = identity.instanceid();
+    if (instanceID.empty()) {
+        return Status(StatusCode::PARAMETER_ERROR, "instance ID is empty");
+    }
+    if (token == 0 || instanceControlView_ == nullptr) {
+        return Status(StatusCode::ERR_INSTANCE_INFO_INVALID, "idle pause gate identity is not available");
+    }
+    auto stateMachine = instanceControlView_->GetInstance(instanceID);
+    if (stateMachine == nullptr) {
+        return Status(StatusCode::ERR_INSTANCE_NOT_FOUND, "idle pause gate instance not found");
+    }
+    const auto current = stateMachine->GetInstanceInfo();
+    if (current.functionproxyid() != nodeID_
+        || current.instancestatus().code() != static_cast<int32_t>(InstanceState::RUNNING)
+        || !IsSamePauseGateIdentity(identity, current)) {
+        return Status(StatusCode::ERR_INSTANCE_INFO_INVALID, "idle pause gate identity changed");
+    }
+    if (gated) {
+        auto existing = pauseGatedInstances_.find(instanceID);
+        if (existing != pauseGatedInstances_.end()) {
+            if (existing->second.token == token && IsSamePauseGateIdentity(existing->second.identity, identity)) {
+                return Status::OK();
+            }
+            return Status(StatusCode::ERR_INSTANCE_BUSY, "idle pause gate belongs to another operation");
+        }
         PauseGateRecord record;
         record.identity.CopyFrom(identity);
         record.token = token;
@@ -478,5 +514,6 @@ std::vector<std::string> IdleActor::GetIdleInstances()
     TryStartIdleTimer(instanceID);
     return Status::OK();
 }
+
 
 }  // namespace functionsystem::local_scheduler
