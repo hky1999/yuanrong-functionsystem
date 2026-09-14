@@ -271,6 +271,44 @@ void IdleActor::MarkInstanceUsed(const std::string &instanceID)
     TryStartIdleTimer(instanceID);
 }
 
+void IdleActor::OnInstanceRunning(const resources::InstanceInfo &identity)
+{
+    const auto &instanceID = identity.instanceid();
+    if (instanceID.empty() || instanceControlView_ == nullptr) {
+        return;
+    }
+    auto stateMachine = instanceControlView_->GetInstance(instanceID);
+    if (stateMachine == nullptr) {
+        return;
+    }
+    const auto current = stateMachine->GetInstanceInfo();
+    if (current.functionproxyid() != nodeID_
+        || current.instancestatus().code() != static_cast<int32_t>(InstanceState::RUNNING)
+        || !IsSamePauseGateIdentity(identity, current)) {
+        return;
+    }
+    if (auto gate = pauseGatedInstances_.find(instanceID); gate != pauseGatedInstances_.end()) {
+        if (IsSamePauseGateIdentity(gate->second.identity, identity)) {
+            return;
+        }
+        pauseGatedInstances_.erase(gate);
+    }
+    // A freshly RUNNING sandbox is idle until one of the independent busy
+    // sources says otherwise; no traffic record yet counts as idle (the
+    // create-race orphan path needs the timer armed from RUNNING itself).
+    instanceTrafficIdle_.try_emplace(instanceID, true);
+    TryStartIdleTimer(instanceID);
+}
+
+void IdleActor::OnInstanceRunning(const std::string &instanceID)
+{
+    if (instanceID.empty() || instanceControlView_ == nullptr) {
+        return;
+    }
+    instanceTrafficIdle_.try_emplace(instanceID, true);
+    TryStartIdleTimer(instanceID);
+}
+
 void IdleActor::TryStartIdleTimer(const std::string &instanceID)
 {
     if (pauseGatedInstances_.find(instanceID) != pauseGatedInstances_.end()) {
