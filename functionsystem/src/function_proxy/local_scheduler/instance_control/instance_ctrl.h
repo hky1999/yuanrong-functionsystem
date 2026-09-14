@@ -283,7 +283,7 @@ public:
     virtual litebus::Future<KillResponse> KillFrontend(const std::string &tenantID,
                                                        const std::shared_ptr<KillRequest> &killReq);
     virtual litebus::Future<FrontendKillCleanupSnapshot> ProbeFrontendKillCleanup(
-        const std::string &requestID, const std::string &instanceID);
+        const std::string &requestID, const std::string &instanceID, uint64_t delayMs = 0);
     virtual litebus::Future<Status> ForceDeleteInstance(const std::string &instanceID);
 
     // Snapshot retirement must not target a replacement sharing the logical ID.

@@ -29,19 +29,19 @@
 namespace functionsystem::local_scheduler {
 
 namespace {
-bool IsSamePauseGateIdentity(const resources::InstanceInfo &left, const resources::InstanceInfo &right)
+constexpr int64_t SECONDS_TO_MILLISECONDS = 1000;
+}
+
+std::atomic<int64_t> IdleActor::orphanGraceSec_{0};
+
+void IdleActor::SetOrphanGraceSec(int64_t graceSec)
 {
-    return left.instanceid() == right.instanceid()
-        && left.requestid() == right.requestid()
-        && left.version() == right.version()
-        && left.functionproxyid() == right.functionproxyid()
-        && left.runtimeid() == right.runtimeid()
-        && left.functionagentid() == right.functionagentid()
-        && left.containerid() == right.containerid()
-        && left.unitid() == right.unitid()
-        && left.tenantid() == right.tenantid()
-        && left.runtimeaddress() == right.runtimeaddress()
-        && left.instancestatus().code() == right.instancestatus().code();
+    orphanGraceSec_.store(graceSec);
+}
+
+int64_t IdleActor::GetOrphanGraceSec()
+{
+    return orphanGraceSec_.load();
 }
 
 constexpr int64_t SECONDS_TO_MILLISECONDS = 1000;
@@ -61,18 +61,6 @@ int64_t PositiveEnvSeconds(const char *name, int64_t fallback)
     }
 }
 }  // namespace
-
-std::atomic<int64_t> IdleActor::orphanGraceSec_{0};
-
-void IdleActor::SetOrphanGraceSec(int64_t graceSec)
-{
-    orphanGraceSec_.store(graceSec);
-}
-
-int64_t IdleActor::GetOrphanGraceSec()
-{
-    return orphanGraceSec_.load();
-}
 
 IdleActor::IdleActor(const std::string &name,
                      const std::string &nodeID,
@@ -118,7 +106,9 @@ void IdleActor::TrafficReport(const std::string &instanceID, const size_t &proce
         // cycle simply re-arms the (short) orphan timer, so an abandoned create
         // whose frontend went silent is reclaimed one grace window later.
         instanceTrafficIdle_.erase(instanceID);
-        CancelIdleTimer(instanceID);
+        if (pauseGatedInstances_.find(instanceID) == pauseGatedInstances_.end()) {
+            CancelIdleTimer(instanceID);
+        }
         return;
     }
 
@@ -261,41 +251,10 @@ void IdleActor::MarkInstanceUsed(const std::string &instanceID)
         CancelIdleTimer(instanceID);
         StartIdleTimer(instanceID);
     }
-}
-
-void IdleActor::OnInstanceRunning(const resources::InstanceInfo &identity)
-{
-    OnInstanceRunning(identity.instanceid());
-}
-
-void IdleActor::OnInstanceRunning(const std::string &instanceID)
-{
-    if (instanceID.empty()) {
-        return;
-    }
-    auto stateMachine = instanceControlView_->GetInstance(instanceID);
-    if (stateMachine == nullptr) {
-        return;
-    }
-    const auto current = stateMachine->GetInstanceInfo();
-    if (current.functionproxyid() != nodeID_
-        || current.instancestatus().code() != static_cast<int32_t>(InstanceState::RUNNING)
-        || !IsSamePauseGateIdentity(identity, current)) {
-        return;
-    }
-    if (auto gate = pauseGatedInstances_.find(instanceID); gate != pauseGatedInstances_.end()) {
-        if (IsSamePauseGateIdentity(gate->second.identity, identity)) {
-            return;
-        }
-        pauseGatedInstances_.erase(gate);
-    }
     // A freshly RUNNING sandbox is idle until one of the independent busy
     // sources says otherwise. The data-plane path bypasses FunctionProxy, so
     // there may never have been an initial TrafficReport(0) to seed this map.
     // Preserve an already-observed busy report that raced ahead of RUNNING.
-    // No traffic record yet counts as idle (create-race orphan path): the
-    // old early return left never-used instances without a timer forever,
-    // so an abandoned late create held its admission slot indefinitely.
     instanceTrafficIdle_.try_emplace(instanceID, true);
     TryStartIdleTimer(instanceID);
 }
@@ -306,7 +265,7 @@ void IdleActor::TryStartIdleTimer(const std::string &instanceID)
         return;
     }
     const auto trafficIt = instanceTrafficIdle_.find(instanceID);
-    if (trafficIt != instanceTrafficIdle_.end() && !trafficIt->second) {
+    if (trafficIt == instanceTrafficIdle_.end() || !trafficIt->second) {
         return;
     }
     if (gatewayActivityUnknown_) {
@@ -495,32 +454,13 @@ void IdleActor::HandleIdleTimeout(const std::string &instanceID, uint64_t genera
     litebus::Async(facadeAID_, &InstanceCtrlActor::EvictByIdleTimeout, instanceID);
 }
 
-Status IdleActor::SetPauseGated(const resources::InstanceInfo &identity, uint64_t token, bool gated)
+std::vector<std::string> IdleActor::GetIdleInstances()
 {
-    const auto &instanceID = identity.instanceid();
-    if (instanceID.empty()) {
-        return Status(StatusCode::PARAMETER_ERROR, "instance ID is empty");
-    }
-    if (token == 0 || instanceControlView_ == nullptr) {
-        return Status(StatusCode::ERR_INSTANCE_INFO_INVALID, "idle pause gate identity is not available");
-    }
-    auto stateMachine = instanceControlView_->GetInstance(instanceID);
-    if (stateMachine == nullptr) {
-        return Status(StatusCode::ERR_INSTANCE_NOT_FOUND, "idle pause gate instance not found");
-    }
-    const auto current = stateMachine->GetInstanceInfo();
-    if (current.functionproxyid() != nodeID_
-        || current.instancestatus().code() != static_cast<int32_t>(InstanceState::RUNNING)
-        || !IsSamePauseGateIdentity(identity, current)) {
-        return Status(StatusCode::ERR_INSTANCE_INFO_INVALID, "idle pause gate identity changed");
-    }
-    if (gated) {
-        auto existing = pauseGatedInstances_.find(instanceID);
-        if (existing != pauseGatedInstances_.end()) {
-            if (existing->second.token == token && IsSamePauseGateIdentity(existing->second.identity, identity)) {
-                return Status::OK();
-            }
-            return Status(StatusCode::ERR_INSTANCE_BUSY, "idle pause gate belongs to another operation");
+    std::vector<std::string> out;
+    out.reserve(instanceTrafficIdle_.size());
+    for (const auto &entry : instanceTrafficIdle_) {
+        if (!entry.second) {
+            continue;
         }
         PauseGateRecord record;
         record.identity.CopyFrom(identity);
@@ -540,21 +480,6 @@ Status IdleActor::SetPauseGated(const resources::InstanceInfo &identity, uint64_
     pauseGatedInstances_.erase(existing);
     TryStartIdleTimer(instanceID);
     return Status::OK();
-std::vector<std::string> IdleActor::GetIdleInstances()
-{
-    std::vector<std::string> out;
-    out.reserve(instanceTrafficIdle_.size());
-    for (const auto &entry : instanceTrafficIdle_) {
-        if (!entry.second) {
-            continue;
-        }
-        auto it = instanceActiveSessions_.find(entry.first);
-        if (it != instanceActiveSessions_.end() && it->second) {
-            continue;
-        }
-        out.push_back(entry.first);
-    }
-    return out;
 }
 
 }  // namespace functionsystem::local_scheduler
