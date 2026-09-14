@@ -53,6 +53,7 @@ struct SandboxInfo {
     messages::RuntimeInstanceInfo instanceInfo;
     std::string registrationID; // fresh for each local registration, including same-ID replacement
     std::string resourceGeneration; // daemon-issued incarnation from Start/Restore
+    std::string sandboxIP; // sandbox network endpoint (upstream 0.10.3 contract)
 };
 
 /**
@@ -116,6 +117,7 @@ public:
 
     // ── Partial updates (applied after sandbox is already registered) ─────────
 
+    void UpdateNetworkEndpoint(const std::string &runtimeID, const std::string &sandboxIP);
     void UpdateSandboxID(const std::string &runtimeID, const std::string &sandboxID,
                          const std::string &resourceGeneration = "");
     void UpdateCheckpoint(const std::string &runtimeID, const std::string &checkpointID);

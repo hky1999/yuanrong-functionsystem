@@ -392,7 +392,7 @@ litebus::Future<messages::StartInstanceResponse> SandboxdExecutor::StartInstance
         }
         deferredStops_.erase(stopping);
     }
-    stateManager_.Register(SandboxInfo{runtimeID, {}, {}, {}, info});
+    stateManager_.Register(SandboxInfo{runtimeID, {}, {}, {}, info, {}, {}});
     stateManager_.ClearPendingDelete(runtimeID);
     sandboxLifecycleStates_.erase(runtimeID);
 
@@ -1303,7 +1303,7 @@ void SandboxdExecutor::AddMissingAndConfirmedEntries(const std::shared_ptr<messa
             instanceInfo.set_instanceid(entry.instanceid());
             instanceInfo.set_runtimeid(entry.runtimeid());
             stateManager_.Register(
-                {entry.runtimeid(), entry.containerid(), {}, entry.portmappings(), instanceInfo, {}});
+                {entry.runtimeid(), entry.containerid(), {}, entry.portmappings(), instanceInfo, {}, {}});
             stateManager_.MarkStartDone(entry.runtimeid());
             StartSandboxStatsCollection(entry.runtimeid(), entry.containerid());
             DoWaitWithRetry(entry.containerid(), entry.runtimeid(), 0);
