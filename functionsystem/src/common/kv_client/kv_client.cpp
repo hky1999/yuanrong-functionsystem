@@ -26,7 +26,7 @@ namespace functionsystem {
 Status KVClient::Init(const std::string &host, int32_t port)
 {
     YRLOG_INFO("initializing kv client with host: {}, port: {}", host, port);
-    datasystem::ConnectOptions connectOptions;
+    datasystem::ConnectOptions connectOptions{};
     connectOptions.host = host;
     connectOptions.port = port;
     dsKvClient_ = std::make_unique<datasystem::KVClient>(connectOptions);

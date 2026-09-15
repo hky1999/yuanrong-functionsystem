@@ -110,7 +110,7 @@ class DedicatedKVDataSystemSnapshotClient final : public DataSystemSnapshotClien
 public:
     Status Init(const DataSystemSnapshotConfig &config) override
     {
-        datasystem::ConnectOptions connectOptions;
+        datasystem::ConnectOptions connectOptions{};
         connectOptions.host = config.host;
         connectOptions.port = config.port;
         auto client = std::make_unique<datasystem::KVClient>(connectOptions);

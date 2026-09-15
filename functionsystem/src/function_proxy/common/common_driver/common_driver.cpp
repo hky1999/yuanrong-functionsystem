@@ -80,8 +80,8 @@ void CommonDriver::BindStateActor()
 
 void CommonDriver::CreateDistributedCacheClient()
 {
-    datasystem::ConnectOptions connectOptions;
-    RouterConnectOptions routerConnectOptions;
+    datasystem::ConnectOptions connectOptions{};
+    RouterConnectOptions routerConnectOptions{};
     DSCacheClientImpl::GetAuthConnectOptions(dsAuthConfig_, connectOptions);
     connectOptions.host = flags_.GetCacheStorageHost();
     connectOptions.port = flags_.GetCacheStoragePort();
