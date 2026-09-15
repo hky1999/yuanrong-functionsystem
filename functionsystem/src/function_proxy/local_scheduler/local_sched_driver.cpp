@@ -309,7 +309,12 @@ Status LocalSchedDriver::PrepareForSnapCtrlBinding()
 
 Status LocalSchedDriver::ContinueAfterSnapCtrlBinding()
 {
-    snapCtrl_ = SnapCtrl::Create(param_.nodeID);
+    // Upstream creates SnapCtrlActor exactly once in CreateAndBindSnapCtrl();
+    // re-creating it here double-registers the same actor name in litebus and
+    // the driver-level Sync message never gets an owner — the local scheduler
+    // then stalls before Recover/ToReady and rejects every agent registration
+    // (2026-09-15 ov6 full-role deployment hang). Keep our extra bindings on
+    // the single instance instead.
     snapCtrl_->BindFunctionAgentMgr(funcAgentMgr_);
     snapCtrl_->BindLocalSchedSrv(localSchedSrv_);
     snapCtrl_->BindInstanceCtrl(instanceCtrl_);
