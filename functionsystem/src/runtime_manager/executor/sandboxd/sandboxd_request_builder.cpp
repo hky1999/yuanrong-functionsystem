@@ -1072,7 +1072,28 @@ void SandboxdRequestBuilder::ApplyResources(const std::shared_ptr<messages::Star
 Status SandboxdRequestBuilder::ApplyElasticResources(
     const std::shared_ptr<messages::StartInstanceRequest> &request, runtime::v1::StartRequest *start) const
 {
-    const auto &options = request->runtimeinstanceinfo().deploymentconfig().deployoptions();
+    auto options = request->runtimeinstanceinfo().deploymentconfig().deployoptions();
+    // The SDK ships elastic options inside the opaque extra_config JSON map;
+    // surface them as sibling deploy options so the flag check below sees them
+    // without requiring every frontend to flatten the map (2026-09-15: the
+    // wheel frontend forwards body.extra_config verbatim as one option).
+    if (options.find(SCHEDULER_ELASTIC_RESOURCES) == options.end()) {
+        if (auto extra = options.find(CONTAINER_EXTRA_CONFIG); extra != options.end()) {
+            try {
+                auto parsed = nlohmann::json::parse(extra->second);
+                if (parsed.is_object()) {
+                    for (const auto &item : parsed.items()) {
+                        options[item.key()] = item.value().is_string()
+                            ? item.value().get<std::string>()
+                            : item.value().dump();
+                    }
+                }
+            } catch (const std::exception &) {
+                // Not a JSON object: leave options unchanged; the plain lookup
+                // below keeps its original semantics.
+            }
+        }
+    }
     const auto enabled = options.find(SCHEDULER_ELASTIC_RESOURCES);
     if (enabled == options.end() || enabled->second == "false") {
         return Status::OK();
