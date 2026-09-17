@@ -959,7 +959,7 @@ litebus::Future<Status> SandboxdExecutor::TerminateSandbox(const std::string &ru
     int64_t faultDelayMs = 0;
     if (RetireFaultGate::Instance().BlockDeleteIfMatched(sandboxID, source->resourceGeneration, faultDelayMs)) {
         auto completion = std::make_shared<litebus::Promise<runtime::v1::DeleteResponse>>();
-        litebus::AsyncAfter(std::chrono::milliseconds(faultDelayMs), GetAID(),
+        litebus::AsyncAfter(faultDelayMs, GetAID(),
                             &SandboxdExecutor::RunFaultDeferredDelete, completion, runtimeID, requestID, del);
         return completion->GetFuture()
             .Then(litebus::Defer(GetAID(), &SandboxdExecutor::OnDeleteDone, runtimeID, requestID, sandboxID,
