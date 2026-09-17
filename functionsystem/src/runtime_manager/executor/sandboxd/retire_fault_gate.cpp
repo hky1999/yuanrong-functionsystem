@@ -60,8 +60,10 @@ void RetireFaultGate::ArmFromSpec(const std::string &specJson)
         action_ = spec.value("action", "");
         sandboxID_ = spec.value("sandbox", "");
         generation_ = spec.value("generation", "");
-        delayMs_ = spec.value("delay_ms", 0);
-        deadlineUnixMs_ = spec.value("deadline_unix_ms", 0);
+        // int64_t defaults: value() returns the default's type, and an int
+        // default silently wraps 13-digit unix-ms deadlines negative.
+        delayMs_ = spec.value("delay_ms", static_cast<int64_t>(0));
+        deadlineUnixMs_ = spec.value("deadline_unix_ms", static_cast<int64_t>(0));
         if ((action_ == "block_delete" || action_ == "drop_receipt") && !sandboxID_.empty()
             && !generation_.empty() && delayMs_ >= 0 && deadlineUnixMs_ > 0) {
             enabled_ = true;

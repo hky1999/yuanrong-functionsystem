@@ -141,7 +141,7 @@ Status NormalizeElasticCreateOptions(InstanceInfo *instance, bool *elastic, Elas
         }
     }
     if (elastic != nullptr) {
-        *elastic = enabled || (canonical != options->end());
+        *elastic = enabled;  // reports "elastic enabled"; explicit false is visible via origin
     }
     if (origin != nullptr) {
         if (canonical == options->end()) {
