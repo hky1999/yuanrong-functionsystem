@@ -47,6 +47,7 @@
 #include "common/posix_service/posix_service.h"
 #include "common/proto/pb/posix/common.pb.h"
 #include "common/proto/pb/posix_pb.h"
+#include "common/resource_view/elastic_options.h"
 #include "common/resource_view/resource_type.h"
 #include "common/resource_view/restore_admission.h"
 #include "common/resource_view/scala_resource_tool.h"
@@ -1902,6 +1903,37 @@ litebus::Future<ScheduleResponse> InstanceCtrlActor::Schedule(
     const std::shared_ptr<messages::ScheduleRequest> &scheduleReq,
     const std::shared_ptr<litebus::Promise<ScheduleResponse>> &runtimePromise)
 {
+    // Surface the SDK elastic marker (nested inside extra_config on the wire)
+    // as the canonical flat create option BEFORE any admission, sampling or
+    // retirement consumer reads it; malformed or conflicting elastic intent
+    // is rejected here instead of silently downgraded to a plain instance.
+    bool elastic = false;
+    auto elasticOrigin = resource_view::ElasticOptionOrigin::NONE;
+    const auto elasticStatus = resource_view::NormalizeElasticCreateOptions(
+        scheduleReq->mutable_instance(), &elastic, &elasticOrigin);
+    if (!elasticStatus.IsOk()) {
+        YRLOG_WARN("{}|{}|elastic create options rejected before admission: {}", scheduleReq->traceid(),
+                   scheduleReq->requestid(), elasticStatus.ToString());
+        auto response = GenScheduleResponse(StatusCode::ERR_PARAM_INVALID, elasticStatus.ToString(), *scheduleReq);
+        runtimePromise->SetValue(response);
+        return response;
+    }
+    if (elastic || elasticOrigin != resource_view::ElasticOptionOrigin::NONE) {
+        const auto &res = scheduleReq->instance().resources().resources();
+        auto describe = [&res](const std::string &name) {
+            auto it = res.find(name);
+            if (it == res.end() || !it->second.has_scalar()) {
+                return std::string("absent");
+            }
+            return std::to_string(static_cast<long long>(it->second.scalar().value())) + "/"
+                + std::to_string(static_cast<long long>(it->second.scalar().limit()));
+        };
+        YRLOG_INFO("{}|{}|elastic create option normalized: instance({}) elastic({}) origin({}) "
+                   "cpu(initial/ceiling millicores: {}) memory(initial/ceiling MiB: {})",
+                   scheduleReq->traceid(), scheduleReq->requestid(), scheduleReq->instance().instanceid(),
+                   elastic, static_cast<int>(elasticOrigin), describe(resource_view::CPU_RESOURCE_NAME),
+                   describe(resource_view::MEMORY_RESOURCE_NAME));
+    }
     if (!scheduleReq->instance().parentid().empty() &&
         scheduleReq->instance().instancestatus().code() == static_cast<int32_t>(InstanceState::NEW)) {
         auto stateMachine = instanceControlView_->GetInstance(scheduleReq->instance().parentid());

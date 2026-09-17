@@ -23,6 +23,7 @@ add_executable(sandboxd_test_bin
     sandbox_stats_polls_test.cpp
     runtime_state_manager_test.cpp
     sandbox_command_utils_test.cpp
+    retire_fault_gate_test.cpp
 )
 target_compile_options(sandboxd_test_bin
     PRIVATE

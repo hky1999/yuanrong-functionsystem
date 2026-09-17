@@ -32,6 +32,7 @@
 #include "executor/docker_executor.h"
 #include "executor/runtime_executor.h"
 #include "executor/sandboxd/sandboxd_executor.h"
+#include "executor/sandboxd/retire_fault_gate.h"
 #include "executor/supervisor_executor.h"
 #include "port/port_manager.h"
 #include "runtime_manager/executor/executor.h"
@@ -1120,6 +1121,19 @@ void RuntimeManager::SendStopInstanceResponse(const litebus::AID &from, const st
             (void)instanceResponseMap_.erase(iter->second.instanceid());
             (void)instanceInfoMap_.erase(iter);
         }
+    }
+    // Physical fault-test hook (default off): suppress exactly one confirmed
+    // retirement receipt travelling upstream after sandboxd durably completed
+    // the delete. The durable receipt stays in sandboxd; the caller's retry
+    // with the same identity must replay it and settle exactly once.
+    if (response->physical_retirement_confirmed()
+        && RetireFaultGate::Instance().DropReceiptIfMatched(response->retired_sandbox_id(),
+                                                           response->retired_resource_generation())) {
+        YRLOG_WARN("{}|retire-fault: dropping confirmed retirement receipt for runtime({}) sandbox({}) "
+                   "generation({}); caller retry must replay the durable receipt",
+                   response->requestid(), runtimeID, response->retired_sandbox_id(),
+                   response->retired_resource_generation());
+        return;
     }
     Send(from, "StopInstanceResponse", response->SerializeAsString());
 }

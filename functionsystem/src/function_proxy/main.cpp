@@ -468,6 +468,10 @@ Status InitLocalSchedParam(const function_proxy::Flags &flags,
                                                                  flags.GetUsageAwareTrendHorizonMs());
     // P2.0 commitment ledger switch (consumed by UsageAwareFilter + UpgradeLadder)
     ::functionsystem::resource_view::CommitmentLedger::SetEnabled(flags.GetEnableCommitmentAdmission());
+    // Read-only deployment audit: record the legacy ledger switch so per-run
+    // evidence can state whether the old commitment account was even live.
+    YRLOG_INFO("commitment ledger enabled({})",
+               ::functionsystem::resource_view::CommitmentLedger::IsEnabled());
     // overcommit ceiling knob (consumed by the OvercommitFilter plugin)
     ::functionsystem::schedule_plugin::filter::OvercommitFilter::SetConfig(flags.GetOvercommitRatio());
     // Ph0.2 orphan grace (consumed by the IdleActor; set before it spawns)

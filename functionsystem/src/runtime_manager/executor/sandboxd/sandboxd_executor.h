@@ -269,6 +269,11 @@ private:
 
     litebus::Future<Status> TerminateSandbox(const std::string &runtimeID, const std::string &requestID,
                                              const std::string &sandboxID, bool force);
+    // Fault-test helper (RetireFaultGate): dispatch a held delete after its
+    // delay elapsed; resolves the waiting TerminateSandbox continuation.
+    void RunFaultDeferredDelete(const std::shared_ptr<litebus::Promise<runtime::v1::DeleteResponse>> &completion,
+                                const std::string &runtimeID, const std::string &requestID,
+                                const std::shared_ptr<runtime::v1::DeleteRequest> &del);
     litebus::Future<Status> OnDeleteDone(const std::string &runtimeID, const std::string &requestID,
                                          const std::string &sandboxID, const runtime::v1::DeleteResponse &response,
                                          const std::string &registrationID);

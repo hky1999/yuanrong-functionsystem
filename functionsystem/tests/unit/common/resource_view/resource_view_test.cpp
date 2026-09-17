@@ -6355,4 +6355,128 @@ TEST_F(PhysicalRetirementTest, SettledPendingReservationCannotBeResurrected)
     EXPECT_EQ(view->GetResizeBudgetEntryCountForTest(), size_t{0});
 }
 
+// Elastic create option normalization: the SDK ships the marker nested inside
+// the opaque extra_config JSON; admission must see the canonical flat key.
+namespace {
+InstanceInfo MakeElasticNormalizeInstance()
+{
+    InstanceInfo instance;
+    instance.set_instanceid("elastic-norm");
+    auto *resources = instance.mutable_resources()->mutable_resources();
+    auto *cpu = (*resources)[resource_view::CPU_RESOURCE_NAME].mutable_scalar();
+    cpu->set_value(500);
+    cpu->set_limit(500);
+    auto *memory = (*resources)[resource_view::MEMORY_RESOURCE_NAME].mutable_scalar();
+    memory->set_value(128);
+    memory->set_limit(512);
+    return instance;
+}
+}  // namespace
+
+TEST(ElasticOptionsTest, NestedMarkerSurfacesAsFlatOption)
+{
+    auto instance = MakeElasticNormalizeInstance();
+    (*instance.mutable_createoptions())["extra_config"] = R"({"scheduler_elastic_resources":"true"})";
+    bool elastic = false;
+    auto origin = resource_view::ElasticOptionOrigin::NONE;
+    auto status = resource_view::NormalizeElasticCreateOptions(&instance, &elastic, &origin);
+    ASSERT_TRUE(status.IsOk()) << status.ToString();
+    EXPECT_TRUE(elastic);
+    EXPECT_EQ(origin, resource_view::ElasticOptionOrigin::NESTED_EXTRA_CONFIG);
+    EXPECT_EQ(instance.createoptions().at(SCHEDULER_ELASTIC_RESOURCES), "true");
+    // The opaque payload itself must survive untouched.
+    EXPECT_EQ(instance.createoptions().at("extra_config"), R"({"scheduler_elastic_resources":"true"})");
+    // Idempotent: a second pass keeps the surfaced key stable.
+    auto again = resource_view::NormalizeElasticCreateOptions(&instance, &elastic, &origin);
+    EXPECT_TRUE(again.IsOk());
+    EXPECT_EQ(instance.createoptions().at(SCHEDULER_ELASTIC_RESOURCES), "true");
+    EXPECT_EQ(origin, resource_view::ElasticOptionOrigin::FLAT);
+}
+
+TEST(ElasticOptionsTest, NestedFalseMarkerAndJsonBoolAreAccepted)
+{
+    auto instance = MakeElasticNormalizeInstance();
+    (*instance.mutable_createoptions())["extra_config"] = R"({"scheduler_elastic_resources":false})";
+    bool elastic = true;
+    auto status = resource_view::NormalizeElasticCreateOptions(&instance, &elastic);
+    ASSERT_TRUE(status.IsOk()) << status.ToString();
+    EXPECT_FALSE(elastic);
+    EXPECT_EQ(instance.createoptions().at(SCHEDULER_ELASTIC_RESOURCES), "false");
+    // Explicit false never requires elastic resource scalars.
+    instance.mutable_resources()->mutable_resources()->erase(resource_view::MEMORY_RESOURCE_NAME);
+    EXPECT_TRUE(resource_view::NormalizeElasticCreateOptions(&instance).IsOk());
+}
+
+TEST(ElasticOptionsTest, FlatMarkerAloneAndLegacyRequestsStayUnchanged)
+{
+    auto instance = MakeElasticNormalizeInstance();
+    (*instance.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+    auto status = resource_view::NormalizeElasticCreateOptions(&instance);
+    ASSERT_TRUE(status.IsOk()) << status.ToString();
+    EXPECT_EQ(instance.createoptions().at(SCHEDULER_ELASTIC_RESOURCES), "true");
+
+    InstanceInfo legacy;
+    (*legacy.mutable_createoptions())["unrelated"] = "keep";
+    EXPECT_TRUE(resource_view::NormalizeElasticCreateOptions(&legacy).IsOk());
+    EXPECT_EQ(legacy.createoptions().size(), size_t{1});
+    EXPECT_FALSE(resource_view::UsesElasticAdmission(legacy));
+}
+
+TEST(ElasticOptionsTest, ConflictingOrMalformedMarkersAreRejected)
+{
+    auto instance = MakeElasticNormalizeInstance();
+    (*instance.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "false";
+    (*instance.mutable_createoptions())["extra_config"] = R"({"scheduler_elastic_resources":"true"})";
+    EXPECT_FALSE(resource_view::NormalizeElasticCreateOptions(&instance).IsOk());
+
+    auto badValue = MakeElasticNormalizeInstance();
+    (*badValue.mutable_createoptions())["extra_config"] = R"({"scheduler_elastic_resources":"typo"})";
+    EXPECT_FALSE(resource_view::NormalizeElasticCreateOptions(&badValue).IsOk());
+
+    auto badType = MakeElasticNormalizeInstance();
+    (*badType.mutable_createoptions())["extra_config"] = R"({"scheduler_elastic_resources":7})";
+    EXPECT_FALSE(resource_view::NormalizeElasticCreateOptions(&badType).IsOk());
+
+    auto badFlat = MakeElasticNormalizeInstance();
+    (*badFlat.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "yes";
+    EXPECT_FALSE(resource_view::NormalizeElasticCreateOptions(&badFlat).IsOk());
+}
+
+TEST(ElasticOptionsTest, OpaqueNonJsonExtraConfigKeepsOriginalSemantics)
+{
+    auto instance = MakeElasticNormalizeInstance();
+    (*instance.mutable_createoptions())["extra_config"] = "not-a-json-object";
+    auto status = resource_view::NormalizeElasticCreateOptions(&instance);
+    ASSERT_TRUE(status.IsOk()) << status.ToString();
+    EXPECT_EQ(instance.createoptions().size(), size_t{1});
+
+    auto flatWithGarbage = MakeElasticNormalizeInstance();
+    (*flatWithGarbage.mutable_createoptions())["extra_config"] = "not-a-json-object";
+    (*flatWithGarbage.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+    EXPECT_TRUE(resource_view::NormalizeElasticCreateOptions(&flatWithGarbage).IsOk());
+}
+
+TEST(ElasticOptionsTest, ElasticTrueRequiresUsableExplicitScalars)
+{
+    auto missingMemory = MakeElasticNormalizeInstance();
+    missingMemory.mutable_resources()->mutable_resources()->erase(resource_view::MEMORY_RESOURCE_NAME);
+    (*missingMemory.mutable_createoptions())["extra_config"] = R"({"scheduler_elastic_resources":"true"})";
+    auto status = resource_view::NormalizeElasticCreateOptions(&missingMemory);
+    EXPECT_FALSE(status.IsOk());
+    // Rejected requests must not leave a half-normalized marker behind.
+    EXPECT_EQ(missingMemory.createoptions().count(SCHEDULER_ELASTIC_RESOURCES), size_t{0});
+
+    auto inverted = MakeElasticNormalizeInstance();
+    (*inverted.mutable_resources()->mutable_resources())[resource_view::MEMORY_RESOURCE_NAME]
+        .mutable_scalar()->set_limit(64);
+    (*inverted.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+    EXPECT_FALSE(resource_view::NormalizeElasticCreateOptions(&inverted).IsOk());
+
+    auto fractional = MakeElasticNormalizeInstance();
+    (*fractional.mutable_resources()->mutable_resources())[resource_view::CPU_RESOURCE_NAME]
+        .mutable_scalar()->set_value(500.5);
+    (*fractional.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+    EXPECT_FALSE(resource_view::NormalizeElasticCreateOptions(&fractional).IsOk());
+}
+
 }  // namespace functionsystem::test

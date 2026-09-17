@@ -41,6 +41,7 @@
 #include "port/port_manager.h"
 #include "runtime_manager/config/build.h"
 #include "runtime_manager/executor/sandboxd/sandbox_command_utils.h"
+#include "runtime_manager/executor/sandboxd/retire_fault_gate.h"
 #include "sandboxd_request_builder.h"
 #include "utils/utils.h"
 
@@ -952,9 +953,30 @@ litebus::Future<Status> SandboxdExecutor::TerminateSandbox(const std::string &ru
     del->set_timeout(force ? 0 : timeout);
     YRLOG_INFO("{}|terminating sandbox({}) runtime({})", requestID, sandboxID, runtimeID);
     userInitiatedTerminateRuntimes_.insert(runtimeID);
+    // Physical fault-test hook (default off): hold the delete dispatch for a
+    // fixed delay BEFORE it reaches sandboxd, keeping the original operation
+    // identity so the settlement converges once the hold elapses.
+    int64_t faultDelayMs = 0;
+    if (RetireFaultGate::Instance().BlockDeleteIfMatched(sandboxID, source->resourceGeneration, faultDelayMs)) {
+        auto completion = std::make_shared<litebus::Promise<runtime::v1::DeleteResponse>>();
+        litebus::AsyncAfter(std::chrono::milliseconds(faultDelayMs), GetAID(),
+                            &SandboxdExecutor::RunFaultDeferredDelete, completion, runtimeID, requestID, del);
+        return completion->GetFuture()
+            .Then(litebus::Defer(GetAID(), &SandboxdExecutor::OnDeleteDone, runtimeID, requestID, sandboxID,
+                                 std::placeholders::_1, source->registrationID));
+    }
     return DoDelete("", runtimeID, requestID, del)
         .Then(litebus::Defer(GetAID(), &SandboxdExecutor::OnDeleteDone, runtimeID, requestID, sandboxID,
                              std::placeholders::_1, source->registrationID));
+}
+
+void SandboxdExecutor::RunFaultDeferredDelete(
+    const std::shared_ptr<litebus::Promise<runtime::v1::DeleteResponse>> &completion,
+    const std::string &runtimeID, const std::string &requestID,
+    const std::shared_ptr<runtime::v1::DeleteRequest> &del)
+{
+    YRLOG_INFO("{}|fault-held delete dispatch resumes now for runtime({})", requestID, runtimeID);
+    completion->Associate(DoDelete("", runtimeID, requestID, del));
 }
 
 litebus::Future<Status> SandboxdExecutor::OnDeleteDone(const std::string &runtimeID, const std::string &requestID,
