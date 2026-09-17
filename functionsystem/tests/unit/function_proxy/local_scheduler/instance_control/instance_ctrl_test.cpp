@@ -2167,7 +2167,7 @@ TEST(FrontendKillEvidenceTest, OlderKillResultCannotOverwriteNewerRequestEvidenc
     messages::KillInstanceResponse response;
     response.set_code(static_cast<int32_t>(StatusCode::SUCCESS));
 
-    auto result = actor->RecordFrontendKillRuntimeResult(olderKill, "older-request", response);
+    auto result = actor->RecordFrontendKillRuntimeResult(olderKill, response);
 
     ASSERT_AWAIT_READY(result);
     EXPECT_EQ(actor->frontendKillRuntimeEvidence_[instanceID].killRequestID, "newer-request");
