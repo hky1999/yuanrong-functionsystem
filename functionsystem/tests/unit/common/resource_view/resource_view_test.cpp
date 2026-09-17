@@ -15,6 +15,7 @@
  */
 
 #include "common/resource_view/resource_view.h"
+#include "common/resource_view/elastic_options.h"
 #include "function_proxy/local_scheduler/pressure_monitor/pressure_resize_policy.h"
 
 #include <gtest/gtest.h>
