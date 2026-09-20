@@ -242,7 +242,7 @@ litebus::Future<Metric> ExternalSystemCPUCollector::GetUsage() const
                 if (totalPtr != nullptr) {
                     auto totalMetric = std::make_shared<Metric>();
                     totalMetric->value = j["totalCpu"].get<double>() * CPU_SCALE;
-                    *totalPtr = std::move(totalMetric);
+                    *totalPtr = std::move(*totalMetric);
                 }
                 return metric;
             }
@@ -290,7 +290,7 @@ litebus::Future<Metric> ExternalSystemMemoryCollector::GetUsage() const
                 if (totalPtr != nullptr) {
                     auto totalMetric = std::make_shared<Metric>();
                     totalMetric->value = double(j["totalMem"].get<int64_t>()) / MEMORY_SCALE;
-                    *totalPtr = std::move(totalMetric);
+                    *totalPtr = std::move(*totalMetric);
                 }
                 return metric;
             }
