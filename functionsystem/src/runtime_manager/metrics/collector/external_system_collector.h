@@ -103,6 +103,9 @@ public:
     Metric GetLimit() const override;
 private:
     std::shared_ptr<Metric> previous_;
+    // Total reported by the node-resource endpoint when it provides an
+    // explicit used/total pair; empty until the first such sample.
+    mutable std::shared_ptr<Metric> total_;
 };
 
 class ExternalSystemMemoryCollector : public ExternalSystemCollector {
@@ -115,6 +118,7 @@ public:
     Metric GetLimit() const override;
 private:
     std::shared_ptr<Metric> previous_;
+    mutable std::shared_ptr<Metric> total_;
 };
 
 class ExternalSystemXPUCollector : public ExternalSystemCollector {

@@ -224,7 +224,7 @@ litebus::Future<std::string> ExternalSystemCollector::CollectFromExternal() cons
 
 litebus::Future<Metric> ExternalSystemCPUCollector::GetUsage() const
 {
-    return CollectFromExternal().Then([previous(previous_)](const std::string& response) -> litebus::Future<Metric> {
+    return CollectFromExternal().Then([previous(previous_), totalPtr(total_)](const std::string& response) -> litebus::Future<Metric> {
         YRLOG_DEBUG_COUNT_60("Received CPU response: {}", response);
         if (response.empty()) {
             return previous != nullptr ? *previous : Metric{};
@@ -232,6 +232,20 @@ litebus::Future<Metric> ExternalSystemCPUCollector::GetUsage() const
         // Parse JSON response and return Metric
         try {
             auto j = nlohmann::json::parse(response);
+            // Preferred form: the node-resource endpoint reports explicit
+            // total/used. usage=used, limit=total (CPU in cores).
+            if (j.contains("usedCpu") && j["usedCpu"].is_number()
+                && j.contains("totalCpu") && j["totalCpu"].is_number()) {
+                auto metric = Metric{};
+                metric.value = j["usedCpu"].get<double>() * CPU_SCALE;
+                *previous = metric;
+                if (totalPtr != nullptr) {
+                    auto totalMetric = std::make_shared<Metric>();
+                    totalMetric->value = j["totalCpu"].get<double>() * CPU_SCALE;
+                    *totalPtr = std::move(totalMetric);
+                }
+                return metric;
+            }
             if (j.contains("cpu") && j["cpu"].is_number_integer()) {
                 auto cpu = j["cpu"].get<int>();
                 auto metric = Metric{ { double(cpu * CPU_SCALE) }, {}, {}, {} } ;
@@ -247,6 +261,9 @@ litebus::Future<Metric> ExternalSystemCPUCollector::GetUsage() const
 
 Metric ExternalSystemCPUCollector::GetLimit() const
 {
+    if (total_ != nullptr && total_->value.IsSome()) {
+        return *total_;
+    }
     if (previous_ == nullptr) {
         YRLOG_DEBUG_COUNT_60("Failed to Get CPU Limit, fallback to default");
         return this->GetLimit();
@@ -256,7 +273,7 @@ Metric ExternalSystemCPUCollector::GetLimit() const
 
 litebus::Future<Metric> ExternalSystemMemoryCollector::GetUsage() const
 {
-    return CollectFromExternal().Then([previous(previous_)](const std::string& response) -> litebus::Future<Metric> {
+    return CollectFromExternal().Then([previous(previous_), totalPtr(total_)](const std::string& response) -> litebus::Future<Metric> {
         YRLOG_DEBUG_COUNT_60("Received Memory response: {}", response);
         if (response.empty()) {
             return previous != nullptr ? *previous : Metric{};
@@ -264,6 +281,19 @@ litebus::Future<Metric> ExternalSystemMemoryCollector::GetUsage() const
         // Parse JSON response and return Metric
         try {
             auto j = nlohmann::json::parse(response);
+            // Preferred form: explicit used/total memory in bytes.
+            if (j.contains("usedMem") && j["usedMem"].is_number_integer()
+                && j.contains("totalMem") && j["totalMem"].is_number_integer()) {
+                auto metric = Metric{};
+                metric.value = double(j["usedMem"].get<int64_t>()) / MEMORY_SCALE;
+                *previous = metric;
+                if (totalPtr != nullptr) {
+                    auto totalMetric = std::make_shared<Metric>();
+                    totalMetric->value = double(j["totalMem"].get<int64_t>()) / MEMORY_SCALE;
+                    *totalPtr = std::move(totalMetric);
+                }
+                return metric;
+            }
             if (j.contains("mem") && j["mem"].is_number_integer()) {
                 auto memory = j["mem"].get<int64_t>();
                 auto metric = Metric{ { double(memory) / MEMORY_SCALE }, {}, {}, {} };
@@ -278,6 +308,9 @@ litebus::Future<Metric> ExternalSystemMemoryCollector::GetUsage() const
 }
 Metric ExternalSystemMemoryCollector::GetLimit() const
 {
+    if (total_ != nullptr && total_->value.IsSome()) {
+        return *total_;
+    }
     if (previous_ == nullptr) {
         YRLOG_DEBUG_COUNT_60("Failed to Get Memory Limit, fallback to default");
         return this->GetLimit();
