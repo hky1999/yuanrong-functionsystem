@@ -1317,8 +1317,14 @@ void AgentServiceActor::StopInstanceResponse(const litebus::AID &from, std::stri
             responseMessage = cleanup.RawMessage();
         }
     }
+    // Reply with the ORIGINAL kill request id the proxy registered its
+    // killNotifyPromise_ under. requestID here is the fresh forward id this
+    // actor generated for the runtime-manager hop; using it left the proxy
+    // promise unresolved ("not find promise to notify response") and the
+    // frontend kill hung re-forwarding the signal every second.
     auto killInstanceResponse = BuildKillInstanceResponse(responseCode, responseMessage,
-                                                          requestID, killInstanceRequest->instanceid());
+                                                          killInstanceRequest->requestid(),
+                                                          killInstanceRequest->instanceid());
     const auto &pending = request->second;
     if (pending.runtimeManager.Name().empty() || from != pending.runtimeManager
         || from != litebus::AID(registerRuntimeMgr_.name, registerRuntimeMgr_.address)
