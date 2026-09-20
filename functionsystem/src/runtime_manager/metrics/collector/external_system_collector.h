@@ -97,7 +97,8 @@ class ExternalSystemCPUCollector : public ExternalSystemCollector {
 public:
     ExternalSystemCPUCollector() = default;
     explicit ExternalSystemCPUCollector(const double &limit, const litebus::ActorReference &curlActorRef)
-        : ExternalSystemCollector(limit, metrics_type::CPU, curlActorRef), previous_(std::make_shared<Metric>()) {};
+        : ExternalSystemCollector(limit, metrics_type::CPU, curlActorRef), previous_(std::make_shared<Metric>()),
+          total_(std::make_shared<Metric>()) {};
     ~ExternalSystemCPUCollector() override = default;
     litebus::Future<Metric> GetUsage() const override;
     Metric GetLimit() const override;
@@ -112,7 +113,8 @@ class ExternalSystemMemoryCollector : public ExternalSystemCollector {
 public:
     ExternalSystemMemoryCollector() = default;
     explicit ExternalSystemMemoryCollector(const double &limit, const litebus::ActorReference &curlActorRef)
-        : ExternalSystemCollector(limit, metrics_type::MEMORY, curlActorRef), previous_(std::make_shared<Metric>()) {};
+        : ExternalSystemCollector(limit, metrics_type::MEMORY, curlActorRef), previous_(std::make_shared<Metric>()),
+          total_(std::make_shared<Metric>()) {};
     ~ExternalSystemMemoryCollector() override = default;
     litebus::Future<Metric> GetUsage() const override;
     Metric GetLimit() const override;
