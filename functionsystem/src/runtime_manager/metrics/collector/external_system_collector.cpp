@@ -231,27 +231,23 @@ litebus::Future<Metric> ExternalSystemCPUCollector::GetUsage() const
         }
         // Parse JSON response and return Metric
         try {
-            auto j = nlohmann::json::parse(response);
-            // Preferred form: the node-resource endpoint reports explicit
-            // total/used. usage=used, limit=total (CPU in cores).
-            if (j.contains("usedCpu") && j["usedCpu"].is_number()
-                && j.contains("totalCpu") && j["totalCpu"].is_number()) {
+            // Only an explicit, known physical sample may update usage.
+            // The legacy cpu field means AVAILABLE and is never read as
+            // usage; an unknown sample leaves the previous value in place
+            // without refreshing the sample clock.
+            auto sample = ParseExternalNodeResource(response);
+            if (sample.known) {
                 auto metric = Metric{};
-                metric.value = j["usedCpu"].get<double>() * CPU_SCALE;
+                metric.value = sample.cpuUsedCores * CPU_SCALE;
                 *previous = metric;
                 if (totalPtr != nullptr) {
                     auto totalMetric = std::make_shared<Metric>();
-                    totalMetric->value = j["totalCpu"].get<double>() * CPU_SCALE;
+                    totalMetric->value = sample.cpuTotalCores * CPU_SCALE;
                     *totalPtr = std::move(*totalMetric);
                 }
                 return metric;
             }
-            if (j.contains("cpu") && j["cpu"].is_number_integer()) {
-                auto cpu = j["cpu"].get<int>();
-                auto metric = Metric{ { double(cpu * CPU_SCALE) }, {}, {}, {} } ;
-                *previous = metric;
-                return metric;
-            }
+            return previous != nullptr ? *previous : Metric{};
         } catch (const std::exception& e) {
             YRLOG_DEBUG_COUNT_60("Failed to parse JSON response: {}, error: {}", response, e.what());
         }
@@ -280,26 +276,19 @@ litebus::Future<Metric> ExternalSystemMemoryCollector::GetUsage() const
         }
         // Parse JSON response and return Metric
         try {
-            auto j = nlohmann::json::parse(response);
-            // Preferred form: explicit used/total memory in bytes.
-            if (j.contains("usedMem") && j["usedMem"].is_number_integer()
-                && j.contains("totalMem") && j["totalMem"].is_number_integer()) {
+            auto sample = ParseExternalNodeResource(response);
+            if (sample.known) {
                 auto metric = Metric{};
-                metric.value = double(j["usedMem"].get<int64_t>()) / MEMORY_SCALE;
+                metric.value = sample.memUsedMb;
                 *previous = metric;
                 if (totalPtr != nullptr) {
                     auto totalMetric = std::make_shared<Metric>();
-                    totalMetric->value = double(j["totalMem"].get<int64_t>()) / MEMORY_SCALE;
+                    totalMetric->value = sample.memTotalMb;
                     *totalPtr = std::move(*totalMetric);
                 }
                 return metric;
             }
-            if (j.contains("mem") && j["mem"].is_number_integer()) {
-                auto memory = j["mem"].get<int64_t>();
-                auto metric = Metric{ { double(memory) / MEMORY_SCALE }, {}, {}, {} };
-                *previous = metric;
-                return metric;
-            }
+            return previous != nullptr ? *previous : Metric{};
         } catch (const std::exception& e) {
             YRLOG_DEBUG_COUNT_60("Failed to parse JSON response: {}, error: {}", response, e.what());
         }
@@ -380,4 +369,36 @@ Metric ExternalSystemStorageCollector::GetLimit() const
 {
     return previous_ != nullptr ? *previous_ : Metric{};
 }
+ExternalNodeResourceSample ParseExternalNodeResource(const std::string &response)
+{
+    ExternalNodeResourceSample sample;
+    try {
+        auto j = nlohmann::json::parse(response);
+        if (!j.is_object()) {
+            return sample;
+        }
+        // Protocol: totalCpu/totalMem/usedCpu/usedMem (always emitted) plus
+        // usedKnown. Anything less is an old server or an unknown physical
+        // read; both are unknown samples, never available-as-usage.
+        if (!j.contains("usedKnown") || !j["usedKnown"].get<bool>()) {
+            return sample;
+        }
+        const bool cpuOk = j.contains("usedCpu") && j["usedCpu"].is_number()
+            && j.contains("totalCpu") && j["totalCpu"].is_number();
+        const bool memOk = j.contains("usedMem") && j["usedMem"].is_number()
+            && j.contains("totalMem") && j["totalMem"].is_number();
+        if (!cpuOk || !memOk) {
+            return sample;
+        }
+        sample.cpuUsedCores = j["usedCpu"].get<double>();
+        sample.cpuTotalCores = j["totalCpu"].get<double>();
+        sample.memUsedMb = double(j["usedMem"].get<int64_t>()) / MEMORY_SCALE;
+        sample.memTotalMb = double(j["totalMem"].get<int64_t>()) / MEMORY_SCALE;
+        sample.known = true;
+        return sample;
+    } catch (const std::exception &) {
+        return sample;
+    }
+}
+
 }  // namespace functionsystem::runtime_manager

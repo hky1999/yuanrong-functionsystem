@@ -93,6 +93,21 @@ private:
     litebus::ActorReference curlActorRef_;
 };
 
+// Parsed node-resource sample from the /resource endpoint (sandboxd
+// resourcemanager). Known=false means the payload did not carry a valid
+// physical-usage sample (missing explicit fields or usedKnown=false): the
+// caller must treat the observation as unknown and emit no sample. The
+// legacy cpu/mem fields mean AVAILABLE and are never interpreted as usage.
+struct ExternalNodeResourceSample {
+    bool known{ false };
+    double cpuUsedCores{ 0.0 };
+    double cpuTotalCores{ 0.0 };
+    double memUsedMb{ 0.0 };
+    double memTotalMb{ 0.0 };
+};
+
+ExternalNodeResourceSample ParseExternalNodeResource(const std::string &response);
+
 class ExternalSystemCPUCollector : public ExternalSystemCollector {
 public:
     ExternalSystemCPUCollector() = default;
