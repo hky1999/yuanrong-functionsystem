@@ -47,13 +47,12 @@ Metric KnownUsage(double value)
 {
     Metric m;
     m.value = value;
-    m.observationKnown = true;
     return m;
 }
 
 Metric UnknownUsage()
 {
-    return Metric{}; // observationKnown = false, no value
+    return Metric{}; // no value: the unknown shape
 }
 
 class UnknownMetricCollector : public BaseMetricsCollector {
@@ -75,7 +74,6 @@ public:
         Metric m;
         if (mode_ == KNOWN) {
             m.value = limit_;
-            m.observationKnown = true;
         }
         return m;
     }

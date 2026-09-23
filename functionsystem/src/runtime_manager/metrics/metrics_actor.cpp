@@ -690,10 +690,13 @@ resources::ResourceUnit MetricsActor::BuildResourceUnitWithSystem(
             continue;
         }
 
-        // Unknown observations (no usage AND no limit) contribute nothing:
-        // no fabricated zero entries, no sample clock, no capacity. The
-        // view keeps its previous values and the missing fresh sample
-        // makes admission conservatively reject.
+        // Unknown observations (no usage AND no limit, e.g. the external
+        // node-resource collectors on provider error / stale-snapshot 503)
+        // contribute nothing: no fabricated zero entries and no sample
+        // clock. The view keeps its previous values and the missing fresh
+        // sample makes admission conservatively reject. Normal collectors
+        // always produce a usage or limit, so this skip is scoped to the
+        // unknown shape only.
         if (metrics.usage.IsNone() && metrics.limit.IsNone()) {
             continue;
         }
