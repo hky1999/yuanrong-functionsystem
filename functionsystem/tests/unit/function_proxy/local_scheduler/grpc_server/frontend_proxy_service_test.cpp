@@ -1323,6 +1323,78 @@ TEST(FrontendProxyResizeEntryTest, PendingFutureYieldsUnknownOutcome)
     EXPECT_EQ(state.dispatchCount, 1); // the dispatch DID happen; outcome unknown
 }
 
+TEST(FrontendProxyResizeEntryTest, FailedTransportReturnsUnknownImmediately)
+{
+    ResizeTestState state;
+    auto param = state.MakeParam([](const std::string &, const std::string &) { return true; });
+    // Simulate a transport failure (litebus Promise::SetFailed): the future
+    // is ready-and-failed; WaitFrontendResult must return None IMMEDIATELY
+    // (the old code busy-waited on the ready-failed future for the whole
+    // budget). EXPECT a fast return, not a multi-second wait.
+    state.result.SetFailed(1);
+    FrontendProxyService service(std::move(param));
+    ::grpc::ServerContext context;
+    auto request = MakeResizeRequest("tenant-1");
+    // give a generous deadline so the old busy-wait would take many seconds
+    request.mutable_resize()->mutable_resize()->set_deadline_unix_ms(
+        request.resize().resize().deadline_unix_ms() + 20000); // ~50s budget
+    ::frontend_proxy::ResizeInstanceResponse response;
+    auto started = std::chrono::steady_clock::now();
+    auto status = service.ResizeInstance(&context, &request, &response);
+    auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    EXPECT_TRUE(status.ok());
+    EXPECT_NE(response.status().code(), 0);
+    EXPECT_EQ(response.resize().outcome(), messages::ResizeSandboxResponse::UNKNOWN);
+    // the fix: a failed future returns in the first poll (~FRONTEND_WAIT_POLL_MS),
+    // not after the full deadline budget
+    EXPECT_LE(elapsedMs, 5000)
+        << "failed transport busy-waited " << elapsedMs << "ms; must fast-exit";
+}
+
+TEST(FrontendProxyResizeEntryTest, ExpectedTargetRevisionForwardedInDispatch)
+{
+    ResizeTestState state;
+    ::frontend_proxy::ResizeInstanceRequest seen;
+    auto param = state.MakeParam([](const std::string &, const std::string &) { return true; });
+    param.resizeReadyDispatcher =
+        [&seen, &state](const ::frontend_proxy::ResizeInstanceRequest &req)
+            -> litebus::Future<messages::ResizeSandboxResponse> {
+        seen = req;
+        state.dispatchCount++;
+        messages::ResizeSandboxResponse observed;
+        observed.set_code(0);
+        observed.set_outcome(messages::ResizeSandboxResponse::OBSERVED);
+        return litebus::Future<messages::ResizeSandboxResponse>(observed);
+    };
+    FrontendProxyService service(std::move(param));
+    ::grpc::ServerContext context;
+    auto request = MakeResizeRequest("tenant-1");
+    // fill in real expected/target/revision — the command must round-trip
+    auto *command = request.mutable_resize()->mutable_resize();
+    command->mutable_expected()->set_cpu_quota_usec(50000);
+    command->mutable_expected()->set_cpu_period_usec(100000);
+    command->mutable_expected()->set_memory_limit_bytes(128 * 1024 * 1024);
+    command->mutable_target()->set_cpu_quota_usec(50000);
+    command->mutable_target()->set_cpu_period_usec(100000);
+    command->mutable_target()->set_memory_limit_bytes(512 * 1024 * 1024);
+    command->set_expected_revision(7);
+    ::frontend_proxy::ResizeInstanceResponse response;
+    auto status = service.ResizeInstance(&context, &request, &response);
+    EXPECT_TRUE(status.ok());
+    ASSERT_EQ(state.dispatchCount, 1);
+    EXPECT_EQ(seen.resize().resize().expected().cpu_quota_usec(), 50000);
+    EXPECT_EQ(seen.resize().resize().expected().cpu_period_usec(), 100000);
+    EXPECT_EQ(seen.resize().resize().expected().memory_limit_bytes(), 128 * 1024 * 1024);
+    EXPECT_EQ(seen.resize().resize().target().cpu_quota_usec(), 50000);
+    EXPECT_EQ(seen.resize().resize().target().cpu_period_usec(), 100000);
+    EXPECT_EQ(seen.resize().resize().target().memory_limit_bytes(), 512 * 1024 * 1024);
+    EXPECT_EQ(seen.resize().resize().expected_revision(), 7);
+    EXPECT_EQ(seen.resize().resize().sandbox_id(), "sbx-1");
+    EXPECT_EQ(seen.resize().resize().resource_generation(), "gen-1");
+    EXPECT_EQ(seen.resize().resize().operation_id(), "op-1");
+}
+
 TEST(FrontendProxyResizeEntryTest, MissingOperationIDIsRejected)
 {
     ResizeTestState state;

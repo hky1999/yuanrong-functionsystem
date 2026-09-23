@@ -117,6 +117,14 @@ litebus::Option<T> WaitFrontendResult(const litebus::Future<T> &future, ::grpc::
         if (result.IsSome()) {
             return result;
         }
+        // A FAILED transport must not busy-wait to the deadline: Get(timeout)
+        // already returns None for a SetFailed future (WaitFor succeeds
+        // immediately, then status.IsError() short-circuits to None), so
+        // without this check the loop spins on the ready-failed future for
+        // the whole budget. Distinguish via IsError on the Future itself.
+        if (future.IsError()) {
+            return litebus::None();
+        }
         elapsed = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started).count());
     }
