@@ -84,10 +84,15 @@ function install_function_proxy() {
   # here are deliberately explicit 0/1|true/false — absence means OFF.
   local elasticity_env="${FUNCTION_SYSTEM_DIR}/deploy/elasticity.env"
   if [ -f "${elasticity_env}" ]; then
+    # set -a: every sourced variable is EXPORTED, so the env-prefix start
+    # line and the exec'd binary both see them (a bare shell assignment
+    # never reaches the process environment — ov15 lesson).
+    set -a
     source "${elasticity_env}"
+    set +a
   else
-    AKERNEL_MEMORY_ELASTICITY=0
-    ENABLE_UPGRADE_LADDER=false
+    export AKERNEL_MEMORY_ELASTICITY=0
+    export ENABLE_UPGRADE_LADDER=false
   fi
   local ladder_args=""
   if [ "${ENABLE_UPGRADE_LADDER:-false}" = "true" ]; then
