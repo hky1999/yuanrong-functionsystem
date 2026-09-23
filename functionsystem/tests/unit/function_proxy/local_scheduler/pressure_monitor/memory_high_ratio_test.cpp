@@ -31,8 +31,21 @@ TEST(MemoryHighRatioTest, DefaultRatioMatchesPhysicalReadbacks)
 TEST(MemoryHighRatioTest, EdgeLimits)
 {
     EXPECT_EQ(resource_view::ExpectedHighBytes(0), 0u);
-    // one-page max: floor(0.9*4096/4096)=0 -> 0 (no enforced high below a page)
-    EXPECT_EQ(resource_view::ExpectedHighBytes(4096), 0u);
+    // Sub-page results stay unaligned (daemon keeps them), always below max.
+    EXPECT_EQ(resource_view::ExpectedHighBytes(4096), 3687u);
+    EXPECT_EQ(resource_view::ExpectedHighBytes(4095), 3686u);
+    EXPECT_EQ(resource_view::ExpectedHighBytes(8192), 4096u);
+}
+
+// The C++ expectation must mirror the daemon's ceil-then-page-down exactly;
+// a floor-only copy diverges by one page on non-page-aligned limits
+// (reviewer example: 0.9 * 134221368 -> Go 120799232, floor gives 120795136).
+TEST(MemoryHighRatioTest, NonPageAlignedLimitMatchesDaemonCeiling)
+{
+    EXPECT_EQ(resource_view::ExpectedHighBytes(134221368), 120799232u);
+    EXPECT_EQ(resource_view::ExpectedHighBytes(134217728 + 1), 120799232u);
+    // ratio*limit already integral: ceil is the identity.
+    EXPECT_EQ(resource_view::ExpectedHighBytes(134217728), 120795136u);
 }
 
 }  // namespace functionsystem::test

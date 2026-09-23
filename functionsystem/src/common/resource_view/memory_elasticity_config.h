@@ -55,16 +55,23 @@ inline double MemoryHighRatio()
     return ratio;
 }
 
-// floor(ratio * maxBytes / pageSize) * pageSize with the same double math the
-// daemon applies; the sub-page double error cannot cross a page boundary for
-// realistic limits (verified against 0.9*128MiB -> 120795136 and
-// 0.9*256MiB -> 241590272 physical readbacks).
+// Mirrors the daemon's cgroupmanager.MemoryHighBytes exactly:
+// ceil(ratio * limit) aligned DOWN to the kernel page, then kept strictly
+// below the limit (limit-1) and zeroed under one page. The page size is
+// fixed at 4096 here because the daemon container and the scheduler deploy
+// on the same host page size; a mismatch is a deployment error.
 inline uint64_t ExpectedHighBytes(uint64_t maxBytes)
 {
     constexpr uint64_t kSafeMax = (1ULL << 62) / 4;
+    constexpr uint64_t kPage = 4096;
     if (maxBytes == 0 || maxBytes >= kSafeMax) { return 0; }
-    const double pages = std::floor(MemoryHighRatio() * static_cast<double>(maxBytes) / 4096.0);
-    return pages > 0.0 ? static_cast<uint64_t>(pages) * 4096 : 0;
+    const double scaled = MemoryHighRatio() * static_cast<double>(maxBytes);
+    const double ceiled = std::ceil(scaled);
+    if (!(ceiled >= 1.0) || ceiled >= static_cast<double>(kSafeMax)) { return 0; }
+    uint64_t high = static_cast<uint64_t>(ceiled);
+    if (high >= kPage) { high -= high % kPage; }
+    if (high >= maxBytes) { high = maxBytes - 1; }
+    return high;
 }
 }
 #endif
