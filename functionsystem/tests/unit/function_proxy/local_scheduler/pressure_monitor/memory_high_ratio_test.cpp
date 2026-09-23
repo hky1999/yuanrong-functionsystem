@@ -42,10 +42,15 @@ TEST(MemoryHighRatioTest, EdgeLimits)
 // (reviewer example: 0.9 * 134221368 -> Go 120799232, floor gives 120795136).
 TEST(MemoryHighRatioTest, NonPageAlignedLimitMatchesDaemonCeiling)
 {
+    // ceil(0.9*134221368)=120799632 -> page-down 120799232 (floor copy gave
+    // 120795136, one page short).
     EXPECT_EQ(resource_view::ExpectedHighBytes(134221368), 120799232u);
-    EXPECT_EQ(resource_view::ExpectedHighBytes(134217728 + 1), 120799232u);
-    // ratio*limit already integral: ceil is the identity.
+    // Page-aligned neighborhood stays put: ceil(0.9*134217729)=120796077 ->
+    // 120795136, same as the aligned 128MiB case.
+    EXPECT_EQ(resource_view::ExpectedHighBytes(134217728 + 1), 120795136u);
     EXPECT_EQ(resource_view::ExpectedHighBytes(134217728), 120795136u);
+    // 0.9*512MiB+1 keeps the aligned 512MiB value as well.
+    EXPECT_EQ(resource_view::ExpectedHighBytes(536870912 + 1), 483180544u);
 }
 
 }  // namespace functionsystem::test
