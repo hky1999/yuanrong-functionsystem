@@ -1126,11 +1126,14 @@ void RuntimeManager::SendStopInstanceResponse(const litebus::AID &from, const st
     }
     // Physical fault-test hook (default off): suppress exactly one confirmed
     // retirement receipt travelling upstream after sandboxd durably completed
-    // the delete. The durable receipt stays in sandboxd; the caller's retry
-    // with the same identity must replay it and settle exactly once.
+    // the delete, matching the exact operation identity (sandbox + generation
+    // + this response's request id). The durable receipt stays in sandboxd;
+    // the caller's retry with the same identity must replay it and settle
+    // exactly once.
     if (response->physical_retirement_confirmed()
         && RetireFaultGate::Instance().DropReceiptIfMatched(response->retired_sandbox_id(),
-                                                           response->retired_resource_generation())) {
+                                                           response->retired_resource_generation(),
+                                                           response->requestid())) {
         YRLOG_WARN("{}|retire-fault: dropping confirmed retirement receipt for runtime({}) sandbox({}) "
                    "generation({}); caller retry must replay the durable receipt",
                    response->requestid(), runtimeID, response->retired_sandbox_id(),

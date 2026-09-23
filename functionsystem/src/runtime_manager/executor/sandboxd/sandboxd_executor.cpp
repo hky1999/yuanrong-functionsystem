@@ -954,10 +954,12 @@ litebus::Future<Status> SandboxdExecutor::TerminateSandbox(const std::string &ru
     YRLOG_INFO("{}|terminating sandbox({}) runtime({})", requestID, sandboxID, runtimeID);
     userInitiatedTerminateRuntimes_.insert(runtimeID);
     // Physical fault-test hook (default off): hold the delete dispatch for a
-    // fixed delay BEFORE it reaches sandboxd, keeping the original operation
-    // identity so the settlement converges once the hold elapses.
+    // fixed delay BEFORE it reaches sandboxd, matching the exact operation
+    // identity (sandbox + generation + this stop request id) so only the
+    // intended dispatch is held and settlement converges once it elapses.
     int64_t faultDelayMs = 0;
-    if (RetireFaultGate::Instance().BlockDeleteIfMatched(sandboxID, source->resourceGeneration, faultDelayMs)) {
+    if (RetireFaultGate::Instance().BlockDeleteIfMatched(sandboxID, source->resourceGeneration,
+                                                         requestID, faultDelayMs)) {
         auto completion = std::make_shared<litebus::Promise<runtime::v1::DeleteResponse>>();
         litebus::AsyncAfter(faultDelayMs, GetAID(),
                             &SandboxdExecutor::RunFaultDeferredDelete, completion, runtimeID, requestID, del);
