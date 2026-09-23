@@ -20,6 +20,7 @@ package frontend_proxy;
 
 import "common.proto";
 import "core_service.proto";
+import "message.proto";
 
 option go_package = "functionsystem/pkg/common/faas_common/grpc/pb/frontend_proxy;frontend_proxy";
 
@@ -36,6 +37,12 @@ service FrontendProxyService {
   rpc InvokeInstanceStream (InvokeInstanceRequest) returns (stream InvokeInstanceStreamResponse) {}
   rpc CreateInstance (CreateInstanceRequest) returns (CreateInstanceResponse) {}
   rpc KillInstance (KillInstanceRequest) returns (KillInstanceResponse) {}
+  // Scheduler-authorized direct resize: a controlled entry that goes through
+  // the node's budget reservation (FunctionAgentMgrActor::ResizeSandbox ->
+  // ReserveResize) before any physical dispatch — never a raw sandboxd call.
+  // Binds the exact registered instance/generation/operation id and returns
+  // the same-operation receipt.
+  rpc ResizeInstance (ResizeInstanceRequest) returns (ResizeInstanceResponse) {}
 }
 
 message FrontendRequestContext {
@@ -125,4 +132,18 @@ message KillInstanceRequest {
 message KillInstanceResponse {
   FrontendProxyStatus status = 1;
   core_service.KillResponse kill = 2;
+}
+
+message ResizeInstanceRequest {
+  FrontendRequestContext context = 1;
+  // The scheduler-side resize command: requestID/instanceID/runtimeID plus
+  // the physical resize payload (sandbox, generation, expected/target
+  // limits, deadline_unix_ms <= now+60s, operation_id, expected_revision)
+  // and the explicit shrink flag.
+  messages.ResizeSandboxRequest resize = 2;
+}
+
+message ResizeInstanceResponse {
+  FrontendProxyStatus status = 1;
+  messages.ResizeSandboxResponse resize = 2;
 }

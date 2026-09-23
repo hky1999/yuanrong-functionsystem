@@ -49,6 +49,9 @@ struct FrontendProxyServiceParam {
             const ::frontend_proxy::KillInstanceRequest &)>;
     using KillCleanupProbe =
         std::function<litebus::Future<FrontendKillCleanupSnapshot>(const std::string &, const std::string &, uint64_t)>;
+    using ResizeReadyDispatcher =
+        std::function<litebus::Future<messages::ResizeSandboxResponse>(
+            const ::frontend_proxy::ResizeInstanceRequest &)>;
 
     std::string nodeID;
     std::string endpointAddress;
@@ -74,8 +77,13 @@ struct FrontendProxyServiceParam {
     KillReadyDispatcher killReadyDispatcher;
     // Read-only production probe. A successful KillResponse is not cleanup evidence.
     KillCleanupProbe killCleanupProbe;
+    // Reviewed resize seam: the dispatcher MUST route through the node's
+    // budget reservation (FunctionAgentMgrActor::ResizeSandbox ->
+    // ReserveResize) — a raw sandboxd ResizeResources is never acceptable.
+    ResizeReadyDispatcher resizeReadyDispatcher;
     bool enableCreateDispatch { false };
     bool enableKillDispatch { false };
+    bool enableResizeDispatch { false };
     bool requireAuthenticatedPeer { false };
     uint64_t invokeResultTimeoutMs { 60000 };
     uint64_t invokeResultTimeoutBufferMs { 5000 };
@@ -112,6 +120,10 @@ public:
     ::grpc::Status KillInstance(::grpc::ServerContext *context,
                                 const ::frontend_proxy::KillInstanceRequest *request,
                                 ::frontend_proxy::KillInstanceResponse *response) override;
+
+    ::grpc::Status ResizeInstance(::grpc::ServerContext *context,
+                                  const ::frontend_proxy::ResizeInstanceRequest *request,
+                                  ::frontend_proxy::ResizeInstanceResponse *response) override;
 
 private:
     bool ValidateInvokeRequest(const ::frontend_proxy::InvokeInstanceRequest &request,

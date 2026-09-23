@@ -261,6 +261,15 @@ FrontendProxyServiceParam BuildFrontendProxyServiceParam(const std::string &node
         param.killReadyDispatcher = BuildFrontendProxyKillReadyDispatcher(bindings.killInvoker);
         param.killCleanupProbe = bindings.killCleanupProbe;
     }
+    param.enableResizeDispatch = bindings.resizeInvoker != nullptr;
+    if (bindings.resizeInvoker != nullptr) {
+        auto invoker = bindings.resizeInvoker;
+        param.resizeReadyDispatcher =
+            [invoker = bindings.resizeInvoker](const ::frontend_proxy::ResizeInstanceRequest &request)
+                -> litebus::Future<messages::ResizeSandboxResponse> {
+                return invoker(std::make_shared<messages::ResizeSandboxRequest>(request.resize()));
+            };
+    }
     return param;
 }
 

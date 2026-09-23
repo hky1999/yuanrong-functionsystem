@@ -72,6 +72,13 @@ struct FrontendProxyServiceBindings {
     FrontendCreateFailureLookup createFailureLookup;
     bool enableKillDispatch { false };
     FrontendProxyKillInvoker killInvoker;
+    // Routes through FunctionAgentMgrActor::ResizeSandbox (ReserveResize ->
+    // OnResizeReserved -> Send): the ONLY scheduler-authorized resize entry.
+    // The implementation resolves the authoritative InstanceInfo from THIS
+    // node's InstanceControlView — a caller-supplied identity is never
+    // trusted. Takes only the request; identity resolution stays internal.
+    std::function<litebus::Future<messages::ResizeSandboxResponse>(
+        const std::shared_ptr<messages::ResizeSandboxRequest> &)> resizeInvoker;
     FrontendProxyKillCleanupProbe killCleanupProbe;
 };
 

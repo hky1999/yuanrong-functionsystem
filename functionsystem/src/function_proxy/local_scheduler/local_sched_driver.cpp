@@ -710,6 +710,91 @@ bool LocalSchedDriver::CreatePosixAndDriverServer()
             (void)caller;
             return instanceCtrl->KillFrontend(tenantID, killReq);
         };
+    bindings.resizeInvoker =
+        [funcAgentMgr(funcAgentMgr_), instanceView(instanceCtrl_->GetInstanceControlView()),
+         primaryView(resourceViewMgr_->GetInf(resource_view::ResourceType::PRIMARY))](
+            const std::shared_ptr<messages::ResizeSandboxRequest> &request)
+            -> litebus::Future<messages::ResizeSandboxResponse> {
+            using Response = messages::ResizeSandboxResponse;
+            auto ready = [](const std::shared_ptr<messages::ResizeSandboxRequest> &req, int32_t code,
+                            const std::string &message,
+                            messages::ResizeSandboxResponse::Outcome outcome) {
+                Response failure;
+                failure.set_requestid(req->requestid());
+                failure.set_instanceid(req->instanceid());
+                failure.set_runtimeid(req->runtimeid());
+                failure.set_code(code);
+                failure.set_message(message);
+                failure.set_outcome(outcome);
+                return litebus::Future<Response>(failure);
+            };
+            // Stage 1 (control view): logical identity + tenant, synchronous.
+            if (funcAgentMgr == nullptr || instanceView == nullptr || primaryView == nullptr) {
+                return ready(request, static_cast<int32_t>(common::ERR_LOCAL_SCHEDULER_ABNORMAL),
+                             "function agent manager, instance view or resource view is nullptr",
+                             Response::REJECTED_BEFORE_DISPATCH);
+            }
+            auto stateMachine = instanceView->GetInstance(request->instanceid());
+            if (stateMachine == nullptr) {
+                return ready(request, static_cast<int32_t>(common::ERR_INSTANCE_NOT_FOUND),
+                             "instance is not registered on this node",
+                             Response::REJECTED_BEFORE_DISPATCH);
+            }
+            const auto &controlInfo = stateMachine->GetInstanceInfo();
+            if (controlInfo.runtimeid() != request->runtimeid()) {
+                return ready(request, static_cast<int32_t>(common::ERR_PARAM_INVALID),
+                             "request runtimeID does not match the authoritative registration",
+                             Response::REJECTED_BEFORE_DISPATCH);
+            }
+            // Stage 2 (resource view, ASYNC COPY): the control-view copy
+            // carries no sandbox_resource_sample (instance_ctrl_actor.cpp:539)
+            // but FunctionAgentMgrActor::ResizeSandbox:1800 requires it to
+            // match sandbox/generation. GetResourceViewCopy() gives a stable
+            // snapshot — no cross-thread mutable view is held.
+            return primaryView->GetResourceViewCopy().Then(
+                [funcAgentMgr, request, controlInfo](
+                    const std::shared_ptr<resource_view::ResourceUnit> &view)
+                    -> litebus::Future<messages::ResizeSandboxResponse> {
+                    using Response = messages::ResizeSandboxResponse;
+                    auto ready = [](const std::shared_ptr<messages::ResizeSandboxRequest> &req, int32_t code,
+                                    const std::string &message,
+                                    messages::ResizeSandboxResponse::Outcome outcome) {
+                        Response failure;
+                        failure.set_requestid(req->requestid());
+                        failure.set_instanceid(req->instanceid());
+                        failure.set_runtimeid(req->runtimeid());
+                        failure.set_code(code);
+                        failure.set_message(message);
+                        failure.set_outcome(outcome);
+                        return litebus::Future<Response>(failure);
+                    };
+                    if (view == nullptr) {
+                        return ready(request, static_cast<int32_t>(common::ERR_INNER_SYSTEM_ERROR),
+                                     "resource view read failed; identity unresolvable", Response::UNKNOWN);
+                    }
+                    const auto &instances = view->instances();
+                    auto found = instances.find(request->instanceid());
+                    if (found == instances.end() || !found->second.has_sandbox_resource_sample()) {
+                        return ready(request, static_cast<int32_t>(common::ERR_INSTANCE_NOT_FOUND),
+                                     "no resource-view allocation with a physical sample",
+                                     Response::REJECTED_BEFORE_DISPATCH);
+                    }
+                    // Cross-check the two INDEPENDENT authorities (tenant,
+                    // instance, runtime) before the budget entry.
+                    const auto &resourceInfo = found->second;
+                    if (resourceInfo.runtimeid() != controlInfo.runtimeid()
+                        || resourceInfo.instanceid() != controlInfo.instanceid()
+                        || resourceInfo.tenantid() != controlInfo.tenantid()) {
+                        return ready(request, static_cast<int32_t>(common::ERR_PARAM_INVALID),
+                                     "control-view and resource-view identities diverge",
+                                     Response::REJECTED_BEFORE_DISPATCH);
+                    }
+                    // The ONLY scheduler-authorized resize entry: budget
+                    // reservation happens inside, on the sample-carrying info;
+                    // the chain stays fully asynchronous.
+                    return funcAgentMgr->ResizeSandbox(resourceInfo, request);
+                });
+        };
     bindings.killCleanupProbe =
         [instanceCtrl(instanceCtrl_)](const std::string &requestID, const std::string &instanceID, uint64_t delayMs) {
             if (instanceCtrl == nullptr) {
@@ -744,18 +829,21 @@ bool LocalSchedDriver::CreatePosixAndDriverServer()
     auto frontendServiceParam = BuildFrontendProxyServiceParam(param_.nodeID, bindings);
     frontendServiceParam.endpointAddress = param_.ip + ":" + param_.posixPort;
     frontendServiceParam.requireAuthenticatedPeer = param_.enableSSL;
+    // Bool contract (true = allowed): the typedef is
+    // InvokeTenantAuthorizer = function<bool(...)>. The previous lambda
+    // returned error codes — ERR_NONE(0) bool-converted to false, making
+    // invoke REJECT the rightful tenant (1944Z independent evidence).
     frontendServiceParam.invokeTenantAuthorizer =
         [instanceView(instanceCtrl_->GetInstanceControlView())](const std::string &tenantID,
                                                                 const std::string &instanceID) {
             if (tenantID.empty() || instanceView == nullptr) {
-                return common::ERR_AUTHORIZE_FAILED;
+                return false;
             }
             auto stateMachine = instanceView->GetInstance(instanceID);
             if (stateMachine == nullptr) {
-                return common::ERR_INSTANCE_NOT_FOUND;
+                return false;
             }
-            return stateMachine->GetInstanceInfo().tenantid() == tenantID ? common::ERR_NONE
-                                                                         : common::ERR_AUTHORIZE_FAILED;
+            return stateMachine->GetInstanceInfo().tenantid() == tenantID;
         };
     // Lifecycle create/kill use reviewed ready dispatcher seams. Legacy stream dispatchers remain
     // disallowed.

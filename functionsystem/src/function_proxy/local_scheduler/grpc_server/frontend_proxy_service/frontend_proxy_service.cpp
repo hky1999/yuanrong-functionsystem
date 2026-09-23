@@ -849,6 +849,108 @@ bool FrontendProxyService::ValidateCreateRequest(const ::frontend_proxy::CreateI
     return ::grpc::Status::OK;
 }
 
+::grpc::Status FrontendProxyService::ResizeInstance(::grpc::ServerContext *context,
+                                                    const ::frontend_proxy::ResizeInstanceRequest *request,
+                                                    ::frontend_proxy::ResizeInstanceResponse *response)
+{
+    if (!HasAuthenticatedPeer(context)) {
+        return { ::grpc::StatusCode::UNAUTHENTICATED,
+                 "frontend proxy resize requires an authenticated component certificate" };
+    }
+    if (request == nullptr || response == nullptr) {
+        return { ::grpc::StatusCode::INVALID_ARGUMENT, "invalid frontend proxy resize args" };
+    }
+    if (!param_.enableResizeDispatch || !param_.resizeReadyDispatcher) {
+        SetStatus(response->mutable_status(), common::ERR_AUTHORIZE_FAILED,
+                  "frontend proxy resize is not enabled on this node");
+        return ::grpc::Status::OK;
+    }
+    if (!HasRequiredLifecycleContext(request->context()) || request->resize().instanceid().empty()
+        || request->resize().runtimeid().empty() || !request->resize().has_resize()
+        || request->resize().resize().sandbox_id().empty()
+        || request->resize().resize().resource_generation().empty()
+        || request->resize().resize().operation_id().empty()) {
+        SetStatus(response->mutable_status(), common::ERR_PARAM_INVALID,
+                  "frontend proxy resize requires context.frontendClientID, context.requestID, "
+                  "context.tenantID, instanceID, runtimeID, sandbox, generation and operation_id");
+        return ::grpc::Status::OK;
+    }
+    const auto &command = request->resize().resize();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    if (command.deadline_unix_ms() <= nowMs || command.deadline_unix_ms() > nowMs + 60000) {
+        SetStatus(response->mutable_status(), common::ERR_PARAM_INVALID,
+                  "frontend proxy resize deadline must be within (now, now+60s]");
+        return ::grpc::Status::OK;
+    }
+    if (HasOperationRequestIDMismatch(request->context(), request->resize().requestid())) {
+        SetStatus(response->mutable_status(), common::ERR_PARAM_INVALID,
+                  "frontend proxy resize request id does not match context request id");
+        return ::grpc::Status::OK;
+    }
+    // Tenant ownership against the authoritative local view (bool contract,
+    // same as invoke): caller-supplied routing is never trusted for a
+    // resource mutation. A MISSING authorizer DENIES — a resource mutation
+    // never proceeds on absent authorization.
+    if (!param_.invokeTenantAuthorizer
+        || !param_.invokeTenantAuthorizer(request->context().tenantid(),
+                                          request->resize().instanceid())) {
+        SetStatus(response->mutable_status(), common::ERR_AUTHORIZE_FAILED,
+                  param_.invokeTenantAuthorizer
+                      ? "frontend proxy resize tenant does not own target instance"
+                      : "frontend proxy resize requires a tenant authorizer (none configured)");
+        return ::grpc::Status::OK;
+    }
+    YRLOG_INFO("{}|frontend proxy resize received by proxy({}), frontendClientID({}), instance({}) "
+               "operation({}) shrink({})",
+               request->context().requestid(), param_.nodeID, request->context().frontendclientid(),
+               request->resize().instanceid(), command.operation_id(), request->resize().shrink());
+    LogLifecycleEvent("resize", "received", request->context(), param_.nodeID,
+                      request->resize().instanceid(), "accepted", false, "", "",
+                      param_.endpointAddress, param_.nodeID);
+    auto resizeFuture = param_.resizeReadyDispatcher(*request);
+    // Bounded wait: never beyond the command deadline (+ a small transport
+    // buffer), honoring gRPC cancellation; a timeout keeps the outcome
+    // UNKNOWN — the reservation is NOT released here.
+    const auto waitBudgetMs = static_cast<uint64_t>(
+        std::max<int64_t>(1000, command.deadline_unix_ms() - nowMs + 2000));
+    bool cancelled = false;
+    auto resizeResult = WaitFrontendResult(resizeFuture, context, waitBudgetMs, cancelled);
+    if (!resizeResult.IsSome()) {
+        SetStatus(response->mutable_status(), common::ERR_INNER_SYSTEM_ERROR,
+                  cancelled ? "frontend proxy resize cancelled with unknown dispatch outcome"
+                            : "frontend proxy resize timed out with unknown dispatch outcome");
+        auto *resize = response->mutable_resize();
+        resize->set_requestid(request->resize().requestid());
+        resize->set_instanceid(request->resize().instanceid());
+        resize->set_runtimeid(request->resize().runtimeid());
+        resize->set_outcome(messages::ResizeSandboxResponse::UNKNOWN);
+        LogLifecycleEvent("resize", "failed", request->context(), param_.nodeID,
+                          request->resize().instanceid(), "post-dispatch-unknown",
+                          false, "", "", param_.endpointAddress, param_.nodeID);
+        return ::grpc::Status::OK;
+    }
+    *response->mutable_resize() = resizeResult.Get();
+    if (response->resize().code() == 0
+        && response->resize().outcome() == messages::ResizeSandboxResponse::OBSERVED) {
+        SetStatus(response->mutable_status(), common::ERR_NONE, "");
+    } else if (response->resize().outcome()
+               == messages::ResizeSandboxResponse::REJECTED_BEFORE_DISPATCH) {
+        SetStatus(response->mutable_status(), common::ERR_RESOURCE_NOT_ENOUGH,
+                  response->resize().message());
+    } else {
+        SetStatus(response->mutable_status(), common::ERR_INNER_SYSTEM_ERROR,
+                  response->resize().message().empty() ? "resize outcome unknown"
+                                                      : response->resize().message());
+    }
+    LogLifecycleEvent("resize", "completed", request->context(), param_.nodeID,
+                      request->resize().instanceid(),
+                      response->resize().outcome() == messages::ResizeSandboxResponse::OBSERVED
+                          ? "completed" : "failed",
+                      false, "", "", param_.endpointAddress, param_.nodeID);
+    return ::grpc::Status::OK;
+}
+
 ::grpc::Status FrontendProxyService::KillInstance(::grpc::ServerContext *context,
                                                   const ::frontend_proxy::KillInstanceRequest *request,
                                                   ::frontend_proxy::KillInstanceResponse *response)
