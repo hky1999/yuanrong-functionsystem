@@ -75,7 +75,7 @@ TEST(ElasticReceiptTest, CorrectNineTenthsHighObservedWrongRejected)
 // entry; a wrong high leaves it unknown for reconciliation.
 TEST(ElasticReceiptTest, OnPressureResizeAcceptsCorrectHighAndKeepsWrongUnknown)
 {
-    PressureMonitorActor monitor("receipt-test", "node-r");
+    PressureMonitorActor monitor("receipt-test", "node-r", PressureMonitorConfig{});
     const std::string instance = "inst-r";
     auto &pending = monitor.pressureResizes_[instance];
     pending.requestID = "req-r";
@@ -104,8 +104,8 @@ TEST(ElasticReceiptTest, OnPressureResizeAcceptsCorrectHighAndKeepsWrongUnknown)
     litebus::Promise<messages::ResizeSandboxResponse> okPromise;
     okPromise.SetValue(ok);
     monitor.OnPressureResize(instance, "req-r", okPromise.GetFuture());
-    EXPECT_FALSE(monitor.pressureResizes_[instance].unknown)
-        << "a correct 0.9 receipt must clear the pending entry";
+    EXPECT_EQ(0u, monitor.pressureResizes_.count(instance))
+        << "a correct 0.9 receipt must REMOVE the pending entry (count, not operator[])";
 
     // wrong high on a fresh pending: the entry must be marked unknown so
     // reconciliation keeps the reservation instead of trusting a bad receipt
@@ -118,14 +118,16 @@ TEST(ElasticReceiptTest, OnPressureResizeAcceptsCorrectHighAndKeepsWrongUnknown)
     litebus::Promise<messages::ResizeSandboxResponse> wrongPromise;
     wrongPromise.SetValue(wrong);
     monitor.OnPressureResize(instance, "req-r", wrongPromise.GetFuture());
-    EXPECT_TRUE(monitor.pressureResizes_[instance].unknown)
+    const auto stillPending = monitor.pressureResizes_.find(instance);
+    ASSERT_NE(monitor.pressureResizes_.end(), stillPending);
+    EXPECT_TRUE(stillPending->second.unknown)
         << "a wrong (0.8-style) high must leave the attempt unknown";
 }
 
 // Fast/slow isolation: separate single-flight gates.
 TEST(ElasticCadenceTest, FastGateIndependentOfSlowGateInFlight)
 {
-    PressureMonitorActor monitor("gate-test", "node-g");
+    PressureMonitorActor monitor("gate-test", "node-g", PressureMonitorConfig{});
     auto slow = monitor.sampleGate_.Begin();
     ASSERT_TRUE(slow.has_value());
     auto fast = monitor.elasticGate_.Begin();
@@ -141,7 +143,7 @@ TEST(ElasticCadenceTest, FastGateIndependentOfSlowGateInFlight)
 // counter and in-flight generation are untouched.
 TEST(ElasticCadenceTest, FastTimeoutDoesNotTouchSlowParkCounters)
 {
-    PressureMonitorActor monitor("timeout-test", "node-t");
+    PressureMonitorActor monitor("timeout-test", "node-t", PressureMonitorConfig{});
     auto slow = monitor.sampleGate_.Begin();
     ASSERT_TRUE(slow.has_value());
     monitor.highSamples_ = 1;
@@ -151,6 +153,50 @@ TEST(ElasticCadenceTest, FastTimeoutDoesNotTouchSlowParkCounters)
     EXPECT_FALSE(monitor.elasticGate_.Active(*fast));
     EXPECT_EQ(1u, monitor.highSamples_);
     EXPECT_TRUE(monitor.sampleGate_.Active(*slow));
+}
+
+
+// Real-callback isolation: OnElasticResourceView Finishes only ITS gate's
+// generation; a late view for a superseded fast generation cannot retire a
+// NEW fast pass, and neither touches the slow gate or its counters.
+TEST(ElasticCadenceTest, LateFastCallbackDoesNotRetireNewFastGeneration)
+{
+    PressureMonitorActor monitor("late-test", "node-l", PressureMonitorConfig{});
+    auto slow = monitor.sampleGate_.Begin();
+    ASSERT_TRUE(slow.has_value());
+    monitor.highSamples_ = 1;
+
+    auto old1 = monitor.elasticGate_.Begin();
+    ASSERT_TRUE(old1.has_value());
+    // old generation times out; tag dies with it
+    monitor.OnElasticSampleTimeout(*old1);
+    EXPECT_FALSE(monitor.elasticGate_.Active(*old1));
+
+    auto fresh = monitor.elasticGate_.Begin();
+    ASSERT_TRUE(fresh.has_value());
+    // LATE callback for the timed-out generation: Finish fails inside
+    // OnElasticResourceView, the fresh fast generation must stay active
+    monitor.OnElasticResourceView(*old1, nullptr);
+    EXPECT_TRUE(monitor.elasticGate_.Active(*fresh));
+    // slow counters still untouched by everything above
+    EXPECT_EQ(1u, monitor.highSamples_);
+    EXPECT_TRUE(monitor.sampleGate_.Active(*slow));
+    EXPECT_TRUE(monitor.sampleGate_.Finish(*slow));
+}
+
+// The real fast completion path: a view for the ACTIVE fast generation
+// retires exactly that generation and leaves the slow pass in flight.
+TEST(ElasticCadenceTest, ActiveFastViewRetiresOnlyItsGeneration)
+{
+    PressureMonitorActor monitor("view-test", "node-v", PressureMonitorConfig{});
+    auto slow = monitor.sampleGate_.Begin();
+    ASSERT_TRUE(slow.has_value());
+    auto fast = monitor.elasticGate_.Begin();
+    ASSERT_TRUE(fast.has_value());
+    monitor.OnElasticResourceView(*fast, nullptr);  // nullptr view: no policy run
+    EXPECT_FALSE(monitor.elasticGate_.Active(*fast));
+    EXPECT_TRUE(monitor.sampleGate_.Active(*slow));
+    EXPECT_EQ(0u, monitor.highSamples_);
 }
 
 }  // namespace
