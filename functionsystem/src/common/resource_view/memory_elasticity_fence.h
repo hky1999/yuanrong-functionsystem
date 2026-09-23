@@ -25,7 +25,12 @@ namespace functionsystem::resource_view {
 // unit tests flip this override instead. Production code must not call the
 // setter.
 bool MemoryElasticityFenceEnabled();
+// Current override state (-1 = env-driven) for test guards that must
+// restore what was there on entry instead of forcing false.
+int MemoryElasticityFenceOverrideState();
 void SetMemoryElasticityFenceForTest(bool enabled);
+// Return to env-driven state (override = -1) for test teardown.
+void ResetMemoryElasticityFenceOverride();
 
 }  // namespace functionsystem::resource_view
 

@@ -156,6 +156,13 @@ TEST_F(ResourceViewTest, RestoreReservationsSpanSeparateAllocationCalls)
         sample->set_runtime_id(first.runtimeid());
         sample->set_sandbox_id("sandbox-first");
         sample->set_resource_generation("generation-first");
+        sample->set_resource_revision(1);
+        sample->set_resource_revision_known(true);
+        sample->set_memory_limit_known(true);
+        sample->set_memory_limit_bytes(512ULL * 1024 * 1024);
+        sample->set_cpu_limits_known(true);
+        sample->set_cpu_quota_usec(50000);
+        sample->set_cpu_period_usec(100000);
         sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
         sample->set_cpu_usage_known(false);
         auto incomplete = view->UpdateResourceUnit(std::make_shared<ResourceUnit>(*report), UpdateType::UPDATE_ACTUAL);
@@ -252,6 +259,13 @@ TEST_F(ResourceViewTest, ElasticColdReservationsSpanCallsAndRequirePhysicalRecon
         sample->set_sandbox_id("cold-sandbox");
         sample->set_resource_generation("cold-generation");
         sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
+        sample->set_resource_revision(1);
+        sample->set_resource_revision_known(true);
+        sample->set_memory_limit_known(true);
+        sample->set_memory_limit_bytes(512ULL * 1024 * 1024);
+        sample->set_cpu_limits_known(true);
+        sample->set_cpu_quota_usec(50000);
+        sample->set_cpu_period_usec(100000);
         sample->set_cpu_usage_known(true);
         sample->set_cpu_usage_cores(0.05);
         auto refreshed = view->UpdateResourceUnit(report, UpdateType::UPDATE_ACTUAL);
@@ -334,6 +348,13 @@ TEST_F(ResourceViewTest, ResizeReservationsShareAdmissionAndRequireOwnUsageToSet
             sample->set_sandbox_id("budget-sandbox");
             sample->set_resource_generation("budget-generation");
             sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
+        sample->set_resource_revision(1);
+        sample->set_resource_revision_known(true);
+        sample->set_memory_limit_known(true);
+        sample->set_memory_limit_bytes(512ULL * 1024 * 1024);
+        sample->set_cpu_limits_known(true);
+        sample->set_cpu_quota_usec(50000);
+        sample->set_cpu_period_usec(100000);
             sample->set_cpu_usage_known(cpuKnown);
             sample->set_cpu_usage_cores(cpuBound && consumed ? 1.0 : 0.05);
             sample->set_cpu_limits_known(true);
@@ -1487,6 +1508,14 @@ TEST_F(ResourceViewTest, UpdateActualMergesPerInstanceActualuse)
     sample->set_resource_generation("generation-1");
     sample->set_sampled_at_unix_ms(2000);
     sample->set_memory_limit_bytes(512ULL * 1024 * 1024);
+    // Revision-complete telemetry: the fence rejects revision-unknown samples
+    // while elasticity is enabled (this binary runs with it on).
+    sample->set_resource_revision(1);
+    sample->set_resource_revision_known(true);
+    sample->set_memory_limit_known(true);
+    sample->set_cpu_limits_known(true);
+    sample->set_cpu_quota_usec(50000);
+    sample->set_cpu_period_usec(100000);
     (*report->mutable_instances())[knownKey] = knownInst;
     auto ghostInst = Get1DInstance();
     ghostInst.set_instanceid("instance-not-in-view");
@@ -4281,6 +4310,13 @@ TEST_F(ResourceViewTest, BindInstanceRuntimeCompletesColdDeployWithoutPreseededR
         sample->set_sandbox_id("bind-cold-sandbox");
         sample->set_resource_generation("bind-cold-generation");
         sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
+        sample->set_resource_revision(1);
+        sample->set_resource_revision_known(true);
+        sample->set_memory_limit_known(true);
+        sample->set_memory_limit_bytes(512ULL * 1024 * 1024);
+        sample->set_cpu_limits_known(true);
+        sample->set_cpu_quota_usec(50000);
+        sample->set_cpu_period_usec(100000);
         sample->set_cpu_usage_known(true);
         sample->set_cpu_usage_cores(0.05);
         sample->set_cpu_limits_known(true);
@@ -4467,6 +4503,13 @@ TEST_F(ResourceViewTest, BindInstanceRuntimeSurvivesDeleteRecreateAndForeignTele
         sample->set_sandbox_id(sandbox);
         sample->set_resource_generation(generation);
         sample->set_sampled_at_unix_ms(report->memory_sample_unix_ms());
+        sample->set_resource_revision(1);
+        sample->set_resource_revision_known(true);
+        sample->set_memory_limit_known(true);
+        sample->set_memory_limit_bytes(512ULL * 1024 * 1024);
+        sample->set_cpu_limits_known(true);
+        sample->set_cpu_quota_usec(50000);
+        sample->set_cpu_period_usec(100000);
         sample->set_cpu_usage_known(true);
         sample->set_cpu_usage_cores(0.05);
         sample->set_cpu_limits_known(true);
@@ -4558,8 +4601,16 @@ TEST_F(ResourceViewTest, ShrinkBudgetTrimsGrowCreditsOnlyAfterConfirmedContract)
     } guard;
     UsageAwareFilter::SetConfig(0.9, 2048, 0);
     struct FenceGuard {
+        int entryState = resource_view::MemoryElasticityFenceOverrideState();
         FenceGuard() { SetMemoryElasticityFenceForTest(true); }
-        ~FenceGuard() { SetMemoryElasticityFenceForTest(false); }
+        ~FenceGuard()
+        {
+            if (entryState < 0) {
+                resource_view::ResetMemoryElasticityFenceOverride();
+            } else {
+                SetMemoryElasticityFenceForTest(entryState != 0);
+            }
+        }
     } fenceGuard;
     auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count(); };
@@ -4795,8 +4846,16 @@ TEST_F(ResourceViewTest, ShrinkBudgetTrimsGrowCreditsOnlyAfterConfirmedContract)
 TEST_F(ResourceViewTest, SampleFenceRejectsStaleAndUnauthorizedReadingsInBothIndexes)
 {
     struct FenceGuard {
+        int entryState = resource_view::MemoryElasticityFenceOverrideState();
         FenceGuard() { SetMemoryElasticityFenceForTest(true); }
-        ~FenceGuard() { SetMemoryElasticityFenceForTest(false); }
+        ~FenceGuard()
+        {
+            if (entryState < 0) {
+                resource_view::ResetMemoryElasticityFenceOverride();
+            } else {
+                SetMemoryElasticityFenceForTest(entryState != 0);
+            }
+        }
     } fenceGuard;
     auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count(); };
@@ -4950,8 +5009,16 @@ TEST_F(ResourceViewTest, RestartRecoveryHoldsFullCurrentMaxUntilShrinkTrimsIt)
     } guard;
     UsageAwareFilter::SetConfig(0.9, 2048, 0);
     struct FenceGuard {
+        int entryState = resource_view::MemoryElasticityFenceOverrideState();
         FenceGuard() { SetMemoryElasticityFenceForTest(true); }
-        ~FenceGuard() { SetMemoryElasticityFenceForTest(false); }
+        ~FenceGuard()
+        {
+            if (entryState < 0) {
+                resource_view::ResetMemoryElasticityFenceOverride();
+            } else {
+                SetMemoryElasticityFenceForTest(entryState != 0);
+            }
+        }
     } fenceGuard;
     auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count(); };
@@ -5155,8 +5222,16 @@ TEST_F(ResourceViewTest, RestartRecoveryHoldsFullCurrentMaxUntilShrinkTrimsIt)
 TEST_F(ResourceViewTest, ShrinkReserveRejectsContractViolationsBeforeAnyHeadroomMath)
 {
     struct FenceGuard {
+        int entryState = resource_view::MemoryElasticityFenceOverrideState();
         FenceGuard() { SetMemoryElasticityFenceForTest(true); }
-        ~FenceGuard() { SetMemoryElasticityFenceForTest(false); }
+        ~FenceGuard()
+        {
+            if (entryState < 0) {
+                resource_view::ResetMemoryElasticityFenceOverride();
+            } else {
+                SetMemoryElasticityFenceForTest(entryState != 0);
+            }
+        }
     } fenceGuard;
     auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count(); };
@@ -5301,8 +5376,16 @@ TEST_F(ResourceViewTest, ShrinkReserveRejectsContractViolationsBeforeAnyHeadroom
 TEST_F(ResourceViewTest, UnknownGrowHoldsSingleOperationUntilContractCloses)
 {
     struct FenceGuard {
+        int entryState = resource_view::MemoryElasticityFenceOverrideState();
         FenceGuard() { SetMemoryElasticityFenceForTest(true); }
-        ~FenceGuard() { SetMemoryElasticityFenceForTest(false); }
+        ~FenceGuard()
+        {
+            if (entryState < 0) {
+                resource_view::ResetMemoryElasticityFenceOverride();
+            } else {
+                SetMemoryElasticityFenceForTest(entryState != 0);
+            }
+        }
     } fenceGuard;
     auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count(); };
@@ -5443,8 +5526,16 @@ TEST_F(ResourceViewTest, UnknownGrowHoldsSingleOperationUntilContractCloses)
 TEST_F(ResourceViewTest, LateStatsCannotRollBackConfirmedRpcReadback)
 {
     struct FenceGuard {
+        int entryState = resource_view::MemoryElasticityFenceOverrideState();
         FenceGuard() { SetMemoryElasticityFenceForTest(true); }
-        ~FenceGuard() { SetMemoryElasticityFenceForTest(false); }
+        ~FenceGuard()
+        {
+            if (entryState < 0) {
+                resource_view::ResetMemoryElasticityFenceOverride();
+            } else {
+                SetMemoryElasticityFenceForTest(entryState != 0);
+            }
+        }
     } fenceGuard;
     auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count(); };
@@ -5607,8 +5698,16 @@ TEST_F(ResourceViewTest, ShrinkTerminalContractRequiresExactHighAndCoversFailedT
     } guard;
     UsageAwareFilter::SetConfig(0.9, 2048, 0);
     struct FenceGuard {
+        int entryState = resource_view::MemoryElasticityFenceOverrideState();
         FenceGuard() { SetMemoryElasticityFenceForTest(true); }
-        ~FenceGuard() { SetMemoryElasticityFenceForTest(false); }
+        ~FenceGuard()
+        {
+            if (entryState < 0) {
+                resource_view::ResetMemoryElasticityFenceOverride();
+            } else {
+                SetMemoryElasticityFenceForTest(entryState != 0);
+            }
+        }
     } fenceGuard;
     auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count(); };
@@ -5824,8 +5923,16 @@ TEST_F(ResourceViewTest, ShrinkTerminalContractRequiresExactHighAndCoversFailedT
 TEST_F(ResourceViewTest, UnitMutationGateBlocksUntilEveryManagedInstanceReconciled)
 {
     struct FenceGuard {
+        int entryState = resource_view::MemoryElasticityFenceOverrideState();
         FenceGuard() { SetMemoryElasticityFenceForTest(true); }
-        ~FenceGuard() { SetMemoryElasticityFenceForTest(false); }
+        ~FenceGuard()
+        {
+            if (entryState < 0) {
+                resource_view::ResetMemoryElasticityFenceOverride();
+            } else {
+                SetMemoryElasticityFenceForTest(entryState != 0);
+            }
+        }
     } fenceGuard;
     auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count(); };

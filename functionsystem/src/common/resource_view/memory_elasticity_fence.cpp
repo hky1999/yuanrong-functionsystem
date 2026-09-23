@@ -32,8 +32,18 @@ bool MemoryElasticityFenceEnabled()
     return overriden >= 0 ? overriden != 0 : MemoryElasticityEnabled();
 }
 
+int MemoryElasticityFenceOverrideState()
+{
+    return g_fenceOverride.load(std::memory_order_relaxed);
+}
+
 void SetMemoryElasticityFenceForTest(bool enabled)
 {
     g_fenceOverride.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+void ResetMemoryElasticityFenceOverride()
+{
+    g_fenceOverride.store(-1, std::memory_order_relaxed);
 }
 }  // namespace functionsystem::resource_view
