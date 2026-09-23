@@ -1925,7 +1925,7 @@ void FunctionAgentMgrActor::ResizeSandboxResponse(const litebus::AID &from, std:
             || response.result().actual().cpu_period_usec() != request.resize().expected().cpu_period_usec()
             || !ResizeReadbackWithinDirection(request.resize(),
                                               response.result().actual().cpu_quota_usec(),
-                                              response.result().actual().memory_limit_bytes())) {
+                                              response.result().actual().memory_limit_bytes()))) {
         response = ResizeTransportResult(request, messages::ResizeSandboxResponse::UNKNOWN,
                                          "resize observed result has no matching physical readback");
     }
