@@ -77,13 +77,18 @@ function install_function_proxy() {
   log_info "start function proxy, proxy_port=${FUNCTION_PROXY_PORT}, grpc_port=${FUNCTION_PROXY_GRPC_PORT}..."
   local bin=${FUNCTION_SYSTEM_DIR}/bin/function_proxy
   # Elasticity-baseline launch configuration (explicit, traceable):
-  #   AKERNEL_MEMORY_ELASTICITY: 1 enables the revision-fenced shrink path.
-  #     Defaults to 0 — absence means OFF; the baseline chart sets 1.
-  #   ENABLE_UPGRADE_LADDER / UPGRADE_STEP_MB / UPGRADE_CAP_MB: the D-3
-  #     growth argv (enable_upgrade_ladder is OFF by default in the binary,
-  #     so an env-only fix leaves PressureMonitor growth disabled; these
-  #     MUST become argv to take effect).
-  AKERNEL_MEMORY_ELASTICITY=${AKERNEL_MEMORY_ELASTICITY:-0}
+  # the deploy launch chain REBUILDS its environment, so container-level
+  # env vars do not survive to the binary. The single authoritative source
+  # is the baked elasticity.env (written by the image build from explicit
+  # baseline inputs; a deployment may override by mounting its own). Values
+  # here are deliberately explicit 0/1|true/false — absence means OFF.
+  local elasticity_env="${FUNCTION_SYSTEM_DIR}/deploy/elasticity.env"
+  if [ -f "${elasticity_env}" ]; then
+    source "${elasticity_env}"
+  else
+    AKERNEL_MEMORY_ELASTICITY=0
+    ENABLE_UPGRADE_LADDER=false
+  fi
   local ladder_args=""
   if [ "${ENABLE_UPGRADE_LADDER:-false}" = "true" ]; then
     ladder_args="--enable_upgrade_ladder=true --upgrade_step_mb=${UPGRADE_STEP_MB:-512} --upgrade_cap_mb=${UPGRADE_CAP_MB:-32768}"
