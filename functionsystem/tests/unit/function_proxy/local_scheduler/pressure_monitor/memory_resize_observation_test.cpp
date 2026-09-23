@@ -1,3 +1,4 @@
+#include "common/resource_view/memory_elasticity_config.h"
 #include <gtest/gtest.h>
 #include "function_proxy/local_scheduler/pressure_monitor/pressure_resize_policy.h"
 
@@ -21,7 +22,7 @@ resources::SandboxResourceSample Sample(uint64_t max)
     s.set_runtime_id("runtime"); s.set_sandbox_id("sandbox"); s.set_resource_generation("generation");
     s.set_resource_revision_known(true); s.set_resource_revision(8); s.set_resource_operation_id("operation");
     s.set_sampled_at_unix_ms(10100); s.set_memory_limit_known(true); s.set_memory_limit_bytes(max);
-    s.set_memory_high_known(true); s.set_memory_high_bytes(static_cast<uint64_t>(0.8 * max / 4096) * 4096);
+    s.set_memory_high_known(true); s.set_memory_high_bytes(functionsystem::resource_view::ExpectedHighBytes(max));
     s.set_cpu_limits_known(true); s.set_cpu_quota_usec(50000); s.set_cpu_period_usec(100000);
     s.set_frozen_known(true); return s;
 }

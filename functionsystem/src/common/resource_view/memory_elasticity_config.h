@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -28,15 +29,27 @@ constexpr int MEMORY_ELASTIC_STATS_INTERVAL_MS = 200;
 inline double MemoryHighRatio()
 {
     static const double ratio = [] {
+        const double fallback = 0.9;
         const char *value = std::getenv("AKERNEL_MEMORY_HIGH_RATIO");
-        if (value == nullptr) {
-            return 0.9;
+        if (value == nullptr || *value == '\0') {
+            return fallback;  // unset is the documented default, not an error
         }
         try {
-            const double parsed = std::stod(value);
-            return parsed >= 0.5 && parsed < 1.0 ? parsed : 0.9;
+            size_t consumed = 0;
+            const double parsed = std::stod(std::string(value), &consumed);
+            const bool whole = consumed == std::string(value).size();
+            if (!whole || !(parsed >= 0.5 && parsed < 1.0)) {
+                std::fprintf(stderr,
+                             "AKERNEL_MEMORY_HIGH_RATIO=%s is malformed or out of [0.5,1); using the 0.9 default\n",
+                             value);
+                return fallback;
+            }
+            return parsed;
         } catch (const std::exception &) {
-            return 0.9;
+            std::fprintf(stderr,
+                         "AKERNEL_MEMORY_HIGH_RATIO=%s is malformed or out of [0.5,1); using the 0.9 default\n",
+                         value);
+            return fallback;
         }
     }();
     return ratio;

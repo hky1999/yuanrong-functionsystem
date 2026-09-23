@@ -4541,8 +4541,10 @@ TEST_F(ResourceViewTest, BindInstanceRuntimeSurvivesDeleteRecreateAndForeignTele
 namespace {
 // MiB helpers keep the credit arithmetic readable against the plan sample.
 constexpr uint64_t MiB(uint64_t value) { return value * 1024ULL * 1024ULL; }
-// The daemon's fixed soft-limit derivation: floor(0.8 * max / 4096) * 4096.
-constexpr uint64_t HighBytes(uint64_t maxBytes) { return (maxBytes * 4 / 5 / 4096) * 4096; }
+// The daemon's soft-limit derivation: floor(0.9 * max / 4096) * 4096 (chart ratio).
+// Keep the test helper pinned to the shared scheduler contract; production
+    // code must use resource_view::ExpectedHighBytes directly.
+    uint64_t HighBytes(uint64_t maxBytes) { return resource_view::ExpectedHighBytes(maxBytes); }
 }  // namespace
 
 TEST_F(ResourceViewTest, ShrinkBudgetTrimsGrowCreditsOnlyAfterConfirmedContract)
@@ -5764,7 +5766,7 @@ TEST_F(ResourceViewTest, ShrinkTerminalContractRequiresExactHighAndCoversFailedT
     EXPECT_TRUE(observeStatus(grow.requestid(), grow, 2, MiB(256), HighBytes(MiB(256)), true).IsOk());
     probeRejected("terminal-held", 800); // 2800 + 128 held
 
-    // A complete readback whose high misses the fixed 0.8 page-aligned value
+    // A complete readback whose high misses the fixed 0.9 page-aligned value
     // does not close the shrink, even with every other field matching.
     auto shrink = buildRequest("terminal-shrink-1", "op-terminal-shrink-1", 2, MiB(256), MiB(128), true);
     EXPECT_TRUE(reserveStatus(shrink).IsOk());
