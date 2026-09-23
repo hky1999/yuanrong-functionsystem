@@ -1860,6 +1860,26 @@ void FunctionAgentMgrActor::OnResizeReserved(const std::string &wireID, const li
     Send(it->second.agent, "ResizeSandbox", forwarded.SerializeAsString());
 }
 
+namespace {
+// A completed readback must lie between the operation's expected and target
+// limits in the operation's own direction: (expected, target] for grow and
+// [target, expected] for shrink. The previous one-sided interval silently
+// downgraded every completed shrink to UNKNOWN.
+bool ResizeReadbackWithinDirection(const runtime::v1::ResizeResourcesRequest &command,
+                                   int64_t cpuQuotaUsec, uint64_t memoryLimitBytes)
+{
+    const auto inRange = [](double value, double a, double b) {
+        return value >= std::min(a, b) && value <= std::max(a, b);
+    };
+    return inRange(static_cast<double>(cpuQuotaUsec),
+                   static_cast<double>(command.expected().cpu_quota_usec()),
+                   static_cast<double>(command.target().cpu_quota_usec()))
+        && inRange(static_cast<double>(memoryLimitBytes),
+                   static_cast<double>(command.expected().memory_limit_bytes()),
+                   static_cast<double>(command.target().memory_limit_bytes()));
+}
+}
+
 void FunctionAgentMgrActor::ResizeSandboxResponse(const litebus::AID &from, std::string &&, std::string &&msg)
 {
     messages::ResizeSandboxResponse response;
@@ -1903,10 +1923,9 @@ void FunctionAgentMgrActor::ResizeSandboxResponse(const litebus::AID &from, std:
             || response.result().actual().memory_limit_bytes()
                 > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
             || response.result().actual().cpu_period_usec() != request.resize().expected().cpu_period_usec()
-            || response.result().actual().cpu_quota_usec() < request.resize().expected().cpu_quota_usec()
-            || response.result().actual().cpu_quota_usec() > request.resize().target().cpu_quota_usec()
-            || response.result().actual().memory_limit_bytes() < request.resize().expected().memory_limit_bytes()
-            || response.result().actual().memory_limit_bytes() > request.resize().target().memory_limit_bytes())) {
+            || !ResizeReadbackWithinDirection(request.resize(),
+                                              response.result().actual().cpu_quota_usec(),
+                                              response.result().actual().memory_limit_bytes())) {
         response = ResizeTransportResult(request, messages::ResizeSandboxResponse::UNKNOWN,
                                          "resize observed result has no matching physical readback");
     }
