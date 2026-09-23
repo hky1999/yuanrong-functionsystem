@@ -245,6 +245,14 @@ private:
     void SendStopInstanceResponse(const litebus::AID &from, const std::string &runtimeID,
                                   const std::shared_ptr<messages::StopInstanceResponse> &response);
 
+    // Fault-test helper (RetireFaultGate): end of the bounded stop-point on
+    // the ORIGINAL retirement receipt — Drop only for a timely exact
+    // confirmation, otherwise send the original message exactly once.
+    void ResolveHeldRetireReceipt(const std::shared_ptr<litebus::AID> &from,
+                                  const std::shared_ptr<std::string> &payload,
+                                  const std::string &sandboxID, const std::string &generation,
+                                  const std::string &requestID, const std::string &runtimeID);
+
     void OnGetRuntimeStatus(const litebus::AID &from, const std::shared_ptr<messages::StopInstanceRequest> &request,
                             const std::shared_ptr<messages::StopInstanceResponse> &response,
                             const litebus::Future<Status> &instanceStatus);

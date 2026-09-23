@@ -1124,23 +1124,66 @@ void RuntimeManager::SendStopInstanceResponse(const litebus::AID &from, const st
             (void)instanceInfoMap_.erase(iter);
         }
     }
-    // Physical fault-test hook (default off): suppress exactly one confirmed
-    // retirement receipt travelling upstream after sandboxd durably completed
-    // the delete, matching the exact operation identity (sandbox + generation
-    // + this response's request id). The durable receipt stays in sandboxd;
-    // the caller's retry with the same identity must replay it and settle
-    // exactly once.
-    if (response->physical_retirement_confirmed()
-        && RetireFaultGate::Instance().DropReceiptIfMatched(response->retired_sandbox_id(),
-                                                           response->retired_resource_generation(),
-                                                           response->requestid())) {
-        YRLOG_WARN("{}|retire-fault: dropping confirmed retirement receipt for runtime({}) sandbox({}) "
-                   "generation({}); caller retry must replay the durable receipt",
-                   response->requestid(), runtimeID, response->retired_sandbox_id(),
-                   response->retired_resource_generation());
-        return;
+    // Physical fault-test hook (default off): bounded stop-point on the
+    // ORIGINAL confirmed retirement receipt BEFORE its first upstream send,
+    // matching the exact operation identity (sandbox + generation + this
+    // response's request id). Once the first confirmed receipt travels, the
+    // budget may already settle upstream — so the prepare form holds THIS
+    // message (0 sends) and only a timely exact confirmation drops it (the
+    // durable receipt stays in sandboxd; the caller's retry replays it and
+    // settles exactly once); an unconfirmed or out-of-window stop-point sends
+    // the ORIGINAL message unchanged (exactly one send).
+    if (response->physical_retirement_confirmed()) {
+        const auto receiptGate = RetireFaultGate::Instance().DropReceiptIfMatched(
+            response->retired_sandbox_id(), response->retired_resource_generation(),
+            response->requestid());
+        if (receiptGate == RetireFaultGate::ReceiptDecision::Drop) {
+            YRLOG_WARN("{}|retire-fault: dropping confirmed retirement receipt for runtime({}) "
+                       "sandbox({}) generation({}); caller retry must replay the durable receipt",
+                       response->requestid(), runtimeID, response->retired_sandbox_id(),
+                       response->retired_resource_generation());
+            return;
+        }
+        if (receiptGate == RetireFaultGate::ReceiptDecision::HoldForConfirm) {
+            const auto state = RetireFaultGate::Instance().GetStateForTest();
+            YRLOG_WARN("{}|retire-fault: holding ORIGINAL retirement receipt for runtime({}) "
+                       "sandbox({}) generation({}) up to {}ms for exact confirmation "
+                       "(0 sends until then)",
+                       response->requestid(), runtimeID, response->retired_sandbox_id(),
+                       response->retired_resource_generation(), state.holdMs);
+            auto heldFrom = std::make_shared<litebus::AID>(from);
+            auto heldPayload = std::make_shared<std::string>(response->SerializeAsString());
+            litebus::AsyncAfter(state.holdMs, GetAID(),
+                                &RuntimeManager::ResolveHeldRetireReceipt, heldFrom,
+                                heldPayload, response->retired_sandbox_id(),
+                                response->retired_resource_generation(), response->requestid(),
+                                runtimeID);
+            return;
+        }
     }
     Send(from, "StopInstanceResponse", response->SerializeAsString());
+}
+
+void RuntimeManager::ResolveHeldRetireReceipt(
+    const std::shared_ptr<litebus::AID> &from, const std::shared_ptr<std::string> &payload,
+    const std::string &sandboxID, const std::string &generation,
+    const std::string &requestID, const std::string &runtimeID)
+{
+    // End of the bounded receipt stop-point: Drop only for a timely exact
+    // confirmation; otherwise the ORIGINAL message is sent exactly once.
+    const auto resolved = RetireFaultGate::Instance().ResolveReceipt(sandboxID, generation,
+                                                                     requestID);
+    if (resolved == RetireFaultGate::ReceiptDecision::Drop) {
+        YRLOG_WARN("{}|retire-fault: confirmation held the ORIGINAL retirement receipt for "
+                   "runtime({}) sandbox({}) generation({}); durable receipt remains in "
+                   "sandboxd for the caller's replay",
+                   requestID, runtimeID, sandboxID, generation);
+        return;
+    }
+    YRLOG_INFO("{}|retire-fault: stop-point released, sending ORIGINAL retirement receipt "
+               "for runtime({}) sandbox({})",
+               requestID, runtimeID, sandboxID);
+    Send(*from, "StopInstanceResponse", *payload);
 }
 }
 

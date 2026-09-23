@@ -109,18 +109,32 @@ void RetireFaultGate::ArmLocked(const std::string &specJson)
             operationID_ = operation;
             holdMs_ = 0;
         }
+        // Window freeze: when an exact spec REPLACES a held prepare for the
+        // same action+identity (the confirmation), the frozen prep-window
+        // deadline survives so a late dispatch cannot apply it out of
+        // window. Any other arm leaves the prepare lineage.
+        const bool confirmOfHeldPrep = (mode_ == "exact" && fromPrepConfirm_ == false
+                                        && prepWindowDeadlineUnixMs_ > 0
+                                        && action_ == action && sandboxID_ == sandbox
+                                        && generation_ == generation);
         action_ = action;
         sandboxID_ = sandbox;
         generation_ = generation;
         delayMs_ = delayMs;
         deadlineUnixMs_ = deadlineUnixMs;
-        prepDeadlineUnixMs_ = 0;
+        if (!confirmOfHeldPrep) {
+            prepWindowDeadlineUnixMs_ = 0;
+            fromPrepConfirm_ = false;
+        } else {
+            fromPrepConfirm_ = true;
+        }
         enabled_ = true;
         consumed_ = false;  // fresh one-shot replaces the spent/prepare spec
         YRLOG_WARN("retire-fault gate ARMED mode({}) action({}) sandbox({}) generation({}) "
-                   "operation({}) delay_ms({}) hold_ms({}) deadline_unix_ms({})",
+                   "operation({}) delay_ms({}) hold_ms({}) deadline_unix_ms({}) "
+                   "prep_window_deadline_unix_ms({}) from_prep_confirm({})",
                    mode_, action_, sandboxID_, generation_, operationID_, delayMs_, holdMs_,
-                   deadlineUnixMs_);
+                   deadlineUnixMs_, prepWindowDeadlineUnixMs_, fromPrepConfirm_);
     } catch (const std::exception &error) {
         YRLOG_WARN("retire-fault gate spec unparsable, staying disabled: {}", error.what());
     }
@@ -151,7 +165,8 @@ void RetireFaultGate::DisarmLocked(const char *reason)
     delayMs_ = 0;
     deadlineUnixMs_ = 0;
     holdMs_ = 0;
-    prepDeadlineUnixMs_ = 0;
+    prepWindowDeadlineUnixMs_ = 0;
+    fromPrepConfirm_ = false;
     YRLOG_WARN("retire-fault gate DISARMED reason({})", reason);
 }
 
@@ -193,7 +208,8 @@ RetireFaultGate::State RetireFaultGate::GetStateForTest() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     return State{ mode_, action_, sandboxID_, generation_, operationID_, delayMs_,
-                  deadlineUnixMs_, holdMs_, enabled_, consumed_ };
+                  deadlineUnixMs_, holdMs_, prepWindowDeadlineUnixMs_, fromPrepConfirm_,
+                  enabled_, consumed_ };
 }
 
 bool RetireFaultGate::ConsumeExactLocked(const char *action, const std::string &sandboxID,
@@ -208,7 +224,18 @@ bool RetireFaultGate::ConsumeExactLocked(const char *action, const std::string &
         || operationID_ != operationID) {
         return false;  // exact operation identity only: neighbours never match
     }
-    if (NowUnixMs() > deadlineUnixMs_) {
+    const int64_t now = NowUnixMs();
+    if (fromPrepConfirm_ && now > prepWindowDeadlineUnixMs_) {
+        // The exact spec is a confirmation of a held prepare, and the event
+        // loop reached this message only after the frozen window closed:
+        // the confirmation is out of window and must NOT fire.
+        consumed_ = true;
+        YRLOG_WARN("retire-fault gate PREP_WINDOW_EXPIRED action({}) sandbox({}) "
+                   "generation({}) operation({}) window_deadline_unix_ms({})",
+                   action_, sandboxID_, generation_, operationID_, prepWindowDeadlineUnixMs_);
+        return false;
+    }
+    if (now > deadlineUnixMs_) {
         consumed_ = true;
         YRLOG_WARN("retire-fault gate EXPIRED action({}) sandbox({}) generation({}) "
                    "operation({}) deadline_unix_ms({})",
@@ -241,17 +268,19 @@ RetireFaultGate::BlockDecision RetireFaultGate::BlockDeleteIfMatched(
     if (enabled_ && !consumed_ && mode_ == "prep_wait" && action_ == "block_delete"
         && sandboxID_ == sandboxID && generation_ == generation && NowUnixMs() <= deadlineUnixMs_) {
         // Bounded confirmation stop-point: capture the unpredictable
-        // operation id, hold the message for holdMs_, and apply the fault
-        // only if an exact confirmation naming this id arrives in the window.
+        // operation id, freeze the window, hold the message for holdMs_, and
+        // apply the fault only if an exact confirmation naming this id
+        // arrives INSIDE the frozen window.
         mode_ = "prep_held";
         operationID_ = operationID;
-        prepDeadlineUnixMs_ = NowUnixMs() + holdMs_;
+        prepWindowDeadlineUnixMs_ = NowUnixMs() + holdMs_;
+        fromPrepConfirm_ = false;
         decision.decision = Decision::MatchPrepare;
         decision.holdMs = holdMs_;
         YRLOG_WARN("retire-fault gate PREPARED(block) sandbox({}) generation({}) "
-                   "operation({}) hold_ms({}) — confirm via control file with this exact "
-                   "operation id within the window",
-                   sandboxID_, generation_, operationID_, holdMs_);
+                   "operation({}) hold_ms({}) window_deadline_unix_ms({}) — confirm via "
+                   "control file with this exact operation id within the window",
+                   sandboxID_, generation_, operationID_, holdMs_, prepWindowDeadlineUnixMs_);
         return decision;
     }
     return decision;
@@ -266,7 +295,8 @@ RetireFaultGate::BlockDecision RetireFaultGate::ResolveBlock(
     BlockDecision decision;
     int64_t delayMs = 0;
     if (ConsumeExactLocked("block_delete", sandboxID, generation, operationID, delayMs)) {
-        // confirmed during the hold: apply the fault to THIS held message
+        // confirmed INSIDE the frozen window: apply the fault to THIS held
+        // message (ConsumeExactLocked rejects out-of-window confirmations)
         decision.decision = Decision::MatchExact;
         decision.delayMs = delayMs;
         return decision;
@@ -283,40 +313,60 @@ RetireFaultGate::BlockDecision RetireFaultGate::ResolveBlock(
     return decision;  // NoMatch: pass the held message through, bounded
 }
 
-bool RetireFaultGate::DropReceiptIfMatched(const std::string &sandboxID,
-                                           const std::string &generation,
-                                           const std::string &operationID)
+RetireFaultGate::ReceiptDecision RetireFaultGate::DropReceiptIfMatched(
+    const std::string &sandboxID, const std::string &generation,
+    const std::string &operationID)
 {
     RefreshFromControlFile();
     std::lock_guard<std::mutex> lock(mutex_);
     int64_t delayMs = 0;
     if (ConsumeExactLocked("drop_receipt", sandboxID, generation, operationID, delayMs)) {
-        return true;
+        return ReceiptDecision::Drop;
     }
     if (enabled_ && !consumed_ && mode_ == "prep_wait" && action_ == "drop_receipt"
         && sandboxID_ == sandboxID && generation_ == generation && NowUnixMs() <= deadlineUnixMs_) {
-        // Capture WITHOUT suppressing: the durable receipt replays, so only a
-        // confirmed exact spec drops a later message carrying this id. The
-        // first message always travels — nothing is lost if no confirmation
-        // arrives.
+        // Hold the ORIGINAL receipt BEFORE its first upstream send: once the
+        // first confirmed receipt travels, the budget may already settle
+        // upstream and dropping a later replay proves nothing about
+        // "deleted but unsettled". The caller keeps this message and calls
+        // ResolveReceipt when the frozen window closes.
         mode_ = "prep_held";
         operationID_ = operationID;
-        prepDeadlineUnixMs_ = NowUnixMs() + holdMs_;
+        prepWindowDeadlineUnixMs_ = NowUnixMs() + holdMs_;
+        fromPrepConfirm_ = false;
         YRLOG_WARN("retire-fault gate PREPARED(receipt) sandbox({}) generation({}) "
-                   "operation({}) hold_ms({}) — first receipt passes; confirm via control "
-                   "file with this exact operation id to drop its replay",
-                   sandboxID_, generation_, operationID_, holdMs_);
-        return false;
+                   "operation({}) hold_ms({}) window_deadline_unix_ms({}) — original "
+                   "receipt held before first send; confirm via control file with this "
+                   "exact operation id within the window to drop it",
+                   sandboxID_, generation_, operationID_, holdMs_, prepWindowDeadlineUnixMs_);
+        return ReceiptDecision::HoldForConfirm;
+    }
+    return ReceiptDecision::Send;
+}
+
+RetireFaultGate::ReceiptDecision RetireFaultGate::ResolveReceipt(
+    const std::string &sandboxID, const std::string &generation,
+    const std::string &operationID)
+{
+    RefreshFromControlFile();  // may have applied the exact confirmation
+    std::lock_guard<std::mutex> lock(mutex_);
+    int64_t delayMs = 0;
+    if (ConsumeExactLocked("drop_receipt", sandboxID, generation, operationID, delayMs)) {
+        // confirmed INSIDE the frozen window: the ORIGINAL receipt is dropped
+        // (0 upstream sends); the durable receipt stays in sandboxd and the
+        // caller's retry replays it to settle exactly once.
+        return ReceiptDecision::Drop;
     }
     if (enabled_ && mode_ == "prep_held" && action_ == "drop_receipt"
         && sandboxID_ == sandboxID && generation_ == generation
-        && operationID_ == operationID && NowUnixMs() > prepDeadlineUnixMs_) {
+        && operationID_ == operationID) {
         YRLOG_WARN("retire-fault gate PREP_EXPIRED(receipt) sandbox({}) generation({}) "
-                   "operation({}): no exact confirmation within hold_ms({})",
+                   "operation({}): no exact confirmation within hold_ms({}), original "
+                   "receipt is sent unchanged",
                    sandboxID_, generation_, operationID_, holdMs_);
         DisarmLocked("prepare-window-elapsed");
     }
-    return false;
+    return ReceiptDecision::Send;  // exactly one send: the ORIGINAL message
 }
 
 }  // namespace functionsystem::runtime_manager

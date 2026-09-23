@@ -85,6 +85,8 @@ public:
         int64_t delayMs{ 0 };
         int64_t deadlineUnixMs{ 0 };
         int64_t holdMs{ 0 };
+        int64_t prepWindowDeadlineUnixMs{ 0 };  // frozen at capture
+        bool fromPrepConfirm{ false };          // exact spec came from a confirm
         bool enabled{ false };
         bool consumed{ false };
     };
@@ -99,15 +101,24 @@ public:
                                        const std::string &operationID);
     // Resolution at the END of the prepare hold: MatchExact applies the
     // confirmed fault (delayMs); NoMatch passes the held message through.
+    // A confirmation arriving after the PREP WINDOW elapsed is rejected even
+    // though it names the right operation: the window identity/deadline are
+    // frozen at capture and survive the confirmation arm.
     BlockDecision ResolveBlock(const std::string &sandboxID, const std::string &generation,
                                const std::string &operationID);
 
-    // Receipt send: exact match suppresses this one confirmed receipt. A
-    // prepare-armed gate captures the operation id WITHOUT suppressing (the
-    // durable receipt replays; only a confirmed exact spec drops a later
-    // message carrying the captured id).
-    bool DropReceiptIfMatched(const std::string &sandboxID, const std::string &generation,
-                              const std::string &operationID);
+    // Receipt send point. Send: pass the message upstream unchanged.
+    // HoldForConfirm: prepare capture — the caller MUST NOT send, MUST keep
+    // the ORIGINAL message, and MUST call ResolveReceipt after holdMs.
+    // Drop: suppress this message (exact confirmed match).
+    enum class ReceiptDecision { Send, HoldForConfirm, Drop };
+    ReceiptDecision DropReceiptIfMatched(const std::string &sandboxID, const std::string &generation,
+                                         const std::string &operationID);
+    // Resolution at the end of the receipt stop-point: Drop only for an
+    // exact confirmation that arrived INSIDE the frozen prep window; Send
+    // otherwise (the caller then sends the ORIGINAL message exactly once).
+    ReceiptDecision ResolveReceipt(const std::string &sandboxID, const std::string &generation,
+                                   const std::string &operationID);
 
 private:
     bool ConsumeExactLocked(const char *action, const std::string &sandboxID,
@@ -127,7 +138,12 @@ private:
     int64_t delayMs_{ 0 };
     int64_t deadlineUnixMs_{ 0 };
     int64_t holdMs_{ 0 };
-    int64_t prepDeadlineUnixMs_{ 0 };
+    // Frozen prepare-window identity/deadline: captured when the stop-point
+    // holds a message, PRESERVED when the confirmation arms the exact spec
+    // (so a late event-loop dispatch can never apply an out-of-window
+    // confirm), cleared only when the gate leaves the prepare lineage.
+    int64_t prepWindowDeadlineUnixMs_{ 0 };
+    bool fromPrepConfirm_{ false };
     bool enabled_{ false };
     bool consumed_{ false };
     std::string lastControlContent_;  // last APPLIED control-file content
