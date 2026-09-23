@@ -12,16 +12,21 @@
  */
 
 // Success -> unknown (empty reply / unknown sample / bad JSON) -> recovery
-// through the REAL ExternalSystem CPU/Memory collectors: an unknown
-// observation yields no usage, no limit and no collection clock, so stale
-// usage can never be stamped as a fresh node sample.
+// through the REAL ExternalSystem CPU/Memory collectors and the REAL
+// MetricsActor::BuildResourceUnitWithSystem: an unknown observation yields
+// no usage entry and no sample clock (capacity is retained), so stale
+// usage can never refresh admission freshness and CheckResourceHeadroom
+// rejects until a fresh known observation arrives.
 #include "runtime_manager/metrics/collector/external_system_collector.h"
+#include "runtime_manager/metrics/metrics_actor.h"
+#include "common/resource_view/restore_admission.h"
 #include <gtest/gtest.h>
 
 namespace functionsystem::test {
 namespace {
 using runtime_manager::ExternalSystemCPUCollector;
 using runtime_manager::ExternalSystemMemoryCollector;
+using runtime_manager::MetricsActor;
 
 std::function<litebus::Future<std::string>()> Reply(const std::string &payload)
 {
@@ -32,70 +37,123 @@ std::function<litebus::Future<std::string>()> Reply(const std::string &payload)
     };
 }
 
+// 201326592 bytes = exactly 192 MiB total; usedMem 8 MiB / 16 MiB.
 const char *kKnownA =
-    R"({"cpu":99,"mem":194347270144,"totalCpu":104,"totalMem":201220395008,"usedCpu":2.5,"usedMem":8388608,"usedKnown":true})";
+    R"({"cpu":99,"mem":194347270144,"totalCpu":104,"totalMem":201326592,"usedCpu":2.5,"usedMem":8388608,"usedKnown":true})";
 const char *kKnownB =
-    R"({"cpu":99,"mem":194347270144,"totalCpu":104,"totalMem":201220395008,"usedCpu":4.125,"usedMem":16777216,"usedKnown":true})";
+    R"({"cpu":99,"mem":194347270144,"totalCpu":104,"totalMem":201326592,"usedCpu":4.125,"usedMem":16777216,"usedKnown":true})";
 
-TEST(ExternalCollectorUnknownPropagation, RealMemoryCollectorUnknownShapesCarryNoClock)
+std::shared_ptr<MetricsActor> UnitBuilder()
+{
+    // BuildResourceUnitWithSystem only reads the metric futures; a bare
+    // actor instance suffices (no Init, no loops).
+    return std::make_shared<MetricsActor>("unknown-propagation-test");
+}
+
+resources::ResourceUnit BuildUnit(const std::vector<litebus::Future<Metrics>> &futures)
+{
+    return UnitBuilder()->BuildResourceUnitWithSystem(futures);
+}
+
+struct AdmissionGuard {
+    resource_view::UsageAdmissionSettings saved = resource_view::GetUsageAdmissionSettings();
+    ~AdmissionGuard() { resource_view::SetUsageAdmissionSettings(saved.safety, saved.floorMb, saved.maxInstances); }
+};
+
+TEST(ExternalCollectorUnknownPropagation, RealMemoryCollectorUnknownShapesCarryNoUsage)
 {
     const char *unknownShapes[] = {
         "", // transport error or daemon 503 mapped to empty
         R"({"cpu":99,"mem":194347270144})", // legacy available-only
-        R"({"totalCpu":104,"totalMem":201220395008,"usedCpu":2.5,"usedKnown":true})", // partial
-        R"({"totalCpu":104,"totalMem":201220395008,"usedCpu":2.5,"usedMem":8,"usedKnown":false})",
+        R"({"totalCpu":104,"totalMem":201326592,"usedCpu":2.5,"usedKnown":true})", // partial
+        R"({"totalCpu":104,"totalMem":201326592,"usedCpu":2.5,"usedMem":8,"usedKnown":false})",
         "not-json",
     };
     for (const auto *shape : unknownShapes) {
         ExternalSystemMemoryCollector collector(Reply(shape));
         auto metrics = collector.GetMetrics();
         ASSERT_TRUE(metrics.IsOK()) << shape;
-        // Unknown: no usage, no limit, NO collection clock.
+        // Unknown observation: no usage value. (The collection timestamp
+        // measures when this collection ran, not sample freshness; the
+        // binding contract is the unit sample clock below.)
         EXPECT_TRUE(metrics.Get().usage.IsNone()) << shape;
-        EXPECT_TRUE(metrics.Get().limit.IsNone()) << shape;
-        EXPECT_EQ(metrics.Get().collectionStartUnixMs, 0) << shape;
+        auto unit = BuildUnit({metrics.Get()});
+        EXPECT_EQ(unit.memory_sample_unix_ms(), 0) << "unknown must not stamp a sample clock: " << shape;
+        EXPECT_FALSE(unit.actualuse().resources().contains(resource_view::MEMORY_RESOURCE_NAME))
+            << "no fabricated usage entry: " << shape;
     }
 }
 
-TEST(ExternalCollectorUnknownPropagation, RealMemoryCollectorSuccessUnknownRecovery)
+TEST(ExternalCollectorUnknownPropagation, MemoryUnknownThenRecoveryThroughAdmission)
 {
-    ExternalSystemMemoryCollector collector(Reply(kKnownA));
-    auto known = collector.GetMetrics();
-    ASSERT_TRUE(known.IsOK());
-    EXPECT_DOUBLE_EQ(known.Get().usage.Get(), 8.0); // 8 MiB used
-    EXPECT_DOUBLE_EQ(known.Get().limit.Get(), 192.0); // total MiB
-    EXPECT_GT(known.Get().collectionStartUnixMs, 0);
+    AdmissionGuard guard;
+    resource_view::SetUsageAdmissionSettings(0.95, 2048, 0);
+    const resource_view::AdmissionReserve reserve{500, 16};
 
-    // A stale previous_ must NOT leak into an unknown observation (the
-    // old bug returned *previous with a fresh wall clock).
+    ExternalSystemMemoryCollector collector(Reply(kKnownA));
+    auto knownMetrics = collector.GetMetrics();
+    ASSERT_TRUE(knownMetrics.IsOK());
+    EXPECT_DOUBLE_EQ(knownMetrics.Get().usage.Get(), 8.0);
+    auto knownUnit = BuildUnit({knownMetrics.Get()});
+    EXPECT_GT(knownUnit.memory_sample_unix_ms(), 0);
+    // Known fresh sample with tiny usage: headroom passes.
+    EXPECT_TRUE(resource_view::CheckResourceHeadroom(knownUnit, reserve).IsOk());
+
+    // Unknown (empty reply = 503/transport): no usage, no clock; the
+    // stale previous_ from the known phase must NOT leak back in.
     collector.SetTestTransport(Reply(""));
-    auto unknown = collector.GetMetrics();
-    ASSERT_TRUE(unknown.IsOK());
-    EXPECT_TRUE(unknown.Get().usage.IsNone());
-    EXPECT_TRUE(unknown.Get().limit.IsNone());
-    EXPECT_EQ(unknown.Get().collectionStartUnixMs, 0);
+    auto unknownMetrics = collector.GetMetrics();
+    ASSERT_TRUE(unknownMetrics.IsOK());
+    EXPECT_TRUE(unknownMetrics.Get().usage.IsNone());
+    auto unknownUnit = BuildUnit({unknownMetrics.Get()});
+    EXPECT_EQ(unknownUnit.memory_sample_unix_ms(), 0);
+    EXPECT_FALSE(unknownUnit.actualuse().resources().contains(resource_view::MEMORY_RESOURCE_NAME));
+    // Stale/absent fresh sample: admission must reject.
+    EXPECT_FALSE(resource_view::CheckResourceHeadroom(unknownUnit, reserve).IsOk());
 
     // Recovery with DIFFERENT values proves a fresh observation.
     collector.SetTestTransport(Reply(kKnownB));
-    auto recovered = collector.GetMetrics();
-    ASSERT_TRUE(recovered.IsOK());
-    EXPECT_DOUBLE_EQ(recovered.Get().usage.Get(), 16.0);
-    EXPECT_DOUBLE_EQ(recovered.Get().limit.Get(), 192.0);
-    EXPECT_GT(recovered.Get().collectionStartUnixMs, 0);
+    auto recoveredMetrics = collector.GetMetrics();
+    ASSERT_TRUE(recoveredMetrics.IsOK());
+    EXPECT_DOUBLE_EQ(recoveredMetrics.Get().usage.Get(), 16.0);
+    auto recoveredUnit = BuildUnit({recoveredMetrics.Get()});
+    EXPECT_GT(recoveredUnit.memory_sample_unix_ms(), 0);
+    EXPECT_TRUE(resource_view::CheckResourceHeadroom(recoveredUnit, reserve).IsOk());
 }
 
-TEST(ExternalCollectorUnknownPropagation, RealCPUCollectorSameContract)
+TEST(ExternalCollectorUnknownPropagation, CpuUnknownKeepsContractAndRecoversNewValue)
 {
-    ExternalSystemCPUCollector collector(Reply(kKnownA));
-    auto known = collector.GetMetrics();
-    ASSERT_TRUE(known.IsOK());
-    EXPECT_TRUE(known.Get().usage.IsSome());
+    AdmissionGuard guard;
+    resource_view::SetUsageAdmissionSettings(0.95, 2048, 0);
+    const resource_view::AdmissionReserve reserve{500, 16};
 
-    collector.SetTestTransport(Reply(R"({"usedKnown":false})"));
-    auto unknown = collector.GetMetrics();
-    ASSERT_TRUE(unknown.IsOK());
-    EXPECT_TRUE(unknown.Get().usage.IsNone());
-    EXPECT_EQ(unknown.Get().collectionStartUnixMs, 0);
+    ExternalSystemCPUCollector cpu(Reply(kKnownA));
+    ExternalSystemMemoryCollector mem(Reply(kKnownA));
+    auto cpuKnown = cpu.GetMetrics();
+    auto memKnown = mem.GetMetrics();
+    ASSERT_TRUE(cpuKnown.IsOK() && memKnown.IsOK());
+    auto unit = BuildUnit({cpuKnown.Get(), memKnown.Get()});
+    EXPECT_GT(unit.cpu_sample_unix_ms(), 0);
+    EXPECT_GT(unit.memory_sample_unix_ms(), 0);
+    EXPECT_TRUE(resource_view::CheckResourceHeadroom(unit, reserve).IsOk());
+
+    // Only CPU unknown: CPU clock drops to 0 -> admission rejects.
+    cpu.SetTestTransport(Reply(R"({"usedKnown":false})"));
+    auto cpuUnknown = cpu.GetMetrics();
+    ASSERT_TRUE(cpuUnknown.IsOK());
+    EXPECT_TRUE(cpuUnknown.Get().usage.IsNone());
+    auto cpuUnknownUnit = BuildUnit({cpuUnknown.Get(), memKnown.Get()});
+    EXPECT_EQ(cpuUnknownUnit.cpu_sample_unix_ms(), 0);
+    EXPECT_GT(cpuUnknownUnit.memory_sample_unix_ms(), 0);
+    EXPECT_FALSE(resource_view::CheckResourceHeadroom(cpuUnknownUnit, reserve).IsOk());
+
+    // CPU recovers with a DIFFERENT value: fresh clock and pass.
+    cpu.SetTestTransport(Reply(kKnownB));
+    auto cpuRecovered = cpu.GetMetrics();
+    ASSERT_TRUE(cpuRecovered.IsOK());
+    auto recoveredUnit = BuildUnit({cpuRecovered.Get(), memKnown.Get()});
+    EXPECT_GT(recoveredUnit.cpu_sample_unix_ms(), 0);
+    EXPECT_TRUE(resource_view::CheckResourceHeadroom(recoveredUnit, reserve).IsOk());
 }
 
 }  // namespace

@@ -151,6 +151,12 @@ public:
     void SetRuntimeMemoryExceedLimitCallback(
         const RuntimeMemoryExceedLimitCallbackFunc &runtimeMemoryExceedLimitCallback);
 
+    // Public for tests: the unknown-observation contract (no usage entry,
+    // no sample clock, capacity retained) is verified on the real unit
+    // builder without standing up the whole actor.
+    resources::ResourceUnit BuildResourceUnitWithSystem(const std::vector<litebus::Future<Metrics>> &metricses);
+    static resources::Value_Type resourceValueTypeFor(const Metrics &metrics);
+
 protected:
     std::vector<int> cardIDs_;
     void Init() override;
@@ -161,7 +167,6 @@ protected:
     virtual std::string BuildUpdateMetricsRequest(const std::vector<litebus::Future<Metrics>> &metricses);
     resources::ResourceUnit BuildResourceUnit(const std::vector<litebus::Future<Metrics>> &metricses);
     resources::ResourceUnit BuildResourceUnitWithInstance(const std::vector<litebus::Future<Metrics>> &metricses);
-    resources::ResourceUnit BuildResourceUnitWithSystem(const std::vector<litebus::Future<Metrics>> &metricses);
 private:
     void CollectAndPublish(bool resources);
     void OnMetricsCollected(bool resources, uint64_t epoch, const std::list<Metrics> &values, bool success,
