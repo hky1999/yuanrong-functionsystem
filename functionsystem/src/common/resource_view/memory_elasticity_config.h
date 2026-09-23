@@ -72,10 +72,10 @@ inline double MemoryHighRatio()
 // below the limit (limit-1). Results below one page keep their byte value
 // (the daemon only aligns once a full page is reached); zero is only for a
 // zero limit. The protocol page must equal the kernel page the daemon
-// reads via os.Getpagesize(); this side verifies the running kernel's page
-// size at process start (ProtocolPageSize below) and refuses to arm the
-// contract checks when it differs from 4096 instead of silently settling
-// on a wrong alignment.
+// reads via os.Getpagesize(); this deployment round pins 4096 and audits
+// the live kernel page at process start (ProtocolPageSize below, logged by
+// the proxy startup audit). A mismatch is observable evidence, not a hard
+// startup refusal in this round.
 inline uint64_t ExpectedHighBytes(uint64_t maxBytes)
 {
     constexpr uint64_t kSafeMax = (1ULL << 62) / 4;
