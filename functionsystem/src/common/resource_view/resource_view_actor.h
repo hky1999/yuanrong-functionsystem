@@ -317,6 +317,10 @@ public:
     // EntryOutstanding, and the legacy CommitmentLedger per real unit id
     // with its enabled state. Startup + periodic; never a writer.
     void LogResourceInventory();
+    // Owning timer for the self-rescheduling inventory; Finalize cancels it
+    // so a rebuilt same-AID actor can never inherit a stale callback.
+    litebus::Timer inventoryTimer_{};
+    bool inventoryScheduled_ = false;
 
     // for test
     [[maybe_unused]] void SetEnableTenantAffinity(bool enable)

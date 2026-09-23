@@ -129,6 +129,10 @@ void ResourceViewActor::Init()
 
 void ResourceViewActor::Finalize()
 {
+    if (inventoryScheduled_) {
+        litebus::TimerTools::Cancel(inventoryTimer_);
+        inventoryScheduled_ = false;
+    }
     if (snapshotFlushScheduled_) {
         litebus::TimerTools::Cancel(snapshotFlushTimer_);
         snapshotFlushScheduled_ = false;
@@ -228,9 +232,18 @@ void ResourceViewActor::LogResourceInventory()
     YRLOG_INFO("resource-inventory {}", snapshot.dump());
     YRLOG_INFO("resource-inventory-end snapshot_id={} entries={}", snapshotId, resizeEntries);
     // Self-rescheduling read-only snapshot; cadence chosen to land inside
-    // the pre-retirement credit window. Finalize stops the chain: the actor
-    // scheduler will not run the callback once the actor is destroyed.
-    litebus::AsyncAfter(std::chrono::seconds(15), GetAID(), &ResourceViewActor::LogResourceInventory);
+    // the pre-retirement credit window. The timer is OWNED (canceled in
+    // Finalize) so a rebuilt same-AID actor never inherits the callback.
+    // Freshness contract: each snapshot carries its own snapshot_unix_ms;
+    // a pre-retirement credit claim must cite a snapshot whose age is
+    // within the collector's freshness bound — an aged positive credit is
+    // NOT a deletion-time credit.
+    if (inventoryScheduled_) {
+        litebus::TimerTools::Cancel(inventoryTimer_);
+    }
+    inventoryTimer_ = litebus::AsyncAfter(std::chrono::seconds(15), GetAID(),
+                                           &ResourceViewActor::LogResourceInventory);
+    inventoryScheduled_ = true;
 }
 
 ResourceViewActor::SnapshotMutationGuard::SnapshotMutationGuard(ResourceViewActor &actor) : actor_(actor)
