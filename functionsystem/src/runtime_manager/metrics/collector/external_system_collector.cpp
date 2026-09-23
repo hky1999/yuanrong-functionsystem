@@ -222,6 +222,50 @@ litebus::Future<std::string> ExternalSystemCollector::CollectFromExternal() cons
     return litebus::Async(curlActorRef_->GetAID(), &CurlHelper::Query);
 }
 
+// Test-transport constructors delegate to the full constructor so
+// previous_/total_ keep their real initialization.
+ExternalSystemCPUCollector::ExternalSystemCPUCollector(
+    const std::function<litebus::Future<std::string>()> &transport)
+    : ExternalSystemCPUCollector(0, litebus::ActorReference{})
+{
+    testTransport_ = transport;
+}
+
+ExternalSystemMemoryCollector::ExternalSystemMemoryCollector(
+    const std::function<litebus::Future<std::string>()> &transport)
+    : ExternalSystemMemoryCollector(0, litebus::ActorReference{})
+{
+    testTransport_ = transport;
+}
+
+void ExternalSystemCPUCollector::SetTestTransport(
+    const std::function<litebus::Future<std::string>()> &transport)
+{
+    testTransport_ = transport;
+}
+
+void ExternalSystemMemoryCollector::SetTestTransport(
+    const std::function<litebus::Future<std::string>()> &transport)
+{
+    testTransport_ = transport;
+}
+
+litebus::Future<std::string> ExternalSystemCPUCollector::CollectFromExternal() const
+{
+    if (testTransport_) {
+        return testTransport_();
+    }
+    return ExternalSystemCollector::CollectFromExternal();
+}
+
+litebus::Future<std::string> ExternalSystemMemoryCollector::CollectFromExternal() const
+{
+    if (testTransport_) {
+        return testTransport_();
+    }
+    return ExternalSystemCollector::CollectFromExternal();
+}
+
 litebus::Future<Metric> ExternalSystemCPUCollector::GetUsage() const
 {
     return CollectFromExternal().Then([previous(previous_), totalPtr(total_)](const std::string& response) -> litebus::Future<Metric> {

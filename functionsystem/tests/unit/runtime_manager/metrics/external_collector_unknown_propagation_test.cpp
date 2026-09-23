@@ -11,125 +11,91 @@
  * limitations under the License.
  */
 
-// Success -> unknown (503/empty/bad payload) -> recovery through the real
-// collectors and BaseMetricsCollector::GetMetrics: an unknown observation
-// must yield no usage, no limit and NO fresh collection clock, so stale
-// usage can never be stamped as a new node sample.
+// Success -> unknown (empty reply / unknown sample / bad JSON) -> recovery
+// through the REAL ExternalSystem CPU/Memory collectors: an unknown
+// observation yields no usage, no limit and no collection clock, so stale
+// usage can never be stamped as a fresh node sample.
 #include "runtime_manager/metrics/collector/external_system_collector.h"
 #include <gtest/gtest.h>
 
 namespace functionsystem::test {
 namespace {
+using runtime_manager::ExternalSystemCPUCollector;
+using runtime_manager::ExternalSystemMemoryCollector;
 
-class FakeCurlActor {
-public:
-    explicit FakeCurlActor(std::string reply) : reply_(std::move(reply)) {}
-
-    litebus::Future<std::string> Query() const
-    {
+std::function<litebus::Future<std::string>()> Reply(const std::string &payload)
+{
+    return [payload]() -> litebus::Future<std::string> {
         litebus::Promise<std::string> promise;
-        promise.SetValue(reply_);
+        promise.SetValue(payload);
         return promise.GetFuture();
-    }
-
-private:
-    std::string reply_;
-};
-
-// The collectors call CollectFromExternal() -> litebus::Async(actor, &CurlHelper::Query).
-// We cannot intercept that static call without an actor system, so the test
-// drives the same then-chain through the exposed pieces: parse + metric
-// assembly is exercised via ParseExternalNodeResource and the GetMetrics
-// unknown contract is verified on a collector whose GetUsage returns an
-// explicitly-unknown metric (what every unknown path now produces).
-
-Metric KnownUsage(double value)
-{
-    Metric m;
-    m.value = value;
-    return m;
+    };
 }
 
-Metric UnknownUsage()
+const char *kKnownA =
+    R"({"cpu":99,"mem":194347270144,"totalCpu":104,"totalMem":201220395008,"usedCpu":2.5,"usedMem":8388608,"usedKnown":true})";
+const char *kKnownB =
+    R"({"cpu":99,"mem":194347270144,"totalCpu":104,"totalMem":201220395008,"usedCpu":4.125,"usedMem":16777216,"usedKnown":true})";
+
+TEST(ExternalCollectorUnknownPropagation, RealMemoryCollectorUnknownShapesCarryNoClock)
 {
-    return Metric{}; // no value: the unknown shape
-}
-
-class UnknownMetricCollector : public BaseMetricsCollector {
-public:
-    UnknownMetricCollector()
-        : BaseMetricsCollector(metrics_type::MEMORY, collector_type::SYSTEM)
-    {
-    }
-
-    litebus::Future<Metric> GetUsage() const override
-    {
-        litebus::Promise<Metric> promise;
-        promise.SetValue(mode_ == KNOWN ? KnownUsage(value_) : UnknownUsage());
-        return promise.GetFuture();
-    }
-
-    Metric GetLimit() const override
-    {
-        Metric m;
-        if (mode_ == KNOWN) {
-            m.value = limit_;
-        }
-        return m;
-    }
-
-    enum Mode { KNOWN, UNKNOWN };
-    void SetMode(Mode mode, double value, double limit)
-    {
-        mode_ = mode;
-        value_ = value;
-        limit_ = limit;
-    }
-
-private:
-    Mode mode_{ UNKNOWN };
-    double value_{ 0 };
-    double limit_{ 0 };
-};
-
-TEST(ExternalCollectorUnknownPropagation, UnknownObservationCarriesNoClockOrValues)
-{
-    UnknownMetricCollector collector;
-    collector.SetMode(UnknownMetricCollector::KNOWN, 512.0, 2048.0);
-    auto known = collector.GetMetrics();
-    ASSERT_TRUE(known.IsOK());
-    EXPECT_TRUE(known.Get().usage.IsSome());
-    EXPECT_DOUBLE_EQ(known.Get().usage.Get(), 512.0);
-    EXPECT_GT(known.Get().collectionStartUnixMs, 0);
-
-    collector.SetMode(UnknownMetricCollector::UNKNOWN, 0, 0);
-    auto unknown = collector.GetMetrics();
-    ASSERT_TRUE(unknown.IsOK());
-    // The contract: no usage, no limit and no refreshed collection clock.
-    EXPECT_TRUE(unknown.Get().usage.IsNone());
-    EXPECT_TRUE(unknown.Get().limit.IsNone());
-    EXPECT_EQ(unknown.Get().collectionStartUnixMs, 0);
-}
-
-TEST(ExternalCollectorUnknownPropagation, ParserUnknownShapesProduceUnknownMetric)
-{
-    // Every non-known payload shape maps to the same explicitly-unknown
-    // metric the propagation test above consumes.
     const char *unknownShapes[] = {
-        "", // transport error / 503 mapped to empty by CollectFromExternal
-        R"({"cpu":99,"mem":1000})", // legacy available-only
-        R"({"totalCpu":104,"totalMem":209715200,"usedCpu":2.5,"usedKnown":true})", // partial
-        R"({"totalCpu":104,"totalMem":209715200,"usedCpu":2.5,"usedMem":8,"usedKnown":false})",
+        "", // transport error or daemon 503 mapped to empty
+        R"({"cpu":99,"mem":194347270144})", // legacy available-only
+        R"({"totalCpu":104,"totalMem":201220395008,"usedCpu":2.5,"usedKnown":true})", // partial
+        R"({"totalCpu":104,"totalMem":201220395008,"usedCpu":2.5,"usedMem":8,"usedKnown":false})",
         "not-json",
     };
     for (const auto *shape : unknownShapes) {
-        auto sample = runtime_manager::ParseExternalNodeResource(shape);
-        EXPECT_FALSE(sample.known) << "shape must be unknown: " << shape;
+        ExternalSystemMemoryCollector collector(Reply(shape));
+        auto metrics = collector.GetMetrics();
+        ASSERT_TRUE(metrics.IsOK()) << shape;
+        // Unknown: no usage, no limit, NO collection clock.
+        EXPECT_TRUE(metrics.Get().usage.IsNone()) << shape;
+        EXPECT_TRUE(metrics.Get().limit.IsNone()) << shape;
+        EXPECT_EQ(metrics.Get().collectionStartUnixMs, 0) << shape;
     }
-    auto known = runtime_manager::ParseExternalNodeResource(
-        R"({"totalCpu":104,"totalMem":209715200,"usedCpu":2.5,"usedMem":8388608,"usedKnown":true})");
-    EXPECT_TRUE(known.known);
-    EXPECT_DOUBLE_EQ(known.memUsedMb, 8.0);
+}
+
+TEST(ExternalCollectorUnknownPropagation, RealMemoryCollectorSuccessUnknownRecovery)
+{
+    ExternalSystemMemoryCollector collector(Reply(kKnownA));
+    auto known = collector.GetMetrics();
+    ASSERT_TRUE(known.IsOK());
+    EXPECT_DOUBLE_EQ(known.Get().usage.Get(), 8.0); // 8 MiB used
+    EXPECT_DOUBLE_EQ(known.Get().limit.Get(), 192.0); // total MiB
+    EXPECT_GT(known.Get().collectionStartUnixMs, 0);
+
+    // A stale previous_ must NOT leak into an unknown observation (the
+    // old bug returned *previous with a fresh wall clock).
+    collector.SetTestTransport(Reply(""));
+    auto unknown = collector.GetMetrics();
+    ASSERT_TRUE(unknown.IsOK());
+    EXPECT_TRUE(unknown.Get().usage.IsNone());
+    EXPECT_TRUE(unknown.Get().limit.IsNone());
+    EXPECT_EQ(unknown.Get().collectionStartUnixMs, 0);
+
+    // Recovery with DIFFERENT values proves a fresh observation.
+    collector.SetTestTransport(Reply(kKnownB));
+    auto recovered = collector.GetMetrics();
+    ASSERT_TRUE(recovered.IsOK());
+    EXPECT_DOUBLE_EQ(recovered.Get().usage.Get(), 16.0);
+    EXPECT_DOUBLE_EQ(recovered.Get().limit.Get(), 192.0);
+    EXPECT_GT(recovered.Get().collectionStartUnixMs, 0);
+}
+
+TEST(ExternalCollectorUnknownPropagation, RealCPUCollectorSameContract)
+{
+    ExternalSystemCPUCollector collector(Reply(kKnownA));
+    auto known = collector.GetMetrics();
+    ASSERT_TRUE(known.IsOK());
+    EXPECT_TRUE(known.Get().usage.IsSome());
+
+    collector.SetTestTransport(Reply(R"({"usedKnown":false})"));
+    auto unknown = collector.GetMetrics();
+    ASSERT_TRUE(unknown.IsOK());
+    EXPECT_TRUE(unknown.Get().usage.IsNone());
+    EXPECT_EQ(unknown.Get().collectionStartUnixMs, 0);
 }
 
 }  // namespace

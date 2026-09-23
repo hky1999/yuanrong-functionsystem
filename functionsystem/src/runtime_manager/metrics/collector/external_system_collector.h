@@ -23,6 +23,7 @@
 #include "utils/os_utils.hpp"
 
 #include "base_metrics_collector.h"
+#include <functional>
 
 namespace functionsystem::runtime_manager {
 // A valid inventory without the requested type returns an empty Metric;
@@ -86,7 +87,10 @@ public:
     }
 
 protected:
-    litebus::Future<std::string> CollectFromExternal() const;
+    // Virtual so tests can substitute the transport and drive the real
+    // CPU/Memory collectors' parse-and-assemble chain (including the
+    // unknown-observation contract) without an actor system.
+    virtual litebus::Future<std::string> CollectFromExternal() const;
 
 private:
     double limit_{0.0};
@@ -114,6 +118,9 @@ public:
     explicit ExternalSystemCPUCollector(const double &limit, const litebus::ActorReference &curlActorRef)
         : ExternalSystemCollector(limit, metrics_type::CPU, curlActorRef), previous_(std::make_shared<Metric>()),
           total_(std::make_shared<Metric>()) {};
+    // Test-only transport injection: drives the real parse/assemble chain.
+    explicit ExternalSystemCPUCollector(const std::function<litebus::Future<std::string>()> &transport);
+    void SetTestTransport(const std::function<litebus::Future<std::string>()> &transport);
     ~ExternalSystemCPUCollector() override = default;
     litebus::Future<Metric> GetUsage() const override;
     Metric GetLimit() const override;
@@ -122,6 +129,10 @@ private:
     // Total reported by the node-resource endpoint when it provides an
     // explicit used/total pair; empty until the first such sample.
     mutable std::shared_ptr<Metric> total_;
+    std::function<litebus::Future<std::string>()> testTransport_;
+
+protected:
+    litebus::Future<std::string> CollectFromExternal() const override;
 };
 
 class ExternalSystemMemoryCollector : public ExternalSystemCollector {
@@ -130,12 +141,19 @@ public:
     explicit ExternalSystemMemoryCollector(const double &limit, const litebus::ActorReference &curlActorRef)
         : ExternalSystemCollector(limit, metrics_type::MEMORY, curlActorRef), previous_(std::make_shared<Metric>()),
           total_(std::make_shared<Metric>()) {};
+    // Test-only transport injection: drives the real parse/assemble chain.
+    explicit ExternalSystemMemoryCollector(const std::function<litebus::Future<std::string>()> &transport);
+    void SetTestTransport(const std::function<litebus::Future<std::string>()> &transport);
     ~ExternalSystemMemoryCollector() override = default;
     litebus::Future<Metric> GetUsage() const override;
     Metric GetLimit() const override;
 private:
     std::shared_ptr<Metric> previous_;
     mutable std::shared_ptr<Metric> total_;
+    std::function<litebus::Future<std::string>()> testTransport_;
+
+protected:
+    litebus::Future<std::string> CollectFromExternal() const override;
 };
 
 class ExternalSystemXPUCollector : public ExternalSystemCollector {
