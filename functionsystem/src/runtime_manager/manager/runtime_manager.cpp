@@ -1090,44 +1090,42 @@ Status RuntimeManager::StartRegister(const std::map<std::string, messages::Runti
 void RuntimeManager::SendStopInstanceResponse(const litebus::AID &from, const std::string &runtimeID,
                                               const std::shared_ptr<messages::StopInstanceResponse> &response)
 {
-    // Table cleanup ONLY: when the registration is already gone (the retry /
-    // durable-receipt replay path), cleanup is skipped but the receipt below
-    // must STILL be sent — a physical retirement confirmed by sandboxd is
-    // settled upstream exactly once via this response, map state or not.
-    if (auto iter(instanceInfoMap_.find(runtimeID)); iter != instanceInfoMap_.end()) {
-        const auto &instanceID = iter->second.instanceid();
-        const bool exactResumeTarget = resume_identity::IsExactResumeTargetCleanupRequest(
-            response->requestid(), instanceID, runtimeID);
-        const auto owner = instanceResponseMap_.find(instanceID);
-        const bool stoppingLogicalOwner = owner == instanceResponseMap_.end()
-            || owner->second.startruntimeinstanceresponse().runtimeid() == runtimeID;
-        if (!exactResumeTarget) {
-            (void)instanceResponseMap_.erase(instanceID);
-        } else if (stoppingLogicalOwner) {
-            bool rebound = false;
-            for (const auto &[survivingRuntimeID, survivingInfo] : instanceInfoMap_) {
-                if (survivingRuntimeID == runtimeID || survivingInfo.instanceid() != instanceID) {
-                    continue;
-                }
-                const auto survivingResponse = runtimeResponseMap_.find(survivingRuntimeID);
-                if (survivingResponse == runtimeResponseMap_.end()) {
-                    continue;
-                }
-                instanceResponseMap_[instanceID] = survivingResponse->second;
-                rebound = true;
-                break;
-            }
-            if (!rebound) {
-                (void)instanceResponseMap_.erase(instanceID);
-            }
-        }
-        (void)runtimeResponseMap_.erase(runtimeID);
-        (void)instanceInfoMap_.erase(runtimeID);
-    }
+    // Table cleanup ONLY for a SUCCESSFUL stop: a failed stop keeps the
+    // registration (identity retained for the retry; the durable-receipt
+    // replay settles later). When the registration is already gone (the
+    // replay path), cleanup is skipped but the receipt below must STILL be
+    // sent — a physical retirement confirmed by sandboxd is settled upstream
+    // exactly once via this response, map state or not.
     if (response->code() == static_cast<int32_t>(StatusCode::SUCCESS)) {
         if (auto iter(instanceInfoMap_.find(runtimeID)); iter != instanceInfoMap_.end()) {
-            (void)instanceResponseMap_.erase(iter->second.instanceid());
-            (void)instanceInfoMap_.erase(iter);
+            const auto &instanceID = iter->second.instanceid();
+            const bool exactResumeTarget = resume_identity::IsExactResumeTargetCleanupRequest(
+                response->requestid(), instanceID, runtimeID);
+            const auto owner = instanceResponseMap_.find(instanceID);
+            const bool stoppingLogicalOwner = owner == instanceResponseMap_.end()
+                || owner->second.startruntimeinstanceresponse().runtimeid() == runtimeID;
+            if (!exactResumeTarget) {
+                (void)instanceResponseMap_.erase(instanceID);
+            } else if (stoppingLogicalOwner) {
+                bool rebound = false;
+                for (const auto &[survivingRuntimeID, survivingInfo] : instanceInfoMap_) {
+                    if (survivingRuntimeID == runtimeID || survivingInfo.instanceid() != instanceID) {
+                        continue;
+                    }
+                    const auto survivingResponse = runtimeResponseMap_.find(survivingRuntimeID);
+                    if (survivingResponse == runtimeResponseMap_.end()) {
+                        continue;
+                    }
+                    instanceResponseMap_[instanceID] = survivingResponse->second;
+                    rebound = true;
+                    break;
+                }
+                if (!rebound) {
+                    (void)instanceResponseMap_.erase(instanceID);
+                }
+            }
+            (void)runtimeResponseMap_.erase(runtimeID);
+            (void)instanceInfoMap_.erase(runtimeID);
         }
     }
     // Physical fault-test hook (default off): bounded stop-point on the
