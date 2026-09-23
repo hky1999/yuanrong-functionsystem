@@ -1323,10 +1323,12 @@ TEST(FrontendProxyResizeEntryTest, PendingFutureYieldsUnknownOutcome)
     EXPECT_EQ(state.dispatchCount, 1); // the dispatch DID happen; outcome unknown
 }
 
-// Real gRPC cancellation: a client TryCancel after the dispatcher has
-// entered its pending Future must make the handler exit promptly (bounded
-// total time), not busy-wait to the deadline. The client observes
-// CANCELLED and the server-side total time proves the handler returned.
+// Real gRPC cancellation (synchronous stub in std::async, matching the
+// proven RealGrpcCancellationStopsInvokeWait pattern): a client TryCancel
+// after the dispatcher has entered its pending Future must make the handler
+// exit promptly. The elapsed clock runs through the server's Shutdown+Wait
+// (inner scope), proving the handler actually returned — not just that the
+// client observed CANCELLED.
 TEST(FrontendProxyResizeEntryTest, ClientCancellationExitsHandlerPromptly)
 {
     auto pending = std::make_shared<litebus::Promise<messages::ResizeSandboxResponse>>();
@@ -1347,48 +1349,53 @@ TEST(FrontendProxyResizeEntryTest, ClientCancellationExitsHandlerPromptly)
         return pending->GetFuture(); // stays pending forever
     };
     FrontendProxyService service(std::move(param));
-    ::grpc::ServerBuilder builder;
-    const auto socketPath = "/tmp/frontend-proxy-resize-cancel-" + std::to_string(::getpid()) + ".sock";
-    const auto address = "unix:" + socketPath;
-    (void)::unlink(socketPath.c_str());
-    builder.AddListeningPort(address, ::grpc::InsecureServerCredentials());
-    builder.RegisterService(&service);
-    UnixGrpcServer server(socketPath, builder.BuildAndStart());
-    ASSERT_NE(server.Get(), nullptr);
-
-    auto channel = ::grpc::CreateChannel(address, ::grpc::InsecureChannelCredentials());
-    ASSERT_TRUE(channel->WaitForConnected(std::chrono::system_clock::now() + std::chrono::seconds(2)));
-    auto stub = ::frontend_proxy::FrontendProxyService::NewStub(channel);
-
     auto request = MakeResizeRequest("tenant-1");
-    // give a generous deadline: the old busy-wait would hold the handler
-    // for the full ~30s+2s budget after cancellation
+    // generous deadline: the old busy-wait would hold the handler for the
+    // full ~50s budget after cancellation
     request.mutable_resize()->mutable_resize()->set_deadline_unix_ms(
         request.resize().resize().deadline_unix_ms() + 20000);
-
-    ::grpc::ClientContext clientContext;
-    ::frontend_proxy::ResizeInstanceResponse response;
-    auto rpc = stub->AsyncResizeInstance(&clientContext, request,
-                                         ::grpc::CompletionQueue::Default());
-    // wait for the dispatcher to actually enter (pending) — THEN cancel
-    {
-        std::unique_lock<std::mutex> lock(mutex);
-        ASSERT_TRUE(entered.wait_for(lock, std::chrono::seconds(3),
-                                     [&] { return dispatchCount >= 1; }));
-    }
-    clientContext.TryCancel();
-
     ::grpc::Status status;
+    ::frontend_proxy::ResizeInstanceResponse response;
     auto started = std::chrono::steady_clock::now();
-    ASSERT_TRUE(rpc->Finish(&response, &status, nullptr));
+    {
+        ::grpc::ServerBuilder builder;
+        const auto socketPath =
+            "/tmp/frontend-proxy-resize-cancel-" + std::to_string(::getpid()) + ".sock";
+        const auto address = "unix:" + socketPath;
+        (void)::unlink(socketPath.c_str());
+        builder.AddListeningPort(address, ::grpc::InsecureServerCredentials());
+        builder.RegisterService(&service);
+        UnixGrpcServer server(socketPath, builder.BuildAndStart());
+        ASSERT_NE(server.Get(), nullptr);
+
+        auto channel = ::grpc::CreateChannel(address, ::grpc::InsecureChannelCredentials());
+        ASSERT_TRUE(channel->WaitForConnected(
+            std::chrono::system_clock::now() + std::chrono::seconds(2)));
+        auto stub = ::frontend_proxy::FrontendProxyService::NewStub(channel);
+        ::grpc::ClientContext clientContext;
+        auto call = std::async(std::launch::async, [&] {
+            return stub->ResizeInstance(&clientContext, request, &response);
+        });
+        bool dispatched = false;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            dispatched = entered.wait_for(lock, std::chrono::seconds(3),
+                                         [&] { return dispatchCount >= 1; });
+        }
+        ASSERT_TRUE(dispatched);
+        clientContext.TryCancel();
+        status = call.get();
+        EXPECT_EQ(status.error_code(), ::grpc::StatusCode::CANCELLED);
+        EXPECT_EQ(dispatchCount, 1);
+        // the UnixGrpcServer destructor (inner scope exit) calls
+        // Shutdown()+Wait(): the elapsed clock below includes the handler's
+        // actual return through the server drain
+    }
     auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started).count();
-    EXPECT_EQ(status.error_code(), ::grpc::StatusCode::CANCELLED);
-    // the handler must actually EXIT on cancellation (not busy-wait the
-    // remaining ~50s budget): bounded by a few poll cycles after the cancel
     EXPECT_LE(elapsedMs, 5000)
-        << "handler held " << elapsedMs << "ms after cancel; must exit promptly";
-    EXPECT_EQ(dispatchCount, 1);
+        << "handler held " << elapsedMs << "ms through cancel+server-drain; "
+        << "must exit promptly, not busy-wait the remaining budget";
 }
 
 TEST(FrontendProxyResizeEntryTest, FailedTransportReturnsUnknownImmediately)
