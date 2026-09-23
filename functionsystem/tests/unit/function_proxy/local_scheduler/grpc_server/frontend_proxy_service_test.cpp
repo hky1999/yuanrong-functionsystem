@@ -1116,8 +1116,9 @@ TEST(FrontendProxyServiceTest, RealGrpcCancellationStopsInvokeWaitAndClearsRegis
     EXPECT_EQ(retryResponse.status().message(), "second dispatch proves registry cleanup");
 }
 
-}  // namespace functionsystem::test
 
+
+using namespace local_scheduler;
 // ---------------------------------------------------------------------------
 // ResizeInstance controlled entry: the scheduler-authorized direct resize.
 // Per-test Promise + counter (no shared globals — the 2003Z review found
@@ -1311,7 +1312,11 @@ TEST(FrontendProxyResizeEntryTest, PendingFutureYieldsUnknownOutcome)
     ::frontend_proxy::ResizeInstanceResponse response;
     auto started = std::chrono::steady_clock::now();
     auto status = service.ResizeInstance(&context, &request, &response);
-    auto elapsed = std::chrono::steady_clock::now() - started;
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    // bounded wait: the deadline budget is ~100ms + 2s transport buffer
+    // (3s floor); the handler must NOT busy-wait the full 60s default
+    EXPECT_LE(elapsed, 5000) << "elapsed " << elapsed << "ms; bounded wait exceeded";
     EXPECT_TRUE(status.ok());
     EXPECT_NE(response.status().code(), 0);
     EXPECT_EQ(response.resize().outcome(), messages::ResizeSandboxResponse::UNKNOWN);
@@ -1333,3 +1338,5 @@ TEST(FrontendProxyResizeEntryTest, MissingOperationIDIsRejected)
     EXPECT_NE(response.status().code(), 0);
     EXPECT_EQ(state.dispatchCount, 0);
 }
+
+}  // namespace functionsystem::test
