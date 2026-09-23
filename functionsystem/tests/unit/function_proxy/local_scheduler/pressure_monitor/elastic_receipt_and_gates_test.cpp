@@ -165,6 +165,7 @@ TEST(ElasticCadenceTest, LateFastCallbackDoesNotRetireNewFastGeneration)
     auto slow = monitor.sampleGate_.Begin();
     ASSERT_TRUE(slow.has_value());
     monitor.highSamples_ = 1;
+    monitor.wakeCooldown_["inst-l"] = 3;  // pre-seeded slow cooldown counter
 
     auto old1 = monitor.elasticGate_.Begin();
     ASSERT_TRUE(old1.has_value());
@@ -179,7 +180,6 @@ TEST(ElasticCadenceTest, LateFastCallbackDoesNotRetireNewFastGeneration)
     EXPECT_TRUE(monitor.elasticGate_.Active(*fresh));
     // LATE view callback for the timed-out generation: Finish fails inside
     // OnElasticResourceView, the fresh fast generation must stay active
-    monitor.wakeCooldown_["inst-l"] = 3;  // pre-seeded slow cooldown counter
     monitor.OnElasticResourceView(*old1, nullptr);
     EXPECT_TRUE(monitor.elasticGate_.Active(*fresh));
     // slow counters and cooldowns still untouched by everything above
