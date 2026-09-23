@@ -24,86 +24,110 @@
 namespace functionsystem::runtime_manager {
 
 // One-shot, default-off fault gate for retirement-chain physical tests
-// (development plan 2026-09-17 stage 4). It is armed ONLY through the
-// AKERNEL_RETIRE_FAULT environment variable or the runtime control file
-// (JSON; absent/unparsable means disabled), matches one exact operation
-// identity (sandbox + generation + operation id), fires at most once and
-// disarms itself at its deadline. It never authorizes resource changes: it
-// either holds a delete dispatch for a fixed delay before it reaches sandboxd,
-// or suppresses exactly one confirmed receipt travelling upstream. Every
-// decision (armed, hit, expired, no-match) is logged with the matched identity
-// so the fault evidence does not depend on test-side expectations.
+// (development plan 2026-09-17 stage 4). It never authorizes resource
+// changes: it either holds a delete dispatch for a fixed delay before it
+// reaches sandboxd, or suppresses exactly one confirmed receipt travelling
+// upstream. Every decision (armed, prepared, hit, expired, no-match) is
+// logged with the matched identity so the fault evidence does not depend on
+// test-side expectations.
+//
+// Two arming forms:
+//  1. EXACT: the spec names action+sandbox+generation+operation_id. The
+//     operation id must be knowable in advance — usable when the driving
+//     request id is externally generated.
+//  2. PREPARE (bounded confirmation stop-point): KillInstance generates a
+//     random per-attempt forward id, so a test CANNOT name the operation id
+//     before the formal kill. A prepare spec (action+sandbox+generation,
+//     "prepare":true, "hold_ms":1000..120000) makes the gate hold the FIRST
+//     matching message for at most hold_ms (the stop-point), log PREPARED
+//     with the observed operation id, and apply the fault only if the
+//     control file confirms an EXACT spec carrying that operation id within
+//     the hold. Without confirmation the message passes through unchanged
+//     (PREP_EXPIRED) — bounded by construction, no deadlock, and the exact
+//     match requirement is never relaxed.
 class RetireFaultGate {
 public:
     static RetireFaultGate &Instance();
 
+    enum class Decision { NoMatch, MatchExact, MatchPrepare };
+
+    struct BlockDecision {
+        Decision decision{ Decision::NoMatch };
+        int64_t delayMs{ 0 };   // MatchExact: hold the dispatch this long
+        int64_t holdMs{ 0 };    // MatchPrepare: confirmation stop-point window
+    };
+
     // Arm from an explicit JSON spec (identical validation to the environment
     // variable). Used by the singleton's environment read and by unit tests;
-    // never touches resource or budget state. Re-arming is rejected while a
-    // spec is active AND unfired; a consumed (spent) one-shot accepts a fresh
+    // never touches resource or budget state. Re-arming is rejected while an
+    // EXACT spec is active AND unfired; a consumed one-shot accepts a fresh
     // spec so the fault matrix can fire repeatedly in one process.
     void ArmFromSpec(const std::string &specJson);
 
     // Runtime test control (stage-4 requirement): re-check the control file
     // before each match attempt so a gate can be armed, hit, disarmed and
-    // re-armed against instances that already exist, without restarting the
-    // process. The file holds the same JSON spec (arm) or {"disarm":true};
-    // a missing file leaves current state untouched; it is only read, never
-    // written, by the gate. Dedup is CONTENT-based (mtime is not trusted:
-    // two changes inside one filesystem timestamp tick must both apply), so
-    // re-firing the same fault requires a changed file — bump the spec's
-    // "control_revision" field. Default path
+    // re-armed without restarting the process. The file holds the same JSON
+    // spec (arm/confirm) or {"disarm":true}; a missing file leaves current
+    // state untouched; it is only read, never written, by the gate. Dedup is
+    // CONTENT-based (mtime is not trusted: two changes inside one filesystem
+    // timestamp tick must both apply), so re-firing the same fault requires a
+    // changed file — bump the spec's "control_revision" field. Default path
     // /run/akernel/retire-fault-control.json, override with
-    // AKERNEL_RETIRE_FAULT_CONTROL_FILE. Test facility only: never touches
-    // resource or budget state.
+    // AKERNEL_RETIRE_FAULT_CONTROL_FILE. Test facility only.
     void RefreshFromControlFile();
-    // Read-only state snapshot for collectors (action/identity/operation/
-    // deadline/enabled/consumed); no writer.
+
     struct State {
+        std::string mode;        // off | exact | prep_wait | prep_held
         std::string action;
         std::string sandboxID;
         std::string generation;
-        std::string operationID;
+        std::string operationID; // exact spec: required id; prep_held: captured
         int64_t delayMs{ 0 };
         int64_t deadlineUnixMs{ 0 };
+        int64_t holdMs{ 0 };
         bool enabled{ false };
         bool consumed{ false };
     };
     State GetStateForTest() const;
 
-    // For "block_delete": true when THIS delete (sandbox + generation +
-    // operation id of the stop request driving it) must be held for delayMs
-    // before dispatch. delayMs is copied under the same lock that validated
-    // the hit, so a concurrent disarm/re-arm cannot alter the fired action.
-    // Consumes the one shot.
-    bool BlockDeleteIfMatched(const std::string &sandboxID, const std::string &generation,
-                              const std::string &operationID, int64_t &delayMs);
+    // Delete dispatch: exact match fires immediately (delayMs under the same
+    // lock that validated the hit). A prepare-armed gate captures this
+    // message's operation id and returns MatchPrepare with the bounded
+    // stop-point window — the caller MUST then call ResolveBlock when the
+    // hold elapses to learn whether the confirmed fault applies.
+    BlockDecision BlockDeleteIfMatched(const std::string &sandboxID, const std::string &generation,
+                                       const std::string &operationID);
+    // Resolution at the END of the prepare hold: MatchExact applies the
+    // confirmed fault (delayMs); NoMatch passes the held message through.
+    BlockDecision ResolveBlock(const std::string &sandboxID, const std::string &generation,
+                               const std::string &operationID);
 
-    // For "drop_receipt": true when THIS confirmed receipt send (sandbox +
-    // generation + the response's request id) must be suppressed. Consumes
-    // the one shot.
+    // Receipt send: exact match suppresses this one confirmed receipt. A
+    // prepare-armed gate captures the operation id WITHOUT suppressing (the
+    // durable receipt replays; only a confirmed exact spec drops a later
+    // message carrying the captured id).
     bool DropReceiptIfMatched(const std::string &sandboxID, const std::string &generation,
                               const std::string &operationID);
 
 private:
-    // Caller holds mutex_; validates the exact identity, checks the deadline,
-    // consumes the one shot and copies the hit's action parameters (delayMs)
-    // before releasing the lock.
-    bool ConsumeIfMatchedLocked(const char *action, const std::string &sandboxID,
-                                const std::string &generation, const std::string &operationID,
-                                int64_t &delayMs);
+    bool ConsumeExactLocked(const char *action, const std::string &sandboxID,
+                            const std::string &generation, const std::string &operationID,
+                            int64_t &delayMs);
     void Disarm(const char *reason);
     void DisarmLocked(const char *reason);  // caller holds mutex_
     void ArmLocked(const std::string &specJson);  // caller holds mutex_
     static std::string ControlFilePath();
 
     mutable std::mutex mutex_;  // mutable: GetStateForTest() const reads under it
+    std::string mode_;          // "", "exact", "prep_wait", "prep_held"
     std::string action_;
     std::string sandboxID_;
     std::string generation_;
-    std::string operationID_;
+    std::string operationID_;   // exact: required; prep_held: captured observation
     int64_t delayMs_{ 0 };
     int64_t deadlineUnixMs_{ 0 };
+    int64_t holdMs_{ 0 };
+    int64_t prepDeadlineUnixMs_{ 0 };
     bool enabled_{ false };
     bool consumed_{ false };
     std::string lastControlContent_;  // last APPLIED control-file content

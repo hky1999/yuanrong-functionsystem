@@ -274,6 +274,13 @@ private:
     void RunFaultDeferredDelete(const std::shared_ptr<litebus::Promise<runtime::v1::DeleteResponse>> &completion,
                                 const std::string &runtimeID, const std::string &requestID,
                                 const std::shared_ptr<runtime::v1::DeleteRequest> &del);
+    // Fault-test helper (RetireFaultGate): end of the bounded prepare
+    // stop-point — apply the confirmed fault (further bounded delay) or
+    // release the held dispatch unchanged. Bounded by construction.
+    void RunFaultPrepResolve(const std::shared_ptr<litebus::Promise<runtime::v1::DeleteResponse>> &completion,
+                             const std::string &runtimeID, const std::string &requestID,
+                             const std::shared_ptr<runtime::v1::DeleteRequest> &del,
+                             const std::string &sandboxID, const std::string &resourceGeneration);
     litebus::Future<Status> OnDeleteDone(const std::string &runtimeID, const std::string &requestID,
                                          const std::string &sandboxID, const runtime::v1::DeleteResponse &response,
                                          const std::string &registrationID);

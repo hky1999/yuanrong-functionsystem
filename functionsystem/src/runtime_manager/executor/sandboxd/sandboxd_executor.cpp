@@ -957,12 +957,27 @@ litebus::Future<Status> SandboxdExecutor::TerminateSandbox(const std::string &ru
     // fixed delay BEFORE it reaches sandboxd, matching the exact operation
     // identity (sandbox + generation + this stop request id) so only the
     // intended dispatch is held and settlement converges once it elapses.
-    int64_t faultDelayMs = 0;
-    if (RetireFaultGate::Instance().BlockDeleteIfMatched(sandboxID, source->resourceGeneration,
-                                                         requestID, faultDelayMs)) {
+    // The prepare form exists because KillInstance assigns a random
+    // per-attempt forward id the test cannot know in advance: the gate
+    // captures it, holds this dispatch for a BOUNDED stop-point window, and
+    // applies the fault only on an exact confirmation (see
+    // RunFaultPrepResolve); unconfirmed holds always pass through.
+    const auto fault = RetireFaultGate::Instance().BlockDeleteIfMatched(
+        sandboxID, source->resourceGeneration, requestID);
+    if (fault.decision == RetireFaultGate::Decision::MatchExact
+        || fault.decision == RetireFaultGate::Decision::MatchPrepare) {
+        const int64_t waitMs = fault.decision == RetireFaultGate::Decision::MatchPrepare
+                                   ? fault.holdMs
+                                   : fault.delayMs;
         auto completion = std::make_shared<litebus::Promise<runtime::v1::DeleteResponse>>();
-        litebus::AsyncAfter(faultDelayMs, GetAID(),
-                            &SandboxdExecutor::RunFaultDeferredDelete, completion, runtimeID, requestID, del);
+        if (fault.decision == RetireFaultGate::Decision::MatchPrepare) {
+            litebus::AsyncAfter(waitMs, GetAID(),
+                                &SandboxdExecutor::RunFaultPrepResolve, completion, runtimeID,
+                                requestID, del, sandboxID, source->resourceGeneration);
+        } else {
+            litebus::AsyncAfter(waitMs, GetAID(),
+                                &SandboxdExecutor::RunFaultDeferredDelete, completion, runtimeID, requestID, del);
+        }
         return completion->GetFuture()
             .Then(litebus::Defer(GetAID(), &SandboxdExecutor::OnDeleteDone, runtimeID, requestID, sandboxID,
                                  std::placeholders::_1, source->registrationID));
@@ -978,6 +993,30 @@ void SandboxdExecutor::RunFaultDeferredDelete(
     const std::shared_ptr<runtime::v1::DeleteRequest> &del)
 {
     YRLOG_INFO("{}|fault-held delete dispatch resumes now for runtime({})", requestID, runtimeID);
+    completion->Associate(DoDelete("", runtimeID, requestID, del));
+}
+
+void SandboxdExecutor::RunFaultPrepResolve(
+    const std::shared_ptr<litebus::Promise<runtime::v1::DeleteResponse>> &completion,
+    const std::string &runtimeID, const std::string &requestID,
+    const std::shared_ptr<runtime::v1::DeleteRequest> &del,
+    const std::string &sandboxID, const std::string &resourceGeneration)
+{
+    // End of the bounded prepare stop-point: the gate captured this dispatch's
+    // operation id when it held it; an exact confirmation that arrived within
+    // the window applies the fault (a further bounded delay), anything else
+    // releases the dispatch unchanged. Never unbounded, never a log race.
+    const auto resolved = RetireFaultGate::Instance().ResolveBlock(
+        sandboxID, resourceGeneration, requestID);
+    if (resolved.decision == RetireFaultGate::Decision::MatchExact) {
+        YRLOG_INFO("{}|retire-fault prepare confirmed: holding delete of runtime({}) for {}ms",
+                   requestID, runtimeID, resolved.delayMs);
+        litebus::AsyncAfter(resolved.delayMs, GetAID(),
+                            &SandboxdExecutor::RunFaultDeferredDelete, completion, runtimeID, requestID, del);
+        return;
+    }
+    YRLOG_INFO("{}|retire-fault prepare unconfirmed: delete of runtime({}) passes through "
+               "unchanged", requestID, runtimeID);
     completion->Associate(DoDelete("", runtimeID, requestID, del));
 }
 

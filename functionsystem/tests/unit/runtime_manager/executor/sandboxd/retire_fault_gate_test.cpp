@@ -35,6 +35,19 @@ std::string BlockSpec(int64_t delayMs, int64_t deadlineUnixMs)
                        R"("operation_id":"op-1","delay_ms":)")
         + std::to_string(delayMs) + R"(,"deadline_unix_ms":)" + std::to_string(deadlineUnixMs) + "}";
 }
+std::string PrepareBlockSpec(int64_t holdMs, int64_t deadlineUnixMs)
+{
+    return std::string(R"({"action":"block_delete","sandbox":"sbox-1","generation":"g-7",)"
+                       R"("prepare":true,"hold_ms":)")
+        + std::to_string(holdMs) + R"(,"delay_ms":9000,"deadline_unix_ms":)"
+        + std::to_string(deadlineUnixMs) + "}";
+}
+std::string ConfirmBlockSpec(const std::string &operation, int64_t deadlineUnixMs)
+{
+    return std::string(R"({"action":"block_delete","sandbox":"sbox-1","generation":"g-7",)"
+                       R"("operation_id":")" + operation + R"(","delay_ms":7000,)"
+                       + R"("deadline_unix_ms":)" + std::to_string(deadlineUnixMs) + "}";
+}
 
 // The control file is deduplicated by CONTENT (mtime is not trusted), so no
 // timestamp forcing is needed or meaningful here: successive writes apply in
@@ -77,12 +90,14 @@ struct ControlFileEnv {
 };
 }  // namespace
 
+using Decision = RetireFaultGate::Decision;
+
 TEST(RetireFaultGateTest, DisabledGateNeverMatches)
 {
     RetireFaultGate gate;  // no ArmFromSpec: default off
-    int64_t delayMs = -1;
-    EXPECT_FALSE(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1", delayMs));
-    EXPECT_EQ(delayMs, 0);
+    auto decision = gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1");
+    EXPECT_EQ(decision.decision, Decision::NoMatch);
+    EXPECT_EQ(decision.delayMs, 0);
     EXPECT_FALSE(gate.DropReceiptIfMatched("sbox-1", "g-7", "op-1"));
 }
 
@@ -90,17 +105,17 @@ TEST(RetireFaultGateTest, BlockDeleteMatchesExactIdentityOnce)
 {
     RetireFaultGate gate;
     gate.ArmFromSpec(BlockSpec(45000, FutureUnixMs(120000)));
-    int64_t delayMs = 0;
     // Neighbour identities, the other action, and a WRONG OPERATION never
     // consume the one shot.
     EXPECT_FALSE(gate.DropReceiptIfMatched("sbox-1", "g-7", "op-1"));
-    EXPECT_FALSE(gate.BlockDeleteIfMatched("sbox-2", "g-7", "op-1", delayMs));
-    EXPECT_FALSE(gate.BlockDeleteIfMatched("sbox-1", "g-8", "op-1", delayMs));
-    EXPECT_FALSE(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-9", delayMs));
-    EXPECT_TRUE(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1", delayMs));
-    EXPECT_EQ(delayMs, 45000);
+    EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-2", "g-7", "op-1").decision, Decision::NoMatch);
+    EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-1", "g-8", "op-1").decision, Decision::NoMatch);
+    EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-9").decision, Decision::NoMatch);
+    const auto hit = gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1");
+    EXPECT_EQ(hit.decision, Decision::MatchExact);
+    EXPECT_EQ(hit.delayMs, 45000);
     // One-shot: the retried delete must pass through untouched.
-    EXPECT_FALSE(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1", delayMs));
+    EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1").decision, Decision::NoMatch);
 }
 
 TEST(RetireFaultGateTest, DropReceiptMatchesOnceAndBlockDoesNot)
@@ -109,8 +124,7 @@ TEST(RetireFaultGateTest, DropReceiptMatchesOnceAndBlockDoesNot)
     gate.ArmFromSpec(R"({"action":"drop_receipt","sandbox":"sbox-9","generation":"g-1",)"
                      R"("operation_id":"op-4","delay_ms":0,"deadline_unix_ms":)"
                      + std::to_string(FutureUnixMs(60000)) + "}");
-    int64_t delayMs = 0;
-    EXPECT_FALSE(gate.BlockDeleteIfMatched("sbox-9", "g-1", "op-4", delayMs));
+    EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-9", "g-1", "op-4").decision, Decision::NoMatch);
     EXPECT_TRUE(gate.DropReceiptIfMatched("sbox-9", "g-1", "op-4"));
     EXPECT_FALSE(gate.DropReceiptIfMatched("sbox-9", "g-1", "op-4"));
 }
@@ -119,12 +133,11 @@ TEST(RetireFaultGateTest, ExpiredOrInvalidSpecsStayInactive)
 {
     RetireFaultGate expired;
     expired.ArmFromSpec(BlockSpec(1000, FutureUnixMs(-1000)));
-    int64_t delayMs = 0;
-    EXPECT_FALSE(expired.BlockDeleteIfMatched("sbox-1", "g-7", "op-1", delayMs));
+    EXPECT_EQ(expired.BlockDeleteIfMatched("sbox-1", "g-7", "op-1").decision, Decision::NoMatch);
 
     RetireFaultGate garbage;
     garbage.ArmFromSpec("not-json");
-    EXPECT_FALSE(garbage.BlockDeleteIfMatched("sbox-1", "g-7", "op-1", delayMs));
+    EXPECT_EQ(garbage.BlockDeleteIfMatched("sbox-1", "g-7", "op-1").decision, Decision::NoMatch);
 
     RetireFaultGate unknownAction;
     unknownAction.ArmFromSpec(R"({"action":"reboot_world","sandbox":"s","generation":"g",)"
@@ -137,12 +150,31 @@ TEST(RetireFaultGateTest, ExpiredOrInvalidSpecsStayInactive)
                         R"("operation_id":"o"})");
     EXPECT_FALSE(partial.DropReceiptIfMatched("", "g", "o"));
 
-    // Missing operation id is an incomplete operation identity: never armed.
+    // Missing operation id is an incomplete operation identity: never armed
+    // as an exact spec.
     RetireFaultGate noOperation;
     noOperation.ArmFromSpec(R"({"action":"block_delete","sandbox":"s","generation":"g",)"
                             R"("delay_ms":1,"deadline_unix_ms":9223372036854775807})");
-    EXPECT_FALSE(noOperation.BlockDeleteIfMatched("s", "g", "", delayMs));
+    EXPECT_EQ(noOperation.BlockDeleteIfMatched("s", "g", "").decision, Decision::NoMatch);
     EXPECT_FALSE(noOperation.GetStateForTest().enabled);
+}
+
+TEST(RetireFaultGateTest, PrepareSpecValidationRejectsBadForms)
+{
+    // naming the operation defeats the stop-point contract: rejected
+    RetireFaultGate withOp;
+    withOp.ArmFromSpec(R"({"action":"block_delete","sandbox":"s","generation":"g",)"
+                       R"("prepare":true,"operation_id":"op","hold_ms":5000,)"
+                       R"("delay_ms":1,"deadline_unix_ms":9223372036854775807})");
+    EXPECT_FALSE(withOp.GetStateForTest().enabled);
+
+    // hold_ms below the floor / above the hard cap: rejected
+    RetireFaultGate tooShort;
+    tooShort.ArmFromSpec(PrepareBlockSpec(100, FutureUnixMs(60000)));
+    EXPECT_FALSE(tooShort.GetStateForTest().enabled);
+    RetireFaultGate tooLong;
+    tooLong.ArmFromSpec(PrepareBlockSpec(120001, FutureUnixMs(60000)));
+    EXPECT_FALSE(tooLong.GetStateForTest().enabled);
 }
 
 TEST(RetireFaultGateTest, RearmWhileActiveIsRejected)
@@ -150,22 +182,23 @@ TEST(RetireFaultGateTest, RearmWhileActiveIsRejected)
     RetireFaultGate gate;
     gate.ArmFromSpec(BlockSpec(1000, FutureUnixMs(60000)));
     gate.ArmFromSpec(BlockSpec(2000, FutureUnixMs(60000)));
-    int64_t delayMs = 0;
-    EXPECT_TRUE(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1", delayMs));
-    EXPECT_EQ(delayMs, 1000);  // first spec wins, not the ignored re-arm
+    const auto hit = gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1");
+    EXPECT_EQ(hit.decision, Decision::MatchExact);
+    EXPECT_EQ(hit.delayMs, 1000);  // first spec wins, not the ignored re-arm
 }
 
 TEST(RetireFaultGateTest, RearmAfterConsumedShotIsAccepted)
 {
     RetireFaultGate gate;
-    int64_t delayMs = 0;
     gate.ArmFromSpec(BlockSpec(1000, FutureUnixMs(60000)));
-    EXPECT_TRUE(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1", delayMs));  // spent
+    EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1").decision,
+              Decision::MatchExact);  // spent
     // A consumed one-shot accepts a fresh spec (fault matrix: 3 repeats in
     // one live proxy process); the new parameters fire normally.
     gate.ArmFromSpec(BlockSpec(2000, FutureUnixMs(60000)));
-    EXPECT_TRUE(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1", delayMs));
-    EXPECT_EQ(delayMs, 2000);
+    const auto hit = gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1");
+    EXPECT_EQ(hit.decision, Decision::MatchExact);
+    EXPECT_EQ(hit.delayMs, 2000);
     const auto state = gate.GetStateForTest();
     EXPECT_TRUE(state.enabled);
     EXPECT_TRUE(state.consumed);
@@ -176,6 +209,7 @@ TEST(RetireFaultGateTest, StateSnapshotExposesOperationIdentity)
     RetireFaultGate gate;
     gate.ArmFromSpec(BlockSpec(500, FutureUnixMs(60000)));
     const auto state = gate.GetStateForTest();  // const read must compile+lock
+    EXPECT_EQ(state.mode, "exact");
     EXPECT_TRUE(state.enabled);
     EXPECT_FALSE(state.consumed);
     EXPECT_EQ(state.action, "block_delete");
@@ -185,20 +219,95 @@ TEST(RetireFaultGateTest, StateSnapshotExposesOperationIdentity)
     EXPECT_EQ(state.delayMs, 500);
 }
 
+TEST(RetireFaultGateTest, PrepareBlockCapturesHoldsAndAppliesOnConfirm)
+{
+    // KillInstance assigns a random per-attempt forward id, so the test can
+    // only learn the operation at the stop-point: capture -> confirm -> the
+    // HELD message itself gets the fault.
+    RetireFaultGate gate;
+    gate.ArmFromSpec(PrepareBlockSpec(30000, FutureUnixMs(120000)));
+    EXPECT_EQ(gate.GetStateForTest().mode, "prep_wait");
+    const auto held = gate.BlockDeleteIfMatched("sbox-1", "g-7", "forward-abc");
+    EXPECT_EQ(held.decision, Decision::MatchPrepare);
+    EXPECT_EQ(held.holdMs, 30000);
+    const auto state = gate.GetStateForTest();
+    EXPECT_EQ(state.mode, "prep_held");
+    EXPECT_EQ(state.operationID, "forward-abc");  // the captured observation
+    // confirmation names the EXACT captured operation
+    gate.ArmFromSpec(ConfirmBlockSpec("forward-abc", FutureUnixMs(120000)));
+    const auto resolved = gate.ResolveBlock("sbox-1", "g-7", "forward-abc");
+    EXPECT_EQ(resolved.decision, Decision::MatchExact);
+    EXPECT_EQ(resolved.delayMs, 7000);
+    // one-shot after apply: a retry of the same op passes through
+    EXPECT_EQ(gate.ResolveBlock("sbox-1", "g-7", "forward-abc").decision, Decision::NoMatch);
+}
+
+TEST(RetireFaultGateTest, PrepareBlockWrongConfirmNeverFires)
+{
+    RetireFaultGate gate;
+    gate.ArmFromSpec(PrepareBlockSpec(30000, FutureUnixMs(120000)));
+    EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-1", "g-7", "forward-abc").decision,
+              Decision::MatchPrepare);
+    // a confirmation naming a DIFFERENT operation does not apply to the held
+    // message, and cannot fire on it either
+    gate.ArmFromSpec(ConfirmBlockSpec("forward-OTHER", FutureUnixMs(120000)));
+    EXPECT_EQ(gate.ResolveBlock("sbox-1", "g-7", "forward-abc").decision, Decision::NoMatch);
+    // the different-op confirmation stays armed for ITS operation only
+    const auto state = gate.GetStateForTest();
+    EXPECT_TRUE(state.enabled);
+    EXPECT_EQ(state.operationID, "forward-OTHER");
+    EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-1", "g-7", "forward-OTHER").decision,
+              Decision::MatchExact);
+}
+
+TEST(RetireFaultGateTest, PrepareBlockPassesThroughWhenUnconfirmed)
+{
+    RetireFaultGate gate;
+    gate.ArmFromSpec(PrepareBlockSpec(30000, FutureUnixMs(120000)));
+    EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-1", "g-7", "forward-abc").decision,
+              Decision::MatchPrepare);
+    // no confirmation written: the held dispatch is released, bounded
+    EXPECT_EQ(gate.ResolveBlock("sbox-1", "g-7", "forward-abc").decision, Decision::NoMatch);
+    EXPECT_FALSE(gate.GetStateForTest().enabled);
+    // and nothing fires afterwards for the same or other operations
+    EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-1", "g-7", "forward-abc").decision,
+              Decision::NoMatch);
+}
+
+TEST(RetireFaultGateTest, PrepareReceiptCapturesThenDropsReplayOnConfirm)
+{
+    RetireFaultGate gate;
+    gate.ArmFromSpec(R"({"action":"drop_receipt","sandbox":"sbox-1","generation":"g-7",)"
+                     R"("prepare":true,"hold_ms":30000,"delay_ms":0,"deadline_unix_ms":)"
+                     + std::to_string(FutureUnixMs(120000)) + "}");
+    // first confirmed receipt PASSES (captured, not suppressed): the durable
+    // receipt replays, so nothing is lost if no confirmation ever arrives
+    EXPECT_FALSE(gate.DropReceiptIfMatched("sbox-1", "g-7", "forward-rc1"));
+    EXPECT_EQ(gate.GetStateForTest().mode, "prep_held");
+    EXPECT_EQ(gate.GetStateForTest().operationID, "forward-rc1");
+    // confirm the exact captured operation
+    gate.ArmFromSpec(R"({"action":"drop_receipt","sandbox":"sbox-1","generation":"g-7",)"
+                     R"("operation_id":"forward-rc1","delay_ms":0,"deadline_unix_ms":)"
+                     + std::to_string(FutureUnixMs(120000)) + "}");
+    // the replay carrying the SAME operation id is the one dropped
+    EXPECT_TRUE(gate.DropReceiptIfMatched("sbox-1", "g-7", "forward-rc1"));
+    EXPECT_FALSE(gate.DropReceiptIfMatched("sbox-1", "g-7", "forward-rc1"));
+}
+
 TEST(RetireFaultGateTest, ControlFileArmsAndFiresWithoutRestart)
 {
     ControlFile control("gate-arm.json");
     control.remove();
     ControlFileEnv env(control.path);
     RetireFaultGate gate;
-    int64_t delayMs = 0;
     // No control file yet: gate stays off and nothing matches.
-    EXPECT_FALSE(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1", delayMs));
+    EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1").decision, Decision::NoMatch);
     control.write(BlockSpec(30000, FutureUnixMs(120000)));
     // The next match attempt rereads the file, arms, and consumes in the
     // same evaluation: stage-4 fault injection without a process restart.
-    EXPECT_TRUE(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1", delayMs));
-    EXPECT_EQ(delayMs, 30000);
+    const auto hit = gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1");
+    EXPECT_EQ(hit.decision, Decision::MatchExact);
+    EXPECT_EQ(hit.delayMs, 30000);
     const auto state = gate.GetStateForTest();
     EXPECT_TRUE(state.enabled);
     EXPECT_TRUE(state.consumed);
@@ -217,8 +326,7 @@ TEST(RetireFaultGateTest, ControlFileDisarmClearsActiveGate)
     control.write(R"({"disarm":true})");
     // Any match attempt first applies the disarm: enabled/consumed/identity
     // all clear, so a stale spec can never fire after an explicit disarm.
-    int64_t delayMs = 0;
-    EXPECT_FALSE(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1", delayMs));
+    EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1").decision, Decision::NoMatch);
     const auto state = gate.GetStateForTest();
     EXPECT_FALSE(state.enabled);
     EXPECT_FALSE(state.consumed);
@@ -236,14 +344,15 @@ TEST(RetireFaultGateTest, ControlFileRearmsAfterConsumedHit)
     RetireFaultGate gate;
     // First shot: block_delete against sbox-1/op-1.
     control.write(BlockSpec(5000, FutureUnixMs(120000)));
-    int64_t delayMs = 0;
-    EXPECT_TRUE(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1", delayMs));
-    EXPECT_EQ(delayMs, 5000);
-    EXPECT_FALSE(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1", delayMs));  // consumed
+    const auto first = gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1");
+    EXPECT_EQ(first.decision, Decision::MatchExact);
+    EXPECT_EQ(first.delayMs, 5000);
+    EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1").decision,
+              Decision::NoMatch);  // consumed
     // Second shot against a DIFFERENT identity: the fault matrix needs
     // repeated faults from one live proxy process.
     control.write(std::string(R"({"action":"drop_receipt","sandbox":"sbox-2","generation":"g-2",)")
-                  + R"("operation_id":"op-2","delay_ms":0,"deadline_unix_ms":)"
+                  + R"("operation_id":"op-2","delay_ms":0,"deadline_unix_ms":)")
                   + std::to_string(FutureUnixMs(120000)) + "}");
     EXPECT_TRUE(gate.DropReceiptIfMatched("sbox-2", "g-2", "op-2"));
     EXPECT_FALSE(gate.DropReceiptIfMatched("sbox-2", "g-2", "op-2"));  // consumed again
@@ -255,6 +364,26 @@ TEST(RetireFaultGateTest, ControlFileRearmsAfterConsumedHit)
     control.remove();
 }
 
+TEST(RetireFaultGateTest, ControlFileConfirmsPrepareStopPoint)
+{
+    // The full stage-4 flow against one live process: prepare via control
+    // file, the message held at the stop-point, confirmation naming the
+    // captured operation id, the fault applied to the HELD message.
+    ControlFile control("gate-prep-confirm.json");
+    control.remove();
+    ControlFileEnv env(control.path);
+    RetireFaultGate gate;
+    control.write(PrepareBlockSpec(60000, FutureUnixMs(300000)));
+    const auto held = gate.BlockDeleteIfMatched("sbox-1", "g-7", "fwd-random-42");
+    EXPECT_EQ(held.decision, Decision::MatchPrepare);
+    EXPECT_EQ(held.holdMs, 60000);
+    control.write(ConfirmBlockSpec("fwd-random-42", FutureUnixMs(300000)));
+    const auto resolved = gate.ResolveBlock("sbox-1", "g-7", "fwd-random-42");
+    EXPECT_EQ(resolved.decision, Decision::MatchExact);
+    EXPECT_EQ(resolved.delayMs, 7000);
+    control.remove();
+}
+
 TEST(RetireFaultGateTest, IdenticalControlContentNeverRefires)
 {
     ControlFile control("gate-same-content.json");
@@ -263,18 +392,19 @@ TEST(RetireFaultGateTest, IdenticalControlContentNeverRefires)
     RetireFaultGate gate;
     const std::string spec = BlockSpec(5000, FutureUnixMs(120000));
     control.write(spec);
-    int64_t delayMs = 0;
-    EXPECT_TRUE(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1", delayMs));
+    EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1").decision,
+              Decision::MatchExact);
     // Rewriting byte-identical content must NOT re-arm: the caller's retry
     // after the hit has to pass through (one-shot semantics preserved).
     control.write(spec);
-    EXPECT_FALSE(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1", delayMs));
+    EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1").decision, Decision::NoMatch);
     // A CHANGED file (bumped control_revision) is the explicit operator
     // intent to fire the same identity again.
     control.write(std::string(R"({"action":"block_delete","sandbox":"sbox-1","generation":"g-7",)")
                   + R"("operation_id":"op-1","control_revision":2,"delay_ms":5000,)"
                   + R"("deadline_unix_ms":)" + std::to_string(FutureUnixMs(120000)) + "}");
-    EXPECT_TRUE(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1", delayMs));
+    EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1").decision,
+              Decision::MatchExact);
     control.remove();
 }
 
@@ -286,15 +416,16 @@ TEST(RetireFaultGateTest, RapidArmDisarmArmAllApplyByContent)
     control.remove();
     ControlFileEnv env(control.path);
     RetireFaultGate gate;
-    int64_t delayMs = 0;
     control.write(BlockSpec(5000, FutureUnixMs(120000)));
-    EXPECT_TRUE(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1", delayMs));  // fires
+    EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1").decision,
+              Decision::MatchExact);  // fires
     control.write(R"({"disarm":true})");
     EXPECT_FALSE(gate.DropReceiptIfMatched("sbox-9", "g-1", "op-4"));  // refresh applies disarm
     EXPECT_FALSE(gate.GetStateForTest().enabled);
     control.write(BlockSpec(6000, FutureUnixMs(120000)));
-    EXPECT_TRUE(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1", delayMs));
-    EXPECT_EQ(delayMs, 6000);
+    const auto again = gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1");
+    EXPECT_EQ(again.decision, Decision::MatchExact);
+    EXPECT_EQ(again.delayMs, 6000);
     control.remove();
 }
 
@@ -305,9 +436,9 @@ TEST(RetireFaultGateTest, MissingControlFileLeavesArmedGateUntouched)
     ControlFileEnv env(control.path);
     RetireFaultGate gate;
     gate.ArmFromSpec(BlockSpec(7000, FutureUnixMs(60000)));
-    int64_t delayMs = 0;
-    EXPECT_TRUE(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1", delayMs));
-    EXPECT_EQ(delayMs, 7000);  // absent control file never disarms or mutates
+    const auto hit = gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1");
+    EXPECT_EQ(hit.decision, Decision::MatchExact);
+    EXPECT_EQ(hit.delayMs, 7000);  // absent control file never disarms or mutates
     control.remove();
 }
 

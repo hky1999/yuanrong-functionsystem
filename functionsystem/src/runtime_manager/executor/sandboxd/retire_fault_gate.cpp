@@ -27,6 +27,8 @@
 namespace functionsystem::runtime_manager {
 namespace {
 
+constexpr int64_t kMaxHoldMs = 120000;  // hard bound of the confirmation stop-point
+
 int64_t NowUnixMs()
 {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -57,35 +59,68 @@ void RetireFaultGate::ArmFromSpec(const std::string &specJson)
 
 void RetireFaultGate::ArmLocked(const std::string &specJson)
 {
-    if (enabled_ && !consumed_) {
-        YRLOG_WARN("retire-fault gate re-arm ignored: a spec is already active");
+    if (enabled_ && !consumed_ && mode_ == "exact") {
+        YRLOG_WARN("retire-fault gate re-arm ignored: an exact spec is already active");
         return;
     }
-    // enabled_ && consumed_ (a spent one-shot) FALLS THROUGH: the fault
-    // matrix arms several faults against one live proxy process, so a
-    // consumed gate must accept a fresh spec without a restart.
+    // A consumed one-shot, a prepare spec, or a held prepare may be replaced:
+    // the fault matrix arms several faults against one live proxy process,
+    // and the control file REPLACES a prepare spec with its confirmation.
     try {
         const auto spec = nlohmann::json::parse(specJson);
-        action_ = spec.value("action", "");
-        sandboxID_ = spec.value("sandbox", "");
-        generation_ = spec.value("generation", "");
-        operationID_ = spec.value("operation_id", "");
+        const std::string action = spec.value("action", "");
+        const std::string sandbox = spec.value("sandbox", "");
+        const std::string generation = spec.value("generation", "");
+        const std::string operation = spec.value("operation_id", "");
         // int64_t defaults: value() returns the default's type, and an int
         // default silently wraps 13-digit unix-ms deadlines negative.
-        delayMs_ = spec.value("delay_ms", static_cast<int64_t>(0));
-        deadlineUnixMs_ = spec.value("deadline_unix_ms", static_cast<int64_t>(0));
-        if ((action_ == "block_delete" || action_ == "drop_receipt") && !sandboxID_.empty()
-            && !generation_.empty() && !operationID_.empty() && delayMs_ >= 0
-            && deadlineUnixMs_ > 0) {
-            enabled_ = true;
-            consumed_ = false;  // fresh one-shot replaces the spent spec
-            YRLOG_WARN("retire-fault gate ARMED action({}) sandbox({}) generation({}) "
-                       "operation({}) delay_ms({}) deadline_unix_ms({})",
-                       action_, sandboxID_, generation_, operationID_, delayMs_, deadlineUnixMs_);
-        } else {
-            YRLOG_WARN("retire-fault gate spec ignored (invalid action/identity/operation/"
-                       "deadline): {}", specJson);
+        const int64_t delayMs = spec.value("delay_ms", static_cast<int64_t>(0));
+        const int64_t deadlineUnixMs = spec.value("deadline_unix_ms", static_cast<int64_t>(0));
+        const int64_t holdMs = spec.value("hold_ms", static_cast<int64_t>(0));
+        const bool prepare = spec.value("prepare", false);
+        const bool actionOk = action == "block_delete" || action == "drop_receipt";
+        if (!actionOk || sandbox.empty() || generation.empty() || delayMs < 0
+            || deadlineUnixMs <= 0) {
+            YRLOG_WARN("retire-fault gate spec ignored (invalid action/identity/deadline): {}",
+                       specJson);
+            return;
         }
+        if (prepare) {
+            if (!operation.empty()) {
+                YRLOG_WARN("retire-fault gate prepare spec must NOT name operation_id (it is "
+                           "observed at the stop-point): {}", specJson);
+                return;
+            }
+            if (holdMs < 1000 || holdMs > kMaxHoldMs) {
+                YRLOG_WARN("retire-fault gate prepare hold_ms must be 1000..{}: {}", kMaxHoldMs,
+                           specJson);
+                return;
+            }
+            mode_ = "prep_wait";
+            operationID_.clear();
+            holdMs_ = holdMs;
+        } else {
+            if (operation.empty()) {
+                YRLOG_WARN("retire-fault gate exact spec requires operation_id (or use "
+                           "prepare): {}", specJson);
+                return;
+            }
+            mode_ = "exact";
+            operationID_ = operation;
+            holdMs_ = 0;
+        }
+        action_ = action;
+        sandboxID_ = sandbox;
+        generation_ = generation;
+        delayMs_ = delayMs;
+        deadlineUnixMs_ = deadlineUnixMs;
+        prepDeadlineUnixMs_ = 0;
+        enabled_ = true;
+        consumed_ = false;  // fresh one-shot replaces the spent/prepare spec
+        YRLOG_WARN("retire-fault gate ARMED mode({}) action({}) sandbox({}) generation({}) "
+                   "operation({}) delay_ms({}) hold_ms({}) deadline_unix_ms({})",
+                   mode_, action_, sandboxID_, generation_, operationID_, delayMs_, holdMs_,
+                   deadlineUnixMs_);
     } catch (const std::exception &error) {
         YRLOG_WARN("retire-fault gate spec unparsable, staying disabled: {}", error.what());
     }
@@ -108,12 +143,15 @@ void RetireFaultGate::DisarmLocked(const char *reason)
 {
     enabled_ = false;
     consumed_ = false;
+    mode_.clear();
     action_.clear();
     sandboxID_.clear();
     generation_.clear();
     operationID_.clear();
     delayMs_ = 0;
     deadlineUnixMs_ = 0;
+    holdMs_ = 0;
+    prepDeadlineUnixMs_ = 0;
     YRLOG_WARN("retire-fault gate DISARMED reason({})", reason);
 }
 
@@ -154,17 +192,17 @@ void RetireFaultGate::RefreshFromControlFile()
 RetireFaultGate::State RetireFaultGate::GetStateForTest() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    return State{ action_, sandboxID_, generation_, operationID_, delayMs_, deadlineUnixMs_,
-                  enabled_, consumed_ };
+    return State{ mode_, action_, sandboxID_, generation_, operationID_, delayMs_,
+                  deadlineUnixMs_, holdMs_, enabled_, consumed_ };
 }
 
-bool RetireFaultGate::ConsumeIfMatchedLocked(const char *action, const std::string &sandboxID,
-                                             const std::string &generation,
-                                             const std::string &operationID, int64_t &delayMs)
+bool RetireFaultGate::ConsumeExactLocked(const char *action, const std::string &sandboxID,
+                                         const std::string &generation,
+                                         const std::string &operationID, int64_t &delayMs)
 {
     delayMs = 0;
-    if (!enabled_ || consumed_) {
-        return false;  // off, or one shot already fired
+    if (!enabled_ || consumed_ || mode_ != "exact") {
+        return false;
     }
     if (action_ != action || sandboxID_ != sandboxID || generation_ != generation
         || operationID_ != operationID) {
@@ -187,21 +225,98 @@ bool RetireFaultGate::ConsumeIfMatchedLocked(const char *action, const std::stri
     return true;
 }
 
-bool RetireFaultGate::BlockDeleteIfMatched(const std::string &sandboxID, const std::string &generation,
-                                           const std::string &operationID, int64_t &delayMs)
+RetireFaultGate::BlockDecision RetireFaultGate::BlockDeleteIfMatched(
+    const std::string &sandboxID, const std::string &generation,
+    const std::string &operationID)
 {
     RefreshFromControlFile();
     std::lock_guard<std::mutex> lock(mutex_);
-    return ConsumeIfMatchedLocked("block_delete", sandboxID, generation, operationID, delayMs);
+    BlockDecision decision;
+    int64_t delayMs = 0;
+    if (ConsumeExactLocked("block_delete", sandboxID, generation, operationID, delayMs)) {
+        decision.decision = Decision::MatchExact;
+        decision.delayMs = delayMs;
+        return decision;
+    }
+    if (enabled_ && !consumed_ && mode_ == "prep_wait" && action_ == "block_delete"
+        && sandboxID_ == sandboxID && generation_ == generation && NowUnixMs() <= deadlineUnixMs_) {
+        // Bounded confirmation stop-point: capture the unpredictable
+        // operation id, hold the message for holdMs_, and apply the fault
+        // only if an exact confirmation naming this id arrives in the window.
+        mode_ = "prep_held";
+        operationID_ = operationID;
+        prepDeadlineUnixMs_ = NowUnixMs() + holdMs_;
+        decision.decision = Decision::MatchPrepare;
+        decision.holdMs = holdMs_;
+        YRLOG_WARN("retire-fault gate PREPARED(block) sandbox({}) generation({}) "
+                   "operation({}) hold_ms({}) — confirm via control file with this exact "
+                   "operation id within the window",
+                   sandboxID_, generation_, operationID_, holdMs_);
+        return decision;
+    }
+    return decision;
 }
 
-bool RetireFaultGate::DropReceiptIfMatched(const std::string &sandboxID, const std::string &generation,
+RetireFaultGate::BlockDecision RetireFaultGate::ResolveBlock(
+    const std::string &sandboxID, const std::string &generation,
+    const std::string &operationID)
+{
+    RefreshFromControlFile();  // may have applied the exact confirmation
+    std::lock_guard<std::mutex> lock(mutex_);
+    BlockDecision decision;
+    int64_t delayMs = 0;
+    if (ConsumeExactLocked("block_delete", sandboxID, generation, operationID, delayMs)) {
+        // confirmed during the hold: apply the fault to THIS held message
+        decision.decision = Decision::MatchExact;
+        decision.delayMs = delayMs;
+        return decision;
+    }
+    if (enabled_ && mode_ == "prep_held" && action_ == "block_delete"
+        && sandboxID_ == sandboxID && generation_ == generation
+        && operationID_ == operationID) {
+        YRLOG_WARN("retire-fault gate PREP_EXPIRED(block) sandbox({}) generation({}) "
+                   "operation({}): no exact confirmation within hold_ms({}), message "
+                   "passes through",
+                   sandboxID_, generation_, operationID_, holdMs_);
+        DisarmLocked("prepare-window-elapsed");
+    }
+    return decision;  // NoMatch: pass the held message through, bounded
+}
+
+bool RetireFaultGate::DropReceiptIfMatched(const std::string &sandboxID,
+                                           const std::string &generation,
                                            const std::string &operationID)
 {
-    int64_t delayMs = 0;
     RefreshFromControlFile();
     std::lock_guard<std::mutex> lock(mutex_);
-    return ConsumeIfMatchedLocked("drop_receipt", sandboxID, generation, operationID, delayMs);
+    int64_t delayMs = 0;
+    if (ConsumeExactLocked("drop_receipt", sandboxID, generation, operationID, delayMs)) {
+        return true;
+    }
+    if (enabled_ && !consumed_ && mode_ == "prep_wait" && action_ == "drop_receipt"
+        && sandboxID_ == sandboxID && generation_ == generation && NowUnixMs() <= deadlineUnixMs_) {
+        // Capture WITHOUT suppressing: the durable receipt replays, so only a
+        // confirmed exact spec drops a later message carrying this id. The
+        // first message always travels — nothing is lost if no confirmation
+        // arrives.
+        mode_ = "prep_held";
+        operationID_ = operationID;
+        prepDeadlineUnixMs_ = NowUnixMs() + holdMs_;
+        YRLOG_WARN("retire-fault gate PREPARED(receipt) sandbox({}) generation({}) "
+                   "operation({}) hold_ms({}) — first receipt passes; confirm via control "
+                   "file with this exact operation id to drop its replay",
+                   sandboxID_, generation_, operationID_, holdMs_);
+        return false;
+    }
+    if (enabled_ && mode_ == "prep_held" && action_ == "drop_receipt"
+        && sandboxID_ == sandboxID && generation_ == generation
+        && operationID_ == operationID && NowUnixMs() > prepDeadlineUnixMs_) {
+        YRLOG_WARN("retire-fault gate PREP_EXPIRED(receipt) sandbox({}) generation({}) "
+                   "operation({}): no exact confirmation within hold_ms({})",
+                   sandboxID_, generation_, operationID_, holdMs_);
+        DisarmLocked("prepare-window-elapsed");
+    }
+    return false;
 }
 
 }  // namespace functionsystem::runtime_manager
