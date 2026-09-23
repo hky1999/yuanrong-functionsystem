@@ -58,10 +58,13 @@ void RetireFaultGate::ArmFromSpec(const std::string &specJson)
 
 void RetireFaultGate::ArmLocked(const std::string &specJson)
 {
-    if (enabled_) {
+    if (enabled_ && !consumed_) {
         YRLOG_WARN("retire-fault gate re-arm ignored: a spec is already active");
         return;
     }
+    // enabled_ && consumed_ (a spent one-shot) FALLS THROUGH: the fault
+    // matrix arms several faults against one live proxy process, so a
+    // consumed gate must accept a fresh spec without a restart.
     try {
         const auto spec = nlohmann::json::parse(specJson);
         action_ = spec.value("action", "");
@@ -74,6 +77,7 @@ void RetireFaultGate::ArmLocked(const std::string &specJson)
         if ((action_ == "block_delete" || action_ == "drop_receipt") && !sandboxID_.empty()
             && !generation_.empty() && delayMs_ >= 0 && deadlineUnixMs_ > 0) {
             enabled_ = true;
+            consumed_ = false;  // fresh one-shot replaces the spent spec
             YRLOG_WARN("retire-fault gate ARMED action({}) sandbox({}) generation({}) delay_ms({}) "
                        "deadline_unix_ms({})",
                        action_, sandboxID_, generation_, delayMs_, deadlineUnixMs_);

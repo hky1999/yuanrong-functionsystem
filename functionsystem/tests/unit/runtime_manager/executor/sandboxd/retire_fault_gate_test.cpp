@@ -14,6 +14,9 @@
 #include "runtime_manager/executor/sandboxd/retire_fault_gate.h"
 #include <gtest/gtest.h>
 #include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 
 namespace functionsystem::test {
 using runtime_manager::RetireFaultGate;
@@ -29,6 +32,52 @@ std::string BlockSpec(int64_t delayMs, int64_t deadlineUnixMs)
     return std::string(R"({"action":"block_delete","sandbox":"sbox-1","generation":"g-7","delay_ms":)")
         + std::to_string(delayMs) + R"(,"deadline_unix_ms":)" + std::to_string(deadlineUnixMs) + "}";
 }
+
+// Writes the control file and forces its mtime FORWARD by a distinct offset
+// per write: the gate only rereads on mtime change, and filesystem mtime
+// granularity could otherwise alias two rapid writes into one revision.
+struct ControlFile {
+    std::filesystem::path path;
+    int revision = 0;
+    explicit ControlFile(const std::string &name)
+        : path(std::filesystem::path(testing::TempDir()) / name)
+    {
+    }
+    void write(const std::string &content)
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << content;
+        out.close();
+        ++revision;
+        std::filesystem::last_write_time(
+            path, std::filesystem::file_time_type::clock::now()
+                      + std::chrono::seconds(revision * 10));
+    }
+    void remove()
+    {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+};
+
+// Points the gate at this process's control file (never the production
+// default) and restores the environment on scope exit.
+struct ControlFileEnv {
+    explicit ControlFileEnv(const std::filesystem::path &path)
+    {
+        saved = std::getenv("AKERNEL_RETIRE_FAULT_CONTROL_FILE");
+        setenv("AKERNEL_RETIRE_FAULT_CONTROL_FILE", path.c_str(), 1);
+    }
+    ~ControlFileEnv()
+    {
+        if (saved != nullptr) {
+            setenv("AKERNEL_RETIRE_FAULT_CONTROL_FILE", saved, 1);
+        } else {
+            unsetenv("AKERNEL_RETIRE_FAULT_CONTROL_FILE");
+        }
+    }
+    const char *saved = nullptr;
+};
 }  // namespace
 
 TEST(RetireFaultGateTest, DisabledGateNeverMatches)
@@ -95,6 +144,101 @@ TEST(RetireFaultGateTest, RearmWhileActiveIsRejected)
     int64_t delayMs = 0;
     EXPECT_TRUE(gate.BlockDeleteIfMatched("sbox-1", "g-7", delayMs));
     EXPECT_EQ(delayMs, 1000);  // first spec wins, not the ignored re-arm
+}
+
+TEST(RetireFaultGateTest, RearmAfterConsumedShotIsAccepted)
+{
+    RetireFaultGate gate;
+    int64_t delayMs = 0;
+    gate.ArmFromSpec(BlockSpec(1000, FutureUnixMs(60000)));
+    EXPECT_TRUE(gate.BlockDeleteIfMatched("sbox-1", "g-7", delayMs));  // spent
+    // A consumed one-shot accepts a fresh spec (fault matrix: 3 repeats in
+    // one live proxy process); the new identity fires normally.
+    gate.ArmFromSpec(BlockSpec(2000, FutureUnixMs(60000)));
+    EXPECT_TRUE(gate.BlockDeleteIfMatched("sbox-1", "g-7", delayMs));
+    EXPECT_EQ(delayMs, 2000);
+    const auto state = gate.GetStateForTest();
+    EXPECT_TRUE(state.enabled);
+    EXPECT_TRUE(state.consumed);
+}
+
+TEST(RetireFaultGateTest, ControlFileArmsAndFiresWithoutRestart)
+{
+    ControlFile control("gate-arm.json");
+    control.remove();
+    ControlFileEnv env(control.path);
+    RetireFaultGate gate;
+    int64_t delayMs = 0;
+    // No control file yet: gate stays off and nothing matches.
+    EXPECT_FALSE(gate.BlockDeleteIfMatched("sbox-1", "g-7", delayMs));
+    control.write(BlockSpec(30000, FutureUnixMs(120000)));
+    // The next match attempt rereads the file, arms, and consumes in the
+    // same evaluation: stage-4 fault injection without a process restart.
+    EXPECT_TRUE(gate.BlockDeleteIfMatched("sbox-1", "g-7", delayMs));
+    EXPECT_EQ(delayMs, 30000);
+    const auto state = gate.GetStateForTest();
+    EXPECT_TRUE(state.enabled);
+    EXPECT_TRUE(state.consumed);
+    EXPECT_EQ(state.sandboxID, "sbox-1");
+    control.remove();
+}
+
+TEST(RetireFaultGateTest, ControlFileDisarmClearsActiveGate)
+{
+    ControlFile control("gate-disarm.json");
+    control.remove();
+    ControlFileEnv env(control.path);
+    RetireFaultGate gate;
+    gate.ArmFromSpec(BlockSpec(1000, FutureUnixMs(60000)));
+    control.write(R"({"disarm":true})");
+    // Any match attempt first applies the disarm: enabled/consumed/identity
+    // all clear, so a stale spec can never fire after an explicit disarm.
+    int64_t delayMs = 0;
+    EXPECT_FALSE(gate.BlockDeleteIfMatched("sbox-1", "g-7", delayMs));
+    const auto state = gate.GetStateForTest();
+    EXPECT_FALSE(state.enabled);
+    EXPECT_FALSE(state.consumed);
+    EXPECT_TRUE(state.sandboxID.empty());
+    EXPECT_TRUE(state.action.empty());
+    control.remove();
+}
+
+TEST(RetireFaultGateTest, ControlFileRearmsAfterConsumedHit)
+{
+    ControlFile control("gate-rearm.json");
+    control.remove();
+    ControlFileEnv env(control.path);
+    RetireFaultGate gate;
+    // First shot: block_delete against sbox-1.
+    control.write(BlockSpec(5000, FutureUnixMs(120000)));
+    int64_t delayMs = 0;
+    EXPECT_TRUE(gate.BlockDeleteIfMatched("sbox-1", "g-7", delayMs));
+    EXPECT_EQ(delayMs, 5000);
+    EXPECT_FALSE(gate.BlockDeleteIfMatched("sbox-1", "g-7", delayMs));  // consumed
+    // Second shot against a DIFFERENT identity: the fault matrix needs
+    // repeated faults from one live proxy process.
+    control.write(std::string(R"({"action":"drop_receipt","sandbox":"sbox-2","generation":"g-2",)")
+                  + R"("delay_ms":0,"deadline_unix_ms":)" + std::to_string(FutureUnixMs(120000)) + "}");
+    EXPECT_TRUE(gate.DropReceiptIfMatched("sbox-2", "g-2"));
+    EXPECT_FALSE(gate.DropReceiptIfMatched("sbox-2", "g-2"));  // consumed again
+    const auto state = gate.GetStateForTest();
+    EXPECT_TRUE(state.enabled);
+    EXPECT_EQ(state.action, "drop_receipt");
+    EXPECT_EQ(state.sandboxID, "sbox-2");
+    control.remove();
+}
+
+TEST(RetireFaultGateTest, MissingControlFileLeavesArmedGateUntouched)
+{
+    ControlFile control("gate-absent.json");
+    control.remove();
+    ControlFileEnv env(control.path);
+    RetireFaultGate gate;
+    gate.ArmFromSpec(BlockSpec(7000, FutureUnixMs(60000)));
+    int64_t delayMs = 0;
+    EXPECT_TRUE(gate.BlockDeleteIfMatched("sbox-1", "g-7", delayMs));
+    EXPECT_EQ(delayMs, 7000);  // absent control file never disarms or mutates
+    control.remove();
 }
 
 }  // namespace functionsystem::test

@@ -38,7 +38,9 @@ public:
 
     // Arm from an explicit JSON spec (identical validation to the environment
     // variable). Used by the singleton's environment read and by unit tests;
-    // never touches resource or budget state.
+    // never touches resource or budget state. Re-arming is rejected while a
+    // spec is active AND unfired; a consumed (spent) one-shot accepts a fresh
+    // spec so the fault matrix can fire repeatedly in one process.
     void ArmFromSpec(const std::string &specJson);
 
     // Runtime test control (stage-4 requirement): re-check the control file
