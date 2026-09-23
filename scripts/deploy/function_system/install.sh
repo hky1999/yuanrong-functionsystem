@@ -175,6 +175,13 @@ function install_function_proxy() {
     --log_expiration_cleanup_interval="${LOG_EXPIRATION_CLEANUP_INTERVAL}" \
     --log_expiration_max_file_count="${LOG_EXPIRATION_MAX_FILE_COUNT}""
   fi
+  # Memory-elasticity static startup switch + ladder growth parameters.
+  # The deploy launch chain rebuilds its environment, so a container-level
+  # env does not survive to the binary; these explicit assignments are the
+  # persistent canonical wiring (flags.cpp: memory_elasticity_config reads
+  # AKERNEL_MEMORY_ELASTICITY==1 at process start; enable_upgrade_ladder/
+  # upgrade_step_mb/upgrade_cap_mb are argv flags consumed by the proxy).
+  AKERNEL_MEMORY_ELASTICITY=${AKERNEL_MEMORY_ELASTICITY:-1} \
   LD_LIBRARY_PATH=${function_system_ld_library_path:-${FUNCTION_SYSTEM_DIR}/lib:${DATA_SYSTEM_DIR}/lib:${LD_LIBRARY_PATH}} \
     PATH="${RUNTIME_HOME_DIR}/service/java/bin:/opt/buildtools/jdk8/bin:${PATH}" \
     LD_PRELOAD="${jemalloc_path}" \
