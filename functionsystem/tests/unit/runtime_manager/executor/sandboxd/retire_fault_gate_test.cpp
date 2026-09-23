@@ -30,24 +30,49 @@ int64_t FutureUnixMs(int64_t offsetMs)
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count() + offsetMs;
 }
+// One generic spec builder: plain std::string concatenation only (the first
+// operand of every + is a std::string), immune to the raw-string
+// multi-literal parsing differences that broke gate-rearm-4/5. An empty
+// operation means a prepare spec (hold_ms window); otherwise an exact spec.
+std::string Spec(const std::string &action, const std::string &sandbox,
+                 const std::string &generation, const std::string &operation,
+                 int64_t holdMs, int64_t delayMs, int64_t deadlineUnixMs,
+                 const std::string &extra = "")
+{
+    std::string spec = std::string("{\"action\":\"") + action + "\",\"sandbox\":\"" + sandbox
+        + "\",\"generation\":\"" + generation + "\"";
+    if (operation.empty()) {
+        spec += std::string(",\"prepare\":true,\"hold_ms\":") + std::to_string(holdMs);
+    } else {
+        spec += std::string(",\"operation_id\":\"") + operation + "\"";
+    }
+    spec += std::string(",\"delay_ms\":") + std::to_string(delayMs);
+    spec += std::string(",\"deadline_unix_ms\":") + std::to_string(deadlineUnixMs);
+    spec += extra;
+    spec += "}";
+    return spec;
+}
 std::string BlockSpec(int64_t delayMs, int64_t deadlineUnixMs)
 {
-    return std::string(R"({"action":"block_delete","sandbox":"sbox-1","generation":"g-7",)"
-                       R"("operation_id":"op-1","delay_ms":)")
-        + std::to_string(delayMs) + R"(,"deadline_unix_ms":)" + std::to_string(deadlineUnixMs) + "}";
+    return Spec("block_delete", "sbox-1", "g-7", "op-1", 0, delayMs, deadlineUnixMs);
 }
 std::string PrepareBlockSpec(int64_t holdMs, int64_t deadlineUnixMs)
 {
-    return std::string(R"({"action":"block_delete","sandbox":"sbox-1","generation":"g-7",)"
-                       R"("prepare":true,"hold_ms":)")
-        + std::to_string(holdMs) + R"(,"delay_ms":9000,"deadline_unix_ms":)"
-        + std::to_string(deadlineUnixMs) + "}";
+    return Spec("block_delete", "sbox-1", "g-7", "", holdMs, 9000, deadlineUnixMs);
 }
 std::string ConfirmBlockSpec(const std::string &operation, int64_t deadlineUnixMs)
 {
-    return std::string(R"({"action":"block_delete","sandbox":"sbox-1","generation":"g-7",)"
-                       R"("operation_id":")" + operation + R"(","delay_ms":7000,)"
-                       R"("deadline_unix_ms":)" + std::to_string(deadlineUnixMs) + "}");
+    return Spec("block_delete", "sbox-1", "g-7", operation, 0, 7000, deadlineUnixMs);
+}
+std::string ReceiptPrepareSpec(const std::string &sandbox, const std::string &generation,
+                               int64_t holdMs, int64_t deadlineUnixMs)
+{
+    return Spec("drop_receipt", sandbox, generation, "", holdMs, 0, deadlineUnixMs);
+}
+std::string ReceiptExactSpec(const std::string &sandbox, const std::string &generation,
+                             const std::string &operation, int64_t deadlineUnixMs)
+{
+    return Spec("drop_receipt", sandbox, generation, operation, 0, 0, deadlineUnixMs);
 }
 
 // The control file is deduplicated by CONTENT (mtime is not trusted), so no
@@ -421,9 +446,8 @@ TEST(RetireFaultGateTest, ControlFileRearmsAfterConsumedHit)
               Decision::NoMatch);  // consumed
     // Second shot against a DIFFERENT identity: the fault matrix needs
     // repeated faults from one live proxy process.
-    control.write(std::string(R"({"action":"drop_receipt","sandbox":"sbox-2","generation":"g-2",)")
-                  + R"("operation_id":"op-2","delay_ms":0,"deadline_unix_ms":)")
-                  + std::to_string(FutureUnixMs(120000)) + "}");
+    control.write(Spec("drop_receipt", "sbox-2", "g-2", "op-2", 0, 0,
+                       FutureUnixMs(120000)));
     EXPECT_EQ(gate.DropReceiptIfMatched("sbox-2", "g-2", "op-2").decision,
               RetireFaultGate::ReceiptDecision::Drop);
     EXPECT_EQ(gate.DropReceiptIfMatched("sbox-2", "g-2", "op-2").decision,
@@ -472,9 +496,8 @@ TEST(RetireFaultGateTest, IdenticalControlContentNeverRefires)
     EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1").decision, Decision::NoMatch);
     // A CHANGED file (bumped control_revision) is the explicit operator
     // intent to fire the same identity again.
-    control.write(std::string(R"({"action":"block_delete","sandbox":"sbox-1","generation":"g-7",)")
-                  + R"("operation_id":"op-1","control_revision":2,"delay_ms":5000,)"
-                  + R"("deadline_unix_ms":)" + std::to_string(FutureUnixMs(120000)) + "}");
+    control.write(Spec("block_delete", "sbox-1", "g-7", "op-1", 0, 5000,
+                       FutureUnixMs(120000), ",\"control_revision\":2"));
     EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1").decision,
               Decision::MatchExact);
     control.remove();

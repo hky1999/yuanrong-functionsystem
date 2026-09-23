@@ -17,6 +17,7 @@
 #include "runtime_manager.h"
 
 #include "async/async.hpp"
+#include "async/asyncafter.hpp"
 #include "async/defer.hpp"
 #include "async/future.hpp"
 #include "common/constants/actor_name.h"
@@ -1192,7 +1193,10 @@ void RuntimeManager::ResolveHeldRetireReceipt(
     YRLOG_INFO("{}|retire-fault: stop-point released, sending ORIGINAL retirement receipt "
                "for runtime({}) sandbox({})",
                requestID, runtimeID, sandboxID);
-    Send(*from, "StopInstanceResponse", *payload);
+    // Send takes std::string&&: copy the held bytes and move them — the
+    // shared_ptr payload itself stays untouched.
+    std::string original(*payload);
+    Send(*from, "StopInstanceResponse", std::move(original));
 }
 
 void RuntimeManager::OnGetRuntimeStatus(const litebus::AID &from,
