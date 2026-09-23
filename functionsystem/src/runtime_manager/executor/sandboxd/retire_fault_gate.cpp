@@ -28,6 +28,7 @@ namespace functionsystem::runtime_manager {
 namespace {
 
 constexpr int64_t kMaxHoldMs = 120000;  // hard bound of the confirmation stop-point
+constexpr int kPollerTickMs = 100;      // in-window control-file observation cadence
 
 int64_t NowUnixMs()
 {
@@ -49,6 +50,33 @@ RetireFaultGate &RetireFaultGate::Instance()
     }();
     (void)envArmed;
     return gate;
+}
+
+RetireFaultGate::~RetireFaultGate()
+{
+    pollerStop_.store(true);
+    if (prepPoller_.joinable()) {
+        prepPoller_.join();  // bounded: the tick loop sees the stop flag
+    }
+}
+
+void RetireFaultGate::StartPrepPollerLocked()
+{
+    if (pollerStarted_.exchange(true)) {
+        return;  // the persistent poller re-checks mode/window each tick, so
+                 // it automatically watches every capture after the first
+    }
+    prepPoller_ = std::thread([this]() {
+        while (!pollerStop_.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(kPollerTickMs));
+            if (pollerStop_.load()) {
+                break;
+            }
+            // Applies an in-window confirmation and freezes its arrival
+            // moment; a no-op read when no control file exists.
+            RefreshFromControlFile();
+        }
+    });
 }
 
 void RetireFaultGate::ArmFromSpec(const std::string &specJson)
@@ -125,8 +153,13 @@ void RetireFaultGate::ArmLocked(const std::string &specJson)
         if (!confirmOfHeldPrep) {
             prepWindowDeadlineUnixMs_ = 0;
             fromPrepConfirm_ = false;
+            confirmArrivalUnixMs_ = 0;
         } else {
             fromPrepConfirm_ = true;
+            // Arrival frozen at the moment the poller (or a refresh) applied
+            // the confirmation — judged against the frozen window, not
+            // against whenever the resolve later runs.
+            confirmArrivalUnixMs_ = NowUnixMs();
         }
         enabled_ = true;
         consumed_ = false;  // fresh one-shot replaces the spent/prepare spec
@@ -167,6 +200,7 @@ void RetireFaultGate::DisarmLocked(const char *reason)
     holdMs_ = 0;
     prepWindowDeadlineUnixMs_ = 0;
     fromPrepConfirm_ = false;
+    confirmArrivalUnixMs_ = 0;
     YRLOG_WARN("retire-fault gate DISARMED reason({})", reason);
 }
 
@@ -225,14 +259,17 @@ bool RetireFaultGate::ConsumeExactLocked(const char *action, const std::string &
         return false;  // exact operation identity only: neighbours never match
     }
     const int64_t now = NowUnixMs();
-    if (fromPrepConfirm_ && now > prepWindowDeadlineUnixMs_) {
-        // The exact spec is a confirmation of a held prepare, and the event
-        // loop reached this message only after the frozen window closed:
-        // the confirmation is out of window and must NOT fire.
+    if (fromPrepConfirm_
+        && (confirmArrivalUnixMs_ <= 0 || confirmArrivalUnixMs_ > prepWindowDeadlineUnixMs_)) {
+        // The exact spec is a confirmation of a held prepare whose ARRIVAL
+        // lies outside the frozen window (late write, or arrival never
+        // recorded): it must NOT fire, no matter when the resolve runs.
         consumed_ = true;
         YRLOG_WARN("retire-fault gate PREP_WINDOW_EXPIRED action({}) sandbox({}) "
-                   "generation({}) operation({}) window_deadline_unix_ms({})",
-                   action_, sandboxID_, generation_, operationID_, prepWindowDeadlineUnixMs_);
+                   "generation({}) operation({}) window_deadline_unix_ms({}) "
+                   "confirm_arrival_unix_ms({})",
+                   action_, sandboxID_, generation_, operationID_, prepWindowDeadlineUnixMs_,
+                   confirmArrivalUnixMs_);
         return false;
     }
     if (now > deadlineUnixMs_) {
@@ -270,13 +307,16 @@ RetireFaultGate::BlockDecision RetireFaultGate::BlockDeleteIfMatched(
         // Bounded confirmation stop-point: capture the unpredictable
         // operation id, freeze the window, hold the message for holdMs_, and
         // apply the fault only if an exact confirmation naming this id
-        // arrives INSIDE the frozen window.
+        // ARRIVES inside the frozen window (observed by the poller).
         mode_ = "prep_held";
         operationID_ = operationID;
         prepWindowDeadlineUnixMs_ = NowUnixMs() + holdMs_;
         fromPrepConfirm_ = false;
+        confirmArrivalUnixMs_ = 0;
+        StartPrepPollerLocked();
         decision.decision = Decision::MatchPrepare;
         decision.holdMs = holdMs_;
+        decision.windowDeadlineUnixMs = prepWindowDeadlineUnixMs_;
         YRLOG_WARN("retire-fault gate PREPARED(block) sandbox({}) generation({}) "
                    "operation({}) hold_ms({}) window_deadline_unix_ms({}) — confirm via "
                    "control file with this exact operation id within the window",
@@ -313,15 +353,17 @@ RetireFaultGate::BlockDecision RetireFaultGate::ResolveBlock(
     return decision;  // NoMatch: pass the held message through, bounded
 }
 
-RetireFaultGate::ReceiptDecision RetireFaultGate::DropReceiptIfMatched(
+RetireFaultGate::ReceiptGate RetireFaultGate::DropReceiptIfMatched(
     const std::string &sandboxID, const std::string &generation,
     const std::string &operationID)
 {
     RefreshFromControlFile();
     std::lock_guard<std::mutex> lock(mutex_);
+    ReceiptGate gate;
     int64_t delayMs = 0;
     if (ConsumeExactLocked("drop_receipt", sandboxID, generation, operationID, delayMs)) {
-        return ReceiptDecision::Drop;
+        gate.decision = ReceiptDecision::Drop;
+        return gate;
     }
     if (enabled_ && !consumed_ && mode_ == "prep_wait" && action_ == "drop_receipt"
         && sandboxID_ == sandboxID && generation_ == generation && NowUnixMs() <= deadlineUnixMs_) {
@@ -329,19 +371,26 @@ RetireFaultGate::ReceiptDecision RetireFaultGate::DropReceiptIfMatched(
         // first confirmed receipt travels, the budget may already settle
         // upstream and dropping a later replay proves nothing about
         // "deleted but unsettled". The caller keeps this message and calls
-        // ResolveReceipt when the frozen window closes.
+        // ResolveReceipt when the frozen window closes. THIS message's hold
+        // parameters are returned immutable — no lock-separated re-read.
         mode_ = "prep_held";
         operationID_ = operationID;
         prepWindowDeadlineUnixMs_ = NowUnixMs() + holdMs_;
         fromPrepConfirm_ = false;
+        confirmArrivalUnixMs_ = 0;
+        StartPrepPollerLocked();
+        gate.decision = ReceiptDecision::HoldForConfirm;
+        gate.holdMs = holdMs_;
+        gate.windowDeadlineUnixMs = prepWindowDeadlineUnixMs_;
         YRLOG_WARN("retire-fault gate PREPARED(receipt) sandbox({}) generation({}) "
                    "operation({}) hold_ms({}) window_deadline_unix_ms({}) — original "
                    "receipt held before first send; confirm via control file with this "
                    "exact operation id within the window to drop it",
                    sandboxID_, generation_, operationID_, holdMs_, prepWindowDeadlineUnixMs_);
-        return ReceiptDecision::HoldForConfirm;
+        return gate;
     }
-    return ReceiptDecision::Send;
+    gate.decision = ReceiptDecision::Send;
+    return gate;
 }
 
 RetireFaultGate::ReceiptDecision RetireFaultGate::ResolveReceipt(

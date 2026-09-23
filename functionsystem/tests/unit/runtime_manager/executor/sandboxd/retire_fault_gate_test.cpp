@@ -99,7 +99,8 @@ TEST(RetireFaultGateTest, DisabledGateNeverMatches)
     auto decision = gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1");
     EXPECT_EQ(decision.decision, Decision::NoMatch);
     EXPECT_EQ(decision.delayMs, 0);
-    EXPECT_FALSE(gate.DropReceiptIfMatched("sbox-1", "g-7", "op-1"));
+    EXPECT_EQ(gate.DropReceiptIfMatched("sbox-1", "g-7", "op-1").decision,
+              RetireFaultGate::ReceiptDecision::Send);
 }
 
 TEST(RetireFaultGateTest, BlockDeleteMatchesExactIdentityOnce)
@@ -108,7 +109,8 @@ TEST(RetireFaultGateTest, BlockDeleteMatchesExactIdentityOnce)
     gate.ArmFromSpec(BlockSpec(45000, FutureUnixMs(120000)));
     // Neighbour identities, the other action, and a WRONG OPERATION never
     // consume the one shot.
-    EXPECT_FALSE(gate.DropReceiptIfMatched("sbox-1", "g-7", "op-1"));
+    EXPECT_EQ(gate.DropReceiptIfMatched("sbox-1", "g-7", "op-1").decision,
+              RetireFaultGate::ReceiptDecision::Send);
     EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-2", "g-7", "op-1").decision, Decision::NoMatch);
     EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-1", "g-8", "op-1").decision, Decision::NoMatch);
     EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-9").decision, Decision::NoMatch);
@@ -126,8 +128,10 @@ TEST(RetireFaultGateTest, DropReceiptMatchesOnceAndBlockDoesNot)
                      R"("operation_id":"op-4","delay_ms":0,"deadline_unix_ms":)"
                      + std::to_string(FutureUnixMs(60000)) + "}");
     EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-9", "g-1", "op-4").decision, Decision::NoMatch);
-    EXPECT_TRUE(gate.DropReceiptIfMatched("sbox-9", "g-1", "op-4"));
-    EXPECT_FALSE(gate.DropReceiptIfMatched("sbox-9", "g-1", "op-4"));
+    EXPECT_EQ(gate.DropReceiptIfMatched("sbox-9", "g-1", "op-4").decision,
+              RetireFaultGate::ReceiptDecision::Drop);
+    EXPECT_EQ(gate.DropReceiptIfMatched("sbox-9", "g-1", "op-4").decision,
+              RetireFaultGate::ReceiptDecision::Send);
 }
 
 TEST(RetireFaultGateTest, ExpiredOrInvalidSpecsStayInactive)
@@ -144,12 +148,14 @@ TEST(RetireFaultGateTest, ExpiredOrInvalidSpecsStayInactive)
     unknownAction.ArmFromSpec(R"({"action":"reboot_world","sandbox":"s","generation":"g",)"
                               R"("operation_id":"o","delay_ms":1,)"
                               R"("deadline_unix_ms":9223372036854775807})");
-    EXPECT_FALSE(unknownAction.DropReceiptIfMatched("s", "g", "o"));
+    EXPECT_EQ(unknownAction.DropReceiptIfMatched("s", "g", "o").decision,
+              RetireFaultGate::ReceiptDecision::Send);
 
     RetireFaultGate partial;
     partial.ArmFromSpec(R"({"action":"drop_receipt","sandbox":"","generation":"g",)"
                         R"("operation_id":"o"})");
-    EXPECT_FALSE(partial.DropReceiptIfMatched("", "g", "o"));
+    EXPECT_EQ(partial.DropReceiptIfMatched("", "g", "o").decision,
+              RetireFaultGate::ReceiptDecision::Send);
 
     // Missing operation id is an incomplete operation identity: never armed
     // as an exact spec.
@@ -287,7 +293,7 @@ TEST(RetireFaultGateTest, PrepareReceiptHoldsOriginalThenDropsOnTimelyConfirm)
     gate.ArmFromSpec(R"({"action":"drop_receipt","sandbox":"sbox-1","generation":"g-7",)"
                      R"("prepare":true,"hold_ms":30000,"delay_ms":0,"deadline_unix_ms":)"
                      + std::to_string(FutureUnixMs(120000)) + "}");
-    EXPECT_EQ(gate.DropReceiptIfMatched("sbox-1", "g-7", "forward-rc1"),
+    EXPECT_EQ(gate.DropReceiptIfMatched("sbox-1", "g-7", "forward-rc1").decision,
               RetireFaultGate::ReceiptDecision::HoldForConfirm);  // 0 sends
     const auto state = gate.GetStateForTest();
     EXPECT_EQ(state.mode, "prep_held");
@@ -313,13 +319,13 @@ TEST(RetireFaultGateTest, PrepareReceiptUnconfirmedSendsOriginalExactlyOnce)
     gate.ArmFromSpec(R"({"action":"drop_receipt","sandbox":"sbox-1","generation":"g-7",)"
                      R"("prepare":true,"hold_ms":30000,"delay_ms":0,"deadline_unix_ms":)"
                      + std::to_string(FutureUnixMs(120000)) + "}");
-    EXPECT_EQ(gate.DropReceiptIfMatched("sbox-1", "g-7", "forward-rc1"),
+    EXPECT_EQ(gate.DropReceiptIfMatched("sbox-1", "g-7", "forward-rc1").decision,
               RetireFaultGate::ReceiptDecision::HoldForConfirm);  // 0 sends
     EXPECT_EQ(gate.ResolveReceipt("sbox-1", "g-7", "forward-rc1"),
               RetireFaultGate::ReceiptDecision::Send);            // exactly 1 send
     EXPECT_FALSE(gate.GetStateForTest().enabled);                 // disarmed
     // Nothing fires afterwards: retries all send.
-    EXPECT_EQ(gate.DropReceiptIfMatched("sbox-1", "g-7", "forward-rc1"),
+    EXPECT_EQ(gate.DropReceiptIfMatched("sbox-1", "g-7", "forward-rc1").decision,
               RetireFaultGate::ReceiptDecision::Send);
 }
 
@@ -332,7 +338,7 @@ TEST(RetireFaultGateTest, PrepareReceiptLateConfirmRejectedOutsideFrozenWindow)
     gate.ArmFromSpec(R"({"action":"drop_receipt","sandbox":"sbox-1","generation":"g-7",)"
                      R"("prepare":true,"hold_ms":1000,"delay_ms":0,"deadline_unix_ms":)"
                      + std::to_string(FutureUnixMs(120000)) + "}");
-    EXPECT_EQ(gate.DropReceiptIfMatched("sbox-1", "g-7", "forward-rc1"),
+    EXPECT_EQ(gate.DropReceiptIfMatched("sbox-1", "g-7", "forward-rc1").decision,
               RetireFaultGate::ReceiptDecision::HoldForConfirm);
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));  // window closes
     gate.ArmFromSpec(R"({"action":"drop_receipt","sandbox":"sbox-1","generation":"g-7",)"
@@ -418,8 +424,10 @@ TEST(RetireFaultGateTest, ControlFileRearmsAfterConsumedHit)
     control.write(std::string(R"({"action":"drop_receipt","sandbox":"sbox-2","generation":"g-2",)")
                   + R"("operation_id":"op-2","delay_ms":0,"deadline_unix_ms":)")
                   + std::to_string(FutureUnixMs(120000)) + "}");
-    EXPECT_TRUE(gate.DropReceiptIfMatched("sbox-2", "g-2", "op-2"));
-    EXPECT_FALSE(gate.DropReceiptIfMatched("sbox-2", "g-2", "op-2"));  // consumed again
+    EXPECT_EQ(gate.DropReceiptIfMatched("sbox-2", "g-2", "op-2").decision,
+              RetireFaultGate::ReceiptDecision::Drop);
+    EXPECT_EQ(gate.DropReceiptIfMatched("sbox-2", "g-2", "op-2").decision,
+              RetireFaultGate::ReceiptDecision::Send);  // consumed again
     const auto state = gate.GetStateForTest();
     EXPECT_TRUE(state.enabled);
     EXPECT_EQ(state.action, "drop_receipt");
@@ -484,7 +492,8 @@ TEST(RetireFaultGateTest, RapidArmDisarmArmAllApplyByContent)
     EXPECT_EQ(gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1").decision,
               Decision::MatchExact);  // fires
     control.write(R"({"disarm":true})");
-    EXPECT_FALSE(gate.DropReceiptIfMatched("sbox-9", "g-1", "op-4"));  // refresh applies disarm
+    EXPECT_EQ(gate.DropReceiptIfMatched("sbox-9", "g-1", "op-4").decision,
+              RetireFaultGate::ReceiptDecision::Send);  // refresh applies disarm
     EXPECT_FALSE(gate.GetStateForTest().enabled);
     control.write(BlockSpec(6000, FutureUnixMs(120000)));
     const auto again = gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1");
@@ -503,6 +512,52 @@ TEST(RetireFaultGateTest, MissingControlFileLeavesArmedGateUntouched)
     const auto hit = gate.BlockDeleteIfMatched("sbox-1", "g-7", "op-1");
     EXPECT_EQ(hit.decision, Decision::MatchExact);
     EXPECT_EQ(hit.delayMs, 7000);  // absent control file never disarms or mutates
+    control.remove();
+}
+
+TEST(RetireFaultGateTest, TimelyFileConfirmSurvivesLateReceiptResolve)
+{
+    // The confirmation is WRITTEN inside the window and observed by the
+    // poller (arrival frozen then); the resolve runs only after the window
+    // closes (late event loop) and must still honour it. Without in-window
+    // observation this scenario would wrongly reject the timely confirm.
+    ControlFile control("gate-timely-confirm.json");
+    control.remove();
+    ControlFileEnv env(control.path);
+    RetireFaultGate gate;
+    control.write(R"({"action":"drop_receipt","sandbox":"sbox-1","generation":"g-7",)"
+                  R"("prepare":true,"hold_ms":1000,"delay_ms":0,"deadline_unix_ms":)"
+                  + std::to_string(FutureUnixMs(120000)) + "}");
+    const auto held = gate.DropReceiptIfMatched("sbox-1", "g-7", "fwd-t1");
+    EXPECT_EQ(held.decision, RetireFaultGate::ReceiptDecision::HoldForConfirm);
+    EXPECT_EQ(held.holdMs, 1000);
+    EXPECT_GT(held.windowDeadlineUnixMs, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));  // inside window
+    control.write(R"({"action":"drop_receipt","sandbox":"sbox-1","generation":"g-7",)"
+                  R"("operation_id":"fwd-t1","delay_ms":0,"deadline_unix_ms":)"
+                  + std::to_string(FutureUnixMs(120000)) + "}");
+    // let the poller observe it well inside the window, then run past expiry
+    std::this_thread::sleep_for(std::chrono::milliseconds(900));
+    EXPECT_EQ(gate.ResolveReceipt("sbox-1", "g-7", "fwd-t1"),
+              RetireFaultGate::ReceiptDecision::Drop);  // arrival was in-window
+    control.remove();
+}
+
+TEST(RetireFaultGateTest, TimelyFileConfirmSurvivesLateBlockResolve)
+{
+    ControlFile control("gate-timely-block.json");
+    control.remove();
+    ControlFileEnv env(control.path);
+    RetireFaultGate gate;
+    control.write(PrepareBlockSpec(1000, FutureUnixMs(300000)));
+    const auto held = gate.BlockDeleteIfMatched("sbox-1", "g-7", "fwd-t2");
+    EXPECT_EQ(held.decision, Decision::MatchPrepare);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));  // inside window
+    control.write(ConfirmBlockSpec("fwd-t2", FutureUnixMs(300000)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));  // past expiry
+    const auto resolved = gate.ResolveBlock("sbox-1", "g-7", "fwd-t2");
+    EXPECT_EQ(resolved.decision, Decision::MatchExact);  // arrival was in-window
+    EXPECT_EQ(resolved.delayMs, 7000);
     control.remove();
 }
 

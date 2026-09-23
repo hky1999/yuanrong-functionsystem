@@ -17,6 +17,7 @@
 #ifndef RUNTIME_MANAGER_MANAGER_RUNTIME_MANAGER_TEST_ACTOR_H
 #define RUNTIME_MANAGER_MANAGER_RUNTIME_MANAGER_TEST_ACTOR_H
 
+#include <atomic>
 #include "actor/actor.hpp"
 #include "common/proto/pb/message_pb.h"
 namespace functionsystem::runtime_manager {
@@ -98,6 +99,17 @@ public:
         return isReceiveStopInstanceResponse_;
     }
 
+    [[maybe_unused]] uint32_t GetStopInstanceResponseCount()
+    {
+        return stopInstanceResponseCount_.load();
+    }
+
+    [[maybe_unused]] void ResetStopInstanceResponseCount()
+    {
+        stopInstanceResponseCount_.store(0);
+        isReceiveStopInstanceResponse_ = false;
+    }
+
     [[maybe_unused]] bool GetIsReceiveQueryInstanceStatusInfoResponse()
     {
         return isReceiveQueryInstanceStatusInfoResponse_;
@@ -135,6 +147,9 @@ private:
     messages::RegisterRuntimeManagerResponse registerRuntimeManagerResponse_ = messages::RegisterRuntimeManagerResponse{};
     uint32_t receiveTimes_ = 0;
     uint32_t startInstanceTimes_ = 0;
+    // Real send-count observable: incremented in the handler on every
+    // StopInstanceResponse that actually arrives through litebus Send.
+    std::atomic<uint32_t> stopInstanceResponseCount_{ 0 };
     bool isReceiveCleanStatusResponse_{ false };
     bool isReceiveStartInstanceResponse_{ false };
     bool isReceiveStopInstanceResponse_{ false };

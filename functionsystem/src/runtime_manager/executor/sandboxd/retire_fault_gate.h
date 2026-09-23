@@ -17,9 +17,11 @@
 #ifndef RUNTIME_MANAGER_RETIRE_FAULT_GATE_H
 #define RUNTIME_MANAGER_RETIRE_FAULT_GATE_H
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <thread>
 
 namespace functionsystem::runtime_manager {
 
@@ -49,12 +51,17 @@ class RetireFaultGate {
 public:
     static RetireFaultGate &Instance();
 
+    // Joins the in-window confirmation poller if still running (bounded by
+    // the prepare window, <= kMaxHoldMs).
+    ~RetireFaultGate();
+
     enum class Decision { NoMatch, MatchExact, MatchPrepare };
 
     struct BlockDecision {
         Decision decision{ Decision::NoMatch };
         int64_t delayMs{ 0 };   // MatchExact: hold the dispatch this long
         int64_t holdMs{ 0 };    // MatchPrepare: confirmation stop-point window
+        int64_t windowDeadlineUnixMs{ 0 };  // frozen at capture
     };
 
     // Arm from an explicit JSON spec (identical validation to the environment
@@ -109,14 +116,23 @@ public:
 
     // Receipt send point. Send: pass the message upstream unchanged.
     // HoldForConfirm: prepare capture — the caller MUST NOT send, MUST keep
-    // the ORIGINAL message, and MUST call ResolveReceipt after holdMs.
-    // Drop: suppress this message (exact confirmed match).
+    // the ORIGINAL message, and MUST call ResolveReceipt after holdMs; the
+    // decision carries THIS message's immutable hold/window parameters (no
+    // second lock-separated read). Drop: suppress this message.
     enum class ReceiptDecision { Send, HoldForConfirm, Drop };
-    ReceiptDecision DropReceiptIfMatched(const std::string &sandboxID, const std::string &generation,
-                                         const std::string &operationID);
+    struct ReceiptGate {
+        ReceiptDecision decision{ ReceiptDecision::Send };
+        int64_t holdMs{ 0 };
+        int64_t windowDeadlineUnixMs{ 0 };
+    };
+    ReceiptGate DropReceiptIfMatched(const std::string &sandboxID, const std::string &generation,
+                                     const std::string &operationID);
     // Resolution at the end of the receipt stop-point: Drop only for an
-    // exact confirmation that arrived INSIDE the frozen prep window; Send
-    // otherwise (the caller then sends the ORIGINAL message exactly once).
+    // exact confirmation that ARRIVED inside the frozen prep window (the
+    // gate polls the control file during the window and freezes the arrival
+    // moment, so a late event-loop dispatch cannot misjudge a timely
+    // confirmation); Send otherwise — the caller sends the ORIGINAL message
+    // exactly once.
     ReceiptDecision ResolveReceipt(const std::string &sandboxID, const std::string &generation,
                                    const std::string &operationID);
 
@@ -127,6 +143,12 @@ private:
     void Disarm(const char *reason);
     void DisarmLocked(const char *reason);  // caller holds mutex_
     void ArmLocked(const std::string &specJson);  // caller holds mutex_
+    // In-window confirmation observation: a short poller (100ms tick) that
+    // rereads the control file while a prepare hold is active, so a
+    // confirmation WRITTEN inside the window is APPLIED inside the window
+    // and its arrival moment is frozen (confirmArrivalUnixMs_). Without
+    // this, the first read at hold expiry would reject timely confirmations.
+    void StartPrepPollerLocked();
     static std::string ControlFilePath();
 
     mutable std::mutex mutex_;  // mutable: GetStateForTest() const reads under it
@@ -143,10 +165,18 @@ private:
     // (so a late event-loop dispatch can never apply an out-of-window
     // confirm), cleared only when the gate leaves the prepare lineage.
     int64_t prepWindowDeadlineUnixMs_{ 0 };
+    int64_t confirmArrivalUnixMs_{ 0 };  // when the poller applied the confirm
     bool fromPrepConfirm_{ false };
     bool enabled_{ false };
     bool consumed_{ false };
     std::string lastControlContent_;  // last APPLIED control-file content
+    // One lazily-started poller thread per gate instance (the singleton
+    // never joins it; test instances join at destruction). It ticks at
+    // kPollerTickMs, rereads the control file, and idles cheaply whenever
+    // no prepare hold is active.
+    std::thread prepPoller_;
+    std::atomic<bool> pollerStarted_{ false };
+    std::atomic<bool> pollerStop_{ false };
 };
 
 }  // namespace functionsystem::runtime_manager

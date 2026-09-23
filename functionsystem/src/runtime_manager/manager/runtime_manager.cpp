@@ -1089,6 +1089,10 @@ Status RuntimeManager::StartRegister(const std::map<std::string, messages::Runti
 void RuntimeManager::SendStopInstanceResponse(const litebus::AID &from, const std::string &runtimeID,
                                               const std::shared_ptr<messages::StopInstanceResponse> &response)
 {
+    // Table cleanup ONLY: when the registration is already gone (the retry /
+    // durable-receipt replay path), cleanup is skipped but the receipt below
+    // must STILL be sent — a physical retirement confirmed by sandboxd is
+    // settled upstream exactly once via this response, map state or not.
     if (auto iter(instanceInfoMap_.find(runtimeID)); iter != instanceInfoMap_.end()) {
         const auto &instanceID = iter->second.instanceid();
         const bool exactResumeTarget = resume_identity::IsExactResumeTargetCleanupRequest(
@@ -1118,6 +1122,7 @@ void RuntimeManager::SendStopInstanceResponse(const litebus::AID &from, const st
         }
         (void)runtimeResponseMap_.erase(runtimeID);
         (void)instanceInfoMap_.erase(runtimeID);
+    }
     if (response->code() == static_cast<int32_t>(StatusCode::SUCCESS)) {
         if (auto iter(instanceInfoMap_.find(runtimeID)); iter != instanceInfoMap_.end()) {
             (void)instanceResponseMap_.erase(iter->second.instanceid());
@@ -1129,31 +1134,33 @@ void RuntimeManager::SendStopInstanceResponse(const litebus::AID &from, const st
     // matching the exact operation identity (sandbox + generation + this
     // response's request id). Once the first confirmed receipt travels, the
     // budget may already settle upstream — so the prepare form holds THIS
-    // message (0 sends) and only a timely exact confirmation drops it (the
-    // durable receipt stays in sandboxd; the caller's retry replays it and
-    // settles exactly once); an unconfirmed or out-of-window stop-point sends
-    // the ORIGINAL message unchanged (exactly one send).
+    // message (0 sends) and only a timely in-window exact confirmation drops
+    // it (the durable receipt stays in sandboxd; the caller's retry replays
+    // it and settles exactly once); an unconfirmed or out-of-window
+    // stop-point sends the ORIGINAL message unchanged (exactly one send).
+    // Runs regardless of the table state above: the replay path must be
+    // faultable exactly like the first send.
     if (response->physical_retirement_confirmed()) {
         const auto receiptGate = RetireFaultGate::Instance().DropReceiptIfMatched(
             response->retired_sandbox_id(), response->retired_resource_generation(),
             response->requestid());
-        if (receiptGate == RetireFaultGate::ReceiptDecision::Drop) {
+        if (receiptGate.decision == RetireFaultGate::ReceiptDecision::Drop) {
             YRLOG_WARN("{}|retire-fault: dropping confirmed retirement receipt for runtime({}) "
                        "sandbox({}) generation({}); caller retry must replay the durable receipt",
                        response->requestid(), runtimeID, response->retired_sandbox_id(),
                        response->retired_resource_generation());
             return;
         }
-        if (receiptGate == RetireFaultGate::ReceiptDecision::HoldForConfirm) {
-            const auto state = RetireFaultGate::Instance().GetStateForTest();
+        if (receiptGate.decision == RetireFaultGate::ReceiptDecision::HoldForConfirm) {
             YRLOG_WARN("{}|retire-fault: holding ORIGINAL retirement receipt for runtime({}) "
-                       "sandbox({}) generation({}) up to {}ms for exact confirmation "
-                       "(0 sends until then)",
+                       "sandbox({}) generation({}) up to {}ms (window deadline {}ms) for "
+                       "exact confirmation (0 sends until then)",
                        response->requestid(), runtimeID, response->retired_sandbox_id(),
-                       response->retired_resource_generation(), state.holdMs);
+                       response->retired_resource_generation(), receiptGate.holdMs,
+                       receiptGate.windowDeadlineUnixMs);
             auto heldFrom = std::make_shared<litebus::AID>(from);
             auto heldPayload = std::make_shared<std::string>(response->SerializeAsString());
-            litebus::AsyncAfter(state.holdMs, GetAID(),
+            litebus::AsyncAfter(receiptGate.holdMs, GetAID(),
                                 &RuntimeManager::ResolveHeldRetireReceipt, heldFrom,
                                 heldPayload, response->retired_sandbox_id(),
                                 response->retired_resource_generation(), response->requestid(),
@@ -1169,8 +1176,10 @@ void RuntimeManager::ResolveHeldRetireReceipt(
     const std::string &sandboxID, const std::string &generation,
     const std::string &requestID, const std::string &runtimeID)
 {
-    // End of the bounded receipt stop-point: Drop only for a timely exact
-    // confirmation; otherwise the ORIGINAL message is sent exactly once.
+    // End of the bounded receipt stop-point: Drop only for a confirmation
+    // that ARRIVED inside the frozen window (the gate polls the control file
+    // during the hold and freezes the arrival moment); otherwise the ORIGINAL
+    // message is sent exactly once.
     const auto resolved = RetireFaultGate::Instance().ResolveReceipt(sandboxID, generation,
                                                                      requestID);
     if (resolved == RetireFaultGate::ReceiptDecision::Drop) {
@@ -1184,7 +1193,6 @@ void RuntimeManager::ResolveHeldRetireReceipt(
                "for runtime({}) sandbox({})",
                requestID, runtimeID, sandboxID);
     Send(*from, "StopInstanceResponse", *payload);
-}
 }
 
 void RuntimeManager::OnGetRuntimeStatus(const litebus::AID &from,

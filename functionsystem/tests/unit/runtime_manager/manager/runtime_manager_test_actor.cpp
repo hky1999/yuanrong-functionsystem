@@ -70,6 +70,10 @@ void RuntimeManagerTestActor::StopInstanceResponse(const litebus::AID &from, std
     response->ParseFromString(msg);
     isReceiveStopInstanceResponse_ = true;
     stopInstanceResponse_ = response;
+    // Publish LAST and with release ordering (default seq_cst): a waiter
+    // that observes the incremented count is guaranteed to read the fully
+    // written message above — never a stale one.
+    stopInstanceResponseCount_.fetch_add(1);
 }
 
 void RuntimeManagerTestActor::Register(const litebus::AID &from, std::string &&, std::string &&msg)

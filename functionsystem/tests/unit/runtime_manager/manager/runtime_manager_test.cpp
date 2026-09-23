@@ -16,13 +16,19 @@
 
 #include "runtime_manager/manager/runtime_manager.h"
 
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <string>
+#include <thread>
 
 #include "common/utils/files.h"
 #include "common/utils/resume_identity.h"
 #include "exec/exec.hpp"
 #include "gtest/gtest.h"
 #include "runtime_manager/config/build.h"
+#include "runtime_manager/executor/sandboxd/retire_fault_gate.h"
 #include "runtime_manager/executor/sandboxd/sandboxd_executor.h"
 #include "runtime_manager/port/port_manager.h"
 #include "runtime_manager_test_actor.h"
@@ -1583,6 +1589,177 @@ TEST(RuntimeRetirementFailureTest, FailedStopKeepsIdentityAndFailedFutureDoesNot
     manager.SendStopInstanceResponse(recipient, "runtime", response);
     EXPECT_EQ(manager.instanceInfoMap_.count("runtime"), 0);
     EXPECT_EQ(manager.instanceResponseMap_.count("instance"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Retirement-receipt send paths: real litebus sends into a spawned receiver
+// actor are COUNTED (RuntimeManagerTestActor::GetStopInstanceResponseCount).
+// Covers: physical receipt confirmed but the in-memory registration is gone
+// (replay path still settles upstream exactly once), and the fault-gate
+// receipt stop-point's timed behaviour (0 sends during the window, exactly 1
+// on unconfirmed expiry, 0 after a timely in-window confirmation).
+// ---------------------------------------------------------------------------
+namespace {
+// Points the SINGLETON fault gate at a per-test control file and disarms it
+// on scope exit, so gate state never leaks between tests.
+class RetireGateControlGuard {
+public:
+    RetireGateControlGuard()
+        : path_(std::filesystem::path(testing::TempDir()) / GenerateRandomName("gate-ctrl"))
+    {
+        saved_ = std::getenv("AKERNEL_RETIRE_FAULT_CONTROL_FILE");
+        setenv("AKERNEL_RETIRE_FAULT_CONTROL_FILE", path_.c_str(), 1);
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+    }
+    ~RetireGateControlGuard()
+    {
+        // disarm while the env still points at our file, then restore
+        std::ofstream out(path_, std::ios::trunc);
+        out << R"({"disarm":true})";
+        out.close();
+        RetireFaultGate::Instance().RefreshFromControlFile();
+        RetireFaultGate::Instance().RefreshFromControlFile();  // content dedup noop
+        if (saved_ != nullptr) {
+            setenv("AKERNEL_RETIRE_FAULT_CONTROL_FILE", saved_, 1);
+        } else {
+            unsetenv("AKERNEL_RETIRE_FAULT_CONTROL_FILE");
+        }
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+    }
+    void write(const std::string &content)
+    {
+        std::ofstream out(path_, std::ios::trunc);
+        out << content;
+    }
+private:
+    std::filesystem::path path_;
+    const char *saved_ = nullptr;
+};
+
+bool WaitForStopResponses(const std::shared_ptr<RuntimeManagerTestActor> &actor,
+                          uint32_t expected, int timeoutMs)
+{
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(timeoutMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (actor->GetStopInstanceResponseCount() >= expected) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return actor->GetStopInstanceResponseCount() >= expected;
+}
+
+int64_t FutureUnixMs(int64_t offsetMs)
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count() + offsetMs;
+}
+
+std::shared_ptr<messages::StopInstanceResponse> ConfirmedRetirementResponse(const std::string &requestID)
+{
+    auto response = std::make_shared<messages::StopInstanceResponse>();
+    response->set_runtimeid("runtime-replay");
+    response->set_requestid(requestID);
+    response->set_code(static_cast<int32_t>(StatusCode::SUCCESS));
+    response->set_physical_retirement_confirmed(true);
+    response->set_retired_sandbox_id("sbox-rr");
+    response->set_retired_resource_generation("gen-rr");
+    return response;
+}
+}  // namespace
+
+class RuntimeRetireReceiptTest : public ::testing::Test {
+public:
+    void SetUp() override
+    {
+        manager_ = std::make_shared<RuntimeManager>(GenerateRandomName("RuntimeRetireReceiptTest"));
+        manager_->isUnitTestSituation_ = true;
+        litebus::Spawn(manager_, true);
+        manager_->connected_ = true;
+        testActor_ = std::make_shared<RuntimeManagerTestActor>(GenerateRandomName("RetireReceiptActor"));
+        litebus::Spawn(testActor_, true);
+    }
+
+    void TearDown() override
+    {
+        litebus::Terminate(testActor_->GetAID());
+        litebus::Await(testActor_->GetAID());
+        litebus::Terminate(manager_->GetAID());
+        litebus::Await(manager_->GetAID());
+    }
+
+protected:
+    std::shared_ptr<RuntimeManager> manager_;
+    std::shared_ptr<RuntimeManagerTestActor> testActor_;
+};
+
+TEST_F(RuntimeRetireReceiptTest, PhysicalReceiptWithoutRegistrationStillSends)
+{
+    // The retry/durable-replay path: sandboxd confirmed physical retirement
+    // but the runtime registration is already cleaned. The receipt must
+    // STILL travel upstream exactly once — settling is not gated on local
+    // table state.
+    RetireGateControlGuard guard;
+    auto response = ConfirmedRetirementResponse("fwd-replay-1");
+    // deliberately NO instanceInfoMap_ entry for "runtime-replay"
+    manager_->SendStopInstanceResponse(testActor_->GetAID(), "runtime-replay", response);
+    EXPECT_TRUE(WaitForStopResponses(testActor_, 1, 5000));
+    EXPECT_EQ(testActor_->GetStopInstanceResponseCount(), 1u);
+    // the confirmed receipt arrived intact
+    auto received = testActor_->GetStopInstanceResponse();
+    ASSERT_NE(received, nullptr);
+    EXPECT_TRUE(received->physical_retirement_confirmed());
+    EXPECT_EQ(received->retired_sandbox_id(), "sbox-rr");
+}
+
+TEST_F(RuntimeRetireReceiptTest, UnconfirmedPrepareSendsOriginalExactlyOnce)
+{
+    RetireGateControlGuard guard;
+    guard.write(R"({"action":"drop_receipt","sandbox":"sbox-rr","generation":"gen-rr",)"
+                R"("prepare":true,"hold_ms":1000,"delay_ms":0,"deadline_unix_ms":)"
+                + std::to_string(FutureUnixMs(120000)) + "}");
+    RetireFaultGate::Instance().RefreshFromControlFile();  // arm before the send
+    auto response = ConfirmedRetirementResponse("fwd-hold-1");
+    manager_->SendStopInstanceResponse(testActor_->GetAID(), "runtime-replay", response);
+    // during the stop-point window: exactly 0 sends
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    EXPECT_EQ(testActor_->GetStopInstanceResponseCount(), 0u);
+    // unconfirmed expiry: the ORIGINAL receipt is sent exactly once
+    EXPECT_TRUE(WaitForStopResponses(testActor_, 1, 5000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(testActor_->GetStopInstanceResponseCount(), 1u);
+    auto received = testActor_->GetStopInstanceResponse();
+    ASSERT_NE(received, nullptr);
+    EXPECT_EQ(received->requestid(), "fwd-hold-1");  // the original message
+}
+
+TEST_F(RuntimeRetireReceiptTest, TimelyConfirmDropsOriginalAndReplaySettles)
+{
+    RetireGateControlGuard guard;
+    guard.write(R"({"action":"drop_receipt","sandbox":"sbox-rr","generation":"gen-rr",)"
+                R"("prepare":true,"hold_ms":1500,"delay_ms":0,"deadline_unix_ms":)"
+                + std::to_string(FutureUnixMs(120000)) + "}");
+    RetireFaultGate::Instance().RefreshFromControlFile();
+    auto response = ConfirmedRetirementResponse("fwd-hold-2");
+    manager_->SendStopInstanceResponse(testActor_->GetAID(), "runtime-replay", response);
+    // confirm INSIDE the window via the control file (the gate's poller
+    // observes it and freezes the arrival moment)
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    guard.write(R"({"action":"drop_receipt","sandbox":"sbox-rr","generation":"gen-rr",)"
+                R"("operation_id":"fwd-hold-2","delay_ms":0,"deadline_unix_ms":)"
+                + std::to_string(FutureUnixMs(120000)) + "}");
+    // past the window: the ORIGINAL receipt was dropped — 0 sends
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+    EXPECT_EQ(testActor_->GetStopInstanceResponseCount(), 0u);
+    // caller retry replays the durable receipt; the gate is spent, so the
+    // replay settles upstream exactly once
+    auto replay = ConfirmedRetirementResponse("fwd-hold-2");
+    manager_->SendStopInstanceResponse(testActor_->GetAID(), "runtime-replay", replay);
+    EXPECT_TRUE(WaitForStopResponses(testActor_, 1, 5000));
+    EXPECT_EQ(testActor_->GetStopInstanceResponseCount(), 1u);
 }
 
 }  // namespace functionsystem::runtime_manager
