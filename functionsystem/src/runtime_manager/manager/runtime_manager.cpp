@@ -562,6 +562,8 @@ void RuntimeManager::OnResizeSandboxComplete(const litebus::AID &from,
     const std::shared_ptr<messages::ResizeSandboxRequest> &request,
     const litebus::Future<messages::ResizeSandboxResponse> &result)
 {
+    YRLOG_INFO("{}|resize relay(rm) complete ok={} outcome={}", request->requestid(), result.IsOK(),
+               result.IsOK() ? static_cast<int>(result.Get().outcome()) : -1);
     messages::ResizeSandboxResponse response;
     if (result.IsOK()) {
         response = result.Get();

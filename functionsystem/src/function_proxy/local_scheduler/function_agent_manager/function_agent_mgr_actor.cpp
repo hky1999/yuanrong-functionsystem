@@ -1864,10 +1864,17 @@ void FunctionAgentMgrActor::ResizeSandboxResponse(const litebus::AID &from, std:
 {
     messages::ResizeSandboxResponse response;
     if (msg.size() > 64 * 1024 || !response.ParseFromString(msg)) {
+        YRLOG_WARN("resize relay(mgr): unparseable response from {}", from.HashString());
         return;
     }
+    YRLOG_INFO("resize relay(mgr) received requestid={} outcome={}", response.requestid(),
+               static_cast<int>(response.outcome()));
     auto it = resizePending_.find(response.requestid());
     if (it == resizePending_.end() || !it->second.dispatched || it->second.agent != from) {
+        YRLOG_WARN("resize relay(mgr): drop requestid={} found={} dispatched={} agent-match={}",
+                   response.requestid(), it != resizePending_.end(),
+                   it != resizePending_.end() && it->second.dispatched,
+                   it != resizePending_.end() && it->second.agent == from);
         return;
     }
     const auto &request = it->second.request;

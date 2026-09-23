@@ -883,16 +883,24 @@ void AgentServiceActor::ResizeSandboxResponse(const litebus::AID &from, std::str
 {
     messages::ResizeSandboxResponse response;
     if (msg.size() > 64 * 1024 || !response.ParseFromString(msg)) {
+        YRLOG_WARN("resize relay(agent): unparseable response from {}", from.HashString());
         return;
     }
+    // Merge-mode relay entry log: without it a silent guard return below is
+    // indistinguishable from the message never arriving.
+    YRLOG_INFO("resize relay(agent) received requestid={} outcome={} from={}", response.requestid(),
+               static_cast<int>(response.outcome()), from.HashString());
     auto it = resizeRequests_.find(response.requestid());
     if (it == resizeRequests_.end() || from != it->second.runtimeManager) {
+        YRLOG_WARN("resize relay(agent): no pending forward for requestid={} from={}", response.requestid(),
+                   from.HashString());
         return;
     }
     const auto &request = *it->second.request;
     if (response.instanceid() != request.instanceid() || response.runtimeid() != request.runtimeid()
         || response.sandboxid() != request.resize().sandbox_id()
         || response.resourcegeneration() != request.resize().resource_generation()) {
+        YRLOG_WARN("resize relay(agent): identity mismatch for requestid={}; keep pending", response.requestid());
         return;  // keep the timer/reservation; this is not a reply to our command
     }
     response.set_requestid(request.requestid());
