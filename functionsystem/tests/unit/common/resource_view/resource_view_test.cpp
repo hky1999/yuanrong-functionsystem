@@ -281,6 +281,23 @@ TEST_F(ResourceViewTest, ElasticColdReservationsSpanCallsAndRequirePhysicalRecon
 
 TEST_F(ResourceViewTest, ResizeReservationsShareAdmissionAndRequireOwnUsageToSettle)
 {
+    // Legacy numeric-settlement semantics: this suite predates the
+    // revision/operation contract (requests carry no operation_id or
+    // expected_revision and outcomes settle on limit values). Scope the
+    // fence off for exactly this test and restore the entry state.
+    const int fenceEntry = resource_view::MemoryElasticityFenceOverrideState();
+    SetMemoryElasticityFenceForTest(false);
+    struct RestoreFence {
+        int entry;
+        ~RestoreFence()
+        {
+            if (entry < 0) {
+                resource_view::ResetMemoryElasticityFenceOverride();
+            } else {
+                SetMemoryElasticityFenceForTest(entry != 0);
+            }
+        }
+    } restoreFence{ fenceEntry };
     using schedule_plugin::filter::UsageAwareFilter;
     struct ConfigGuard {
         double safety = UsageAwareFilter::GetSafety();
@@ -4344,6 +4361,8 @@ TEST_F(ResourceViewTest, BindInstanceRuntimeCompletesColdDeployWithoutPreseededR
         resize->set_sandbox_id("bind-cold-sandbox");
         resize->set_resource_generation("bind-cold-generation");
         resize->set_deadline_unix_ms(nowMs() + 30000);
+        resize->set_operation_id("bind-cold-lease-op");
+        resize->set_expected_revision(1);
         resize->mutable_expected()->set_cpu_quota_usec(50000);
         resize->mutable_expected()->set_cpu_period_usec(100000);
         resize->mutable_expected()->set_memory_limit_bytes(512ULL * 1024 * 1024);
