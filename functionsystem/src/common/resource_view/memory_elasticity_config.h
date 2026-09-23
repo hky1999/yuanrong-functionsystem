@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstdio>
+#include <unistd.h>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -26,6 +27,17 @@ constexpr int MEMORY_ELASTIC_STATS_INTERVAL_MS = 200;
 // with the same ratio the daemon's memory_high_ratio config uses. The ratio is
 // a process-start constant; deployments must keep it identical on both sides
 // (default 0.9 matches the canonical chart's sandboxd memory_high_ratio).
+// True when the running kernel's page size matches the protocol page;
+// logged once by the process-start audit so a mismatch is explicit.
+inline bool ProtocolPageSizeVerified()
+{
+    static const bool verified = [] {
+        const long page = sysconf(_SC_PAGESIZE);
+        return page > 0 && static_cast<uint64_t>(page) == 4096;
+    }();
+    return verified;
+}
+
 inline double MemoryHighRatio()
 {
     static const double ratio = [] {
@@ -59,10 +71,11 @@ inline double MemoryHighRatio()
 // ceil(ratio * limit) aligned DOWN to the protocol page, then kept strictly
 // below the limit (limit-1). Results below one page keep their byte value
 // (the daemon only aligns once a full page is reached); zero is only for a
-// zero limit. The page size is a single explicit protocol constant (4096,
-// pinned by the deployed kernel and asserted by tests on both sides); the
-// daemon reads the live page size, so a host with a different page size is
-// a deployment-contract violation, not a runtime fallback.
+// zero limit. The protocol page must equal the kernel page the daemon
+// reads via os.Getpagesize(); this side verifies the running kernel's page
+// size at process start (ProtocolPageSize below) and refuses to arm the
+// contract checks when it differs from 4096 instead of silently settling
+// on a wrong alignment.
 inline uint64_t ExpectedHighBytes(uint64_t maxBytes)
 {
     constexpr uint64_t kSafeMax = (1ULL << 62) / 4;

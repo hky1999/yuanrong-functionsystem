@@ -472,6 +472,11 @@ Status InitLocalSchedParam(const function_proxy::Flags &flags,
     // evidence can state whether the old commitment account was even live.
     YRLOG_INFO("commitment ledger enabled({})",
                ::functionsystem::resource_view::CommitmentLedger::IsEnabled());
+    // High-ratio contract audit: the enforced-high checks assume the kernel
+    // page matches the 4096 protocol constant the daemon also uses.
+    YRLOG_INFO("high-ratio protocol page verified({}) ratio({})",
+               ::functionsystem::resource_view::ProtocolPageSizeVerified(),
+               ::functionsystem::resource_view::MemoryHighRatio());
     // overcommit ceiling knob (consumed by the OvercommitFilter plugin)
     ::functionsystem::schedule_plugin::filter::OvercommitFilter::SetConfig(flags.GetOvercommitRatio());
     // Ph0.2 orphan grace (consumed by the IdleActor; set before it spawns)

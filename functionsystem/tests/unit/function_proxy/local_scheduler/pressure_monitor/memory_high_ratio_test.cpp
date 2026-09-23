@@ -20,6 +20,13 @@ namespace functionsystem::test {
 // memory.high = floor(memory_high_ratio * max) page-aligned down. Default
 // ratio 0.9 mirrors the canonical chart sandboxd config; values verified
 // against physical readbacks (case-2d 128MiB, case-3 256MiB).
+TEST(MemoryHighRatioTest, ProtocolPageMatchesRunningKernel)
+{
+    // The contract checks are only valid on a 4096-page kernel, which this
+    // test environment pins explicitly.
+    EXPECT_TRUE(resource_view::ProtocolPageSizeVerified());
+}
+
 TEST(MemoryHighRatioTest, DefaultRatioMatchesPhysicalReadbacks)
 {
     EXPECT_DOUBLE_EQ(resource_view::MemoryHighRatio(), 0.9);
