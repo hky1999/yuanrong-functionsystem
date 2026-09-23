@@ -20,7 +20,7 @@ inline bool MemoryShrinkFailedTerminal(const runtime::v1::ResizeResourcesRequest
     if (!command.has_expected() || command.operation_id().empty()
         || command.expected_revision() == std::numeric_limits<uint64_t>::max()) { return false; }
     const auto &expected = command.expected();
-    const auto high = static_cast<uint64_t>(std::floor(0.8 * expected.memory_limit_bytes() / 4096.0)) * 4096;
+    const auto high = resource_view::ExpectedHighBytes(expected.memory_limit_bytes());
     return sample.resource_generation() == command.resource_generation()
         && sample.resource_revision_known() && sample.resource_revision() == command.expected_revision() + 1
         && sample.resource_operation_id() == command.operation_id() && !sample.resource_operation_pending()
@@ -63,8 +63,7 @@ inline bool PressureResizeTargetObserved(const runtime::v1::ResizeResourcesReque
         return false;
     }
     if (resource_view::MemoryElasticityEnabled()) {
-        const auto targetHigh = static_cast<uint64_t>(std::floor(
-            0.8 * command.target().memory_limit_bytes() / 4096.0)) * 4096;
+        const auto targetHigh = resource_view::ExpectedHighBytes(command.target().memory_limit_bytes());
         if (command.operation_id().empty() || command.expected_revision() == 0
             || !sample.memory_limit_known()
             || command.expected_revision() == std::numeric_limits<uint64_t>::max()

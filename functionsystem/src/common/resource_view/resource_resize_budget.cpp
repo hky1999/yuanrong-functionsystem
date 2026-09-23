@@ -70,14 +70,8 @@ uint64_t InstanceMemoryFloorBytes(const InstanceInfo &instance)
     if (!std::isfinite(value) || value <= 0) { return 0; }
     return static_cast<uint64_t>(value) * 1024ULL * 1024ULL;
 }
-// This round's fixed soft-limit derivation: floor(0.8 * max / 4096) * 4096.
-// Kept in exact integer arithmetic equal to the double formula for realistic
-// limits; overflow-safe inputs below 2^62 bytes cover every real node.
-uint64_t ExpectedHighBytes(uint64_t maxBytes)
-{
-    constexpr uint64_t kSafeMax = (1ULL << 62) / 4;
-    return maxBytes < kSafeMax ? (maxBytes * 4 / 5 / 4096) * 4096 : 0;
-}
+// ExpectedHighBytes now lives in memory_elasticity_config.h so the transport
+// checks and the pressure monitor share one ratio contract with the daemon.
 // The soft limit is only proven when it is known, finite, and exactly the
 // fixed-ratio page-aligned expectation for the readback hard limit.
 bool StatsHighMatches(const runtime::v1::StatsResponse &actual)

@@ -1,6 +1,7 @@
 #ifndef FUNCTIONSYSTEM_MEMORY_ELASTICITY_POLICY_H
 #define FUNCTIONSYSTEM_MEMORY_ELASTICITY_POLICY_H
 
+#include "common/resource_view/memory_elasticity_config.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -66,7 +67,7 @@ public:
         idlePeak_ = std::max(idlePeak_, s.current);
         if (s.sampledMs - idleSinceMs_ < 5000 || s.maximum == s.floor) { return {}; }
         const uint64_t target = std::max(s.floor, s.maximum / 2);
-        const uint64_t targetHigh = static_cast<uint64_t>(std::floor(0.8 * target / Page)) * Page;
+        const uint64_t targetHigh = resource_view::ExpectedHighBytes(target);
         if (idlePeak_ + 32 * MiB > targetHigh) { return {}; }
         idleSinceMs_ = 0;
         return Decision{target, true};
