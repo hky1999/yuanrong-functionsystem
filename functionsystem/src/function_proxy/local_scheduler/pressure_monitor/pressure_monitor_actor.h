@@ -44,7 +44,16 @@ namespace functionsystem::local_scheduler {
 
 /** Runtime knobs for PressureMonitorActor (mirrors the driver flags). */
 struct PressureMonitorConfig {
+    // Park/ratio cadence: UNCHANGED (5000ms x sustainSamples semantics).
     uint32_t checkIntervalMs = 5000;
+    // Elastic-policy consumption cadence: MemoryElasticityPolicy::Observe
+    // requires ADJACENT CONSUMED samples <=600ms apart to accumulate the 5s
+    // low-usage window; a 5000ms consumer never satisfied it, so elastic
+    // sandboxes never shrank (pc-elastic-4 root cause #1; 1631Z experiment:
+    // 200/500ms cadences shrink after 5s, 1000/5000ms never do). 200ms
+    // matches the Stats producer contract. Only scheduled when memory
+    // elasticity is enabled — the legacy path keeps its single 5000ms loop.
+    uint32_t elasticIntervalMs = 200;
     double highWatermark = 0.85;
     double lowWatermark = 0.70;
     uint32_t sustainSamples = 2;
@@ -162,6 +171,13 @@ public:
 private:
     /** Kick off one sampling cycle; reschedules itself via AsyncAfter. */
     void RunCycle();
+    // fast tick (elasticIntervalMs): feeds ONLY the elasticity policy via
+    // its OWN single-flight gate and timeout; park/ratio accounting and the
+    // IdleMgr/parked-table hops stay exclusively on the 5000ms RunCycle
+    void RunElasticCycle();
+    void OnElasticSampleTimeout(uint64_t generation);
+    void OnElasticResourceView(uint64_t generation,
+                               const std::shared_ptr<resource_view::ResourceUnit> &view);
 
     /** One sampling cycle without the reschedule (shared by poll and event). */
     void SampleNow();
@@ -270,6 +286,10 @@ private:
     PressureEventQueue pendingCpuEvents_;
 
     uint32_t highSamples_ = 0; // consecutive samples at/above the high mark
+    // The fast path's OWN single-flight gate: interleaving with the slow
+    // loop's sampleGate_ never blocks either side (a hanging IdleMgr on the
+    // slow path cannot stall the 200ms policy consumption and vice versa).
+    PressureSampleGate elasticGate_;
     uint64_t requestSeq_ = 0;  // requestID sequence for pressure-* tracing
 
     // Wake cooldown (D-4): restores are async and slow; re-issuing HandleWake

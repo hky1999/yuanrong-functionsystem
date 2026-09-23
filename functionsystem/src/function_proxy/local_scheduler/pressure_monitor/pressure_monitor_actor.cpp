@@ -54,6 +54,11 @@ void PressureMonitorActor::Init()
     // All pressure growth uses the generation-conditional, shared-budget RPC.
     // Never instantiate the historical direct-cgroup writers here.
     (void)litebus::AsyncAfter(config_.checkIntervalMs, GetAID(), &PressureMonitorActor::RunCycle);
+    if (resource_view::MemoryElasticityEnabled() && config_.elasticIntervalMs > 0) {
+        // Fast tick feeding ONLY the elasticity policy (<=600ms adjacency
+        // contract); the park/ratio loop keeps its 5000ms cadence below.
+        (void)litebus::AsyncAfter(config_.elasticIntervalMs, GetAID(), &PressureMonitorActor::RunElasticCycle);
+    }
 }
 
 void PressureMonitorActor::RunCycle()
@@ -61,6 +66,58 @@ void PressureMonitorActor::RunCycle()
     // reschedule first: a slow cross-actor hop must not stall the cadence
     (void)litebus::AsyncAfter(config_.checkIntervalMs, GetAID(), &PressureMonitorActor::RunCycle);
     SampleNow();
+}
+
+void PressureMonitorActor::RunElasticCycle()
+{
+    // reschedule first: a slow cross-actor hop must not stall the cadence
+    (void)litebus::AsyncAfter(config_.elasticIntervalMs, GetAID(), &PressureMonitorActor::RunElasticCycle);
+    if (idleMgr_ == nullptr || resourceView_ == nullptr || snapCtrl_ == nullptr) {
+        return; // not fully bound yet
+    }
+    // OWN single-flight: a slow-loop pass in flight never blocks the fast
+    // consumption, and vice versa.
+    const auto sample = elasticGate_.Begin();
+    if (!sample.has_value()) {
+        return;
+    }
+    const auto generation = *sample;
+    // bounded fast timeout: 3 elastic intervals, independent of the slow
+    // gate — clearing ONLY fast-pass state (never highSamples_/cooldowns)
+    (void)litebus::AsyncAfter(static_cast<uint64_t>(config_.elasticIntervalMs) * 3, GetAID(),
+                              &PressureMonitorActor::OnElasticSampleTimeout, generation);
+    resourceView_->GetResourceView().Then(
+        [aid(GetAID()), generation](const std::shared_ptr<resource_view::ResourceUnit> &view)
+            -> std::shared_ptr<resource_view::ResourceUnit> {
+            litebus::Async(aid, &PressureMonitorActor::OnElasticResourceView, generation, view);
+            return view;
+        });
+}
+
+void PressureMonitorActor::OnElasticSampleTimeout(uint64_t generation)
+{
+    if (!elasticGate_.Finish(generation)) {
+        return;
+    }
+    // deliberately NO highSamples_/lastRatio_ resets: those belong to the
+    // slow park loop's own timeout path only
+    YRLOG_DEBUG("pressure monitor on node {}: elastic sampling generation {} timed out", nodeID_, generation);
+}
+
+void PressureMonitorActor::OnElasticResourceView(uint64_t generation,
+    const std::shared_ptr<resource_view::ResourceUnit> &view)
+{
+    if (!elasticGate_.Finish(generation)) {
+        return;
+    }
+    if (view == nullptr) {
+        return;
+    }
+    const auto observedAtMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    // policy consumption ONLY: no IdleMgr hop, no parked-table read, no
+    // ratio/park accounting — the fast path reads the resource view alone.
+    ResizeUnderPressure(*view, observedAtMs);
 }
 
 void PressureMonitorActor::SampleNow()
@@ -71,7 +128,7 @@ void PressureMonitorActor::SampleNow()
     }
     const auto sample = sampleGate_.Begin();
     if (!sample.has_value()) {
-        return; // new pressure sources remain in their coalescing queues
+        return; // a pass is already in flight: it owns its own completion
     }
     const auto generation = *sample;
     const auto timeoutMs = std::max<uint64_t>(1000, static_cast<uint64_t>(config_.checkIntervalMs) * 2);
@@ -317,8 +374,7 @@ void PressureMonitorActor::OnPressureResize(const std::string &instanceID, const
         const auto &reply = result.Get().result();
         const auto &actual = reply.actual();
         const auto &command = pending->second.request.resize();
-        const auto targetHigh = static_cast<uint64_t>(std::floor(
-            0.8 * command.target().memory_limit_bytes() / 4096.0)) * 4096;
+        const auto targetHigh = ElasticResizeReceiptHighBytes(command);
         const bool failedTerminal = pending->second.request.shrink() && !reply.complete()
             && reply.has_actual() && MemoryShrinkFailedTerminal(command, actual);
         if (!failedTerminal && (command.expected_revision() == std::numeric_limits<uint64_t>::max()

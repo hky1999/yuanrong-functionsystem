@@ -144,5 +144,17 @@ inline std::optional<runtime::v1::ResourceLimits> PressureResizeTarget(
         && target.memory_limit_bytes() == s.memory_limit_bytes()) { return std::nullopt; }
     return target;
 }
+
+
+// The high watermark a COMPLETED elastic resize receipt must carry: the
+// daemon computes high as ceil(ratio*max) page-aligned-down capped below
+// max (memory_elasticity_config.h, default ratio 0.9). A local 0.8 copy in
+// OnPressureResize misrecorded every CORRECT 0.9 receipt as unknown
+// (pc-elastic-4 live evidence, 1631Z) — this helper keeps one contract.
+inline uint64_t ElasticResizeReceiptHighBytes(const runtime::v1::ResizeResourcesRequest &command)
+{
+    return resource_view::ExpectedHighBytes(command.target().memory_limit_bytes());
+}
+
 } // namespace functionsystem::local_scheduler
 #endif
