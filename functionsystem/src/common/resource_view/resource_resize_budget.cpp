@@ -20,6 +20,7 @@
 #include <cmath>
 #include <limits>
 #include "common/logs/logging.h"
+#include "memory_elasticity_config.h"
 #include "memory_elasticity_fence.h"
 #include "resource_sample_freshness.h"
 
