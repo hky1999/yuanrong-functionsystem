@@ -138,3 +138,46 @@ TEST_F(CommitmentLedgerTest, UnknownUnitAndZeroRaise)
 }  // namespace
 
 }  // namespace functionsystem::test
+
+// SnapshotAllUnits must expose the raw stored balance for EVERY tracked
+// unit regardless of view membership or enabled state — these three
+// boundaries are exactly the legacy-tail hunts the inventory serves.
+TEST(CommitmentLedgerSnapshotTest, RawBalanceSurvivesDisabledLedger)
+{
+    CommitmentLedger::ResetForTest();
+    CommitmentLedger::SetEnabled(true);
+    CommitmentLedger::OnRaise("unit-disabled-tail", 64ULL << 20, 0);
+    CommitmentLedger::SetEnabled(false);
+    bool enabled = true;
+    const auto snapshot = CommitmentLedger::SnapshotAllUnits(&enabled);
+    EXPECT_FALSE(enabled);
+    // Outstanding() would read 0 while disabled; the raw snapshot must
+    // still report the stored balance so disabled-0 reads as unknown.
+    EXPECT_EQ(snapshot.at("unit-disabled-tail"), 64ULL << 20);
+    CommitmentLedger::ResetForTest();
+}
+
+TEST(CommitmentLedgerSnapshotTest, EmptyLedgerSnapshotsEmptyAndEnabled)
+{
+    CommitmentLedger::ResetForTest();
+    CommitmentLedger::SetEnabled(true);
+    bool enabled = false;
+    const auto snapshot = CommitmentLedger::SnapshotAllUnits(&enabled);
+    EXPECT_TRUE(enabled);
+    EXPECT_TRUE(snapshot.empty());
+    CommitmentLedger::ResetForTest();
+}
+
+TEST(CommitmentLedgerSnapshotTest, ViewExternalUnitRemainsVisible)
+{
+    CommitmentLedger::ResetForTest();
+    CommitmentLedger::SetEnabled(true);
+    // No resource view ever knew this unit; the snapshot is the ledger's
+    // own state and must still show it.
+    CommitmentLedger::OnRaise("unit-never-in-view", 32ULL << 20, 0);
+    bool enabled = false;
+    const auto snapshot = CommitmentLedger::SnapshotAllUnits(&enabled);
+    ASSERT_EQ(snapshot.count("unit-never-in-view"), size_t{1});
+    EXPECT_EQ(snapshot.at("unit-never-in-view"), 32ULL << 20);
+    CommitmentLedger::ResetForTest();
+}
