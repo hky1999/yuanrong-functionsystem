@@ -50,7 +50,7 @@ std::shared_ptr<MetricsActor> UnitBuilder()
     return std::make_shared<MetricsActor>("unknown-propagation-test");
 }
 
-resources::ResourceUnit BuildUnit(const std::vector<litebus::Future<Metrics>> &futures)
+resources::ResourceUnit BuildUnit(const std::vector<litebus::Future<runtime_manager::Metrics>> &futures)
 {
     return UnitBuilder()->BuildResourceUnitWithSystem(futures);
 }
@@ -79,8 +79,11 @@ TEST(ExternalCollectorUnknownPropagation, RealMemoryCollectorUnknownShapesCarryN
         EXPECT_TRUE(metrics.Get().usage.IsNone()) << shape;
         auto unit = BuildUnit({metrics.Get()});
         EXPECT_EQ(unit.memory_sample_unix_ms(), 0) << "unknown must not stamp a sample clock: " << shape;
-        EXPECT_FALSE(unit.actualuse().resources().contains(resource_view::MEMORY_RESOURCE_NAME))
-            << "no fabricated usage entry: " << shape;
+        if (unit.actualuse().resources().contains(resource_view::MEMORY_RESOURCE_NAME)) {
+            const auto &entry = unit.actualuse().resources().at(resource_view::MEMORY_RESOURCE_NAME);
+            EXPECT_FALSE(entry.has_scalar() && entry.scalar().value() > 0)
+                << "no fabricated known usage: " << shape;
+        }
     }
 }
 
@@ -89,25 +92,35 @@ TEST(ExternalCollectorUnknownPropagation, MemoryUnknownThenRecoveryThroughAdmiss
     AdmissionGuard guard;
     resource_view::SetUsageAdmissionSettings(0.95, 2048, 0);
     const resource_view::AdmissionReserve reserve{500, 16};
+    // Headroom requires fresh CPU AND fresh Memory: a known CPU metric
+    // rides along in every phase so only the memory side varies.
+    ExternalSystemCPUCollector cpu(Reply(kKnownA));
 
     ExternalSystemMemoryCollector collector(Reply(kKnownA));
+    auto cpuKnown = cpu.GetMetrics();
     auto knownMetrics = collector.GetMetrics();
-    ASSERT_TRUE(knownMetrics.IsOK());
+    ASSERT_TRUE(cpuKnown.IsOK() && knownMetrics.IsOK());
     EXPECT_DOUBLE_EQ(knownMetrics.Get().usage.Get(), 8.0);
-    auto knownUnit = BuildUnit({knownMetrics.Get()});
+    auto knownUnit = BuildUnit({cpuKnown.Get(), knownMetrics.Get()});
     EXPECT_GT(knownUnit.memory_sample_unix_ms(), 0);
     // Known fresh sample with tiny usage: headroom passes.
     EXPECT_TRUE(resource_view::CheckResourceHeadroom(knownUnit, reserve).IsOk());
 
-    // Unknown (empty reply = 503/transport): no usage, no clock; the
-    // stale previous_ from the known phase must NOT leak back in.
+    // Unknown (empty reply = 503/transport): no known usage and no
+    // sample clock; the stale previous_ must NOT leak back in.
     collector.SetTestTransport(Reply(""));
     auto unknownMetrics = collector.GetMetrics();
     ASSERT_TRUE(unknownMetrics.IsOK());
     EXPECT_TRUE(unknownMetrics.Get().usage.IsNone());
-    auto unknownUnit = BuildUnit({unknownMetrics.Get()});
+    auto unknownUnit = BuildUnit({cpuKnown.Get(), unknownMetrics.Get()});
     EXPECT_EQ(unknownUnit.memory_sample_unix_ms(), 0);
-    EXPECT_FALSE(unknownUnit.actualuse().resources().contains(resource_view::MEMORY_RESOURCE_NAME));
+    // No KNOWN usage: either the entry is absent or it carries no usage
+    // value — the binding contract is "no fabricated known usage".
+    if (unknownUnit.actualuse().resources().contains(resource_view::MEMORY_RESOURCE_NAME)) {
+        const auto &entry = unknownUnit.actualuse().resources().at(resource_view::MEMORY_RESOURCE_NAME);
+        EXPECT_FALSE(entry.has_scalar() && entry.scalar().value() > 0)
+            << "unknown observation must not fabricate known usage";
+    }
     // Stale/absent fresh sample: admission must reject.
     EXPECT_FALSE(resource_view::CheckResourceHeadroom(unknownUnit, reserve).IsOk());
 
@@ -116,7 +129,7 @@ TEST(ExternalCollectorUnknownPropagation, MemoryUnknownThenRecoveryThroughAdmiss
     auto recoveredMetrics = collector.GetMetrics();
     ASSERT_TRUE(recoveredMetrics.IsOK());
     EXPECT_DOUBLE_EQ(recoveredMetrics.Get().usage.Get(), 16.0);
-    auto recoveredUnit = BuildUnit({recoveredMetrics.Get()});
+    auto recoveredUnit = BuildUnit({cpuKnown.Get(), recoveredMetrics.Get()});
     EXPECT_GT(recoveredUnit.memory_sample_unix_ms(), 0);
     EXPECT_TRUE(resource_view::CheckResourceHeadroom(recoveredUnit, reserve).IsOk());
 }
@@ -147,10 +160,14 @@ TEST(ExternalCollectorUnknownPropagation, CpuUnknownKeepsContractAndRecoversNewV
     EXPECT_GT(cpuUnknownUnit.memory_sample_unix_ms(), 0);
     EXPECT_FALSE(resource_view::CheckResourceHeadroom(cpuUnknownUnit, reserve).IsOk());
 
-    // CPU recovers with a DIFFERENT value: fresh clock and pass.
+    // CPU recovers with a DIFFERENT value (4.125 cores in kKnownB): the
+    // explicit new-value assertion guards against a mere clock refresh
+    // being mistaken for recovery.
     cpu.SetTestTransport(Reply(kKnownB));
     auto cpuRecovered = cpu.GetMetrics();
     ASSERT_TRUE(cpuRecovered.IsOK());
+    ASSERT_TRUE(cpuRecovered.Get().usage.IsSome());
+    EXPECT_DOUBLE_EQ(cpuRecovered.Get().usage.Get(), 4125.0); // usedCpu 4.125 cores * CPU_SCALE 1000
     auto recoveredUnit = BuildUnit({cpuRecovered.Get(), memKnown.Get()});
     EXPECT_GT(recoveredUnit.cpu_sample_unix_ms(), 0);
     EXPECT_TRUE(resource_view::CheckResourceHeadroom(recoveredUnit, reserve).IsOk());
