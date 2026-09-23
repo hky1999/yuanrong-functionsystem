@@ -1117,3 +1117,219 @@ TEST(FrontendProxyServiceTest, RealGrpcCancellationStopsInvokeWaitAndClearsRegis
 }
 
 }  // namespace functionsystem::test
+
+// ---------------------------------------------------------------------------
+// ResizeInstance controlled entry: the scheduler-authorized direct resize.
+// Per-test Promise + counter (no shared globals — the 2003Z review found
+// shared state leaking across cases).
+// ---------------------------------------------------------------------------
+namespace {
+
+struct ResizeTestState {
+    litebus::Promise<messages::ResizeSandboxResponse> result;
+    int dispatchCount = 0;
+
+    FrontendProxyServiceParam MakeParam(
+        std::function<bool(const std::string &, const std::string &)> authorizer,
+        bool enable = true)
+    {
+        FrontendProxyServiceParam param;
+        param.nodeID = "resize-node";
+        param.requireAuthenticatedPeer = false;
+        param.enableResizeDispatch = enable;
+        param.invokeTenantAuthorizer = authorizer;
+        auto *state = this;
+        param.resizeReadyDispatcher =
+            [state](const ::frontend_proxy::ResizeInstanceRequest &)
+            -> litebus::Future<messages::ResizeSandboxResponse> {
+            state->dispatchCount++;
+            return state->result.GetFuture();
+        };
+        return param;
+    }
+};
+
+::frontend_proxy::ResizeInstanceRequest MakeResizeRequest(const std::string &tenant) {
+    ::frontend_proxy::ResizeInstanceRequest request;
+    auto *context = request.mutable_context();
+    context->set_frontendclientid("fc-1");
+    context->set_requestid("req-1");
+    context->set_tenantid(tenant);
+    auto *resize = request.mutable_resize();
+    resize->set_requestid("req-1");
+    resize->set_instanceid("inst-1");
+    resize->set_runtimeid("rt-1");
+    auto *command = resize->mutable_resize();
+    command->set_sandbox_id("sbx-1");
+    command->set_resource_generation("gen-1");
+    command->set_operation_id("op-1");
+    command->set_deadline_unix_ms(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count() + 30000);
+    return request;
+}
+
+}  // namespace
+
+TEST(FrontendProxyResizeEntryTest, ResizeWithoutAuthorizerIsDenied)
+{
+    ResizeTestState state;
+    auto param = state.MakeParam(nullptr);
+    FrontendProxyService service(std::move(param));
+    ::grpc::ServerContext context;
+    auto request = MakeResizeRequest("tenant-1");
+    ::frontend_proxy::ResizeInstanceResponse response;
+    auto status = service.ResizeInstance(&context, &request, &response);
+    EXPECT_TRUE(status.ok());
+    EXPECT_NE(response.status().code(), 0);
+    EXPECT_EQ(state.dispatchCount, 0);
+}
+
+TEST(FrontendProxyResizeEntryTest, ResizeWithWrongTenantIsDenied)
+{
+    ResizeTestState state;
+    auto param = state.MakeParam(
+        [](const std::string &t, const std::string &) { return t == "owner"; });
+    FrontendProxyService service(std::move(param));
+    ::grpc::ServerContext context;
+    auto request = MakeResizeRequest("attacker");
+    ::frontend_proxy::ResizeInstanceResponse response;
+    auto status = service.ResizeInstance(&context, &request, &response);
+    EXPECT_TRUE(status.ok());
+    EXPECT_NE(response.status().code(), 0);
+    EXPECT_EQ(state.dispatchCount, 0);
+}
+
+TEST(FrontendProxyResizeEntryTest, ResizeWithSameTenantDispatchesAndObserves)
+{
+    ResizeTestState state;
+    auto param = state.MakeParam(
+        [](const std::string &t, const std::string &) { return t == "tenant-1"; });
+    messages::ResizeSandboxResponse observed;
+    observed.set_code(0);
+    observed.set_outcome(messages::ResizeSandboxResponse::OBSERVED);
+    state.result.SetValue(observed);
+    FrontendProxyService service(std::move(param));
+    ::grpc::ServerContext context;
+    auto request = MakeResizeRequest("tenant-1");
+    ::frontend_proxy::ResizeInstanceResponse response;
+    auto status = service.ResizeInstance(&context, &request, &response);
+    EXPECT_TRUE(status.ok());
+    EXPECT_EQ(response.status().code(), 0);
+    EXPECT_EQ(response.resize().outcome(), messages::ResizeSandboxResponse::OBSERVED);
+    EXPECT_EQ(state.dispatchCount, 1);
+}
+
+TEST(FrontendProxyResizeEntryTest, BudgetRejectionPropagates)
+{
+    ResizeTestState state;
+    auto param = state.MakeParam(
+        [](const std::string &t, const std::string &) { return t == "tenant-1"; });
+    messages::ResizeSandboxResponse rejected;
+    rejected.set_code(7);
+    rejected.set_outcome(messages::ResizeSandboxResponse::REJECTED_BEFORE_DISPATCH);
+    rejected.set_message("budget exhausted");
+    state.result.SetValue(rejected);
+    FrontendProxyService service(std::move(param));
+    ::grpc::ServerContext context;
+    auto request = MakeResizeRequest("tenant-1");
+    ::frontend_proxy::ResizeInstanceResponse response;
+    auto status = service.ResizeInstance(&context, &request, &response);
+    EXPECT_TRUE(status.ok());
+    EXPECT_NE(response.status().code(), 0);
+    EXPECT_EQ(response.resize().outcome(),
+               messages::ResizeSandboxResponse::REJECTED_BEFORE_DISPATCH);
+}
+
+TEST(FrontendProxyResizeEntryTest, NotEnabledDeniesWithAuthorizeFailed)
+{
+    ResizeTestState state;
+    auto param = state.MakeParam(
+        [](const std::string &, const std::string &) { return true; }, false);
+    FrontendProxyService service(std::move(param));
+    ::grpc::ServerContext context;
+    auto request = MakeResizeRequest("tenant-1");
+    ::frontend_proxy::ResizeInstanceResponse response;
+    auto status = service.ResizeInstance(&context, &request, &response);
+    EXPECT_TRUE(status.ok());
+    EXPECT_NE(response.status().code(), 0);
+    EXPECT_EQ(state.dispatchCount, 0);
+}
+
+TEST(FrontendProxyResizeEntryTest, ExpiredDeadlineIsRejectedBeforeDispatch)
+{
+    ResizeTestState state;
+    auto param = state.MakeParam(
+        [](const std::string &, const std::string &) { return true; });
+    FrontendProxyService service(std::move(param));
+    ::grpc::ServerContext context;
+    auto request = MakeResizeRequest("tenant-1");
+    request.mutable_resize()->mutable_resize()->set_deadline_unix_ms(1);
+    ::frontend_proxy::ResizeInstanceResponse response;
+    auto status = service.ResizeInstance(&context, &request, &response);
+    EXPECT_TRUE(status.ok());
+    EXPECT_NE(response.status().code(), 0);
+    EXPECT_EQ(state.dispatchCount, 0);
+}
+
+TEST(FrontendProxyResizeEntryTest, ShrinkFlagForwardedInDispatchedRequest)
+{
+    ResizeTestState state;
+    ::frontend_proxy::ResizeInstanceRequest seen;
+    auto param = state.MakeParam([](const std::string &, const std::string &) { return true; });
+    param.resizeReadyDispatcher =
+        [&seen, &state](const ::frontend_proxy::ResizeInstanceRequest &req)
+            -> litebus::Future<messages::ResizeSandboxResponse> {
+        seen = req;
+        state.dispatchCount++;
+        messages::ResizeSandboxResponse observed;
+        observed.set_code(0);
+        observed.set_outcome(messages::ResizeSandboxResponse::OBSERVED);
+        return litebus::Future<messages::ResizeSandboxResponse>(observed);
+    };
+    FrontendProxyService service(std::move(param));
+    ::grpc::ServerContext context;
+    auto request = MakeResizeRequest("tenant-1");
+    request.mutable_resize()->set_shrink(true);
+    ::frontend_proxy::ResizeInstanceResponse response;
+    auto status = service.ResizeInstance(&context, &request, &response);
+    EXPECT_TRUE(status.ok());
+    EXPECT_EQ(state.dispatchCount, 1);
+    EXPECT_TRUE(seen.resize().shrink());
+}
+
+TEST(FrontendProxyResizeEntryTest, PendingFutureYieldsUnknownOutcome)
+{
+    ResizeTestState state;  // never SetValue: stays pending, WaitFrontendResult times out
+    auto param = state.MakeParam([](const std::string &, const std::string &) { return true; });
+    // force a very short deadline so the bounded wait exits quickly
+    FrontendProxyService service(std::move(param));
+    ::grpc::ServerContext context;
+    auto request = MakeResizeRequest("tenant-1");
+    request.mutable_resize()->mutable_resize()->set_deadline_unix_ms(
+        request.resize().resize().deadline_unix_ms() - 29900); // ~100ms budget
+    ::frontend_proxy::ResizeInstanceResponse response;
+    auto started = std::chrono::steady_clock::now();
+    auto status = service.ResizeInstance(&context, &request, &response);
+    auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_TRUE(status.ok());
+    EXPECT_NE(response.status().code(), 0);
+    EXPECT_EQ(response.resize().outcome(), messages::ResizeSandboxResponse::UNKNOWN);
+    EXPECT_EQ(state.dispatchCount, 1); // the dispatch DID happen; outcome unknown
+}
+
+TEST(FrontendProxyResizeEntryTest, MissingOperationIDIsRejected)
+{
+    ResizeTestState state;
+    auto param = state.MakeParam(
+        [](const std::string &, const std::string &) { return true; });
+    FrontendProxyService service(std::move(param));
+    ::grpc::ServerContext context;
+    auto request = MakeResizeRequest("tenant-1");
+    request.mutable_resize()->mutable_resize()->clear_operation_id();
+    ::frontend_proxy::ResizeInstanceResponse response;
+    auto status = service.ResizeInstance(&context, &request, &response);
+    EXPECT_TRUE(status.ok());
+    EXPECT_NE(response.status().code(), 0);
+    EXPECT_EQ(state.dispatchCount, 0);
+}
