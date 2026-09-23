@@ -76,6 +76,18 @@ function get_runtime_checkpoint_dir() {
 function install_function_proxy() {
   log_info "start function proxy, proxy_port=${FUNCTION_PROXY_PORT}, grpc_port=${FUNCTION_PROXY_GRPC_PORT}..."
   local bin=${FUNCTION_SYSTEM_DIR}/bin/function_proxy
+  # Elasticity-baseline launch configuration (explicit, traceable):
+  #   AKERNEL_MEMORY_ELASTICITY: 1 enables the revision-fenced shrink path.
+  #     Defaults to 0 — absence means OFF; the baseline chart sets 1.
+  #   ENABLE_UPGRADE_LADDER / UPGRADE_STEP_MB / UPGRADE_CAP_MB: the D-3
+  #     growth argv (enable_upgrade_ladder is OFF by default in the binary,
+  #     so an env-only fix leaves PressureMonitor growth disabled; these
+  #     MUST become argv to take effect).
+  AKERNEL_MEMORY_ELASTICITY=${AKERNEL_MEMORY_ELASTICITY:-0}
+  local ladder_args=""
+  if [ "${ENABLE_UPGRADE_LADDER:-false}" = "true" ]; then
+    ladder_args="--enable_upgrade_ladder=true --upgrade_step_mb=${UPGRADE_STEP_MB:-512} --upgrade_cap_mb=${UPGRADE_CAP_MB:-32768}"
+  fi
   local is_pseudo_data_plane="false"
   if [ ${CPU4COMP} -le 100 ]; then
     is_pseudo_data_plane="true"
@@ -175,13 +187,7 @@ function install_function_proxy() {
     --log_expiration_cleanup_interval="${LOG_EXPIRATION_CLEANUP_INTERVAL}" \
     --log_expiration_max_file_count="${LOG_EXPIRATION_MAX_FILE_COUNT}""
   fi
-  # Memory-elasticity static startup switch + ladder growth parameters.
-  # The deploy launch chain rebuilds its environment, so a container-level
-  # env does not survive to the binary; these explicit assignments are the
-  # persistent canonical wiring (flags.cpp: memory_elasticity_config reads
-  # AKERNEL_MEMORY_ELASTICITY==1 at process start; enable_upgrade_ladder/
-  # upgrade_step_mb/upgrade_cap_mb are argv flags consumed by the proxy).
-  AKERNEL_MEMORY_ELASTICITY=${AKERNEL_MEMORY_ELASTICITY:-1} \
+  # (switch + ladder argv are set in the explicit block at function start)
   LD_LIBRARY_PATH=${function_system_ld_library_path:-${FUNCTION_SYSTEM_DIR}/lib:${DATA_SYSTEM_DIR}/lib:${LD_LIBRARY_PATH}} \
     PATH="${RUNTIME_HOME_DIR}/service/java/bin:/opt/buildtools/jdk8/bin:${PATH}" \
     LD_PRELOAD="${jemalloc_path}" \
@@ -190,7 +196,7 @@ function install_function_proxy() {
     RUNTIME_METRICS_CONFIG=$RUNTIME_METRICS_CONFIG \
     RUNTIME_METRICS_CONFIG_FILE=$RUNTIME_METRICS_CONFIG_FILE \
     INIT_LABELS=${LABELS} \
-    ${bin} --address="${IP_ADDRESS}:${FUNCTION_PROXY_PORT}" --meta_store_address="${META_STORE_ADDRESS}" \
+    ${bin} ${ladder_args} --address="${IP_ADDRESS}:${FUNCTION_PROXY_PORT}" --meta_store_address="${META_STORE_ADDRESS}" \
     --etcd_address="${ETCD_CLUSTER_ADDRESS}" \
     --node_id="${NODE_ID}" --log_config="${FS_LOG_CONFIG}" \
     --services_path="${SERVICES_PATH}" \
