@@ -41,6 +41,28 @@ public:
     // never touches resource or budget state.
     void ArmFromSpec(const std::string &specJson);
 
+    // Runtime test control (stage-4 requirement): re-check the control file
+    // before each match attempt so a gate can be armed, hit, disarmed and
+    // re-armed against instances that already exist, without restarting the
+    // process. The file holds the same JSON spec (arm) or {"disarm":true};
+    // a missing file leaves current state untouched; it is only read, never
+    // written, by the gate. Default path /run/akernel/retire-fault-control.json,
+    // override with AKERNEL_RETIRE_FAULT_CONTROL_FILE. This is a test
+    // facility only: it never touches resource or budget state.
+    void RefreshFromControlFile();
+    // Read-only state snapshot for collectors (action/identity/deadline/
+    // enabled/consumed); no writer.
+    struct State {
+        std::string action;
+        std::string sandboxID;
+        std::string generation;
+        int64_t delayMs{ 0 };
+        int64_t deadlineUnixMs{ 0 };
+        bool enabled{ false };
+        bool consumed{ false };
+    };
+    State GetStateForTest() const;
+
     // For "block_delete": true when this delete must be held for delayMs
     // before dispatch. Consumes the one shot.
     bool BlockDeleteIfMatched(const std::string &sandboxID, const std::string &generation, int64_t &delayMs);
@@ -52,6 +74,10 @@ public:
 private:
     bool MatchAndConsume(const std::string &action, const std::string &sandboxID,
                          const std::string &generation, bool &armed);
+    void Disarm(const char *reason);
+    void DisarmLocked(const char *reason);  // caller holds mutex_
+    void ArmLocked(const std::string &specJson);  // caller holds mutex_
+    static std::string ControlFilePath();
 
     std::mutex mutex_;
     std::string action_;
@@ -61,6 +87,7 @@ private:
     int64_t deadlineUnixMs_{ 0 };
     bool enabled_{ false };
     bool consumed_{ false };
+    int64_t lastControlMtimeMs_{ -1 };  // last applied control-file revision
 };
 
 }  // namespace functionsystem::runtime_manager

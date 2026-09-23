@@ -18,6 +18,8 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 
 #include <nlohmann/json.hpp>
 
@@ -51,6 +53,11 @@ RetireFaultGate &RetireFaultGate::Instance()
 void RetireFaultGate::ArmFromSpec(const std::string &specJson)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    ArmLocked(specJson);
+}
+
+void RetireFaultGate::ArmLocked(const std::string &specJson)
+{
     if (enabled_) {
         YRLOG_WARN("retire-fault gate re-arm ignored: a spec is already active");
         return;
@@ -78,9 +85,78 @@ void RetireFaultGate::ArmFromSpec(const std::string &specJson)
     }
 }
 
+std::string RetireFaultGate::ControlFilePath()
+{
+    const char *raw = std::getenv("AKERNEL_RETIRE_FAULT_CONTROL_FILE");
+    return raw != nullptr && *raw != '\0' ? std::string(raw)
+                                           : std::string("/run/akernel/retire-fault-control.json");
+}
+
+void RetireFaultGate::Disarm(const char *reason)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    DisarmLocked(reason);
+}
+
+void RetireFaultGate::DisarmLocked(const char *reason)
+{
+    enabled_ = false;
+    consumed_ = false;
+    action_.clear();
+    sandboxID_.clear();
+    generation_.clear();
+    delayMs_ = 0;
+    deadlineUnixMs_ = 0;
+    YRLOG_WARN("retire-fault gate DISARMED reason({})", reason);
+}
+
+void RetireFaultGate::RefreshFromControlFile()
+{
+    const auto path = ControlFilePath();
+    std::error_code ec;
+    const auto mtime = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        return;  // no control file: keep current state
+    }
+    const auto mtimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        mtime.time_since_epoch()).count();
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (mtimeMs == lastControlMtimeMs_) {
+        return;  // already applied
+    }
+    lastControlMtimeMs_ = mtimeMs;
+    std::ifstream input(path);
+    if (!input) {
+        return;
+    }
+    std::string spec((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    if (spec.empty()) {
+        return;
+    }
+    try {
+        const auto parsed = nlohmann::json::parse(spec);
+        if (parsed.is_object() && parsed.value("disarm", false)) {
+            if (enabled_ || consumed_) {
+                DisarmLocked("control-file");
+            }
+            return;
+        }
+    } catch (const std::exception &) {
+        // not a disarm object: fall through to spec validation
+    }
+    ArmLocked(spec);  // caller already holds mutex_; ArmFromSpec would relock
+}
+
+RetireFaultGate::State RetireFaultGate::GetStateForTest() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return State{ action_, sandboxID_, generation_, delayMs_, deadlineUnixMs_, enabled_, consumed_ };
+}
+
 bool RetireFaultGate::MatchAndConsume(const std::string &action, const std::string &sandboxID,
                                       const std::string &generation, bool &armed)
 {
+    RefreshFromControlFile();
     std::lock_guard<std::mutex> lock(mutex_);
     armed = enabled_;
     if (!enabled_) {
