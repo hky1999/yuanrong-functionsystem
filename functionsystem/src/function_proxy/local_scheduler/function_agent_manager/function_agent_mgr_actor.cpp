@@ -1881,6 +1881,10 @@ void FunctionAgentMgrActor::ResizeSandboxResponse(const litebus::AID &from, std:
     if (response.instanceid() != request.instanceid() || response.runtimeid() != request.runtimeid()
         || response.sandboxid() != request.resize().sandbox_id()
         || response.resourcegeneration() != request.resize().resource_generation()) {
+        YRLOG_WARN("resize relay(mgr): reply identity mismatch requestid={} inst={} vs {} rt={} vs {} sbx={} vs {} gen={} vs {}",
+                   response.requestid(), response.instanceid(), request.instanceid(), response.runtimeid(),
+                   request.runtimeid(), response.sandboxid(), request.resize().sandbox_id(),
+                   response.resourcegeneration(), request.resize().resource_generation());
         return;
     }
     response.set_requestid(request.requestid());
@@ -1909,7 +1913,11 @@ void FunctionAgentMgrActor::ResizeSandboxResponse(const litebus::AID &from, std:
     if (it->second.budgetView) {
         auto budgetResponse = response;
         budgetResponse.set_requestid(it->first);
+        YRLOG_INFO("resize relay(mgr) observing budget requestid={} outcome={}", it->first,
+                   static_cast<int>(budgetResponse.outcome()));
         (void)it->second.budgetView->ObserveResize(budgetResponse);
+    } else {
+        YRLOG_WARN("resize relay(mgr): no budget view bound for requestid={}", it->first);
     }
     litebus::TimerTools::Cancel(it->second.timeout);
     auto completion = it->second.completion;
