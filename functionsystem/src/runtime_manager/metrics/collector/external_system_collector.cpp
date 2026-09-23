@@ -226,32 +226,37 @@ litebus::Future<Metric> ExternalSystemCPUCollector::GetUsage() const
 {
     return CollectFromExternal().Then([previous(previous_), totalPtr(total_)](const std::string& response) -> litebus::Future<Metric> {
         YRLOG_DEBUG_COUNT_60("Received CPU response: {}", response);
+        // Unknown observations (empty reply = transport error or non-200
+        // such as the daemon's stale-snapshot 503, unknown sample, parse
+        // failure) return an explicitly-unknown metric: no value, no
+        // refreshed clock, no stale usage.
+        const auto unknown = [] { return Metric{}; };
         if (response.empty()) {
-            return previous != nullptr ? *previous : Metric{};
+            return unknown();
         }
-        // Parse JSON response and return Metric
         try {
             // Only an explicit, known physical sample may update usage.
             // The legacy cpu field means AVAILABLE and is never read as
-            // usage; an unknown sample leaves the previous value in place
-            // without refreshing the sample clock.
+            // usage.
             auto sample = ParseExternalNodeResource(response);
             if (sample.known) {
                 auto metric = Metric{};
                 metric.value = sample.cpuUsedCores * CPU_SCALE;
+                metric.observationKnown = true;
                 *previous = metric;
                 if (totalPtr != nullptr) {
                     auto totalMetric = std::make_shared<Metric>();
                     totalMetric->value = sample.cpuTotalCores * CPU_SCALE;
+                    totalMetric->observationKnown = true;
                     *totalPtr = std::move(*totalMetric);
                 }
                 return metric;
             }
-            return previous != nullptr ? *previous : Metric{};
+            return unknown();
         } catch (const std::exception& e) {
             YRLOG_DEBUG_COUNT_60("Failed to parse JSON response: {}, error: {}", response, e.what());
         }
-        return previous != nullptr ? *previous : Metric{};
+        return unknown();
     });
 }
 
@@ -271,28 +276,30 @@ litebus::Future<Metric> ExternalSystemMemoryCollector::GetUsage() const
 {
     return CollectFromExternal().Then([previous(previous_), totalPtr(total_)](const std::string& response) -> litebus::Future<Metric> {
         YRLOG_DEBUG_COUNT_60("Received Memory response: {}", response);
+        const auto unknown = [] { return Metric{}; };
         if (response.empty()) {
-            return previous != nullptr ? *previous : Metric{};
+            return unknown();
         }
-        // Parse JSON response and return Metric
         try {
             auto sample = ParseExternalNodeResource(response);
             if (sample.known) {
                 auto metric = Metric{};
                 metric.value = sample.memUsedMb;
+                metric.observationKnown = true;
                 *previous = metric;
                 if (totalPtr != nullptr) {
                     auto totalMetric = std::make_shared<Metric>();
                     totalMetric->value = sample.memTotalMb;
+                    totalMetric->observationKnown = true;
                     *totalPtr = std::move(*totalMetric);
                 }
                 return metric;
             }
-            return previous != nullptr ? *previous : Metric{};
+            return unknown();
         } catch (const std::exception& e) {
             YRLOG_DEBUG_COUNT_60("Failed to parse JSON response: {}, error: {}", response, e.what());
         }
-        return previous != nullptr ? *previous : Metric{};
+        return unknown();
     });
 }
 Metric ExternalSystemMemoryCollector::GetLimit() const

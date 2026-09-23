@@ -690,6 +690,14 @@ resources::ResourceUnit MetricsActor::BuildResourceUnitWithSystem(
             continue;
         }
 
+        // Unknown observations (no usage AND no limit) contribute nothing:
+        // no fabricated zero entries, no sample clock, no capacity. The
+        // view keeps its previous values and the missing fresh sample
+        // makes admission conservatively reject.
+        if (metrics.usage.IsNone() && metrics.limit.IsNone()) {
+            continue;
+        }
+
         if (metrics.metricsType == metrics_type::MEMORY && metrics.usage.IsSome() && metrics.limit.IsSome()
             && std::isfinite(metrics.usage.Get()) && metrics.usage.Get() >= 0
             && std::isfinite(metrics.limit.Get()) && metrics.limit.Get() > 0) {

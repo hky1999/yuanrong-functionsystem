@@ -87,6 +87,10 @@ struct Metric {
     litebus::Option<DevClusterMetrics> devClusterMetrics;
     litebus::Option<std::unordered_map<std::string, std::string>> initLabels;
     int64_t sampleStartUnixMs = 0; // optional conservative start of a counter window
+    // False means THIS observation is unknown (provider error, missing
+    // explicit sample, parse failure). Consumers must not refresh any
+    // cached usage or sample clock with it.
+    bool observationKnown = false;
 };
 
 class BaseMetricsCollector {
@@ -119,6 +123,14 @@ public:
                 Metrics metrics;
                 metrics.collectionStartUnixMs = collectionStartUnixMs;
                 auto usage = future.Get();
+                if (!usage.observationKnown) {
+                    // Unknown observation: no usage, no limit, and NO
+                    // fresh collection clock — carrying the wall-clock here
+                    // would let BuildResourceUnit stamp stale usage as a
+                    // new node sample and refresh admission freshness.
+                    promise.SetValue(std::move(metrics));
+                    return;
+                }
                 if (usage.sampleStartUnixMs > 0) {
                     metrics.collectionStartUnixMs = usage.sampleStartUnixMs;
                 }
