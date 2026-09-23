@@ -278,8 +278,14 @@ FrontendProxyServiceParam BuildFrontendProxyServiceParam(const std::string &node
 {
     return BuildFrontendProxyServiceParam(
         nodeID, FrontendProxyServiceBindings{
+            .enableCreateDispatch = false,
+            .scheduler = nullptr,
+            .readyUnregister = nullptr,
+            .createFailureLookup = nullptr,
             .enableKillDispatch = enableKillDispatch,
             .killInvoker = killInvoker,
+            .resizeInvoker = nullptr,
+            .killCleanupProbe = nullptr,
         });
 }
 
