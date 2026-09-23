@@ -143,6 +143,21 @@ void CommitmentLedger::OnUsage(const std::string &unitId, uint64_t useBytes)
     }
 }
 
+std::map<std::string, uint64_t> CommitmentLedger::SnapshotAllUnits(bool *enabled)
+{
+    std::map<std::string, uint64_t> snapshot;
+    std::lock_guard<std::mutex> lock(Mutex());
+    if (enabled != nullptr) {
+        *enabled = enabled_;
+    }
+    // Raw stored balances read under the lock: Outstanding() would re-lock
+    // (deadlock) and would zero the values we must report when disabled.
+    for (const auto &unit : Units()) {
+        snapshot[unit.first] = unit.second.commitmentBytes;
+    }
+    return snapshot;
+}
+
 uint64_t CommitmentLedger::Outstanding(const std::string &unitId)
 {
     std::lock_guard<std::mutex> lock(Mutex());

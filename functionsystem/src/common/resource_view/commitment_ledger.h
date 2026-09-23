@@ -68,6 +68,14 @@ public:
     // remaining promise for the unit (0 when disabled / unknown unit).
     static uint64_t Outstanding(const std::string &unitId);
 
+    // Read-only raw snapshot of EVERY tracked unit taken under the ledger
+    // lock, regardless of enabled state or view membership: the caller
+    // must be able to prove "no legacy tail anywhere", including units
+    // that already left the resource view. Bytes are raw balances; a
+    // disabled ledger still reports its stored state so 0-with-disabled
+    // is unknown, not proven-empty.
+    static std::map<std::string, uint64_t> SnapshotAllUnits(bool *enabled);
+
     // test hook: wipe all state.
     static void ResetForTest();
 

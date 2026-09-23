@@ -311,6 +311,13 @@ public:
         return resizeBudget_.size();
     }
 
+    // Read-only authoritative inventory serialized on this actor: one JSON
+    // snapshot (snapshot_id + declared counts + end marker) of resize-budget
+    // entries with full operation identity, per-entry remaining credit via
+    // EntryOutstanding, and the legacy CommitmentLedger per real unit id
+    // with its enabled state. Startup + periodic; never a writer.
+    void LogResourceInventory();
+
     // for test
     [[maybe_unused]] void SetEnableTenantAffinity(bool enable)
     {

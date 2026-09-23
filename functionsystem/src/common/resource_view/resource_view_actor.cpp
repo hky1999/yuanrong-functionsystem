@@ -123,6 +123,8 @@ void ResourceViewActor::Init()
     }
     Receive("PullResource", &ResourceViewActor::PullResource);
     Receive("ReportResource", &ResourceViewActor::ReportResource);
+    // Startup read-only inventory; the function self-reschedules.
+    LogResourceInventory();
 }
 
 void ResourceViewActor::Finalize()
@@ -135,6 +137,100 @@ void ResourceViewActor::Finalize()
         poller_->Stop();
     }
     YRLOG_DEBUG("Finalize resource view actor");
+}
+
+void ResourceViewActor::LogResourceInventory()
+{
+    // Authoritative read-only inventory serialized on the actor: one JSON
+    // object per snapshot (snapshot_id + declared entry count + end marker)
+    // so collectors can detect lost or interleaved lines; absence of these
+    // lines never proves the accounts empty. Credit math reuses
+    // EntryOutstanding (cap/peak-aware, period-normalized); pending shrinks
+    // reserve nothing. The legacy ledger is reported per real unit id with
+    // its enabled state, never summed from the actor name.
+    const auto snapshotMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto snapshotId = litebus::uuid_generator::UUID::GetRandomUUID().ToString();
+    size_t resizeEntries = resizeBudget_.size();
+    size_t baselineEntries = 0;
+    size_t shrinkEntries = 0;
+    AdmissionReserve outstanding{};
+    for (const auto &item : resizeBudget_) {
+        if (item.second.baseline) { baselineEntries++; }
+        if (item.second.shrink) { shrinkEntries++; }
+        const auto credit = EntryOutstanding(item.second);
+        outstanding.cpuMillicores += credit.cpuMillicores;
+        outstanding.memoryMb += credit.memoryMb;
+    }
+    // The legacy ledger snapshot comes from the ledger's OWN lock over ALL
+    // tracked units — view fragments and budget entries are NOT the source:
+    // a tail on a unit that already left the view is exactly what must
+    // still be visible. Enabled state is reported verbatim; a disabled
+    // ledger reading 0 is unknown, not proven-empty.
+    bool legacyEnabled = false;
+    const auto legacyRaw = CommitmentLedger::SnapshotAllUnits(&legacyEnabled);
+    nlohmann::json legacy;
+    legacy["enabled"] = legacyEnabled;
+    nlohmann::json legacyUnits = nlohmann::json::array();
+    uint64_t legacyTotal = 0;
+    for (const auto &unit : legacyRaw) {
+        legacyTotal += unit.second;
+        legacyUnits.push_back({{"unit", unit.first}, {"outstanding_bytes", unit.second}});
+    }
+    legacy["unit_count"] = legacyRaw.size();
+    legacy["units"] = std::move(legacyUnits);
+    legacy["units_total_bytes"] = legacyTotal;
+    nlohmann::json entries = nlohmann::json::array();
+    for (const auto &item : resizeBudget_) {
+        const auto &entry = item.second;
+        const auto &cmd = entry.request.resize();
+        const auto credit = EntryOutstanding(entry);
+        entries.push_back({
+            {"request", item.first},
+            {"unit", entry.unitID},
+            {"instance", entry.request.instanceid()},
+            {"runtime", entry.request.runtimeid()},
+            {"sandbox", cmd.sandbox_id()},
+            {"generation", cmd.resource_generation()},
+            {"operation_id", entry.operationId},
+            {"shrink", entry.shrink},
+            {"baseline", entry.baseline},
+            {"observed", entry.observed},
+            {"observed_at_ms", entry.observedAtMs},
+            {"reserved_at_ms", entry.reservedAtMs},
+            {"expected_revision", entry.expectedRevision},
+            {"confirmed_revision", entry.confirmedRevision},
+            {"remaining_credit_cpu_millicores", credit.cpuMillicores},
+            {"remaining_credit_memory_mb", credit.memoryMb},
+            {"cap_memory_bytes", entry.capMemoryBytes},
+            {"expected_memory_limit_bytes", cmd.expected().memory_limit_bytes()},
+            {"target_memory_limit_bytes", cmd.target().memory_limit_bytes()},
+            {"landed_memory_limit_bytes", entry.landed.memory_limit_bytes()},
+            {"peak_memory_bytes", entry.peakMemoryBytes},
+            {"peak_cpu_millicores", entry.peakCpuMillicores},
+        });
+    }
+    nlohmann::json snapshot;
+    snapshot["snapshot_id"] = snapshotId;
+    snapshot["snapshot_unix_ms"] = snapshotMs;
+    snapshot["event"] = "resource-inventory-begin";
+    snapshot["view_actor"] = GetAID().Name();
+    snapshot["is_local_view"] = isLocal_;
+    snapshot["unit_count"] = view_->fragment().size();
+    snapshot["instance_count"] = view_->instances().size();
+    snapshot["resize_budget_entries"] = resizeEntries;
+    snapshot["baseline_entries"] = baselineEntries;
+    snapshot["shrink_entries"] = shrinkEntries;
+    snapshot["resize_outstanding_cpu_millicores"] = outstanding.cpuMillicores;
+    snapshot["resize_outstanding_memory_mb"] = outstanding.memoryMb;
+    snapshot["commitment_ledger"] = std::move(legacy);
+    snapshot["entries"] = std::move(entries);
+    YRLOG_INFO("resource-inventory {}", snapshot.dump());
+    YRLOG_INFO("resource-inventory-end snapshot_id={} entries={}", snapshotId, resizeEntries);
+    // Self-rescheduling read-only snapshot; cadence chosen to land inside
+    // the pre-retirement credit window. Finalize stops the chain: the actor
+    // scheduler will not run the callback once the actor is destroyed.
+    litebus::AsyncAfter(std::chrono::seconds(15), GetAID(), &ResourceViewActor::LogResourceInventory);
 }
 
 ResourceViewActor::SnapshotMutationGuard::SnapshotMutationGuard(ResourceViewActor &actor) : actor_(actor)
