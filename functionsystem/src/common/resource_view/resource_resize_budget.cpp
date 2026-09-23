@@ -265,11 +265,19 @@ Status ResourceViewActor::CancelResizeBeforeDispatch(const std::string &reservat
 Status ResourceViewActor::ObserveResize(const messages::ResizeSandboxResponse &response)
 {
     auto it = resizeBudget_.find(response.requestid());
-    if (it == resizeBudget_.end()) { return Status::OK(); }
+    if (it == resizeBudget_.end()) {
+        YRLOG_WARN("resize observation dropped: no budget entry requestid={} entries={}", response.requestid(),
+                   resizeBudget_.size());
+        return Status::OK();
+    }
     auto &entry = it->second;
     const auto &command = entry.request.resize();
     if (response.instanceid() != entry.request.instanceid() || response.runtimeid() != entry.request.runtimeid()
         || response.sandboxid() != command.sandbox_id() || response.resourcegeneration() != command.resource_generation()) {
+        YRLOG_WARN("resize observation identity mismatch requestid={} inst({} vs {}) rt({} vs {}) sbx({} vs {}) gen({} vs {})",
+                   response.requestid(), response.instanceid(), entry.request.instanceid(), response.runtimeid(),
+                   entry.request.runtimeid(), response.sandboxid(), command.sandbox_id(), response.resourcegeneration(),
+                   command.resource_generation());
         return Status(ERR_PARAM_INVALID, "resize observation identity mismatch");
     }
     if (entry.observed) { return Status::OK(); } // late completions cannot undo reconciliation
@@ -278,7 +286,11 @@ Status ResourceViewActor::ObserveResize(const messages::ResizeSandboxResponse &r
         return Status::OK();
     }
     if (response.outcome() != messages::ResizeSandboxResponse::OBSERVED || !response.has_result()
-        || !response.result().has_actual()) { return Status::OK(); } // UNKNOWN retains the full possible write
+        || !response.result().has_actual()) {
+        YRLOG_WARN("resize observation retained (non-observed) requestid={} outcome={}", response.requestid(),
+                   static_cast<int>(response.outcome()));
+        return Status::OK(); // UNKNOWN retains the full possible write
+    }
     const auto &actual = response.result().actual();
     // Entries reserved under the revision contract settle only on that
     // contract; legacy entries keep the numeric-only behaviour.
@@ -286,6 +298,9 @@ Status ResourceViewActor::ObserveResize(const messages::ResizeSandboxResponse &r
     if (fenced) {
         if (actual.resource_generation() != command.resource_generation() || !actual.cpu_limits_known()
             || !actual.memory_limit_known() || !actual.resource_revision_known()) {
+            YRLOG_WARN("resize readback identity incomplete requestid={} genKnown={} cpuKnown={} memKnown={} revKnown={}",
+                       response.requestid(), actual.resource_generation() == command.resource_generation(),
+                       actual.cpu_limits_known(), actual.memory_limit_known(), actual.resource_revision_known());
             return Status(ERR_PARAM_INVALID, "resize readback identity is incomplete");
         }
         if (!response.result().complete()) {
