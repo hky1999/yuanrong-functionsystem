@@ -1331,7 +1331,7 @@ TEST(FrontendProxyResizeEntryTest, FailedTransportReturnsUnknownImmediately)
     // is ready-and-failed; WaitFrontendResult must return None IMMEDIATELY
     // (the old code busy-waited on the ready-failed future for the whole
     // budget). EXPECT a fast return, not a multi-second wait.
-    state.result.SetFailed(1);
+    state.result.SetFailed(100);  // 1 aliases KOK and trips the promise assertion
     FrontendProxyService service(std::move(param));
     ::grpc::ServerContext context;
     auto request = MakeResizeRequest("tenant-1");
