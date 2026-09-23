@@ -15,6 +15,8 @@
  */
 
 #include "resource_view_actor.h"
+#include "commitment_ledger.h"
+#include <nlohmann/json.hpp>
 
 #include <utility>
 #include <chrono>
@@ -172,7 +174,7 @@ void ResourceViewActor::LogResourceInventory()
     // still be visible. Enabled state is reported verbatim; a disabled
     // ledger reading 0 is unknown, not proven-empty.
     bool legacyEnabled = false;
-    const auto legacyRaw = CommitmentLedger::SnapshotAllUnits(&legacyEnabled);
+    const auto legacyRaw = resource_view::CommitmentLedger::SnapshotAllUnits(&legacyEnabled);
     nlohmann::json legacy;
     legacy["enabled"] = legacyEnabled;
     nlohmann::json legacyUnits = nlohmann::json::array();
@@ -241,8 +243,7 @@ void ResourceViewActor::LogResourceInventory()
     if (inventoryScheduled_) {
         litebus::TimerTools::Cancel(inventoryTimer_);
     }
-    inventoryTimer_ = litebus::AsyncAfter(std::chrono::seconds(15), GetAID(),
-                                           &ResourceViewActor::LogResourceInventory);
+    inventoryTimer_ = litebus::AsyncAfter(15ULL * 1000, GetAID(), &ResourceViewActor::LogResourceInventory);
     inventoryScheduled_ = true;
 }
 

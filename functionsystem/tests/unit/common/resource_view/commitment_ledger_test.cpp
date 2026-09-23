@@ -137,8 +137,6 @@ TEST_F(CommitmentLedgerTest, UnknownUnitAndZeroRaise)
 
 }  // namespace
 
-}  // namespace functionsystem::test
-
 // SnapshotAllUnits must expose the raw stored balance for EVERY tracked
 // unit regardless of view membership or enabled state — these three
 // boundaries are exactly the legacy-tail hunts the inventory serves.
@@ -181,3 +179,5 @@ TEST(CommitmentLedgerSnapshotTest, ViewExternalUnitRemainsVisible)
     EXPECT_EQ(snapshot.at("unit-never-in-view"), 32ULL << 20);
     CommitmentLedger::ResetForTest();
 }
+
+}  // namespace functionsystem::test
