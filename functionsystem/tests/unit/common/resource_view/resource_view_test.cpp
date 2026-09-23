@@ -4341,6 +4341,11 @@ TEST_F(ResourceViewTest, BindInstanceRuntimeCompletesColdDeployWithoutPreseededR
         sample->set_cpu_quota_usec(50000);
         sample->set_memory_limit_bytes(512ULL * 1024 * 1024);
         sample->set_memory_current_bytes(430ULL * 1024 * 1024);
+        sample->set_memory_high_known(true);
+        sample->set_memory_high_unlimited(false);
+        sample->set_memory_high_bytes(resource_view::ExpectedHighBytes(512ULL * 1024 * 1024));
+        sample->set_frozen_known(true);
+        sample->set_frozen(false);
         sample->set_elastic_policy(R"({"version":1,"CPU":{"initial":500,"ceiling":8000},"Memory":{"initial":512,"ceiling":8192}})");
         auto refreshed = view->UpdateResourceUnit(report, UpdateType::UPDATE_ACTUAL);
         ASSERT_AWAIT_READY(refreshed);
@@ -6127,11 +6132,15 @@ protected:
         double safety = UsageAwareFilter::GetSafety();
         double floor = UsageAwareFilter::GetFloorMb();
         int32_t cap = UsageAwareFilter::GetMaxInstances();
-        bool fence = false;
+        int fenceEntry = resource_view::MemoryElasticityFenceOverrideState();
         ~Guards()
         {
             UsageAwareFilter::SetConfig(safety, floor, cap);
-            SetMemoryElasticityFenceForTest(fence);
+            if (fenceEntry < 0) {
+                resource_view::ResetMemoryElasticityFenceOverride();
+            } else {
+                SetMemoryElasticityFenceForTest(fenceEntry != 0);
+            }
         }
     };
     static int64_t NowMs()
