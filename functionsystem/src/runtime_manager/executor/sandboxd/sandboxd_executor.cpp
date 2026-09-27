@@ -637,7 +637,8 @@ litebus::Future<messages::StartInstanceResponse> SandboxdExecutor::StartByManage
     // sandboxd takes the legacy dir-verified branch — never a half-filled
     // strict-path rejection (half-fill is rejected at 80004).
     const auto &snapshotInfo = info.snapshotinfo();
-    if (!snapshotInfo.sandbox_id().empty() && !snapshotInfo.sha256().empty() && snapshotInfo.size() > 0) {
+    if (!snapshotInfo.checkpointid().empty() && !snapshotInfo.sandbox_id().empty()
+        && !snapshotInfo.sha256().empty() && snapshotInfo.size() > 0) {
         restoreReq->mutable_sandbox()->set_sandbox_id(snapshotInfo.sandbox_id());
         restoreReq->set_checkpoint_id(snapshotInfo.checkpointid());
         restoreReq->set_expected_sha256(snapshotInfo.sha256());
@@ -706,7 +707,8 @@ litebus::Future<messages::StartInstanceResponse> SandboxdExecutor::OnCheckpointR
     // 时查不到），与 PR#16 的 replay 去重设计（同 id + 同 restore identity
     // 幂等返回）对齐；任一条件缺失时整体留空退回 legacy 语义。
     const auto &snapshotInfo = info.snapshotinfo();
-    if (!snapshotInfo.sandbox_id().empty() && !snapshotInfo.sha256().empty() && snapshotInfo.size() > 0) {
+    if (!snapshotInfo.checkpointid().empty() && !snapshotInfo.sandbox_id().empty()
+        && !snapshotInfo.sha256().empty() && snapshotInfo.size() > 0) {
         restoreReq->mutable_sandbox()->set_sandbox_id(snapshotInfo.sandbox_id());
         restoreReq->set_checkpoint_id(snapshotInfo.checkpointid());
         restoreReq->set_expected_sha256(snapshotInfo.sha256());

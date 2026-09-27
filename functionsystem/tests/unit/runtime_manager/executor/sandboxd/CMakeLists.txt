@@ -24,6 +24,9 @@ add_executable(sandboxd_test_bin
     runtime_state_manager_test.cpp
     sandbox_command_utils_test.cpp
     retire_fault_gate_test.cpp
+    managed_checkpoint_divergence_test.cpp
+    managed_restore_dispatch_test.cpp
+    ../../ckpt/ckpt_ownership_isolation_test.cpp
 )
 target_compile_options(sandboxd_test_bin
     PRIVATE
@@ -41,6 +44,8 @@ target_include_directories(sandboxd_test_bin PRIVATE
 target_link_libraries(sandboxd_test_bin PRIVATE
     runtime_manager_lib
     metrics_adapter
+    ${grpcpp_LIB}
+    ${gpr_LIB}
     ${gtest_LIB_A}
     ${gmock_LIB_A}
     pthread
