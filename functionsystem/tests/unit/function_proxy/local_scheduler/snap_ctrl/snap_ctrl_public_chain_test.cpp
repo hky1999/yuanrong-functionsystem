@@ -550,7 +550,7 @@ TEST_F(SnapCtrlPublicChainTest, ReplayPrepareSnapFailureRetainsUnknownAndNeverFa
     // for other requests
     auto replay = PublicSnapshot("pub-1");
     FlushActor();
-    runtimeClient_->SettlePrepare(common::ERR_INNER_COMMUNICATION, "replay prepare failed");
+    SettlePrepareFail("replay prepare failed");
     ASSERT_AWAIT_READY(replay);
     EXPECT_NE(common::ERR_NONE, replay.Get().code());
     EXPECT_EQ(0, schedProbe_->FailCalls());
@@ -737,6 +737,58 @@ TEST_F(SnapCtrlPublicChainTest, SettledReplayFreesBothGateAndReplayEntrance)
     ASSERT_AWAIT_READY(again);
     EXPECT_EQ(common::ERR_NONE, again.Get().code());
     EXPECT_EQ(3, schedProbe_->BeginCalls());  // first + replay + fresh
+}
+
+// A LATE completion from a STALE attempt context must not disturb the
+// CURRENT unknown entry: while a fresh UNKNOWN entry exists (attempt B),
+// an old context (attempt A) completes through the REAL actor method —
+// the guard must leave the gate busy, the current entry intact, and new
+// requests still blocked. Uses -fno-access-control (already set for this
+// target) to build a context and call the real completion path on the
+// actor thread via litebus::Async; nothing is re-implemented here.
+TEST_F(SnapCtrlPublicChainTest, StaleAttemptLateCompletionTouchesNothing)
+{
+    PublicChainAgentProbe::TypedOutcome unknown;
+    unknown.code = common::ERR_INNER_COMMUNICATION;
+    unknown.resultUnknown = true;
+    agentProbe_->SetTypedOutcome(unknown);
+    auto first = PublicSnapshot("pub-1");
+    FlushActor();
+    SettlePrepareOk();
+    ASSERT_AWAIT_READY(first);
+    EXPECT_NE(common::ERR_NONE, first.Get().code());
+
+    // capture the CURRENT (only) entry as attempt B, then occupy a stale
+    // attempt id A that no longer owns the slot
+    const uint64_t staleAttempt = 1;
+    auto lateContext = std::make_shared<SnapCtrlActor::ReusableSnapshotContext>();
+    lateContext->requestID = "pub-stale";
+    lateContext->instanceID = INSTANCE_ID;
+    lateContext->snapshotAttempt = staleAttempt;  // NOT the live attempt
+    lateContext->sourceInstanceInfo = MakePublicInstanceInfo();
+    lateContext->completion = std::make_shared<litebus::Promise<KillResponse>>();
+    lateContext->outcomeKnown = true;  // even a KNOWN stale outcome must not release
+
+    auto driven = litebus::Async(actor_->GetAID(), &SnapCtrlActor::CompleteReusableSnapshotRequest,
+                                 lateContext, KillResponse{});
+    FlushActor();
+    ASSERT_AWAIT_READY(driven);
+
+    // the live unknown entry survived the stale completion: new requests
+    // stay busy, and the same pinned request can still re-query
+    auto other = PublicSnapshot("pub-9");
+    FlushActor();
+    ASSERT_AWAIT_READY(other);
+    EXPECT_EQ(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY),
+              static_cast<int32_t>(other.Get().code()));
+
+    PublicChainAgentProbe::TypedOutcome healthy;
+    agentProbe_->SetTypedOutcome(healthy);
+    auto replay = PublicSnapshot("pub-1");
+    FlushActor();
+    SettlePrepareOk();
+    ASSERT_AWAIT_READY(replay);
+    EXPECT_EQ(common::ERR_NONE, replay.Get().code());
 }
 
 }  // namespace
