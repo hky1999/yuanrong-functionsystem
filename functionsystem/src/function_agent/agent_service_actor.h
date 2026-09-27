@@ -306,12 +306,14 @@ public:
         // managed artifacts live under the dedicated 'managed' sub-root:
         // their lifecycle belongs to this store alone; the runtime
         // manager's anonymous checkpoint cache uses the sibling
-        // 'anonymous' sub-root, so its TTL scan can never reach them
-        const auto managedRoot = validCheckpointRoot
-            ? (std::filesystem::path(checkpointRoot_) / "managed").lexically_normal()
-            : std::filesystem::path{};
+        // 'anonymous' sub-root, so its TTL scan can never reach them.
+        // managedCheckpointRoot_ is the ONE effective root for every
+        // Prepare/Commit/Publish/Restore path in this actor.
+        managedCheckpointRoot_ = validCheckpointRoot
+            ? (std::filesystem::path(checkpointRoot_) / "managed").lexically_normal().string()
+            : std::string{};
         localSnapshotStore_ = validCheckpointRoot
-                                  ? std::make_shared<LocalSnapshotStore>(managedRoot, cacheBudget)
+                                  ? std::make_shared<LocalSnapshotStore>(managedCheckpointRoot_, cacheBudget)
                                   : nullptr;
         if (snapshotStorage_ != nullptr && !checkpointRoot_.empty() && snapshotWorker_ == nullptr) {
             snapshotWorker_ = std::make_shared<ActorWorker>();
@@ -748,6 +750,9 @@ private:
     SnapshotStorageMode snapshotStorageMode_{ SnapshotStorageMode::LOCAL_ONLY };
     uint64_t snapshotLocalCacheMaxBytes_{ 0 };
     std::string checkpointRoot_;
+    // effective managed root (<checkpointRoot_>/managed): single source for
+    // artifactPath, materialization, and the local snapshot store
+    std::string managedCheckpointRoot_;
     std::shared_ptr<ActorWorker> snapshotWorker_;
     std::shared_ptr<LocalSnapshotStore> localSnapshotStore_;
     std::unordered_map<std::string, litebus::Future<Status>> snapshotMaterializations_;

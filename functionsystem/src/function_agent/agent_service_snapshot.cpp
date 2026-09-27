@@ -321,7 +321,7 @@ void AgentServiceActor::SnapshotRuntimeResponse(const litebus::AID &from, std::s
         return;
     }
     CopyLocalSnapshotMetadata(committed.descriptor, pending.localSnapshot);
-    pending.artifactPath = (std::filesystem::path(checkpointRoot_)
+    pending.artifactPath = (std::filesystem::path(managedCheckpointRoot_)
                             / pending.request.snapshotid()).string();
     auto *snapshotInfo = response.mutable_snapshotinfo();
     snapshotInfo->set_checkpointid(committed.descriptor.snapshotID);

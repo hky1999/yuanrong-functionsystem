@@ -423,7 +423,10 @@ private:
     std::unordered_set<std::string> warmupRuntimes_;
     std::unordered_set<std::string> registeredTemplateIDs_;
     litebus::AID functionAgentAID_;
-    std::string checkpointDir_;  // resolved base dir for checkpoint artifacts
+    std::string checkpointDir_;
+    // anonymous cache sub-root (TTL scan + legacy fallback); member so
+    // InitConfig() can hand it to the orchestrator after sandboxd_ binds
+    std::filesystem::path anonymousRoot_;  // resolved base dir for checkpoint artifacts
     AvailableRuntimesCallback availableRuntimesCallback_;
     bool reconnecting_ = false;
     bool synced_       = false;

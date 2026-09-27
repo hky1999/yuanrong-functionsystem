@@ -325,7 +325,8 @@ SandboxdExecutor::SandboxdExecutor(const std::string &name, const litebus::AID &
     // legacy minted-id fallback operate ONLY here — never on the agent's
     // 'managed' sibling, whose artifacts this manager must not own
     const auto baseDir = std::filesystem::path(checkpointDir_).lexically_normal();
-    const auto anonymousRoot = (baseDir / "anonymous").lexically_normal();
+    anonymousRoot_ = (baseDir / "anonymous").lexically_normal();
+    const auto &anonymousRoot = anonymousRoot_;
     // Upgrade gate (empty-old-cache only): this deployment generation does
     // NOT migrate a legacy populated cache root. If the base holds anything
     // other than the new 'anonymous'/'managed' sub-roots, refuse to start —
