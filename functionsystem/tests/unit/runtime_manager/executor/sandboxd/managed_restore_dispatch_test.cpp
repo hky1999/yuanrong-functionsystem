@@ -186,6 +186,14 @@ class ManagedRestoreDispatchTest : public ::testing::Test {
 protected:
     void SetUp() override
     {
+        // Isolated PortManager pool per test: the singleton is shared by the
+        // whole binary and an earlier suite leaves it in the reconciling
+        // state (BeginReconcile without a rebuild -> ready_ == false, every
+        // RequestPorts rejected with PORT_UNAVAILABLE). Re-initializing a
+        // dedicated high range both reopens allocation and keeps this
+        // suite's ports away from every other suite's entries.
+        PortManager::GetInstance().InitPortResource(31000, 64);
+
         const auto uid = litebus::uuid_generator::UUID::GetRandomUUID().ToString();
         base_ = "/tmp/managed_restore_" + uid;
         std::filesystem::create_directories(base_ + "/managed/snap-m1");
