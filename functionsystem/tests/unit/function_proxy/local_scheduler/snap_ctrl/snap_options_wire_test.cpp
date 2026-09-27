@@ -59,7 +59,8 @@ TEST(SnapOptionsWire, PublicFieldsPinUpstreamTagsFiveAndSix)
 TEST(SnapOptionsWire, PrivateParkFieldsLiveClearOfPublicTags)
 {
     const auto *d = SnapOptionsDesc();
-    for (const auto *field : d->fields()) {
+    for (int fieldIndex = 0; fieldIndex < d->field_count(); ++fieldIndex) {
+        const auto *field = d->field(fieldIndex);
         if (field->name() == "hold_token" || field->name() == "expected_runtime_id"
             || field->name() == "expected_sandbox_id"
             || field->name() == "expected_resource_generation") {
