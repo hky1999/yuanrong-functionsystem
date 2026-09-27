@@ -203,10 +203,12 @@ protected:
                                                        nullptr);
         litebus::Spawn(executor_);
         executor_->SetHealthCheckClient(std::make_shared<HealthCheck>("hc_" + uid));
-        // InitConfig returns void (the Async wrapper has no Get()); calling
-        // it on the test thread sets sandboxd_/ckptOrch_ synchronously before
-        // any Start is issued, exactly like the other direct-call suites.
-        executor_->InitConfig();
+        // InitConfig returns void (no Get() on the wrapper); enqueue it on
+        // the ACTOR and never touch actor internals from the test thread.
+        // The mailbox is FIFO per AID, so every later Start/Snapshot future
+        // resolved in these tests is itself the proof that InitConfig
+        // (sandboxd_ client + ckptOrch_ construction) already ran.
+        (void)litebus::Async(executor_->GetAID(), &SandboxdExecutor::InitConfig);
     }
 
     void TearDown() override
@@ -498,13 +500,19 @@ TEST_F(ManagedRestoreDispatchTest, ManagedRestoreRpcFailureReleasesAllocatedPort
         << "guard rollback must eventually unregister the failed runtime";
 }
 
-// TRANSPORT UNKNOWN retains ownership: the fake service takes the real
-// gRPC-level failure path (UNAVAILABLE after dispatch), so DoRestoreObserved
-// records replyReceived=false. The restore may have physically executed and a
-// live instance may still hold the ports — the response must say UNKNOWN
-// explicitly (never a plain failure that reads as "physically not executed"),
-// and the ORIGINAL owner keeps both the PortManager allocation and the
-// recorded mapping.
+// TRANSPORT UNKNOWN retains the PHYSICAL allocation: the fake service takes
+// the real gRPC-level failure path (UNAVAILABLE after dispatch), so
+// DoRestoreObserved records replyReceived=false. The restore may have
+// physically executed and a live instance may still hold the ports — the
+// response must say UNKNOWN explicitly (never a plain failure that reads as
+// "physically not executed"), and the ORIGINAL owner keeps the PortManager
+// allocation, EXACTLY the port that went out on the dispatched RPC.
+//
+// Boundary (not a claim of full unknown-state convergence): only the
+// PortManager allocation is retained. The LOCAL registration — including its
+// port-mappings record — rolls back with the start guard, so the record is
+// gone together with the runtime; reconciling a possibly-live physical
+// instance against the retained allocation is later reconcile work.
 TEST_F(ManagedRestoreDispatchTest, ManagedRestoreTransportFailureRetainsPortsAsUnknown)
 {
     service_.SetTransportFailRestore(true);
@@ -524,12 +532,10 @@ TEST_F(ManagedRestoreDispatchTest, ManagedRestoreTransportFailureRetainsPortsAsU
 
     const auto held = PortManager::GetInstance().GetPorts("rt-port-unknown");
     ASSERT_EQ(held.size(), 1UL) << "an unknown outcome must NOT free the host port";
-    EXPECT_NE(recorded.restorePorts[0].find(":" + std::to_string(held[0]) + ":"), std::string::npos)
-        << "the retained port must still be the ORIGINAL owner's dispatched allocation";
-    EXPECT_FALSE(executor_->stateManager_.GetPortMappingsJson("rt-port-unknown").empty())
-        << "the recorded mapping must stay with the retained ownership";
+    EXPECT_EQ(recorded.restorePorts[0], "tcp:" + std::to_string(held[0]) + ":18080")
+        << "the retained allocation must be EXACTLY the original owner's dispatched port";
     EXPECT_TRUE(WaitUnregistered(*executor_, "rt-port-unknown"))
-        << "the local registration still rolls back; only the physical resources are retained";
+        << "the local registration rolls back; only the physical allocation is retained";
 
     PortManager::GetInstance().ReleasePorts("rt-port-unknown");  // singleton hygiene
 }
