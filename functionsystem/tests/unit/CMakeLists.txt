@@ -176,8 +176,14 @@ target_link_libraries(snap_ctrl_public_chain_test PRIVATE
         ${RESOURCE_GROUP_MANAGER_LIB}
         ${FUNCTION_AGENT_LIB}
         ${META_STORE_LIB}
+        snapshot_storage
+        busproxy_lib
         local_scheduler_lib
         function_proxy_common_lib
+        ${FUNCTION_AGENT_LIB}
+        runtime_manager_lib
+        scheduler
+        schedule_plugin_common
         pthread)
 add_test(NAME snap_ctrl_public_chain_test COMMAND snap_ctrl_public_chain_test)
 
