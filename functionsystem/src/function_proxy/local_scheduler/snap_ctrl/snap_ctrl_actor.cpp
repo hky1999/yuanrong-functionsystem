@@ -1493,6 +1493,19 @@ void SnapCtrlActor::OnReusableSnapshotPrepared(
     if (future.IsError() || future.Get().IsError()) {
         const auto message = future.IsError() ? "reusable snapshot PrepareSnap future failed"
                                               : future.Get().RawMessage();
+        if (context->replayOfUnknown) {
+            // replay of an UNKNOWN outcome: a pre-physical failure here says
+            // nothing about the OLD physical result, and Fail would
+            // CAS-delete the PUBLISHING record the re-query settles against.
+            // Keep the record; the UNKNOWN stands.
+            context->outcomeKnown = false;
+            CompleteReusableSnapshotRequest(
+                context, BuildReusableSnapshotResponse(
+                             common::ERR_INNER_COMMUNICATION,
+                             "reusable snapshot re-query PrepareSnap failed; "
+                             "prior UNKNOWN outcome retained"));
+            return;
+        }
         context->failOutcomeUnknown = false;  // pre-physical: checkpoint not attempted
         FailReusableSnapshot(context, common::ERR_INNER_COMMUNICATION, message);
         return;
@@ -1507,24 +1520,44 @@ void SnapCtrlActor::OnReusableSnapshotCheckpointed(
     const std::shared_ptr<ReusableSnapshotContext> &context,
     const litebus::Future<::messages::SnapshotRuntimeResponse> &future)
 {
-    if (future.IsError()) {
-        // LOST checkpoint RPC reply: the physical execution is UNKNOWN. Do
-        // NOT Fail here — ReusableSnapshotStore::Fail CAS-deletes the
-        // PUBLISHING record, which would destroy the coordination facts the
-        // deterministic replay must settle against (the stable snapshot ID
-        // is a hash of tenant+instance+request, so the SAME record is what
-        // a later re-query reconciles). Keep the record; complete UNKNOWN.
+    // Uncertainty classification uses the REAL response contract
+    // (message.proto SnapshotRuntimeResponse): resultUnknown=5 and
+    // checkpointNotStarted=11 — the agent reports code=ERR_INNER_COMMUNICATION
+    // with resultunknown=true inside a NORMAL (successful) future, so checking
+    // future.IsError() alone is not enough. checkpointNotStarted=true is the
+    // ONLY reply that proves the checkpoint never started.
+    if (future.IsError() || future.Get().resultunknown()) {
+        // Physical execution UNKNOWN (lost RPC reply or explicit
+        // resultunknown). Do NOT Fail: ReusableSnapshotStore::Fail
+        // CAS-deletes the PUBLISHING record — the very coordination facts
+        // (stable snapshot ID = hash of tenant+instance+request) a later
+        // re-query must settle against. Keep the record; complete UNKNOWN.
         context->outcomeKnown = false;
         CompleteReusableSnapshotRequest(
             context, BuildReusableSnapshotResponse(
                          common::ERR_INNER_COMMUNICATION,
-                         "reusable snapshot LOCAL_READY result is unknown "
-                         "(checkpoint RPC reply lost; PUBLISHING record kept)"));
+                         future.IsError()
+                             ? "reusable snapshot LOCAL_READY result is unknown "
+                               "(checkpoint RPC reply lost; PUBLISHING record kept)"
+                             : "reusable snapshot LOCAL_READY result is unknown "
+                               "(agent resultunknown; PUBLISHING record kept)"));
         return;
     }
     if (future.Get().code() != common::ERR_NONE
         || !future.Get().has_localsnapshot()) {
-        context->failOutcomeUnknown = false;  // definite agent answer: checkpoint did not complete
+        if (!future.Get().checkpointnotstarted()) {
+            // A code-bearing failure WITHOUT checkpointNotStarted=true does
+            // NOT prove the checkpoint never ran — treat as uncertain, keep
+            // the PUBLISHING record for authoritative re-query.
+            context->outcomeKnown = false;
+            CompleteReusableSnapshotRequest(
+                context, BuildReusableSnapshotResponse(
+                             common::ERR_INNER_COMMUNICATION,
+                             "reusable snapshot LOCAL_READY failed without "
+                             "checkpointNotStarted proof; PUBLISHING record kept"));
+            return;
+        }
+        context->failOutcomeUnknown = false;  // proven never started
         FailReusableSnapshot(
             context, common::ERR_INNER_COMMUNICATION,
             future.Get().message());
@@ -1717,6 +1750,9 @@ void SnapCtrlActor::OnReusableSnapshotFinalized(
         return;
     }
     if (operation == ::messages::REUSABLE_SNAPSHOT_ABORTED) {
+        // exact local+remote cleanup was proven by this Finalize success —
+        // the Fail that follows only records the terminal code
+        context->failSettledByExactCleanup = true;
         FailReusableSnapshot(context, terminalCode, terminalMessage);
         return;
     }
@@ -1752,7 +1788,11 @@ void SnapCtrlActor::OnReusableSnapshotFailedRecord(
                          terminalMessage + "; " + cleanupMessage));
         return;
     }
-    context->outcomeKnown = !context->failOutcomeUnknown;  // a recorded Fail does NOT prove the checkpoint never ran
+    // a recorded Fail does NOT prove the checkpoint never ran: release only
+    // when the exact-cleanup Finalize proved settlement, or on a FIRST
+    // attempt whose failure provably preceded the checkpoint
+    context->outcomeKnown = context->failSettledByExactCleanup
+        || (!context->replayOfUnknown && !context->failOutcomeUnknown);
     CompleteReusableSnapshotRequest(
         context, BuildReusableSnapshotResponse(terminalCode, terminalMessage));
 }

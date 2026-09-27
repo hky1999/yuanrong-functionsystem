@@ -132,6 +132,55 @@ add_executable(${PAUSE_RESUME_UNIT_TEST}
         function_proxy/local_scheduler/snap_ctrl/snap_ctrl_actor_test.cpp
         function_proxy/local_scheduler/snap_ctrl/snap_options_wire_test.cpp)
 
+# Real SnapCtrlActor public-chain fixture tests (restored type=SNAPSHOT
+# chain): the actor is instantiated and driven through litebus; only the
+# service boundaries are mocks.
+add_executable(snap_ctrl_public_chain_test
+        main.cpp
+        function_proxy/local_scheduler/snap_ctrl/snap_ctrl_public_chain_test.cpp)
+target_compile_options(snap_ctrl_public_chain_test PRIVATE
+        -Wno-error
+        -fno-access-control
+        -Wno-missing-field-initializers)
+add_dependencies(snap_ctrl_public_chain_test gtest_1_10_0)
+target_include_directories(snap_ctrl_public_chain_test PRIVATE
+        ${CLIENT_CPP_INCLUDE}
+        ${gtest_INCLUDE_DIR}
+        ${SRC_INCLUDE_DIR}
+        ${META_STORE_DIR}
+        ${SRC_BUSPROXY_INCLUDE_DIR}
+        ${SRC_LOCAL_SCHEDULER_INCLUDE_DIR}
+        ${SRC_FUNCTION_PROXY_INCLUDE_DIR}
+        ${GLOBAL_SCHEDULER_DIR}
+        ${INSTANCE_MANAGER_DIR}
+        ${FUNCTION_AGENT_DIR}
+        ${SRC_RUNTIME_MANAGER_INCLUDE_DIR})
+target_link_libraries(snap_ctrl_public_chain_test PRIVATE
+        ${crypto_LIB}
+        ${ssl_LIB}
+        ${zlib_LIB}
+        ${protobuf_LIB}
+        ${grpcpp_LIB}
+        ${gpr_LIB}
+        ${etcdapi_LIB_A}
+        ${securec_LIB}
+        ${gtest_LIB_A}
+        ${gmock_LIB_A}
+        ${litebus_ALL_LIB}
+        ${GLOBAL_SCHEDULER_LIB}
+        ${MASTER_COMMON_LIB}
+        ${INSTANCE_MANAGER_LIB}
+        ${SNAP_MANAGER_LIB}
+        ${SYSTEM_FUNCTION_LOADER_LIB}
+        ${SCALER_LIB}
+        ${RESOURCE_GROUP_MANAGER_LIB}
+        ${FUNCTION_AGENT_LIB}
+        ${META_STORE_LIB}
+        local_scheduler_lib
+        function_proxy_common_lib
+        pthread)
+add_test(NAME snap_ctrl_public_chain_test COMMAND snap_ctrl_public_chain_test)
+
 add_executable(snap_options_policy_gate_test
         function_proxy/local_scheduler/snap_ctrl/snap_options_policy_gate_test.cpp)
 target_compile_options(snap_options_policy_gate_test PRIVATE -Wno-error)

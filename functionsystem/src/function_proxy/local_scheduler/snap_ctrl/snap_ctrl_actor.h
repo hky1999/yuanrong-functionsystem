@@ -293,6 +293,9 @@ private:
         bool outcomeKnown{ false };
         bool replayOfUnknown{ false };
         bool failOutcomeUnknown{ false };
+        // the exact-cleanup Finalize succeeded before the Fail — the only
+        // Fail path that authoritatively proves settlement
+        bool failSettledByExactCleanup{ false };
         uint64_t checkpointTimeoutMs{ 0 };  // pinned replay parameter
         bool tunnelGateHeld{ false };
         bool completed{ false };
