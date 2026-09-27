@@ -16,6 +16,8 @@
 
 #include "sandboxd_checkpoint_orchestrator.h"
 
+#include "runtime_manager/ckpt/checkpoint_plan.h"
+
 #include "common/logs/logging.h"
 #include "common/status/status.h"
 
@@ -108,12 +110,22 @@ litebus::Future<messages::SnapshotRuntimeResponse> SandboxdCheckpointOrchestrato
         return response;
     }
 
-    // Generate unique checkpoint ID and local path
-    const std::string checkpointID =
-        fmt::format("ckpt-{}-{}", instanceID, std::chrono::system_clock::now().time_since_epoch().count());
-    // must live under sandboxd's managed checkpoint root (config.RootDir/checkpoints);
-    // the deploy scripts point --checkpoint_dir at a subdirectory of that root
-    const std::string checkpointPath = fmt::format("{}/{}", checkpointDir_, checkpointID);
+    // Managed-identity contract (ResolveManagedCheckpointTarget): honor the
+    // caller-provided snapshotid + prepared staging directory; mint the
+    // timestamped id under the configured base only when absent (legacy
+    // anonymous callers). sandboxd independently re-validates that the
+    // directory is below its managed checkpoint root.
+    runtime_manager::ManagedCheckpointTarget target;
+    if (const auto plan = runtime_manager::ResolveManagedCheckpointTarget(
+            *request, checkpointDir_, instanceID, target);
+        plan.IsError()) {
+        YRLOG_ERROR("{}|TakeSnapshot: managed checkpoint target rejected: {}", requestID, plan.RawMessage());
+        response.set_code(static_cast<int32_t>(StatusCode::PARAMETER_ERROR));
+        response.set_message(plan.RawMessage());
+        return response;
+    }
+    const std::string &checkpointID = target.checkpointID;
+    const std::string &checkpointPath = target.checkpointPath;
 
     auto ckptReq = std::make_shared<runtime::v1::CheckpointRequest>();
     ckptReq->set_id(sandboxID);
