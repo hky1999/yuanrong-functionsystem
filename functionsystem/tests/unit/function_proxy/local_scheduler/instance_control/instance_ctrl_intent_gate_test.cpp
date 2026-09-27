@@ -234,7 +234,7 @@ TEST_F(InstanceCtrlIntentGateTest, HelperResolveFutureSetFailedRejects)
     EXPECT_CALL(*mockLocalSchedSrv_, ResolveReusableSnapshotForCreate)
         .WillOnce(Invoke([](const std::shared_ptr<::messages::ResolveReusableSnapshotForCreateRequest> &) {
             auto p = std::make_shared<litebus::Promise<::messages::ResolveReusableSnapshotForCreateResponse>>();
-            p->SetFailed(static_cast<int32_t>(common::ErrorCode::GRPC_UNAVAILABLE));
+            p->SetFailed(litebus::Status::KERROR);  // transport-grade failure code (GRPC_* live in functionsystem::StatusCode, not common::ErrorCode)
             return p->GetFuture();
         }));
     auto runtimePromise = std::make_shared<litebus::Promise<messages::ScheduleResponse>>();
