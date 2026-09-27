@@ -50,7 +50,6 @@ double ReserveCPU(const InstanceInfo &instance)
 static AdmissionCheckResult CheckRestoreCPU(const InstanceInfo *instance, const ResourceUnit &unit, double safety,
                                               int64_t nowMs, const AdmissionReserve &extra)
 {
-    const auto reject = [] { return Status(StatusCode::RESOURCE_NOT_ENOUGH, "CPU: Atomic Admission Rejected"); };
     const auto fail = [nowMs](AdmissionRejectReason r) -> AdmissionCheckResult {
         return {Status(StatusCode::RESOURCE_NOT_ENOUGH, "CPU: Atomic Admission Rejected"), r, nowMs};
     };
@@ -98,7 +97,6 @@ static AdmissionCheckResult CheckAdmissionWithReason(const InstanceInfo *instanc
     const auto config = GetUsageAdmissionSettings();
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    const auto reject = [] { return Status(StatusCode::RESOURCE_NOT_ENOUGH, "Memory: Atomic Admission Rejected"); };
     const auto fail = [nowMs](AdmissionRejectReason r) -> AdmissionCheckResult {
         return {Status(StatusCode::RESOURCE_NOT_ENOUGH, "Memory: Atomic Admission Rejected"), r, nowMs};
     };
