@@ -1,0 +1,232 @@
+{
+ "eligible": false,
+ "reasons": [
+  "snapshot store holds 1 persistent record(s): ['/yr/snapshots/v1/37a8eec1ce19687d132fe29051dca629d164e2c4958ba141d5f4133a33f0688f/snap-eb47ef3c94cd94f3584041680879e014']"
+ ],
+ "started_unix_ms": 1790531079101,
+ "nodes": {
+  "akernel-node-g46g6": {
+   "ls_rc": 0,
+   "base_entries": [],
+   "legacy_entries": [],
+   "budget_snapshot": {
+    "snapshot_id": "abbe9b76-7701-4000-8000-00000bc98e2f",
+    "snapshot_unix_ms": 1790531067787,
+    "view_actor": "akernel-node-g46g6-ResourceViewActor"
+   }
+  },
+  "akernel-node-kt96j": {
+   "ls_rc": 0,
+   "base_entries": [],
+   "legacy_entries": [],
+   "budget_snapshot": {
+    "snapshot_id": "b35b707a-8b85-4100-8000-000000048b07",
+    "snapshot_unix_ms": 1790531068309,
+    "view_actor": "akernel-node-kt96j-ResourceViewActor"
+   }
+  },
+  "akernel-node-xrrjf": {
+   "ls_rc": 0,
+   "base_entries": [],
+   "legacy_entries": [],
+   "budget_snapshot": {
+    "snapshot_id": "9e707701-0000-4000-8000-66184ba8d8a7",
+    "snapshot_unix_ms": 1790531068319,
+    "view_actor": "akernel-node-xrrjf-ResourceViewActor"
+   }
+  }
+ },
+ "node_pods": [
+  "akernel-node-g46g6",
+  "akernel-node-kt96j",
+  "akernel-node-xrrjf"
+ ],
+ "identity": {
+  "akernel-node-g46g6": {
+   "exe_sha": "8b9ca50b5d42df1050c5b8d3e737b3df3f3fc22cb103777702249acefa44089e",
+   "process_count": 1
+  },
+  "akernel-node-kt96j": {
+   "exe_sha": "8b9ca50b5d42df1050c5b8d3e737b3df3f3fc22cb103777702249acefa44089e",
+   "process_count": 1
+  },
+  "akernel-node-xrrjf": {
+   "exe_sha": "8b9ca50b5d42df1050c5b8d3e737b3df3f3fc22cb103777702249acefa44089e",
+   "process_count": 1
+  }
+ },
+ "snapshot_store": {
+  "rc": 0,
+  "keys": [
+   "/yr/snapshots/v1/37a8eec1ce19687d132fe29051dca629d164e2c4958ba141d5f4133a33f0688f/snap-eb47ef3c94cd94f3584041680879e014"
+  ]
+ },
+ "collector": {
+  "nodes": {
+   "akernel-node-g46g6": {
+    "sandbox_count": 0,
+    "inventory": {
+     "status": "ok",
+     "snapshot": {
+      "baseline_entries": 0,
+      "commitment_ledger": {
+       "enabled": true,
+       "unit_count": 0,
+       "units": [],
+       "units_total_bytes": 0
+      },
+      "entries": [],
+      "event": "resource-inventory-begin",
+      "instance_count": 0,
+      "is_local_view": true,
+      "node_diagnostics": [
+       {
+        "cpu_actualuse_known": true,
+        "cpu_actualuse_millicores": 153.59578991002462,
+        "cpu_capacity_known": true,
+        "cpu_capacity_millicores": 8000.0,
+        "cpu_sample_unix_ms": 1790531067759,
+        "fragment_id": "akernel-node-g46g6",
+        "memory_actualuse_known": true,
+        "memory_actualuse_mb": 8438.578125,
+        "memory_capacity_known": true,
+        "memory_capacity_mb": 16384.0,
+        "memory_sample_unix_ms": 1790531067759,
+        "unit_id": "akernel-node-g46g6"
+       }
+      ],
+      "resize_budget_entries": 0,
+      "resize_outstanding_cpu_millicores": 0.0,
+      "resize_outstanding_memory_mb": 0.0,
+      "shrink_entries": 0,
+      "snapshot_id": "abbe9b76-7701-4000-8000-00000bc98e2f",
+      "snapshot_unix_ms": 1790531067787,
+      "unit_count": 1,
+      "view_actor": "akernel-node-g46g6-ResourceViewActor"
+     }
+    },
+    "identity": {
+     "status": "ok",
+     "exe_sha": "8b9ca50b5d42df1050c5b8d3e737b3df3f3fc22cb103777702249acefa44089e",
+     "processes": [
+      {
+       "pid": "240",
+       "starttime": "79529625",
+       "exe_sha": "8b9ca50b5d42df1050c5b8d3e737b3df3f3fc22cb103777702249acefa44089e"
+      }
+     ]
+    }
+   },
+   "akernel-node-kt96j": {
+    "sandbox_count": 0,
+    "inventory": {
+     "status": "ok",
+     "snapshot": {
+      "baseline_entries": 0,
+      "commitment_ledger": {
+       "enabled": true,
+       "unit_count": 0,
+       "units": [],
+       "units_total_bytes": 0
+      },
+      "entries": [],
+      "event": "resource-inventory-begin",
+      "instance_count": 0,
+      "is_local_view": true,
+      "node_diagnostics": [
+       {
+        "cpu_actualuse_known": true,
+        "cpu_actualuse_millicores": 502.73992534249754,
+        "cpu_capacity_known": true,
+        "cpu_capacity_millicores": 16000.0,
+        "cpu_sample_unix_ms": 1790531068247,
+        "fragment_id": "akernel-node-kt96j",
+        "memory_actualuse_known": true,
+        "memory_actualuse_mb": 9192.58984375,
+        "memory_capacity_known": true,
+        "memory_capacity_mb": 49152.0,
+        "memory_sample_unix_ms": 1790531068247,
+        "unit_id": "akernel-node-kt96j"
+       }
+      ],
+      "resize_budget_entries": 0,
+      "resize_outstanding_cpu_millicores": 0.0,
+      "resize_outstanding_memory_mb": 0.0,
+      "shrink_entries": 0,
+      "snapshot_id": "b35b707a-8b85-4100-8000-000000048b07",
+      "snapshot_unix_ms": 1790531068309,
+      "unit_count": 1,
+      "view_actor": "akernel-node-kt96j-ResourceViewActor"
+     }
+    },
+    "identity": {
+     "status": "ok",
+     "exe_sha": "8b9ca50b5d42df1050c5b8d3e737b3df3f3fc22cb103777702249acefa44089e",
+     "processes": [
+      {
+       "pid": "227",
+       "starttime": "79529679",
+       "exe_sha": "8b9ca50b5d42df1050c5b8d3e737b3df3f3fc22cb103777702249acefa44089e"
+      }
+     ]
+    }
+   },
+   "akernel-node-xrrjf": {
+    "sandbox_count": 0,
+    "inventory": {
+     "status": "ok",
+     "snapshot": {
+      "baseline_entries": 0,
+      "commitment_ledger": {
+       "enabled": true,
+       "unit_count": 0,
+       "units": [],
+       "units_total_bytes": 0
+      },
+      "entries": [],
+      "event": "resource-inventory-begin",
+      "instance_count": 0,
+      "is_local_view": true,
+      "node_diagnostics": [
+       {
+        "cpu_actualuse_known": true,
+        "cpu_actualuse_millicores": 268.2106074011269,
+        "cpu_capacity_known": true,
+        "cpu_capacity_millicores": 16000.0,
+        "cpu_sample_unix_ms": 1790531068289,
+        "fragment_id": "akernel-node-xrrjf",
+        "memory_actualuse_known": true,
+        "memory_actualuse_mb": 8632.3125,
+        "memory_capacity_known": true,
+        "memory_capacity_mb": 49152.0,
+        "memory_sample_unix_ms": 1790531068289,
+        "unit_id": "akernel-node-xrrjf"
+       }
+      ],
+      "resize_budget_entries": 0,
+      "resize_outstanding_cpu_millicores": 0.0,
+      "resize_outstanding_memory_mb": 0.0,
+      "shrink_entries": 0,
+      "snapshot_id": "9e707701-0000-4000-8000-66184ba8d8a7",
+      "snapshot_unix_ms": 1790531068319,
+      "unit_count": 1,
+      "view_actor": "akernel-node-xrrjf-ResourceViewActor"
+     }
+    },
+    "identity": {
+     "status": "ok",
+     "exe_sha": "8b9ca50b5d42df1050c5b8d3e737b3df3f3fc22cb103777702249acefa44089e",
+     "processes": [
+      {
+       "pid": "236",
+       "starttime": "79529679",
+       "exe_sha": "8b9ca50b5d42df1050c5b8d3e737b3df3f3fc22cb103777702249acefa44089e"
+      }
+     ]
+    }
+   }
+  }
+ },
+ "node_pods_rc": 0,
+ "collector_rc": 0
+}
