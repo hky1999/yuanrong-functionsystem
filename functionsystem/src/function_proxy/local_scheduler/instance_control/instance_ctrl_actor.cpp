@@ -5541,9 +5541,14 @@ litebus::Future<messages::ScheduleResponse> InstanceCtrlActor::DoAuthorizeCreate
 // NOTE on resources: ApplyResolvedReusableSnapshotForCreate inherits ONLY
 // genuinely ABSENT resource keys from the snapshot template; an explicit
 // value (including an explicit 0) is a caller override and is never silently
-// replaced. Upstream fabricating CPU:0/Memory:0 entries for OMITTED SDK
-// values therefore pins 0/0 — that is an upstream-entry bug to fix there,
-// not something this gate may paper over.
+// replaced. A request that OMITS cpu/memory arrives here with the keys
+// absent and inherits the template values BEFORE CheckSchedRequestValid's
+// funcMeta default fill (instance_ctrl_actor.cpp ~3032) — so a restored
+// instance carries the snapshot template's resources instead of the
+// function-meta defaults. The 0/0 observed live in pc-snapshot-8b97-2 was
+// that funcMeta default fill on omitted keys (no Resolve step existed to
+// inherit first); it is not an upstream fabrication defect. Effect to be
+// proven by the real-entry tests, not asserted.
 constexpr uint64_t REUSABLE_SNAPSHOT_RESOLVE_TIMEOUT_MS = 30000;
 
 litebus::Future<Status> InstanceCtrlActor::ResolveReusableSnapshotIntent(
