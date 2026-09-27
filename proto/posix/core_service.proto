@@ -210,14 +210,26 @@ message SnapOptions {
   int32           ttl  = 2;  // seconds
   bool            leaveRunning = 3;
   string          functionType = 4;  // moduleName.className for actors
-  string          hold_token = 5; // proxy physical-hold attempt; park only
-  string          expected_runtime_id = 6;
-  string          expected_sandbox_id = 7;
-  string          expected_resource_generation = 8;
-  // Upstream snapshot-family fields, renumbered during the 2026-09-11
-  // scheduler-line rebase (our wire pins 5-8).
-  string          name = 9;
-  uint64          checkpointTimeoutMs = 10;}
+  // PUBLIC upstream snapshot-family wire contract: the openYuanRong SDK
+  // and the frontend (faasfrontend) encode name at tag 5 and
+  // checkpointTimeoutMs at tag 6. The 2026-09-11 scheduler-line rebase
+  // parked private hold fields on tags 5-8, silently repurposing the
+  // public wire: the first physical Plan A case (pc-snapshot-ov23-1,
+  // 2026-09-27) had its snapshot name decoded as hold_token and was
+  // rejected by the identity guard. Tags 5/6 are pinned to the upstream
+  // meaning again; the private park identity fields moved to 21-24,
+  // clear of every upstream tag used or reserved in this message.
+  string          name = 5;
+  uint64          checkpointTimeoutMs = 6;
+  // PRIVATE scheduler-line park fields (never encoded by the SDK or the
+  // frontend). Renumbering is internal to this line: the frontend pod
+  // and the node pods deploy from the same image, and rollout requires
+  // no in-flight park attempt and no parked instance (the park/wake
+  // senders and this decoder upgrade together).
+  string          hold_token = 21; // proxy physical-hold attempt; park only
+  string          expected_runtime_id = 22;
+  string          expected_sandbox_id = 23;
+  string          expected_resource_generation = 24;}
 
 message SnapStartOptions {
   common.SnapType type = 1;

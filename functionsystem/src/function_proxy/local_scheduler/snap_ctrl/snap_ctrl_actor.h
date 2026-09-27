@@ -20,6 +20,7 @@
 #include <actor/actor.hpp>
 #include <async/future.hpp>
 #include <chrono>
+#include <functional>
 #include <atomic>
 #include <memory>
 #include <string>
@@ -247,7 +248,97 @@ public:
         idleMgr_ = idleMgr;
     }
 
+    /**
+     * Bind the per-instance reverse-tunnel admission gate for the PUBLIC
+     * reusable-snapshot chain (type=SNAPSHOT). The acquire callback returns
+     * false when a tunnel is active; a successful acquire is paired with
+     * exactly one release after the reusable Snapshot operation reaches a
+     * terminal response. Restored from the pre-G3b public chain: the driver
+     * has wired this hook all along, but the sink was a no-op after the
+     * actor-side chain was dropped.
+     */
+    void BindReusableSnapshotTunnelGate(
+        std::function<bool(const std::string &)> acquire,
+        std::function<void(const std::string &)> release)
+    {
+        reusableSnapshotTunnelGateAcquire_ = std::move(acquire);
+        reusableSnapshotTunnelGateRelease_ = std::move(release);
+    }
+
 private:
+    // ---- PUBLIC reusable named-snapshot chain (type=SNAPSHOT), restored
+    // verbatim from the pre-G3b canonical actor (d01e1328^): Begin ->
+    // READY-resolve | PUBLISHING -> PrepareSnap -> typed SnapshotRuntime ->
+    // SnapStarted -> PublishSnapshotArtifact -> Commit -> exact-cleanup
+    // Finalize, with Fail coordination and an idempotent-replay-preserving
+    // error contract. This is the public wire contract the frontend/SDK
+    // encode (name=5/checkpointTimeoutMs=6); it never falls back to the
+    // anonymous RecordSnapshotMetadata path.
+    struct ReusableSnapshotContext {
+        std::string requestID;
+        std::string instanceID;
+        std::string snapshotID;
+        std::string name;
+        resources::InstanceInfo sourceInstanceInfo;
+        ::messages::SnapshotArtifact artifact;
+        ::core_service::SnapshotInfo publicInfo;
+        std::shared_ptr<litebus::Promise<KillResponse>> completion;
+        bool tunnelGateHeld{ false };
+        bool completed{ false };
+    };
+
+    litebus::Future<KillResponse> HandleReusableSnapshot(
+        const std::string &requestID, const std::string &instanceID,
+        const resources::InstanceInfo &instanceInfo, const SnapOptions &options);
+    void OnReusableSnapshotBegun(
+        const std::shared_ptr<ReusableSnapshotContext> &context,
+        const litebus::Future<::messages::BeginReusableSnapshotResponse> &future);
+    void OnReusableSnapshotResolvedForCleanup(
+        const std::shared_ptr<ReusableSnapshotContext> &context,
+        const litebus::Future<::messages::ResolveReusableSnapshotForCreateResponse> &future);
+    void OnReusableSnapshotPrepared(
+        const std::shared_ptr<ReusableSnapshotContext> &context,
+        const litebus::Future<Status> &future);
+    void OnReusableSnapshotCheckpointed(
+        const std::shared_ptr<ReusableSnapshotContext> &context,
+        const litebus::Future<messages::SnapshotRuntimeResponse> &future);
+    void OnReusableSnapshotPublished(
+        const std::shared_ptr<ReusableSnapshotContext> &context,
+        const litebus::Future<messages::SnapshotRuntimeResponse> &future);
+    void OnReusableSnapshotClient(
+        const std::shared_ptr<ReusableSnapshotContext> &context,
+        const litebus::Future<std::shared_ptr<ControlInterfacePosixClient>> &future);
+    void OnReusableSnapshotStarted(
+        const std::shared_ptr<ReusableSnapshotContext> &context,
+        const litebus::Future<runtime::SnapStartedResponse> &future);
+    void OnReusableSnapshotCommitted(
+        const std::shared_ptr<ReusableSnapshotContext> &context,
+        const litebus::Future<::messages::CommitReusableSnapshotResponse> &future);
+    void OnReusableSnapshotFinalized(
+        const std::shared_ptr<ReusableSnapshotContext> &context,
+        ::messages::SnapshotAttemptFinalizeOperation operation,
+        common::ErrorCode terminalCode, const std::string &terminalMessage,
+        const litebus::Future<::messages::SnapshotAttemptFinalizeResponse> &future);
+    void OnReusableSnapshotFailedRecord(
+        const std::shared_ptr<ReusableSnapshotContext> &context,
+        common::ErrorCode terminalCode, const std::string &terminalMessage,
+        const litebus::Future<::messages::FailReusableSnapshotResponse> &future);
+    void FailReusableSnapshot(
+        const std::shared_ptr<ReusableSnapshotContext> &context,
+        common::ErrorCode code, const std::string &message);
+    void FinalizeReusableSnapshot(
+        const std::shared_ptr<ReusableSnapshotContext> &context,
+        ::messages::SnapshotAttemptFinalizeOperation operation,
+        common::ErrorCode terminalCode, const std::string &terminalMessage);
+    void CompleteReusableSnapshotRequest(
+        const std::shared_ptr<ReusableSnapshotContext> &context,
+        const KillResponse &response);
+    KillResponse BuildReusableSnapshotResponse(
+        common::ErrorCode code, const std::string &message,
+        const ::core_service::SnapshotInfo *snapshotInfo = nullptr) const;
+    void ReleaseReusableSnapshotTunnelGate(
+        const std::shared_ptr<ReusableSnapshotContext> &context);
+
     /**
      * Exact-pointer source fence for the conditional snapshot path: the
      * originally captured state machine must still be the instance's current
@@ -328,6 +419,10 @@ private:
     std::shared_ptr<ControlInterfaceClientManagerProxy> clientManager_;
     std::shared_ptr<InstanceCtrl> instanceCtrl_;
     std::shared_ptr<IdleMgr> idleMgr_;
+
+    // reverse-tunnel admission gate for the PUBLIC reusable-snapshot chain
+    std::function<bool(const std::string &)> reusableSnapshotTunnelGateAcquire_;
+    std::function<void(const std::string &)> reusableSnapshotTunnelGateRelease_;
 
     // Instances parked on this node via leaveRunning=false snapshots:
     // original instanceID -> checkpoint. Enables wake-by-instanceID and

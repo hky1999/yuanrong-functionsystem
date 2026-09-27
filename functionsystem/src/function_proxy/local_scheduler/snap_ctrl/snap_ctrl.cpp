@@ -94,6 +94,15 @@ void SnapCtrl::BindClientManager(const std::shared_ptr<ControlInterfaceClientMan
     litebus::Async(aid_, &SnapCtrlActor::BindClientManager, clientManager);
 }
 
+void SnapCtrl::BindReusableSnapshotTunnelGate(
+    std::function<bool(const std::string &)> acquire,
+    std::function<void(const std::string &)> release)
+{
+    ASSERT_IF_NULL(snapCtrlActor_);
+    litebus::Async(aid_, &SnapCtrlActor::BindReusableSnapshotTunnelGate,
+                   std::move(acquire), std::move(release));
+}
+
 litebus::Future<KillResponse> SnapCtrl::HandleSnapshot(const std::string &requestID,
                                                        const std::string &instanceID,
                                                        const std::string &payload)

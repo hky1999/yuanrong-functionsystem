@@ -193,8 +193,8 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
     std::string expectedSandboxID;
     std::string expectedGeneration;
     bool hasExpected = false;
+    SnapOptions options;
     if (!payload.empty()) {
-        SnapOptions options;
         if (!options.ParseFromString(payload)) {
             YRLOG_ERROR("{}|{}|failed to parse snapshot payload", requestID, instanceID);
             KillResponse errorRsp;
@@ -251,6 +251,14 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
     }
     YRLOG_INFO("{}|{}|start snapshot, leave_running: {}", requestID, instanceID, leaveRunning);
     auto instanceInfo = stateMachine->GetInstanceInfo();
+    // PUBLIC reusable named-snapshot chain (type=SNAPSHOT): the wire
+    // contract the frontend/SDK encode (name=5/checkpointTimeoutMs=6 on
+    // SnapOptions). Restored verbatim from the pre-G3b public path; the
+    // park/hold chain below remains the private scheduler-line semantics
+    // and is never entered for a public typed request.
+    if (options.type() == common::SnapType::SNAPSHOT) {
+        return HandleReusableSnapshot(requestID, instanceID, instanceInfo, options);
+    }
     // Conditional-path fence, still before any gate/mark/drain mutation: the
     // expected runtime must be this source's and the source must be RUNNING.
     // The optional Stats cached in InstanceInfo are deliberately NOT trusted
@@ -1260,3 +1268,448 @@ litebus::Future<Status> SnapCtrlActor::PrepareSnap(const std::string &requestID,
         }));
 }
 }  // namespace functionsystem::local_scheduler
+
+// ---- PUBLIC reusable named-snapshot chain (type=SNAPSHOT), restored
+// verbatim from the pre-G3b canonical actor (d01e1328^). The chain:
+// Begin -> READY-resolve | PUBLISHING -> PrepareSnap -> typed
+// SnapshotRuntime -> SnapStarted -> PublishSnapshotArtifact -> Commit
+// -> exact-cleanup Finalize, with Fail coordination and an
+// idempotent-replay-preserving unknown-outcome contract. It never
+// falls back to the anonymous RecordSnapshotMetadata path.
+constexpr uint32_t SNAPSHOT_ATTEMPT_PROTOCOL_VERSION = 1;
+
+litebus::Future<KillResponse> SnapCtrlActor::HandleReusableSnapshot(
+    const std::string &requestID, const std::string &instanceID,
+    const resources::InstanceInfo &instanceInfo, const SnapOptions &options)
+{
+    auto context = std::make_shared<ReusableSnapshotContext>();
+    context->requestID = requestID;
+    context->instanceID = instanceID;
+    context->name = options.name();
+    context->sourceInstanceInfo = instanceInfo;
+    if (options.checkpointtimeoutms() > 0) {
+        (*context->sourceInstanceInfo.mutable_createoptions())["YR_CHECKPOINT_TIMEOUT_MS"] =
+            std::to_string(options.checkpointtimeoutms());
+    }
+    context->completion = std::make_shared<litebus::Promise<KillResponse>>();
+
+    if (requestID.empty() || instanceID.empty() || instanceInfo.tenantid().empty()
+        || instanceInfo.runtimeid().empty() || instanceInfo.functionagentid().empty()
+        || instanceInfo.version() == 0 || localSchedSrv_ == nullptr
+        || functionAgentMgr_ == nullptr || clientManager_ == nullptr) {
+        CompleteReusableSnapshotRequest(
+            context, BuildReusableSnapshotResponse(
+                         common::ERR_INNER_SYSTEM_ERROR,
+                         "reusable snapshot source identity or dependency is unavailable"));
+        return context->completion->GetFuture();
+    }
+
+    if (reusableSnapshotTunnelGateAcquire_ != nullptr) {
+        if (!reusableSnapshotTunnelGateAcquire_(instanceID)) {
+            CompleteReusableSnapshotRequest(
+                context, BuildReusableSnapshotResponse(
+                             common::ERR_INNER_SYSTEM_ERROR,
+                             "reusable snapshot is not allowed while a reverse tunnel is active"));
+            return context->completion->GetFuture();
+        }
+        context->tunnelGateHeld = true;
+    }
+
+    auto request = std::make_shared<::messages::BeginReusableSnapshotRequest>();
+    request->set_requestid(requestID);
+    request->set_tenantid(instanceInfo.tenantid());
+    request->set_sourceinstanceid(instanceID);
+    if (!options.name().empty()) {
+        request->add_names(options.name());
+    }
+    localSchedSrv_->BeginReusableSnapshot(request).OnComplete(
+        litebus::Defer(GetAID(), &SnapCtrlActor::OnReusableSnapshotBegun,
+                       context, std::placeholders::_1));
+    return context->completion->GetFuture();
+}
+
+void SnapCtrlActor::OnReusableSnapshotBegun(
+    const std::shared_ptr<ReusableSnapshotContext> &context,
+    const litebus::Future<::messages::BeginReusableSnapshotResponse> &future)
+{
+    if (future.IsError()) {
+        CompleteReusableSnapshotRequest(
+            context, BuildReusableSnapshotResponse(
+                         common::ERR_INNER_COMMUNICATION,
+                         "reusable snapshot Begin request failed"));
+        return;
+    }
+    const auto &response = future.Get();
+    if (response.code() != common::ERR_NONE) {
+        CompleteReusableSnapshotRequest(
+            context, BuildReusableSnapshotResponse(
+                         static_cast<common::ErrorCode>(response.code()), response.message()));
+        return;
+    }
+    if (response.snapshotid().empty()) {
+        CompleteReusableSnapshotRequest(
+            context, BuildReusableSnapshotResponse(
+                         common::ERR_INNER_SYSTEM_ERROR,
+                         "reusable snapshot Begin response omitted snapshot ID"));
+        return;
+    }
+    context->snapshotID = response.snapshotid();
+    if (response.has_snapshotinfo()) {
+        context->publicInfo = response.snapshotinfo();
+    }
+    if (context->publicInfo.snapshotid().empty()) {
+        context->publicInfo.set_snapshotid(context->snapshotID);
+        if (!context->name.empty()) {
+            context->publicInfo.add_names(context->name);
+        }
+    }
+
+    if (response.phase() == ::messages::REUSABLE_SNAPSHOT_READY) {
+        auto request = std::make_shared<::messages::ResolveReusableSnapshotForCreateRequest>();
+        request->set_requestid(context->requestID);
+        request->set_tenantid(context->sourceInstanceInfo.tenantid());
+        request->set_snapshotid(context->snapshotID);
+        localSchedSrv_->ResolveReusableSnapshotForCreate(request).OnComplete(
+            litebus::Defer(GetAID(), &SnapCtrlActor::OnReusableSnapshotResolvedForCleanup,
+                           context, std::placeholders::_1));
+        return;
+    }
+    if (response.phase() != ::messages::REUSABLE_SNAPSHOT_PUBLISHING) {
+        CompleteReusableSnapshotRequest(
+            context, BuildReusableSnapshotResponse(
+                         common::ERR_INNER_SYSTEM_ERROR,
+                         "reusable snapshot Begin returned an invalid phase"));
+        return;
+    }
+
+    PrepareSnap(context->requestID, context->instanceID).OnComplete(
+        litebus::Defer(GetAID(), &SnapCtrlActor::OnReusableSnapshotPrepared,
+                       context, std::placeholders::_1));
+}
+
+void SnapCtrlActor::OnReusableSnapshotResolvedForCleanup(
+    const std::shared_ptr<ReusableSnapshotContext> &context,
+    const litebus::Future<::messages::ResolveReusableSnapshotForCreateResponse> &future)
+{
+    if (future.IsError()) {
+        CompleteReusableSnapshotRequest(
+            context, BuildReusableSnapshotResponse(
+                         common::ERR_INNER_COMMUNICATION,
+                         "reusable snapshot READY cleanup resolution failed"));
+        return;
+    }
+    const auto &response = future.Get();
+    if (response.code() != common::ERR_NONE
+        || !response.has_reusablesnapshotrestore()
+        || !response.reusablesnapshotrestore().has_artifact()) {
+        CompleteReusableSnapshotRequest(
+            context, BuildReusableSnapshotResponse(
+                         response.code() == common::ERR_NONE ? common::ERR_INNER_SYSTEM_ERROR
+                                                             : static_cast<common::ErrorCode>(response.code()),
+                         response.message().empty()
+                             ? "reusable snapshot READY record omitted artifact"
+                             : response.message()));
+        return;
+    }
+    context->artifact = response.reusablesnapshotrestore().artifact();
+    FinalizeReusableSnapshot(context, ::messages::REUSABLE_SNAPSHOT_COMMITTED,
+                             common::ERR_NONE, "");
+}
+
+void SnapCtrlActor::OnReusableSnapshotPrepared(
+    const std::shared_ptr<ReusableSnapshotContext> &context,
+    const litebus::Future<Status> &future)
+{
+    if (future.IsError() || future.Get().IsError()) {
+        const auto message = future.IsError() ? "reusable snapshot PrepareSnap future failed"
+                                              : future.Get().RawMessage();
+        FailReusableSnapshot(context, common::ERR_INNER_COMMUNICATION, message);
+        return;
+    }
+    functionAgentMgr_->SnapshotRuntime(
+        context->requestID, context->sourceInstanceInfo, 0, common::SNAPSHOT,
+        context->snapshotID, {}).OnComplete(
+            litebus::Defer(GetAID(), &SnapCtrlActor::OnReusableSnapshotCheckpointed,
+                           context, std::placeholders::_1));
+}
+
+void SnapCtrlActor::OnReusableSnapshotCheckpointed(
+    const std::shared_ptr<ReusableSnapshotContext> &context,
+    const litebus::Future<::messages::SnapshotRuntimeResponse> &future)
+{
+    if (future.IsError() || future.Get().code() != common::ERR_NONE
+        || !future.Get().has_localsnapshot()) {
+        FailReusableSnapshot(
+            context, common::ERR_INNER_COMMUNICATION,
+            future.IsError() ? "reusable snapshot LOCAL_READY future failed"
+                             : future.Get().message());
+        return;
+    }
+    clientManager_->GetControlInterfacePosixClient(context->instanceID)
+        .OnComplete(litebus::Defer(
+            GetAID(), &SnapCtrlActor::OnReusableSnapshotClient,
+            context, std::placeholders::_1));
+}
+
+void SnapCtrlActor::OnReusableSnapshotPublished(
+    const std::shared_ptr<ReusableSnapshotContext> &context,
+    const litebus::Future<::messages::SnapshotRuntimeResponse> &future)
+{
+    if (future.IsError()) {
+        // The Agent may have checkpointed or published successfully before
+        // its reply was lost. Without exact artifact facts, neither local nor
+        // remote deletion is safe. Keep PUBLISHING for deterministic replay.
+        CompleteReusableSnapshotRequest(
+            context, BuildReusableSnapshotResponse(
+                common::ERR_INNER_COMMUNICATION,
+                "reusable snapshot Agent result is unknown"));
+        return;
+    }
+    const auto &response = future.Get();
+    if (response.code() != common::ERR_NONE) {
+        if (response.has_reusablesnapshotartifact()
+            && !response.reusablesnapshotartifact().storagebackend().empty()
+            && !response.reusablesnapshotartifact().objectkey().empty()
+            && response.reusablesnapshotartifact().size() > 0
+            && !response.reusablesnapshotartifact().sha256().empty()) {
+            context->artifact = response.reusablesnapshotartifact();
+            if (context->artifact.storagebackend() == "local") {
+                context->artifact.set_sourcenodeid(nodeID_);
+            }
+            FinalizeReusableSnapshot(context, ::messages::REUSABLE_SNAPSHOT_ABORTED,
+                                     static_cast<common::ErrorCode>(response.code()),
+                                     response.message());
+            return;
+        }
+        // The publisher did not return an exact physical identity. Keep the
+        // Master record in PUBLISHING so an idempotent replay can re-inspect
+        // the deterministic checkpoint. Removing the record here would
+        // orphan local/remote data that cannot be deleted safely.
+        CompleteReusableSnapshotRequest(
+            context, BuildReusableSnapshotResponse(
+                static_cast<common::ErrorCode>(response.code()),
+                response.message().empty()
+                    ? "reusable snapshot publish failed without exact cleanup identity"
+                    : response.message()));
+        return;
+    }
+    if (!response.has_reusablesnapshotartifact()) {
+        CompleteReusableSnapshotRequest(
+            context, BuildReusableSnapshotResponse(
+                common::ERR_INNER_SYSTEM_ERROR,
+                "reusable snapshot Agent response omitted frozen artifact; publishing preserved"));
+        return;
+    }
+    context->artifact = response.reusablesnapshotartifact();
+    if (context->artifact.storagebackend() == "local") {
+        context->artifact.set_sourcenodeid(nodeID_);
+    }
+    auto request = std::make_shared<::messages::CommitReusableSnapshotRequest>();
+    request->set_requestid(context->requestID);
+    request->set_tenantid(context->sourceInstanceInfo.tenantid());
+    request->set_snapshotid(context->snapshotID);
+    *request->mutable_sourceinstanceinfo() = context->sourceInstanceInfo;
+    *request->mutable_artifact() = context->artifact;
+    localSchedSrv_->CommitReusableSnapshot(request).OnComplete(
+        litebus::Defer(GetAID(), &SnapCtrlActor::OnReusableSnapshotCommitted,
+                       context, std::placeholders::_1));
+}
+
+void SnapCtrlActor::OnReusableSnapshotClient(
+    const std::shared_ptr<ReusableSnapshotContext> &context,
+    const litebus::Future<std::shared_ptr<ControlInterfacePosixClient>> &future)
+{
+    if (future.IsError() || future.Get() == nullptr) {
+        FinalizeReusableSnapshot(
+            context, ::messages::REUSABLE_SNAPSHOT_ABORTED,
+            common::ERR_INNER_COMMUNICATION,
+            "failed to get runtime client for reusable SnapStarted");
+        return;
+    }
+    runtime::SnapStartedRequest request;
+    future.Get()->SnapStarted(std::move(request)).OnComplete(litebus::Defer(
+        GetAID(), &SnapCtrlActor::OnReusableSnapshotStarted,
+        context, std::placeholders::_1));
+}
+
+void SnapCtrlActor::OnReusableSnapshotStarted(
+    const std::shared_ptr<ReusableSnapshotContext> &context,
+    const litebus::Future<runtime::SnapStartedResponse> &future)
+{
+    if (future.IsError() || future.Get().code() != common::ERR_NONE) {
+        FinalizeReusableSnapshot(
+            context, ::messages::REUSABLE_SNAPSHOT_ABORTED,
+            common::ERR_INNER_COMMUNICATION,
+            future.IsError() ? "reusable SnapStarted future failed"
+                             : future.Get().message());
+        return;
+    }
+    functionAgentMgr_->PublishSnapshotArtifact(
+        context->requestID, context->sourceInstanceInfo, context->snapshotID)
+        .OnComplete(litebus::Defer(
+            GetAID(), &SnapCtrlActor::OnReusableSnapshotPublished,
+            context, std::placeholders::_1));
+}
+
+void SnapCtrlActor::OnReusableSnapshotCommitted(
+    const std::shared_ptr<ReusableSnapshotContext> &context,
+    const litebus::Future<::messages::CommitReusableSnapshotResponse> &future)
+{
+    if (future.IsError()) {
+        // The Master may have committed READY even though its reply was lost.
+        // Preserve both PUBLISHING/READY coordination and the exact artifact so
+        // an idempotent replay can Resolve and finish cleanup safely.
+        CompleteReusableSnapshotRequest(
+            context, BuildReusableSnapshotResponse(
+                         common::ERR_INNER_COMMUNICATION,
+                         "reusable snapshot Commit result is unknown"));
+        return;
+    }
+    const auto &response = future.Get();
+    if (response.code() != common::ERR_NONE) {
+        FinalizeReusableSnapshot(context, ::messages::REUSABLE_SNAPSHOT_ABORTED,
+                                 static_cast<common::ErrorCode>(response.code()),
+                                 response.message());
+        return;
+    }
+    if (!response.has_snapshotinfo()
+        || response.snapshotinfo().snapshotid() != context->snapshotID) {
+        FinalizeReusableSnapshot(
+            context, ::messages::REUSABLE_SNAPSHOT_ABORTED,
+            common::ERR_INNER_SYSTEM_ERROR,
+            "reusable snapshot Commit response omitted matching public metadata");
+        return;
+    }
+    context->publicInfo = response.snapshotinfo();
+    FinalizeReusableSnapshot(context, ::messages::REUSABLE_SNAPSHOT_COMMITTED,
+                             common::ERR_NONE, "");
+}
+
+void SnapCtrlActor::FinalizeReusableSnapshot(
+    const std::shared_ptr<ReusableSnapshotContext> &context,
+    ::messages::SnapshotAttemptFinalizeOperation operation,
+    common::ErrorCode terminalCode, const std::string &terminalMessage)
+{
+    if (context->artifact.storagebackend().empty() || context->artifact.objectkey().empty()
+        || (context->artifact.storagebackend() == "local"
+            && context->artifact.sourcenodeid().empty())) {
+        const auto message = "reusable snapshot exact cleanup artifact identity is incomplete";
+        // Keep the PUBLISHING/READY coordination record when exact cleanup
+        // cannot be proven.  Deleting it here would orphan an immutable
+        // object that this node can no longer identify safely.
+        CompleteReusableSnapshotRequest(
+            context, BuildReusableSnapshotResponse(common::ERR_INNER_SYSTEM_ERROR, message));
+        return;
+    }
+    ::messages::SnapshotAttemptFinalizeRequest request;
+    request.set_protocolversion(SNAPSHOT_ATTEMPT_PROTOCOL_VERSION);
+    request.set_operation(operation);
+    request.set_tenantid(context->sourceInstanceInfo.tenantid());
+    request.set_instanceid(context->instanceID);
+    request.set_snapshotid(context->snapshotID);
+    request.set_attemptid(context->requestID);
+    request.set_runtimeid(context->sourceInstanceInfo.runtimeid());
+    request.set_expectedsize(static_cast<uint64_t>(context->artifact.size()));
+    request.set_expectedsha256(context->artifact.sha256());
+    request.set_expectedstorage(context->artifact.storagebackend());
+    functionAgentMgr_->FinalizeSnapshotAttempt(context->sourceInstanceInfo, request).OnComplete(
+        litebus::Defer(GetAID(), &SnapCtrlActor::OnReusableSnapshotFinalized,
+                       context, operation, terminalCode, terminalMessage,
+                       std::placeholders::_1));
+}
+
+void SnapCtrlActor::OnReusableSnapshotFinalized(
+    const std::shared_ptr<ReusableSnapshotContext> &context,
+    ::messages::SnapshotAttemptFinalizeOperation operation,
+    common::ErrorCode terminalCode, const std::string &terminalMessage,
+    const litebus::Future<::messages::SnapshotAttemptFinalizeResponse> &future)
+{
+    if (future.IsError() || future.Get().code() != static_cast<int32_t>(StatusCode::SUCCESS)
+        || future.Get().resultunknown() || !future.Get().localcleanupcomplete()
+        || !future.Get().remotecleanupcomplete()) {
+        const auto message = future.IsError()
+            ? "reusable snapshot exact cleanup request failed"
+            : (future.Get().message().empty()
+                   ? "reusable snapshot exact cleanup is incomplete"
+                   : future.Get().message());
+        CompleteReusableSnapshotRequest(
+            context, BuildReusableSnapshotResponse(common::ERR_INNER_COMMUNICATION, message));
+        return;
+    }
+    if (operation == ::messages::REUSABLE_SNAPSHOT_ABORTED) {
+        FailReusableSnapshot(context, terminalCode, terminalMessage);
+        return;
+    }
+    CompleteReusableSnapshotRequest(
+        context, BuildReusableSnapshotResponse(common::ERR_NONE, "", &context->publicInfo));
+}
+
+void SnapCtrlActor::FailReusableSnapshot(
+    const std::shared_ptr<ReusableSnapshotContext> &context,
+    common::ErrorCode code, const std::string &message)
+{
+    auto request = std::make_shared<::messages::FailReusableSnapshotRequest>();
+    request->set_requestid(context->requestID);
+    request->set_tenantid(context->sourceInstanceInfo.tenantid());
+    request->set_snapshotid(context->snapshotID);
+    request->set_reason(message);
+    localSchedSrv_->FailReusableSnapshot(request).OnComplete(
+        litebus::Defer(GetAID(), &SnapCtrlActor::OnReusableSnapshotFailedRecord,
+                       context, code, message, std::placeholders::_1));
+}
+
+void SnapCtrlActor::OnReusableSnapshotFailedRecord(
+    const std::shared_ptr<ReusableSnapshotContext> &context,
+    common::ErrorCode terminalCode, const std::string &terminalMessage,
+    const litebus::Future<::messages::FailReusableSnapshotResponse> &future)
+{
+    if (future.IsError() || future.Get().code() != common::ERR_NONE) {
+        const auto cleanupMessage = future.IsError()
+            ? "reusable snapshot Fail coordination request failed"
+            : future.Get().message();
+        CompleteReusableSnapshotRequest(
+            context, BuildReusableSnapshotResponse(
+                         common::ERR_INNER_COMMUNICATION,
+                         terminalMessage + "; " + cleanupMessage));
+        return;
+    }
+    CompleteReusableSnapshotRequest(
+        context, BuildReusableSnapshotResponse(terminalCode, terminalMessage));
+}
+
+KillResponse SnapCtrlActor::BuildReusableSnapshotResponse(
+    common::ErrorCode code, const std::string &message,
+    const ::core_service::SnapshotInfo *snapshotInfo) const
+{
+    KillResponse response;
+    response.set_code(code);
+    response.set_message(message);
+    if (code == common::ERR_NONE && snapshotInfo != nullptr) {
+        response.set_payload(snapshotInfo->SerializeAsString());
+    }
+    return response;
+}
+
+void SnapCtrlActor::ReleaseReusableSnapshotTunnelGate(
+    const std::shared_ptr<ReusableSnapshotContext> &context)
+{
+    if (!context->tunnelGateHeld) {
+        return;
+    }
+    context->tunnelGateHeld = false;
+    if (reusableSnapshotTunnelGateRelease_ != nullptr) {
+        reusableSnapshotTunnelGateRelease_(context->instanceID);
+    }
+}
+
+void SnapCtrlActor::CompleteReusableSnapshotRequest(
+    const std::shared_ptr<ReusableSnapshotContext> &context,
+    const KillResponse &response)
+{
+    if (context->completed) {
+        return;
+    }
+    context->completed = true;
+    ReleaseReusableSnapshotTunnelGate(context);
+    context->completion->SetValue(response);
+}

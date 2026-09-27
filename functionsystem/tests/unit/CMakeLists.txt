@@ -129,7 +129,8 @@ add_executable(${PAUSE_RESUME_UNIT_TEST}
         function_agent/snapshot/local_snapshot_store_test.cpp
         function_master/snap_manager/reusable_snapshot_proto_test.cpp
         function_master/snap_manager/reusable_snapshot_store_test.cpp
-        function_proxy/local_scheduler/snap_ctrl/snap_ctrl_actor_test.cpp)
+        function_proxy/local_scheduler/snap_ctrl/snap_ctrl_actor_test.cpp
+        function_proxy/local_scheduler/snap_ctrl/snap_options_wire_test.cpp)
 
 target_compile_options(${PAUSE_RESUME_UNIT_TEST} PRIVATE
         -Wno-error
