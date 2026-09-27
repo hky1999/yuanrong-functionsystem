@@ -225,32 +225,39 @@ Status ResourceViewActor::ReserveResize(const messages::ResizeSandboxRequest &re
         auto total = OutstandingResize(unit->first);
         total.cpuMillicores += added.cpuMillicores;
         total.memoryMb += added.memoryMb;
-        const auto verdict = CheckResourceHeadroom(unit->second, total);
-        if (!verdict.IsOk()) {
-            // Structured read-only rejection log: the observation-fault test
-            // facility matches THIS line by request/operation/instance ID +
-            // outcome=rejected + the observation-specific reason. The
-            // sample timestamps let the test prove the C++ consumer
-            // actually saw a stale/unknown observation (not just a
-            // capacity shortfall).
-            const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-            const bool memStale = UsableNodeMemorySampleTime(
-                unit->second, nowMs, DEFAULT_RESOURCE_SAMPLE_MAX_AGE_MS) == 0;
-            const bool cpuStale = UsableNodeCPUSampleTime(
-                unit->second, nowMs, DEFAULT_RESOURCE_SAMPLE_MAX_AGE_MS) == 0;
+        const auto checkResult = CheckResourceHeadroomWithReason(unit->second, total);
+        if (!checkResult.status.IsOk()) {
+            // Structured read-only rejection log: the reason comes from the
+            // ACTUAL rejecting branch inside CheckAdmission — it is NEVER
+            // guessed by re-reading timestamps after the failure. The
+            // observation-fault test facility matches THIS line by
+            // request/operation/instance ID + outcome=rejected + the
+            // branch-specific reason. Sample timestamps from the unit are
+            // included for independent verification.
+            const char *reasonStr = "other";
+            switch (checkResult.reason) {
+            case AdmissionRejectReason::MemorySampleStale:
+            case AdmissionRejectReason::CPUSampleStale:
+                reasonStr = "node_observation_unknown_or_stale";
+                break;
+            case AdmissionRejectReason::CapacityExceeded:
+                reasonStr = "capacity_exceeded";
+                break;
+            default:
+                reasonStr = "other";
+                break;
+            }
             YRLOG_WARN("resize admission REJECTED instance={} runtime={} request={} sandbox={} generation={} "
                        "operationId={} unit={} outcome=rejected reason={} "
                        "node_memory_sample_unix_ms={} node_cpu_sample_unix_ms={} "
-                       "memory_sample_stale={} cpu_sample_stale={}",
-                       request.instanceid(), request.runtimeid(), requestID,
+                       "checked_at_unix_ms={}",
+                       request.instanceid(), request.runtimeid(), request.requestid(),
                        command.sandbox_id(), command.resource_generation(),
                        command.operation_id(), unit->first,
-                       memStale || cpuStale ? "node_observation_unknown_or_stale"
-                                            : "capacity_exceeded",
+                       reasonStr,
                        unit->second.memory_sample_unix_ms(), unit->second.cpu_sample_unix_ms(),
-                       memStale, cpuStale);
-            return verdict;
+                       checkResult.checkedAtUnixMs);
+            return checkResult.status;
         }
     }
     ResizeBudgetEntry entry;

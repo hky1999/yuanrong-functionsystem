@@ -26,6 +26,24 @@ void SetUsageAdmissionSettings(double safety, double floorMb, int32_t maxInstanc
 UsageAdmissionSettings GetUsageAdmissionSettings();
 bool UsesElasticAdmission(const InstanceInfo &instance);
 struct AdmissionReserve { double cpuMillicores = 0; double memoryMb = 0; };
+
+// Internal diagnostic reason from the ACTUAL rejecting branch — never
+// guessed after the fact. The Status/code and admission decision are
+// unchanged; this is read-only evidence for the observation-fault test.
+enum class AdmissionRejectReason {
+    None,               // not rejected
+    MemorySampleStale,  // UsableNodeMemorySampleTime == 0 (the observation guard)
+    CPUSampleStale,     // UsableNodeCPUSampleTime == 0 (the observation guard)
+    CapacityExceeded,   // usage+commitment+reserve > capacity*safety
+    Other,              // settings invalid, instance-limit, malformed resource data, etc.
+};
+struct AdmissionCheckResult {
+    Status status;
+    AdmissionRejectReason reason = AdmissionRejectReason::None;
+    int64_t checkedAtUnixMs = 0;
+};
+AdmissionCheckResult CheckResourceHeadroomWithReason(const ResourceUnit &unit,
+                                                      const AdmissionReserve &extra);
 Status CheckResourceHeadroom(const ResourceUnit &unit, const AdmissionReserve &extra);
 Status CheckRestoreAllocation(const InstanceInfo &instance, const ResourceUnit &unit,
                               const AdmissionReserve &extra = {});
