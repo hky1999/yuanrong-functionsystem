@@ -286,6 +286,18 @@ private:
         uint64_t snapshotAttempt{ 0 };  // shared per-instance single-flight slot
         bool tunnelGateHeld{ false };
         bool completed{ false };
+        // terminal response delivered, but the PHYSICAL outcome is only
+        // authoritative on the known-success/definite-failure paths; lost
+        // replies and resultunknown/incomplete coordination leave it false
+        // so the shared slot stays busy with a same-requestID replay entrance
+        bool outcomeKnown{ false };
+    };
+
+    /** Bounded re-query entrance for one UNKNOWN public-snapshot outcome. */
+    struct UnknownReusableEntry {
+        std::string requestID;
+        uint64_t attempt;
+        std::string runtimeID;  // original source identity fence for replay
     };
 
     litebus::Future<KillResponse> HandleReusableSnapshot(
@@ -433,6 +445,7 @@ private:
     // the instance re-appears in the control view.
     std::unordered_map<std::string, ParkedEntry> parkedInstances_;
     SnapshotAttemptGate snapshotAttempts_;
+    std::unordered_map<std::string, UnknownReusableEntry> unknownReusable_;
     void FinishSnapshotAttempt(const std::string &instanceID, uint64_t attempt, bool markParked,
         const std::shared_ptr<std::atomic<bool>> &dispatched, const litebus::Future<KillResponse> &result,
         const std::shared_ptr<std::atomic<bool>> &sourceMismatched = nullptr);

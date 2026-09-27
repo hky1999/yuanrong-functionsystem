@@ -135,7 +135,12 @@ add_executable(${PAUSE_RESUME_UNIT_TEST}
 add_executable(snap_options_policy_gate_test
         function_proxy/local_scheduler/snap_ctrl/snap_options_policy_gate_test.cpp)
 target_compile_options(snap_options_policy_gate_test PRIVATE -Wno-error)
-add_dependencies(snap_options_policy_gate_test posix_pb)
+target_include_directories(snap_options_policy_gate_test PRIVATE
+        ${CMAKE_CURRENT_LIST_DIR}/../../src
+        ${CMAKE_CURRENT_LIST_DIR}/../../src/common/proto/pb
+        ${CMAKE_CURRENT_LIST_DIR}/../../src/function_proxy)
+target_link_libraries(snap_options_policy_gate_test PRIVATE posix_pb)
+add_test(NAME snap_options_policy_gate_test COMMAND snap_options_policy_gate_test)
 
 target_compile_options(${PAUSE_RESUME_UNIT_TEST} PRIVATE
         -Wno-error
