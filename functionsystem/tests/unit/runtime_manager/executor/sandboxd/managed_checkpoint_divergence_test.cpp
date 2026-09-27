@@ -157,7 +157,12 @@ TEST_F(ManagedCheckpointDivergenceTest, ManagedArtifactNeverEntersAnonymousTable
 
     auto addRef = litebus::Async(ckptActorAID_, &CkptFileManagerActor::AddReference, managedID);
     addRef.Wait();
-    EXPECT_TRUE(addRef.IsError()) << "managed artifact must not be addressable in the anonymous table";
+    // Real Future<Status> semantics: a missing id yields a COMPLETED future
+    // whose VALUE is the error Status — the future machinery itself stays
+    // intact, so assert on the carried result, not on IsError().
+    EXPECT_FALSE(addRef.IsError()) << "the lookup failure is a result value, not a broken future";
+    ASSERT_TRUE(addRef.Get().IsError()) << "managed artifact must not be addressable in the anonymous table";
+    EXPECT_EQ(addRef.Get().StatusCode(), StatusCode::ERR_CHECKPOINT_NOT_FOUND);
     EXPECT_TRUE(std::filesystem::exists(dir + "/checkpoint.img"));
 }
 
