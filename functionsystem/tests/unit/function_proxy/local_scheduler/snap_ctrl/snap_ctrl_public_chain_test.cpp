@@ -748,23 +748,42 @@ TEST_F(SnapCtrlPublicChainTest, SettledReplayFreesBothGateAndReplayEntrance)
 // actor thread via litebus::Async; nothing is re-implemented here.
 TEST_F(SnapCtrlPublicChainTest, StaleAttemptLateCompletionTouchesNothing)
 {
+    // 1) a FIRST real public request completes successfully: its attempt id
+    //    (read from the live entry machinery) becomes the STALE id below
+    PublicChainAgentProbe::TypedOutcome healthy;
+    agentProbe_->SetTypedOutcome(healthy);
+    auto settled = PublicSnapshot("pub-settled");
+    FlushActor();
+    SettlePrepareOk();
+    ASSERT_AWAIT_READY(settled);
+    EXPECT_EQ(common::ERR_NONE, settled.Get().code());
+    FlushActor();
+    ASSERT_EQ(0u, actor_->unknownReusable_.size());
+
+    // 2) a SECOND real public request lands UNKNOWN and owns the live slot
     PublicChainAgentProbe::TypedOutcome unknown;
     unknown.code = common::ERR_INNER_COMMUNICATION;
     unknown.resultUnknown = true;
     agentProbe_->SetTypedOutcome(unknown);
-    auto first = PublicSnapshot("pub-1");
+    auto second = PublicSnapshot("pub-unknown");
     FlushActor();
     SettlePrepareOk();
-    ASSERT_AWAIT_READY(first);
-    EXPECT_NE(common::ERR_NONE, first.Get().code());
+    ASSERT_AWAIT_READY(second);
+    EXPECT_NE(common::ERR_NONE, second.Get().code());
+    FlushActor();
+    ASSERT_EQ(1u, actor_->unknownReusable_.size());
+    const auto liveEntry = actor_->unknownReusable_.at(INSTANCE_ID);
+    const uint64_t liveAttempt = liveEntry.attempt;
+    const std::string liveRequestID = liveEntry.requestID;
 
-    // capture the CURRENT (only) entry as attempt B, then occupy a stale
-    // attempt id A that no longer owns the slot
-    const uint64_t staleAttempt = 1;
+    // 3) the STALE attempt is a DIFFERENT, earlier id — proven, not assumed
+    ASSERT_GE(liveAttempt, 2u);  // the settled first request consumed id 1..
+    const uint64_t staleAttempt = liveAttempt - 1;
+    ASSERT_NE(staleAttempt, liveAttempt);
     auto lateContext = std::make_shared<SnapCtrlActor::ReusableSnapshotContext>();
-    lateContext->requestID = "pub-stale";
+    lateContext->requestID = "pub-settled";  // the FIRST request's id
     lateContext->instanceID = INSTANCE_ID;
-    lateContext->snapshotAttempt = staleAttempt;  // NOT the live attempt
+    lateContext->snapshotAttempt = staleAttempt;
     lateContext->sourceInstanceInfo = MakePublicInstanceInfo();
     lateContext->completion = std::make_shared<litebus::Promise<KillResponse>>();
     lateContext->outcomeKnown = true;  // even a KNOWN stale outcome must not release
@@ -773,18 +792,23 @@ TEST_F(SnapCtrlPublicChainTest, StaleAttemptLateCompletionTouchesNothing)
                                  lateContext, KillResponse{});
     FlushActor();
     ASSERT_AWAIT_READY(driven);
+    FlushActor();
 
-    // the live unknown entry survived the stale completion: new requests
-    // stay busy, and the same pinned request can still re-query
-    auto other = PublicSnapshot("pub-9");
+    // 4) the live entry survived the stale completion UNCHANGED
+    ASSERT_EQ(1u, actor_->unknownReusable_.size());
+    const auto afterEntry = actor_->unknownReusable_.at(INSTANCE_ID);
+    EXPECT_EQ(liveAttempt, afterEntry.attempt);
+    EXPECT_EQ(liveRequestID, afterEntry.requestID);
+
+    // 5) new requests stay busy; the pinned request can still re-query
+    auto other = PublicSnapshot("pub-other");
     FlushActor();
     ASSERT_AWAIT_READY(other);
     EXPECT_EQ(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY),
               static_cast<int32_t>(other.Get().code()));
 
-    PublicChainAgentProbe::TypedOutcome healthy;
     agentProbe_->SetTypedOutcome(healthy);
-    auto replay = PublicSnapshot("pub-1");
+    auto replay = PublicSnapshot(liveRequestID);
     FlushActor();
     SettlePrepareOk();
     ASSERT_AWAIT_READY(replay);
