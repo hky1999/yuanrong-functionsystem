@@ -246,6 +246,9 @@ private:
 
     // Restore: download checkpoint -> add ref -> Restore RPC.
     litebus::Future<messages::StartInstanceResponse> StartBySnapshot(const SandboxdStartContext &context);
+    // managed restore: agent-materialized artifact under <base>/managed/<id>;
+    // no anonymous download, no anonymous refcount
+    litebus::Future<messages::StartInstanceResponse> StartByManagedSnapshot(const SandboxdStartContext &context);
     litebus::Future<messages::StartInstanceResponse> OnCheckpointDownloaded(const std::string &checkpointPath,
                                                                             const SandboxdStartContext &context);
     litebus::Future<messages::StartInstanceResponse> OnCheckpointRefAdded(const Status &refStatus,

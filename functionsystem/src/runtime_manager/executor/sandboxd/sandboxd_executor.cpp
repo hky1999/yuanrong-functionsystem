@@ -437,13 +437,23 @@ litebus::Future<messages::StartInstanceResponse> SandboxdExecutor::StartInstance
     auto guard = std::make_shared<SandboxdStartGuard>(stateManager_, runtimeID, promise.GetFuture());
     SandboxdStartContext context{request, cmdArgs, port, envs, cardIDs, guard};
 
+    const bool managedRestore = !info.restoresnapshotid().empty();
     YRLOG_INFO("{}|{}|StartInstance: route to {}",
                info.traceid(), info.requestid(),
-               isWarmUp ? "WarmUp" : (info.snapshotinfo().checkpointid().empty() ? "Normal" : "Restore"));
+               isWarmUp ? "WarmUp"
+                        : (managedRestore ? "ManagedRestore"
+                                          : (info.snapshotinfo().checkpointid().empty() ? "Normal" : "Restore")));
 
     litebus::Future<messages::StartInstanceResponse> future;
     if (isWarmUp) {
         future = StartWarmUp(request, cmdArgs, port, envs, guard);
+    } else if (managedRestore) {
+        // MANAGED restore: the FunctionAgent materialized the artifact
+        // under <checkpoint_base>/managed/<restoresnapshotid> and set the
+        // runtime-instance restore id. This must NEVER fall through to
+        // StartNormal (a silent fresh instance) and never enter the
+        // anonymous DownloadForRestore/AddRef refcount world.
+        future = StartByManagedSnapshot(context);
     } else if (!info.snapshotinfo().checkpointid().empty()) {
         future = StartBySnapshot(context);
     } else {
@@ -577,6 +587,62 @@ litebus::Future<messages::StartInstanceResponse> SandboxdExecutor::StartBySnapsh
         ->DownloadForRestore(snapshotInfo.checkpointid(), snapshotInfo.storage(), info.requestid(),
                              snapshotInfo.sha256(), snapshotInfo.size())
         .Then(litebus::Defer(GetAID(), &SandboxdExecutor::OnCheckpointDownloaded, std::placeholders::_1, context));
+}
+
+litebus::Future<messages::StartInstanceResponse> SandboxdExecutor::StartByManagedSnapshot(
+    const SandboxdStartContext &context)
+{
+    const auto &request = context.request;
+    const auto &info = request->runtimeinstanceinfo();
+    const auto &restoreID = info.restoresnapshotid();
+
+    // identity-component safety before any path join (traversal guard)
+    if (restoreID.find('/') != std::string::npos || restoreID.find('\\') != std::string::npos
+        || restoreID.find('\0') != std::string::npos || restoreID == "." || restoreID == "..") {
+        ReportSandboxLifecycleStatus(info, info.runtimeid(), SandboxLifecycleStatus::ABNORMAL);
+        return GenFailStartInstanceResponse(request, StatusCode::PARAMETER_ERROR,
+                                            "managed restore identity is invalid");
+    }
+    const auto managedPath =
+        (std::filesystem::path(checkpointDir_) / "managed" / restoreID).lexically_normal();
+    std::error_code ec;
+    if (!std::filesystem::is_directory(managedPath, ec) || ec) {
+        ReportSandboxLifecycleStatus(info, info.runtimeid(), SandboxLifecycleStatus::ABNORMAL);
+        return GenFailStartInstanceResponse(request, StatusCode::RUNTIME_MANAGER_CHECKPOINT_FAILED,
+                                            "managed restore artifact directory missing: " + managedPath.string());
+    }
+
+    YRLOG_INFO("{}|{}|StartByManagedSnapshot: instance({}) runtime({}) managed checkpoint({})",
+               info.traceid(), info.requestid(), info.instanceid(), info.runtimeid(), restoreID);
+
+    SandboxdRequestBuilder builder{cmdBuilder_};
+    SandboxdStartParams params;
+    params.request   = request;
+    params.cmdArgs   = context.cmdArgs;
+    params.envs      = context.envs;
+    params.runtimeID = info.runtimeid();
+    params.registeredTemplateIDs = registeredTemplateIDs_;
+    auto [status, startReq] = builder.Build(params);
+    if (!status.IsOk()) {
+        ReportSandboxLifecycleStatus(info, info.runtimeid(), SandboxLifecycleStatus::ABNORMAL);
+        return GenFailStartInstanceResponse(request, status.StatusCode(), status.RawMessage());
+    }
+    auto restoreReq = std::make_shared<runtime::v1::RestoreRequest>();
+    *restoreReq->mutable_sandbox() = *startReq;
+    restoreReq->set_checkpoint_dir(managedPath.string());
+    restoreReq->set_checkpoint_id(restoreID);
+    // identity/integrity fields: only when the request carries a complete
+    // snapshotinfo (all-or-nothing contract; the reusable chain restores
+    // without snapshotinfo and takes the dir-verified path here)
+    const auto &snapshotInfo = info.snapshotinfo();
+    if (!snapshotInfo.sandbox_id().empty() && !snapshotInfo.sha256().empty() && snapshotInfo.size() > 0) {
+        restoreReq->mutable_sandbox()->set_sandbox_id(snapshotInfo.sandbox_id());
+        restoreReq->set_expected_sha256(snapshotInfo.sha256());
+        restoreReq->set_expected_size(snapshotInfo.size());
+    }
+    return sandboxd_->Restore(restoreReq)
+        .Then(litebus::Defer(GetAID(), &SandboxdExecutor::OnStartCompleted, info.runtimeid(),
+                             std::placeholders::_1));
 }
 
 litebus::Future<messages::StartInstanceResponse> SandboxdExecutor::OnCheckpointDownloaded(
