@@ -171,7 +171,8 @@ Status LocalSnapshotStore::InspectArtifact(const fs::path &directory, uint64_t &
     return Status::OK();
 }
 
-LocalSnapshotPrepareResult LocalSnapshotStore::Prepare(const LocalSnapshotCommitRequest &request)
+LocalSnapshotPrepareResult LocalSnapshotStore::Prepare(const LocalSnapshotCommitRequest &request,
+                                                        PrepareLeaf leaf)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     auto status = ValidateCommitRequest(request);
@@ -197,6 +198,18 @@ LocalSnapshotPrepareResult LocalSnapshotStore::Prepare(const LocalSnapshotCommit
     }
     if (error && error != std::errc::no_such_file_or_directory) {
         return {Status(StatusCode::FAILED, "inspect local artifact directory: " + error.message()), {}};
+    }
+    if (leaf == PrepareLeaf::LeaveAbsentForDaemon) {
+        // Physical checkpoint: the daemon publishes the final directory
+        // atomically (staging sibling + rename). A pre-created empty leaf is
+        // precisely the "checkpoint directory is incomplete" state its
+        // PublishAt refuses — keep the leaf absent, only ensure the root.
+        std::error_code rootError;
+        fs::create_directories(checkpointRoot_, rootError);
+        if (rootError) {
+            return {Status(StatusCode::FAILED, "ensure local artifact root: " + rootError.message()), {}};
+        }
+        return {Status::OK(), directory, false};
     }
     if (!fs::create_directory(directory, error) || error) {
         return {Status(StatusCode::FAILED, "create local artifact directory: " + error.message()), {}};

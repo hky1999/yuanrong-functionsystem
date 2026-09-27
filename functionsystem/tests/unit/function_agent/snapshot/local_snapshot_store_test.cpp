@@ -247,5 +247,73 @@ TEST_F(LocalSnapshotStoreTest, LruDoesNotKeepPhantomRemoteRecord)
     EXPECT_EQ(store_->List().front().snapshotID, "checkpoint-b");
 }
 
+// ── daemon atomic-publish leaf contract (sandboxd checkpoint store) ─────────
+// The daemon's PublishAt creates the final artifact directory ATOMICALLY from
+// a staging sibling and rejects a pre-existing incomplete final directory
+// with failed-precondition ("checkpoint directory is incomplete" — the
+// pc-snapshot-67e5-1 physical failure). Its own real-storage Go tests
+// (internal/checkpoint/store_test.go: PublishAt replay on complete dirs,
+// rejection on pre-existing/incomplete and foreign-identity dirs) pin the
+// daemon side; these tests pin the Agent side of that boundary.
+
+TEST_F(LocalSnapshotStoreTest, PhysicalPrepareLeavesFinalLeafAbsent)
+{
+    // First physical checkpoint on a clean id: Prepare succeeds WITHOUT
+    // creating the final directory — only the managed root is ensured.
+    const auto prepared = store_->Prepare(
+        Request("snap-phys-1"), LocalSnapshotStore::PrepareLeaf::LeaveAbsentForDaemon);
+    ASSERT_TRUE(prepared.status.IsOk()) << prepared.status.ToString();
+    EXPECT_FALSE(prepared.replayed);
+    EXPECT_EQ(prepared.directory, root_ / "snap-phys-1");
+    EXPECT_TRUE(fs::is_directory(root_));
+    EXPECT_FALSE(fs::exists(root_ / "snap-phys-1"))
+        << "a pre-created leaf is exactly the incomplete state the daemon must reject";
+    // DiscardPrepared on a never-created leaf is an idempotent no-op
+    EXPECT_TRUE(store_->DiscardPrepared("snap-phys-1").IsOk());
+    EXPECT_FALSE(fs::exists(root_ / "snap-phys-1"));
+}
+
+TEST_F(LocalSnapshotStoreTest, PhysicalPrepareReplaysCompleteCommittedArtifact)
+{
+    // A complete, committed artifact replays identically in physical mode —
+    // the daemon's InspectAt/MatchSource acceptance path.
+    Commit("snap-phys-2", "payload");
+    const auto replay = store_->Prepare(
+        Request("snap-phys-2"), LocalSnapshotStore::PrepareLeaf::LeaveAbsentForDaemon);
+    ASSERT_TRUE(replay.status.IsOk()) << replay.status.ToString();
+    EXPECT_TRUE(replay.replayed);
+}
+
+TEST_F(LocalSnapshotStoreTest, PhysicalPrepareRejectsForeignOrIncompleteLeaf)
+{
+    // A leaf WITHOUT a committed record conflicts in BOTH modes: the
+    // residue/foreign-identity guards stay exactly as before, and the leaf
+    // is never removed to force progress.
+    const auto request = Request("snap-phys-3");
+    const auto prepared = store_->Prepare(request);  // materialization mode creates it
+    ASSERT_TRUE(prepared.status.IsOk());
+    Write(prepared.directory / "checkpoint.img", "partial");
+
+    const auto physical = store_->Prepare(
+        request, LocalSnapshotStore::PrepareLeaf::LeaveAbsentForDaemon);
+    EXPECT_FALSE(physical.status.IsOk());
+    EXPECT_FALSE(physical.replayed);
+    const auto materialAgain = store_->Prepare(request);
+    EXPECT_FALSE(materialAgain.status.IsOk()) << "materialization guard is unchanged";
+
+    EXPECT_TRUE(fs::exists(prepared.directory))
+        << "the foreign leaf stays in place for inspection";
+}
+
+TEST_F(LocalSnapshotStoreTest, MaterializationPrepareStillCreatesLeaf)
+{
+    // Remote materialization (distributed-storage download) genuinely writes
+    // into the directory and keeps the original create-leaf behavior.
+    const auto prepared = store_->Prepare(Request("snap-remote-1"));
+    ASSERT_TRUE(prepared.status.IsOk()) << prepared.status.ToString();
+    EXPECT_FALSE(prepared.replayed);
+    EXPECT_TRUE(fs::is_directory(root_ / "snap-remote-1"));
+}
+
 }  // namespace
 }  // namespace functionsystem::function_agent

@@ -65,7 +65,20 @@ class LocalSnapshotStore {
 public:
     explicit LocalSnapshotStore(std::filesystem::path checkpointRoot, uint64_t maxCacheBytes = 0);
 
-    LocalSnapshotPrepareResult Prepare(const LocalSnapshotCommitRequest &request);
+    // Leaf policy of Prepare: the final artifact directory is created only
+    // when the CALLER materializes the artifact into it (remote download).
+    // A local PHYSICAL checkpoint must leave the leaf ABSENT — the daemon
+    // (sandboxd checkpoint store PublishAt) creates the final directory
+    // atomically from a staging sibling and REJECTS a pre-existing
+    // incomplete final directory with failed-precondition. Pre-creating the
+    // leaf here is exactly the state the daemon must refuse.
+    enum class PrepareLeaf {
+        CreateForMaterialization,
+        LeaveAbsentForDaemon,
+    };
+
+    LocalSnapshotPrepareResult Prepare(const LocalSnapshotCommitRequest &request,
+        PrepareLeaf leaf = PrepareLeaf::CreateForMaterialization);
     LocalSnapshotCommitResult Commit(const LocalSnapshotCommitRequest &request);
     std::vector<LocalSnapshotDescriptor> List() const;
     Status ValidateForRestore(const std::string &snapshotID, LocalSnapshotDescriptor &descriptor);

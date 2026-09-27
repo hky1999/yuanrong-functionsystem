@@ -215,7 +215,12 @@ void AgentServiceActor::SnapshotRuntime(const litebus::AID &from, std::string &&
         pending.storageBackend = "local";
     }
 
-    const auto prepared = localSnapshotStore_->Prepare(pending.localCommitRequest);
+    // Physical checkpoint: the final directory is the daemon's atomic
+    // publish target and must stay ABSENT (sandboxd PublishAt rejects a
+    // pre-created incomplete leaf with failed-precondition). Only remote
+    // materialization creates the leaf itself.
+    const auto prepared = localSnapshotStore_->Prepare(
+        pending.localCommitRequest, LocalSnapshotStore::PrepareLeaf::LeaveAbsentForDaemon);
     if (prepared.status.IsError()) {
         response.set_code(static_cast<int32_t>(prepared.status.StatusCode()));
         response.set_message(prepared.status.RawMessage());
