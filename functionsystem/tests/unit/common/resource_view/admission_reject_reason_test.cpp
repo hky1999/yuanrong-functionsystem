@@ -110,7 +110,7 @@ TEST_F(AdmissionRejectReasonTest, StatusCodeUnchanged)
     AdmissionReserve extra{0, 100};
     auto result = CheckResourceHeadroomWithReason(unit, extra);
     ASSERT_FALSE(result.status.IsOk());
-    EXPECT_EQ(result.status.Code(), StatusCode::RESOURCE_NOT_ENOUGH);
+    EXPECT_EQ(result.status.StatusCode(), StatusCode::RESOURCE_NOT_ENOUGH);
     EXPECT_NE(result.status.ToString().find("Atomic Admission Rejected"),
               std::string::npos);
 }
