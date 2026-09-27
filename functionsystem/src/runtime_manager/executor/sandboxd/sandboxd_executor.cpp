@@ -321,7 +321,32 @@ SandboxdExecutor::SandboxdExecutor(const std::string &name, const litebus::AID &
       checkpointDir_(checkpointDir.empty() ? DEFAULT_CHECKPOINT_DIR : checkpointDir),
       availableRuntimesCallback_(std::move(availableRuntimesCallback))
 {
-    const std::string &dir = checkpointDir_;
+    // anonymous cache sub-root: the CkptFileManager TTL scan and the
+    // legacy minted-id fallback operate ONLY here — never on the agent's
+    // 'managed' sibling, whose artifacts this manager must not own
+    const auto baseDir = std::filesystem::path(checkpointDir_).lexically_normal();
+    const auto anonymousRoot = (baseDir / "anonymous").lexically_normal();
+    // Upgrade gate (empty-old-cache only): this deployment generation does
+    // NOT migrate a legacy populated cache root. If the base holds anything
+    // other than the new 'anonymous'/'managed' sub-roots, refuse to start —
+    // a pre-existing populated cache or live parked records require the
+    // separately-tracked migration before upgrade. Never auto-move, never
+    // scan/delete unexpected entries.
+    std::error_code gateError;
+    if (std::filesystem::exists(baseDir, gateError)) {
+        for (const auto &entry : std::filesystem::directory_iterator(baseDir)) {
+            const auto name = entry.path().filename().string();
+            if (name == "anonymous" || name == "managed" || (!name.empty() && name[0] == '.')) {
+                continue;
+            }
+            YRLOG_ERROR("legacy checkpoint cache not empty (found {}); "
+                        "refusing to start: empty-old-cache upgrade only, "
+                        "migration is a separate tracked gap",
+                        entry.path().string());
+            std::terminate();
+        }
+    }
+    const std::string dir = anonymousRoot.string();
     auto ckptActor = std::make_shared<CkptFileManagerActor>(name + "_CkptFileManager", dir);
     litebus::Spawn(ckptActor);
     ckptFileManager_ = std::make_shared<CkptFileManager>(ckptActor);
@@ -357,7 +382,7 @@ void SandboxdExecutor::InitConfig()
     }
     // ckptOrch_ MUST be created after sandboxd_ is set. Sync() runs after.
     ckptOrch_ = std::make_shared<SandboxdCheckpointOrchestrator>(GetAID(), sandboxd_, ckptFileManager_, stateManager_,
-                                                                checkpointDir_);
+                                                                anonymousRoot.string());
     Sync();
 }
 

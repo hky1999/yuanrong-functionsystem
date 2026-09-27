@@ -117,7 +117,8 @@ private:
         // generation）：上传与落账前用它复核沙箱未被同 runtimeID 顶替
         std::string registrationID;
         std::string resourceGeneration;
-    };
+        bool managed{false};
+};
 
     litebus::Future<messages::SnapshotRuntimeResponse> OnCheckpointDone(
         const runtime::v1::CheckpointResponse &ckptResponse, const SnapshotContext &context);

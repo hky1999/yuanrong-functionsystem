@@ -141,7 +141,8 @@ litebus::Future<messages::SnapshotRuntimeResponse> SandboxdCheckpointOrchestrato
     ckptReq->set_include_filesystem(true);
 
     SnapshotContext context{
-        requestID, runtimeID, checkpointID, checkpointPath, sandboxID, ttl, registrationID, resourceGeneration};
+        requestID, runtimeID, checkpointID, checkpointPath, sandboxID, ttl, registrationID, resourceGeneration,
+        /*managed=*/!request->snapshotid().empty()};
     return DoCheckpoint(ckptReq, resourceGeneration).Then(
         litebus::Defer(ownerAID_,
             [self = shared_from_this(), context](const runtime::v1::CheckpointResponse &response) {
@@ -193,13 +194,35 @@ litebus::Future<messages::SnapshotRuntimeResponse> SandboxdCheckpointOrchestrato
         return response;
     }
 
-    YRLOG_INFO("{}|checkpoint succeeded, uploading checkpoint({}) for runtime({})", context.requestID,
-               context.checkpointID, context.runtimeID);
-
     // Birth identity stays authoritative through the asynchronous upload; the
     // daemon echo was verified above to match it exactly.
     response.mutable_snapshotinfo()->set_source_generation(context.resourceGeneration);
     response.mutable_snapshotinfo()->set_source_runtime_id(context.runtimeID);
+
+    if (context.managed) {
+        // MANAGED artifact (caller provided identity + staging directory):
+        // the FunctionAgent's local-snapshot store owns the artifact
+        // lifecycle (Commit/Publish/delete under this id). Do NOT enter the
+        // anonymous cache chain at all — no RegisterCheckpoint (whose TTL
+        // registration starts at refCount=0), no AddRef, no
+        // SetCheckpointID(runtimeID->checkpointID) mapping, so source
+        // retirement's ReleaseRef can never put this artifact on the
+        // anonymous TTL path. The Agent publishes to remote storage itself
+        // (PublishSnapshotArtifact) and guards the returned identity
+        // (checkpointid == its request snapshotid).
+        YRLOG_INFO("{}|managed checkpoint({}) complete for runtime({}); agent-owned, "
+                   "anonymous cache skipped",
+                   context.requestID, context.checkpointID, context.runtimeID);
+        auto *info = response.mutable_snapshotinfo();
+        info->set_checkpointid(context.checkpointID);
+        info->set_sandbox_id(context.sandboxID);
+        response.set_code(static_cast<int32_t>(StatusCode::SUCCESS));
+        response.set_message("managed checkpoint created");
+        return response;
+    }
+
+    YRLOG_INFO("{}|checkpoint succeeded, uploading checkpoint({}) for runtime({})", context.requestID,
+               context.checkpointID, context.runtimeID);
     ASSERT_IF_NULL(ckptFileManager_);
     return ckptFileManager_
         ->RegisterCheckpoint(context.checkpointID, context.checkpointPath, context.checkpointID, context.ttl)

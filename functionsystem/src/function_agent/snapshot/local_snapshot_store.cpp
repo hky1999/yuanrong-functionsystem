@@ -217,19 +217,6 @@ LocalSnapshotCommitResult LocalSnapshotStore::Commit(const LocalSnapshotCommitRe
     if (status.IsError()) {
         return {status, {}};
     }
-    // Ownership marker: the runtime manager's restart scan
-    // (RestoreCheckpointsFromLocal) must recognize this directory as a
-    // MANAGED artifact whose lifecycle this store owns, and must not
-    // attach the anonymous-cache TTL that would delete it later.
-    {
-        std::error_code markerError;
-        std::filesystem::permissions(directory, std::filesystem::perms::owner_write,
-                                      std::filesystem::perm_options::add, markerError);
-        const auto marker = directory / ".akernel-managed";
-        std::ofstream stream(marker, std::ios::trunc);
-        stream << request.snapshotID << "\n";
-        stream.close();
-    }
     LocalSnapshotDescriptor descriptor;
     descriptor.snapshotID = request.snapshotID;
     descriptor.recoveryCandidate = request.recoveryCandidate;

@@ -303,8 +303,15 @@ public:
             && std::filesystem::path(checkpointRoot_).is_absolute();
         const auto cacheBudget = storageMode == SnapshotStorageMode::DISTRIBUTED_CACHE
             ? localCacheMaxBytes : 0;
+        // managed artifacts live under the dedicated 'managed' sub-root:
+        // their lifecycle belongs to this store alone; the runtime
+        // manager's anonymous checkpoint cache uses the sibling
+        // 'anonymous' sub-root, so its TTL scan can never reach them
+        const auto managedRoot = validCheckpointRoot
+            ? (std::filesystem::path(checkpointRoot_) / "managed").lexically_normal()
+            : std::filesystem::path{};
         localSnapshotStore_ = validCheckpointRoot
-                                  ? std::make_shared<LocalSnapshotStore>(checkpointRoot_, cacheBudget)
+                                  ? std::make_shared<LocalSnapshotStore>(managedRoot, cacheBudget)
                                   : nullptr;
         if (snapshotStorage_ != nullptr && !checkpointRoot_.empty() && snapshotWorker_ == nullptr) {
             snapshotWorker_ = std::make_shared<ActorWorker>();
