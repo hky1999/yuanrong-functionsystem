@@ -743,6 +743,16 @@ litebus::Future<messages::StartInstanceResponse> SandboxdExecutor::OnRestoreDone
         ReportSandboxLifecycleStatus(info, info.runtimeid(), SandboxLifecycleStatus::ABNORMAL);
         // Compensate: release the checkpoint ref we added before restore
         ckptOrch_->ReleaseRef(info.runtimeid(), info.requestid());
+        // MANAGED restore allocated host ports before dispatch (the same
+        // bookkeeping as StartNormal); the start guard destructor only
+        // unregisters state and never touches PortManager, so the allocation
+        // must be released here or it leaks until process restart. The
+        // anonymous snapshot chain never allocates in this path, so it is
+        // deliberately excluded and keeps its exact legacy behavior.
+        if (!info.restoresnapshotid().empty()) {
+            stateManager_.UpdatePortMappings(info.runtimeid(), "");
+            PortManager::GetInstance().ReleasePorts(info.runtimeid());
+        }
         // guard destructor rolls back state
         return GenFailStartInstanceResponse(request, RUNTIME_MANAGER_CREATE_EXEC_FAILED, response.message());
     }

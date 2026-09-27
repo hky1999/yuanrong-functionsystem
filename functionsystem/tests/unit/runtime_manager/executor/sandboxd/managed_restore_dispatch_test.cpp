@@ -10,20 +10,34 @@
  *    NOTHING — a reusable managed request carries no snapshotinfo, so all
  *    four stay empty (sandboxd legacy dir-verified branch), never a
  *    half-filled strict request (rejected 80004 in production);
+ *  - a REAL TakeSnapshot goes out as CheckpointIfGeneration (the wrapper
+ *    proto the orchestrator actually sends): the nested CheckpointRequest
+ *    carries the agent's checkpoint_id + staging dir + leave_running +
+ *    include_filesystem, and expected_generation rides the wrapper —
+ *    CheckpointRequest itself has no generation field;
+ *  - port-forward bookkeeping follows StartNormal semantics: mappings are
+ *    allocated + recorded before dispatch, appear on the Restore RPC's
+ *    sandbox, SURVIVE success, and are RELEASED in the real PortManager
+ *    when the restore RPC fails (the start guard alone never frees them);
  *  - a missing managed artifact fails EXPLICITLY — zero Start AND zero
  *    Restore dispatches (never a silent fresh instance);
  *  - traversal-shaped ids are rejected before any RPC;
  *  - success registers the NEW sandbox id + generation in the state
- *    manager and commits the start guard (state stays active).
+ *    manager and commits the start guard (state stays active);
+ *  - the anonymous snapshot chain (snapshotinfo, no restoresnapshotid)
+ *    never allocates ports here, and a failed anonymous restore must not
+ *    disturb any PortManager allocation (legacy compatibility).
  */
 #include <grpcpp/server_builder.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -31,11 +45,13 @@
 #include "common/proto/pb/posix/sandbox_api.grpc.pb.h"
 #include "runtime_manager/executor/sandboxd/sandboxd_executor.h"
 #include "runtime_manager/healthcheck/health_check.h"
+#include "runtime_manager/port/port_manager.h"
 
 namespace {
 
 using functionsystem::StatusCode;
 using functionsystem::runtime_manager::HealthCheck;
+using functionsystem::runtime_manager::PortManager;
 using functionsystem::runtime_manager::SandboxdExecutor;
 
 struct RecordedRestore {
@@ -47,19 +63,31 @@ struct RecordedRestore {
     std::string expectedSha256;
     int64_t expectedSize = -1;
     std::string sandboxId;
+    std::vector<std::string> restorePorts;
     std::string ckptSandboxId;
     std::string ckptDir;
+    std::string ckptCheckpointId;
+    std::string ckptExpectedGeneration;
+    bool ckptLeaveRunning = false;
+    bool ckptIncludeFilesystem = false;
 };
 
 class FakeSandboxdService final : public runtime::v1::SandboxService::Service {
 public:
-    grpc::Status Checkpoint(grpc::ServerContext *, const runtime::v1::CheckpointRequest *req,
-                            runtime::v1::CheckpointResponse *rsp) override
+    // The REAL physical interface: the orchestrator sends CheckpointIfGeneration
+    // with the fence on the wrapper, never a bare Checkpoint.
+    grpc::Status CheckpointIfGeneration(grpc::ServerContext *,
+                                        const runtime::v1::CheckpointIfGenerationRequest *req,
+                                        runtime::v1::CheckpointResponse *rsp) override
     {
         const std::lock_guard<std::mutex> lock(mu_);
         ++recorded_.checkpoints;
-        recorded_.ckptSandboxId = req->id();
-        recorded_.ckptDir = req->checkpoint_dir();
+        recorded_.ckptSandboxId = req->checkpoint().id();
+        recorded_.ckptDir = req->checkpoint().checkpoint_dir();
+        recorded_.ckptCheckpointId = req->checkpoint().checkpoint_id();
+        recorded_.ckptExpectedGeneration = req->expected_generation();
+        recorded_.ckptLeaveRunning = req->checkpoint().leave_running();
+        recorded_.ckptIncludeFilesystem = req->checkpoint().include_filesystem();
         rsp->set_success(true);
         // echo the fenced generation: OnCheckpointDone requires an exact match
         rsp->set_source_generation(req->expected_generation());
@@ -76,6 +104,12 @@ public:
         recorded_.expectedSha256 = req->expected_sha256();
         recorded_.expectedSize = req->expected_size();
         recorded_.sandboxId = req->sandbox().sandbox_id();
+        recorded_.restorePorts.assign(req->sandbox().ports().begin(), req->sandbox().ports().end());
+        if (failRestore_) {
+            rsp->set_code(static_cast<int32_t>(StatusCode::RUNTIME_MANAGER_CREATE_EXEC_FAILED));
+            rsp->set_message("fake restore rejected");
+            return grpc::Status::OK;
+        }
         rsp->set_code(static_cast<int32_t>(StatusCode::SUCCESS));
         rsp->set_id("sbox-restored-1");
         rsp->set_resource_generation("gen-restore-9");
@@ -113,9 +147,16 @@ public:
         return recorded_;
     }
 
+    void SetFailRestore(bool fail)
+    {
+        const std::lock_guard<std::mutex> lock(mu_);
+        failRestore_ = fail;
+    }
+
 private:
     mutable std::mutex mu_;
     RecordedRestore recorded_;
+    bool failRestore_ = false;
 };
 
 class ManagedRestoreDispatchTest : public ::testing::Test {
@@ -173,10 +214,32 @@ protected:
         return request;
     }
 
+    // Adds one tcp port-forwarding entry (container port 18080) in the exact
+    // deploy-option shape ApplyPortForwardMappings parses in production.
+    static void AddPortForwarding(const std::shared_ptr<messages::StartInstanceRequest> &request)
+    {
+        (*request->mutable_runtimeinstanceinfo()->mutable_deploymentconfig()->mutable_deployoptions())["network"] =
+            R"({"portForwardings":[{"port":18080,"protocol":"tcp"}]})";
+    }
+
     messages::StartInstanceResponse Start(const std::shared_ptr<messages::StartInstanceRequest> &request)
     {
         return litebus::Async(executor_->GetAID(), &SandboxdExecutor::StartInstance, request,
                               std::vector<int>{}).Get();
+    }
+
+    // The guard destructor (state rollback) runs when the DoRestore continuation
+    // releases its bound copy, which may complete just after the response
+    // future resolves — poll briefly instead of asserting a strict ordering.
+    static bool WaitUnregistered(SandboxdExecutor &executor, const std::string &runtimeID)
+    {
+        for (int i = 0; i < 200; ++i) {
+            if (!executor.stateManager_.Find(runtimeID).has_value()) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
     }
 
     std::string base_;
@@ -283,9 +346,10 @@ TEST_F(ManagedRestoreDispatchTest, TraversalIdentityRejectedBeforeAnyRpc)
     EXPECT_FALSE(executor_->stateManager_.Find("rt-managed-5").has_value());
 }
 
-// REAL TakeSnapshot chain for a MANAGED request: the agent-supplied id and
-// staging directory must survive to the physical Checkpoint RPC, and the
-// completion must return the agent's id (the ov24c-1 physical failure point).
+// REAL TakeSnapshot chain for a MANAGED request: the physical RPC is
+// CheckpointIfGeneration — the wrapper carries the fence, the nested
+// CheckpointRequest carries the agent's id/staging dir/physical mode — and
+// the completion must return the agent's id (the ov24c-1 failure point).
 TEST_F(ManagedRestoreDispatchTest, ManagedTakeSnapshotCarriesAgentIdentityAndDirToCheckpointRpc)
 {
     // register a live source sandbox with a birth generation
@@ -303,6 +367,7 @@ TEST_F(ManagedRestoreDispatchTest, ManagedTakeSnapshotCarriesAgentIdentityAndDir
     request->set_checkpointdir(base_ + "/managed/snap-agent-77");
     request->set_expected_sandbox_id("sbox-src-live");
     request->set_expected_resource_generation("gen-live-1");
+    request->set_leaverunning(true);  // park semantics: keep the source alive
 
     const auto response =
         litebus::Async(executor_->GetAID(), &SandboxdExecutor::SnapshotRuntime, request).Get();
@@ -315,6 +380,13 @@ TEST_F(ManagedRestoreDispatchTest, ManagedTakeSnapshotCarriesAgentIdentityAndDir
     EXPECT_EQ(recorded.ckptSandboxId, "sbox-src-live");
     EXPECT_EQ(recorded.ckptDir, base_ + "/managed/snap-agent-77")
         << "the physical Checkpoint RPC must use the agent's staging directory";
+    EXPECT_EQ(recorded.ckptCheckpointId, "snap-agent-77")
+        << "sandboxd PR#16 requires the logical checkpoint identity on the wire";
+    EXPECT_EQ(recorded.ckptExpectedGeneration, "gen-live-1")
+        << "the generation fence rides the CheckpointIfGenerationRequest wrapper";
+    EXPECT_TRUE(recorded.ckptLeaveRunning) << "leave_running must pass through from the request";
+    EXPECT_TRUE(recorded.ckptIncludeFilesystem)
+        << "agent tools mutate the writable rootfs; memory-only park cannot restore that state";
     // managed completion never maps runtime->checkpoint in the state manager
     EXPECT_TRUE(executor_->stateManager_.GetCheckpointID("rt-snap-1").empty());
 }
@@ -342,6 +414,106 @@ TEST_F(ManagedRestoreDispatchTest, HalfPassedManagedSnapshotIdentityRejectedBefo
 
     const auto recorded = service_.Snapshot();
     EXPECT_EQ(recorded.checkpoints, 0) << "half-passed identity must never reach sandboxd";
+}
+
+// ── Managed-restore port-forward bookkeeping (real PortManager, no mocks) ─────
+
+// SUCCESS keeps the allocation: the host port picked by the REAL PortManager
+// lands on the Restore RPC's sandbox ("tcp:<host>:18080"), stays recorded in
+// the state manager, and the mapping survives into the start response.
+TEST_F(ManagedRestoreDispatchTest, ManagedRestoreWithPortsKeepsMappingsOnSuccess)
+{
+    auto request = MakeRequest("rt-port-ok", "snap-m1");
+    AddPortForwarding(request);
+
+    ASSERT_TRUE(PortManager::GetInstance().GetPorts("rt-port-ok").empty()) << "unique runtime must start clean";
+
+    const auto response = Start(request);
+    EXPECT_EQ(response.code(), static_cast<int32_t>(StatusCode::SUCCESS));
+
+    const auto held = PortManager::GetInstance().GetPorts("rt-port-ok");
+    ASSERT_EQ(held.size(), 1UL) << "success must keep the host port allocated";
+
+    const auto recorded = service_.Snapshot();
+    ASSERT_EQ(recorded.restores, 1);
+    ASSERT_EQ(recorded.restorePorts.size(), 1UL);
+    EXPECT_EQ(recorded.restorePorts[0], "tcp:" + std::to_string(held[0]) + ":18080")
+        << "the Restore RPC must carry the allocated host port mapping";
+    EXPECT_FALSE(executor_->stateManager_.GetPortMappingsJson("rt-port-ok").empty())
+        << "the canonical mapping record must survive a successful restore";
+    EXPECT_EQ(response.startruntimeinstanceresponse().port(),
+              executor_->stateManager_.GetPortMappingsJson("rt-port-ok"));
+
+    PortManager::GetInstance().ReleasePorts("rt-port-ok");  // singleton hygiene
+}
+
+// FAILURE releases the allocation in the REAL PortManager: the guard
+// destructor only unregisters state, so without the explicit failure-path
+// release the host port would leak until process restart.
+TEST_F(ManagedRestoreDispatchTest, ManagedRestoreRpcFailureReleasesAllocatedPorts)
+{
+    service_.SetFailRestore(true);
+    auto request = MakeRequest("rt-port-fail", "snap-m1");
+    AddPortForwarding(request);
+
+    const auto response = Start(request);
+    EXPECT_EQ(response.code(), static_cast<int32_t>(StatusCode::RUNTIME_MANAGER_CREATE_EXEC_FAILED));
+
+    const auto recorded = service_.Snapshot();
+    ASSERT_EQ(recorded.restores, 1) << "the failure must come from the physical Restore RPC";
+    ASSERT_EQ(recorded.restorePorts.size(), 1UL) << "ports were allocated and dispatched before the failure";
+
+    EXPECT_TRUE(PortManager::GetInstance().GetPorts("rt-port-fail").empty())
+        << "a failed managed restore must return the host port to the pool";
+    EXPECT_TRUE(executor_->stateManager_.GetPortMappingsJson("rt-port-fail").empty())
+        << "the recorded mapping must be cleared with the allocation";
+    EXPECT_TRUE(WaitUnregistered(*executor_, "rt-port-fail"))
+        << "guard rollback must eventually unregister the failed runtime";
+}
+
+// LEGACY compatibility: the anonymous snapshot chain (snapshotinfo, no
+// restoresnapshotid) never allocates ports in this path, and its restore
+// failure must not disturb ANY PortManager allocation — an unrelated
+// runtime's reserved ports survive untouched.
+TEST_F(ManagedRestoreDispatchTest, AnonymousRestoreFailureLeavesPortManagerUntouched)
+{
+    // a locally registered anonymous artifact so the real chain runs:
+    // DownloadForRestore short-circuits to the on-disk copy, AddRef succeeds,
+    // and the failure lands in OnRestoreDone with restoresnapshotid EMPTY.
+    const std::string anonID = "anon-compat-1";
+    const std::string anonDir = base_ + "/anonymous/" + anonID;
+    std::filesystem::create_directories(anonDir);
+    { std::ofstream f(anonDir + "/checkpoint.img", std::ios::binary); f << "anonymous-artifact"; }
+    // register through the executor's OWN manager (KV is uninitialized in the
+    // test process, so registration stays local-only): Future<Status>-style
+    // semantics — the outcome is a completed result value, not an exception
+    const auto registered = executor_->ckptFileManager_->RegisterCheckpoint(anonID, anonDir, anonID, 60).Get();
+    ASSERT_EQ(registered.storageUrl, anonID + ".zip") << "registration must succeed before the restore";
+
+    auto request = MakeRequest("rt-anon-fail", "");
+    auto *snap = request->mutable_runtimeinstanceinfo()->mutable_snapshotinfo();
+    snap->set_checkpointid(anonID);
+    snap->set_storage(anonID + ".zip");  // sha/size/sandbox_id empty: legacy quartet
+
+    // an unrelated runtime holds a real allocation that must survive
+    const auto bystander = PortManager::GetInstance().RequestPorts("rt-port-bystander", 1);
+    ASSERT_EQ(bystander.size(), 1UL);
+
+    service_.SetFailRestore(true);
+    const auto response = Start(request);
+    EXPECT_EQ(response.code(), static_cast<int32_t>(StatusCode::RUNTIME_MANAGER_CREATE_EXEC_FAILED));
+
+    const auto recorded = service_.Snapshot();
+    EXPECT_EQ(recorded.restores, 1);
+    EXPECT_TRUE(recorded.restorePorts.empty())
+        << "the anonymous chain never puts port mappings on the wire";
+    EXPECT_TRUE(PortManager::GetInstance().GetPorts("rt-anon-fail").empty());
+
+    const auto survivor = PortManager::GetInstance().GetPorts("rt-port-bystander");
+    ASSERT_EQ(survivor.size(), 1UL);
+    EXPECT_EQ(survivor[0], bystander[0]) << "an anonymous restore failure must never free a bystander's port";
+
+    PortManager::GetInstance().ReleasePorts("rt-port-bystander");  // singleton hygiene
 }
 
 // The executor-constructed anonymous cache root: the ckpt manager the
