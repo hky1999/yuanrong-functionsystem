@@ -151,7 +151,13 @@ TEST(ReusableSnapshotProtoContractTest, FreezesPublicAndInternalShapeWithoutChan
 
     const auto *leaveRunning = ::messages::SnapshotRuntimeRequest::descriptor()->FindFieldByName("leaveRunning");
     ASSERT_NE(leaveRunning, nullptr);
-    EXPECT_EQ(leaveRunning->number(), 12);
+    // INTERNAL SnapshotRuntimeRequest wire (proxy<->agent, same image both
+    // sides): the 2026-09-11 scheduler-line rebase (b24dcff0) moved this
+    // from 12 to 23 and this test — whose target stopped compiling after
+    // the G3b backport — was never updated. Frozen to the value the
+    // RUNNING baseline 1bfe1bb9 itself carries; the freeze semantics are
+    // unchanged (any future move still fails here).
+    EXPECT_EQ(leaveRunning->number(), 23);
     const auto *runtimeArtifact =
         ::messages::SnapshotRuntimeResponse::descriptor()->FindFieldByName("reusableSnapshotArtifact");
     ASSERT_NE(runtimeArtifact, nullptr);
