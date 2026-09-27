@@ -135,9 +135,20 @@ add_executable(${PAUSE_RESUME_UNIT_TEST}
 # Real SnapCtrlActor public-chain fixture tests (restored type=SNAPSHOT
 # chain): the actor is instantiated and driven through litebus; only the
 # service boundaries are mocks.
+# Targeted regression set for the snapshot protocol fix: the NEW real-actor
+# public-chain fixture plus EXISTING test files moved in verbatim (no
+# assertion changes): the wire regression, the store proto contract, and
+# the identity-carrying relay (conditional snapshot) direct-callback
+# tests. The legacy snap_ctrl_actor_test.cpp TU stays out of this target:
+# it references MockInstanceCtrl methods removed from the current mock
+# (BeginPauseGate/ReleasePausedInstanceResources) and cannot compile as-is;
+# that compatibility gap is registered, and the old suite is NOT claimed.
 add_executable(snap_ctrl_public_chain_test
         main.cpp
-        function_proxy/local_scheduler/snap_ctrl/snap_ctrl_public_chain_test.cpp)
+        function_proxy/local_scheduler/snap_ctrl/snap_ctrl_public_chain_test.cpp
+        function_proxy/local_scheduler/snap_ctrl/snap_options_wire_test.cpp
+        function_master/snap_manager/reusable_snapshot_proto_test.cpp
+        function_proxy/local_scheduler/function_agent_manager/conditional_snapshot_test.cpp)
 target_compile_options(snap_ctrl_public_chain_test PRIVATE
         -Wno-error
         -fno-access-control
