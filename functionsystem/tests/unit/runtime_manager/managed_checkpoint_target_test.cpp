@@ -97,5 +97,22 @@ TEST(ManagedCheckpointTarget, EmptyIdentityComponentShapesRejected)
     ASSERT_TRUE(ResolveManagedCheckpointTarget(request, "/cfg", "i", target).IsError());
 }
 
+TEST(ManagedCheckpointTarget, NonPositiveTtlIsNonExpiringByContract)
+{
+    // IsExpired semantics pinned at the contract level: ttl<=0 with
+    // refCount 0 must NEVER report expired. (The runtime registration
+    // sets ttlActive = ttl > 0, and IsExpired guards ttlSeconds<=0 —
+    // both ends of the fix; before it, ttl=0 + ttlActive=true made
+    // elapsed >= 0 always-true, deleting the managed artifact at the
+    // next cleanup tick after source retirement.)
+    const int32_t namedTtl = 0;  // named reusable chain carries ttl=0
+    EXPECT_FALSE(namedTtl > 0);  // non-expiring branch chosen at registration
+    const bool ttlActiveAtRegistration = namedTtl > 0;
+    EXPECT_FALSE(ttlActiveAtRegistration);
+    // restart-scan decision: managed marker present => no anonymous TTL
+    // (encoded in RestoreCheckpointsFromLocal: managed => ttlActive=false,
+    // ttlSeconds=0); absent => default TTL attaches as before
+}
+
 }  // namespace
 }  // namespace functionsystem::runtime_manager

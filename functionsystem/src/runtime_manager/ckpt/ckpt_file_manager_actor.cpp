@@ -392,7 +392,12 @@ void CkptFileManagerActor::OnUploadSuccess(
     info.size = result.size;
     info.refCount = 0;  // Start with 0, will be incremented when used for restore
     info.ttlSeconds = ttl;  // Set TTL from parameter
-    info.ttlActive = true;  // Start TTL immediately since refCount is 0
+    // ttl <= 0 means NON-EXPIRING (the named reusable-snapshot chain
+    // carries ttl=0 by contract): no TTL timer at all. A zero timer with
+    // ttlActive=true would make IsExpired (elapsed >= ttlSeconds) true on
+    // the very next cleanup tick once refCount returns to 0 — silently
+    // deleting the managed artifact at source retirement.
+    info.ttlActive = ttl > 0;
     info.createdTime = std::chrono::steady_clock::now();
     info.lastAccessTime = info.createdTime;
     info.ttlStartTime = info.createdTime;  // Start TTL timer now
@@ -492,6 +497,11 @@ bool CkptFileManagerActor::IsExpired(const CheckpointFileInfo &info) const
     if (!info.ttlActive || info.refCount > 0) {
         return false;
     }
+    if (info.ttlSeconds <= 0) {
+        // defensive: a non-positive TTL is the non-expiring contract,
+        // never an immediate expiry (elapsed >= 0 would always be true)
+        return false;
+    }
 
     auto now = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - info.ttlStartTime).count();
@@ -559,15 +569,22 @@ void CkptFileManagerActor::RestoreCheckpointsFromLocal()
                 continue;
             }
 
-            // Create checkpoint info with default settings
+            // Managed artifacts (named reusable-snapshot chain) carry a
+            // marker file written by the FunctionAgent's local-snapshot
+            // store at Commit: their lifecycle belongs to that store, so
+            // the restart scan must NOT attach the anonymous-cache TTL —
+            // otherwise a proxy restart silently reclaims them 30 minutes
+            // later even though the runtime registration was non-expiring.
+            const bool managed = std::filesystem::exists(
+                entry.path() / ".akernel-managed");
             CheckpointFileInfo info;
             info.checkpointID = checkpointID;
             info.localPath = localPath;
             info.storageUrl = "";  // Unknown after restart
             info.refCount = 0;  // Start with 0 references
-            info.ttlActive = true;  // Start TTL immediately
+            info.ttlActive = !managed;  // managed => no anonymous TTL
             info.ttlStartTime = std::chrono::steady_clock::now();
-            info.ttlSeconds = defaultTTLSeconds_;
+            info.ttlSeconds = managed ? 0 : defaultTTLSeconds_;
             info.createdTime = std::chrono::steady_clock::now();
             info.lastAccessTime = std::chrono::steady_clock::now();
 
