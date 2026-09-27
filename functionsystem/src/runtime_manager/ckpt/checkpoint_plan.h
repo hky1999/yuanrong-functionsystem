@@ -75,22 +75,17 @@ inline Status BuildCheckpointPlan(const messages::SnapshotRuntimeRequest &reques
     return Status::OK();
 }
 
-}  // namespace functionsystem::runtime_manager
 
-#endif  // FUNCTIONSYSTEM_SRC_RUNTIME_MANAGER_CKPT_CHECKPOINT_PLAN_H
-
-// Managed-checkpoint target for the sandboxd executor: when the caller
-// (FunctionAgent, on behalf of the named reusable-snapshot chain or the
-// replay-aware anonymous path) provides a snapshot identity and a
-// prepared staging directory, the checkpoint MUST be taken under THAT
-// identity and path — the Agent's local-snapshot store prepared the
-// staging directory, validates the returned identity against its request
-// (agent_service_snapshot.cpp checkpointid==snapshotid guard), and
-// commits/publishes under the same id. Ignoring them strands a
+// Managed-checkpoint target for the sandboxd executor: ALL-OR-NOTHING.
+// When the caller (FunctionAgent, on behalf of the named
+// reusable-snapshot chain or the replay-aware anonymous path) provides
+// EITHER of the managed fields (snapshot identity / prepared staging
+// directory), BOTH must be present — the Agent's contract resolves the
+// directory before execution (BuildCheckpointPlan) and guards the
+// returned identity against its request; a half-passed pair strands a
 // physically-successful checkpoint under an unreachable identity (first
-// ov24c physical case: code-0 checkpoint, then agent guard
-// ERR_PARAM_INVALID). Legacy callers that pass neither keep the minted
-// timestamped id under the configured base directory.
+// ov24c physical case). Legacy callers that pass NEITHER keep the
+// minted timestamped id under the configured base directory.
 struct ManagedCheckpointTarget {
     std::string checkpointID;
     std::string checkpointPath;
@@ -101,6 +96,12 @@ inline Status ResolveManagedCheckpointTarget(const messages::SnapshotRuntimeRequ
                                              const std::string &instanceID,
                                              ManagedCheckpointTarget &target)
 {
+    const bool hasID = !request.snapshotid().empty();
+    const bool hasDir = !request.checkpointdir().empty();
+    if (hasID != hasDir) {
+        return Status(StatusCode::PARAMETER_ERROR,
+                      "managed checkpoint requires both snapshot identity and resolved directory");
+    }
     std::string id = request.snapshotid();
     if (id.empty()) {
         id = "ckpt-" + instanceID + "-"
@@ -121,3 +122,7 @@ inline Status ResolveManagedCheckpointTarget(const messages::SnapshotRuntimeRequ
     target.checkpointPath = normalized.string();
     return Status::OK();
 }
+
+}  // namespace functionsystem::runtime_manager
+
+#endif  // FUNCTIONSYSTEM_SRC_RUNTIME_MANAGER_CKPT_CHECKPOINT_PLAN_H
