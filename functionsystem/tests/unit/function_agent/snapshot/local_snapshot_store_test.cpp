@@ -20,10 +20,13 @@ namespace fs = std::filesystem;
 
 TEST(LocalSnapshotProtoTest, UsesStableInternalFieldNumbers)
 {
+    // Pinned to the CURRENT shipped message.proto (the old pin 13 predates
+    // the renumbered wire and only survived because this TU never compiled
+    // in the registered-broken pause_resume target).
     const auto *candidate = messages::SnapshotRuntimeRequest::descriptor()
         ->FindFieldByName("localRecoveryCandidate");
     ASSERT_NE(candidate, nullptr);
-    EXPECT_EQ(candidate->number(), 13);
+    EXPECT_EQ(candidate->number(), 24);
     const auto *localSnapshot = messages::SnapshotRuntimeResponse::descriptor()
         ->FindFieldByName("localSnapshot");
     ASSERT_NE(localSnapshot, nullptr);
