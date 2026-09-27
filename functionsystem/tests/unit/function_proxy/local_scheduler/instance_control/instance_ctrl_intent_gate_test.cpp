@@ -211,8 +211,12 @@ TEST_F(InstanceCtrlIntentGateTest, RealEntryResolvedContextFlowsIntoCreateAndSyn
         }));
     auto runtimePromise = std::make_shared<litebus::Promise<messages::ScheduleResponse>>();
     auto future = runtimePromise->GetFuture();
-    litebus::Async(instanceCtrlActor_->GetAID(), &InstanceCtrlActor::DoAuthorizeCreate, MakeMeta(), scheduleReq,
-                   runtimePromise);
+    auto chain = litebus::Async(instanceCtrlActor_->GetAID(), &InstanceCtrlActor::DoAuthorizeCreate, MakeMeta(),
+                                scheduleReq, runtimePromise);
+    // wait the FULL chain future BEFORE reading actor-side objects: the
+    // response future can complete while the chain continuation is still
+    // touching the request/probe on the actor strand
+    ASSERT_AWAIT_READY_FOR(chain, 10000);
     ASSERT_AWAIT_READY_FOR(future, 10000);
     EXPECT_EQ(future.Get().message(), probeView_->sentinel.message())
         << "only the duplicate short-circuit can resolve this future";
