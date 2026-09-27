@@ -226,7 +226,32 @@ Status ResourceViewActor::ReserveResize(const messages::ResizeSandboxRequest &re
         total.cpuMillicores += added.cpuMillicores;
         total.memoryMb += added.memoryMb;
         const auto verdict = CheckResourceHeadroom(unit->second, total);
-        if (!verdict.IsOk()) { return verdict; }
+        if (!verdict.IsOk()) {
+            // Structured read-only rejection log: the observation-fault test
+            // facility matches THIS line by request/operation/instance ID +
+            // outcome=rejected + the observation-specific reason. The
+            // sample timestamps let the test prove the C++ consumer
+            // actually saw a stale/unknown observation (not just a
+            // capacity shortfall).
+            const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            const bool memStale = UsableNodeMemorySampleTime(
+                unit->second, nowMs, DEFAULT_RESOURCE_SAMPLE_MAX_AGE_MS) == 0;
+            const bool cpuStale = UsableNodeCPUSampleTime(
+                unit->second, nowMs, DEFAULT_RESOURCE_SAMPLE_MAX_AGE_MS) == 0;
+            YRLOG_WARN("resize admission REJECTED instance={} runtime={} request={} sandbox={} generation={} "
+                       "operationId={} unit={} outcome=rejected reason={} "
+                       "node_memory_sample_unix_ms={} node_cpu_sample_unix_ms={} "
+                       "memory_sample_stale={} cpu_sample_stale={}",
+                       request.instanceid(), request.runtimeid(), requestID,
+                       command.sandbox_id(), command.resource_generation(),
+                       command.operation_id(), unit->first,
+                       memStale || cpuStale ? "node_observation_unknown_or_stale"
+                                            : "capacity_exceeded",
+                       unit->second.memory_sample_unix_ms(), unit->second.cpu_sample_unix_ms(),
+                       memStale, cpuStale);
+            return verdict;
+        }
     }
     ResizeBudgetEntry entry;
     entry.request = request;

@@ -230,6 +230,59 @@ void ResourceViewActor::LogResourceInventory()
     snapshot["resize_outstanding_cpu_millicores"] = outstanding.cpuMillicores;
     snapshot["resize_outstanding_memory_mb"] = outstanding.memoryMb;
     snapshot["commitment_ledger"] = std::move(legacy);
+    // Minimal read-only node observation diagnostics: capacity + actualuse
+    // + per-resource sample timestamps + full unit identity, so the
+    // unknown/stale→rejection→recovery chain can be verified per point
+    // against the SAME authoritative view. No admission-decision change.
+    // LEAF units only (has no sub-fragments): an aggregate unit's
+    // capacity/usage is the SUM of its leaves, not a leaf observation.
+    // Missing or non-finite values emit null + known=false — never a
+    // sentinel like -1 that could be misread as a real observation.
+    {
+        nlohmann::json unitsDiag = nlohmann::json::array();
+        const auto emitLeafUnit = [&](const std::string &fragmentId, const auto &u) {
+            if (!u.fragment().empty()) { return; }
+            nlohmann::json d;
+            d["unit_id"] = u.id();
+            d["fragment_id"] = fragmentId;
+            const auto &cap = u.capacity().resources();
+            const auto &use = u.actualuse().resources();
+            const auto scalarVal = [](const decltype(cap) &m,
+                                      const std::string &k) -> std::pair<nlohmann::json, bool> {
+                auto it = m.find(k);
+                if (it == m.end() || !it->second.has_scalar()) {
+                    return {nullptr, false};
+                }
+                const double v = it->second.scalar().value();
+                if (!std::isfinite(v)) {
+                    return {nullptr, false};
+                }
+                return {v, true};
+            };
+            const auto [cpuCap, cpuCapKnown] = scalarVal(cap, CPU_RESOURCE_NAME);
+            const auto [memCap, memCapKnown] = scalarVal(cap, MEMORY_RESOURCE_NAME);
+            const auto [cpuUse, cpuUseKnown] = scalarVal(use, CPU_RESOURCE_NAME);
+            const auto [memUse, memUseKnown] = scalarVal(use, MEMORY_RESOURCE_NAME);
+            d["cpu_capacity_millicores"] = cpuCap;
+            d["cpu_capacity_known"] = cpuCapKnown;
+            d["memory_capacity_mb"] = memCap;
+            d["memory_capacity_known"] = memCapKnown;
+            d["cpu_actualuse_millicores"] = cpuUse;
+            d["cpu_actualuse_known"] = cpuUseKnown;
+            d["memory_actualuse_mb"] = memUse;
+            d["memory_actualuse_known"] = memUseKnown;
+            d["cpu_sample_unix_ms"] = u.cpu_sample_unix_ms() > 0
+                                          ? nlohmann::json(u.cpu_sample_unix_ms()) : nlohmann::json(nullptr);
+            d["memory_sample_unix_ms"] = u.memory_sample_unix_ms() > 0
+                                             ? nlohmann::json(u.memory_sample_unix_ms()) : nlohmann::json(nullptr);
+            unitsDiag.push_back(std::move(d));
+        };
+        emitLeafUnit("", *view_);
+        for (const auto &f : view_->fragment()) {
+            emitLeafUnit(f.first, f.second);
+        }
+        snapshot["node_diagnostics"] = std::move(unitsDiag);
+    }
     snapshot["entries"] = std::move(entries);
     YRLOG_INFO("resource-inventory {}", snapshot.dump());
     YRLOG_INFO("resource-inventory-end snapshot_id={} entries={}", snapshotId, resizeEntries);
