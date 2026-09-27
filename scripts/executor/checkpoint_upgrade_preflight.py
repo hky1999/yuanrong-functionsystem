@@ -256,8 +256,13 @@ for n in a.nodes.split(","):
     rec = {}
     try:
         resp = collect_stats.grpc_call(n, "akernel", "runtime.v1.SandboxService/List", {}, 15)
-        sandboxes = resp.get("sandboxes") if isinstance(resp, dict) else None
-        rec["sandbox_count"] = len(sandboxes) if isinstance(sandboxes, list) else None
+        if isinstance(resp, dict):
+            # proto3 JSON omits empty repeated fields: a dict WITHOUT
+            # "sandboxes" is a VALID empty list, not an unknown response
+            sandboxes = resp.get("sandboxes", [])
+            rec["sandbox_count"] = len(sandboxes) if isinstance(sandboxes, list) else None
+        else:
+            rec["sandbox_count"] = None
     except Exception as exc:  # probe failure => unknown, never zero
         rec["sandbox_error"] = f"{type(exc).__name__}: {exc}"[:200]
     try:

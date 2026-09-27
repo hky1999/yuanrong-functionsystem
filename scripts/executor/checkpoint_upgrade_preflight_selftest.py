@@ -119,12 +119,16 @@ def as_float(value):
 def grpc_call(node, namespace, method, request, timeout):
     """Fake SandboxService/List boundary (same signature as the verified
     collector): injected failures raise, injected live sandboxes return a
-    non-empty list, everything else is an empty node."""
+    non-empty list, an empty node returns the REAL proto3 shape (a dict
+    with the empty repeated field OMITTED), and a garbage node returns a
+    non-dict that must be judged unknown."""
     if os.environ.get("LIST_FAIL_NODE") == node:
         raise RuntimeError("grpcurl exit 1: injected List failure")
     if os.environ.get("SANDBOX_NODE") == node:
         return {"sandboxes": [{"id": "sbox-selftest"}]}
-    return {"sandboxes": []}
+    if os.environ.get("LIST_GARBAGE_NODE") == node:
+        return []  # valid JSON, wrong shape -> unknown, never zero
+    return {}
 '''
 
 FAKE_SDK_LIFECYCLE = r'''
@@ -245,6 +249,7 @@ NEW_CASES = [
     ("missing_budget_field", {"MISSING_FIELD": "instance_count"}, None, None, 1),
     ("live_sandbox_present", {"SANDBOX_NODE": "akernel-node-b"}, None, None, 1),
     ("sandbox_list_probe_error", {"LIST_FAIL_NODE": "akernel-node-b"}, None, None, 1),
+    ("sandbox_list_non_dict_response", {"LIST_GARBAGE_NODE": "akernel-node-b"}, None, None, 1),
     ("stale_budget_snapshot", {"STALE": "1"}, None, None, 1),
     ("proxy_identity_split", {"IDENTITY_SPLIT": "1"}, None, None, 1),
     ("proxy_identity_unknown", {"IDENTITY_UNKNOWN": "1"}, None, None, 1),
