@@ -190,6 +190,7 @@ protected:
         base_ = "/tmp/managed_restore_" + uid;
         std::filesystem::create_directories(base_ + "/managed/snap-m1");
         { std::ofstream f(base_ + "/managed/snap-m1/checkpoint.img", std::ios::binary); f << "artifact"; }
+        std::filesystem::create_directories("/tmp/fake-rootfs");  // rootfs path referenced by every request
 
         const std::string sock = "unix:///tmp/managed_restore_" + uid + ".sock";
         builderSock_ = sock;
@@ -235,6 +236,8 @@ protected:
         info->set_instanceid("inst-mr");
         info->set_runtimeid(runtimeID);
         info->set_restoresnapshotid(restoreID);
+        // the builder validates a non-empty sandbox runtime before any RPC
+        info->mutable_container()->set_runtime("runsc");
         // self-contained bootstrap keeps command building minimal
         (*info->mutable_deploymentconfig()->mutable_deployoptions())["rootfs"] =
             R"({"type":"local","path":"/tmp/fake-rootfs"})";

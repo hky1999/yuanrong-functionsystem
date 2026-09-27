@@ -42,8 +42,13 @@ TEST(SandboxdProtoContractTest, UsesPublicCheckpointAndStartRestore)
     const auto *service = google::protobuf::DescriptorPool::generated_pool()->FindServiceByName(
         "runtime.v1.SandboxService");
     ASSERT_NE(service, nullptr);
+    // Current wire (sandbox_api.proto in this repo): the generation-fenced
+    // checkpoint RPC plus Restore; DeleteCheckpoint does not exist. The old
+    // assertions pinned the pre-Restore upstream draft (no Restore, fields
+    // 1-5, empty CheckpointResponse) and no longer match the shipped proto.
     EXPECT_NE(service->FindMethodByName("Checkpoint"), nullptr);
-    EXPECT_EQ(service->FindMethodByName("Restore"), nullptr);
+    EXPECT_NE(service->FindMethodByName("CheckpointIfGeneration"), nullptr);
+    EXPECT_NE(service->FindMethodByName("Restore"), nullptr);
     EXPECT_EQ(service->FindMethodByName("DeleteCheckpoint"), nullptr);
 
     const auto *checkpoint = runtime::v1::CheckpointRequest::descriptor();
@@ -53,12 +58,28 @@ TEST(SandboxdProtoContractTest, UsesPublicCheckpointAndStartRestore)
     ASSERT_NE(checkpoint->FindFieldByName("timeout_seconds"), nullptr);
     ASSERT_NE(checkpoint->FindFieldByName("compress"), nullptr);
     ASSERT_NE(checkpoint->FindFieldByName("leave_running"), nullptr);
+    // Upstream checkpoint contract, renumbered: our wire pins 3-8
+    // (timeout, compress, trace_id, checkpoint_id, leave_running,
+    // include_filesystem) and appends timeout_seconds/snapshot_type.
     EXPECT_EQ(checkpoint->FindFieldByName("id")->number(), 1);
     EXPECT_EQ(checkpoint->FindFieldByName("checkpoint_dir")->number(), 2);
-    EXPECT_EQ(checkpoint->FindFieldByName("timeout_seconds")->number(), 3);
+    EXPECT_EQ(checkpoint->FindFieldByName("timeout")->number(), 3);
     EXPECT_EQ(checkpoint->FindFieldByName("compress")->number(), 4);
-    EXPECT_EQ(checkpoint->FindFieldByName("leave_running")->number(), 5);
-    EXPECT_EQ(runtime::v1::CheckpointResponse::descriptor()->field_count(), 0);
+    EXPECT_EQ(checkpoint->FindFieldByName("trace_id")->number(), 5);
+    EXPECT_EQ(checkpoint->FindFieldByName("checkpoint_id")->number(), 6);
+    EXPECT_EQ(checkpoint->FindFieldByName("leave_running")->number(), 7);
+    EXPECT_EQ(checkpoint->FindFieldByName("include_filesystem")->number(), 8);
+    EXPECT_EQ(checkpoint->FindFieldByName("timeout_seconds")->number(), 9);
+    // CheckpointResponse: success/message/artifact_path/artifact_size/
+    // artifact_sha256/source_generation
+    EXPECT_EQ(runtime::v1::CheckpointResponse::descriptor()->field_count(), 6);
+    ASSERT_NE(runtime::v1::CheckpointResponse::descriptor()->FindFieldByName("source_generation"), nullptr);
+
+    // The fence rides the wrapper, never CheckpointRequest itself.
+    const auto *wrapper = runtime::v1::CheckpointIfGenerationRequest::descriptor();
+    ASSERT_NE(wrapper, nullptr);
+    EXPECT_EQ(wrapper->FindFieldByName("checkpoint")->number(), 1);
+    EXPECT_EQ(wrapper->FindFieldByName("expected_generation")->number(), 2);
 
     const auto *start = runtime::v1::StartRequest::descriptor();
     ASSERT_NE(start, nullptr);
