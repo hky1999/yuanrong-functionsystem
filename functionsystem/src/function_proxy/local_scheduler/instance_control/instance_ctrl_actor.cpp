@@ -5525,8 +5525,75 @@ litebus::Future<messages::ScheduleResponse> InstanceCtrlActor::DoAuthorizeCreate
 {
     return AuthorizeCreate(functionMeta, scheduleReq, runtimePromise)
         .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::GetAffinity, _1, scheduleReq))
+        .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::ResolveReusableSnapshotIntent, _1, scheduleReq))
         .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::DoCreateInstance, _1, functionMeta, scheduleReq,
                              runtimePromise));
+}
+
+// Reusable-snapshot intent gate (fail-closed): the requested-id extension is
+// set from CreateRequest.snapshotid at EVERY entry into the schedule request
+// (struct_transfer.h TransFromCreateReqToScheduleReq), so this single choke
+// point covers the public frontend create and every internal caller. Without
+// it the extension rides along ignored and the deploy builds without the
+// trusted-restore context — exactly the pc-snapshot-8b97-2 silent cold start
+// (OnStartDone "StartNormal success" for a snapshot-bearing create).
+// NOTE on resources: ApplyResolvedReusableSnapshotForCreate inherits ONLY
+// genuinely ABSENT resource keys from the snapshot template; an explicit
+// value (including an explicit 0) is a caller override and is never silently
+// replaced. Upstream fabricating CPU:0/Memory:0 entries for OMITTED SDK
+// values therefore pins 0/0 — that is an upstream-entry bug to fix there,
+// not something this gate may paper over.
+litebus::Future<Status> InstanceCtrlActor::ResolveReusableSnapshotIntent(
+    const Status &priorStatus, const std::shared_ptr<messages::ScheduleRequest> &scheduleReq)
+{
+    const std::string traceID = scheduleReq->traceid();
+    const std::string requestID = scheduleReq->requestid();
+    if (priorStatus.IsError()) {
+        return priorStatus;
+    }
+    const auto &extensions = scheduleReq->instance().scheduleoption().extension();
+    const auto requested = extensions.find(REUSABLE_SNAPSHOT_REQUESTED_ID_EXTENSION);
+    if (requested == extensions.end() || requested->second.empty()) {
+        return priorStatus;  // no snapshot intent: plain create, unchanged path
+    }
+    if (localSchedSrv_ == nullptr) {
+        YRLOG_ERROR("{}|{}|reusable snapshot resolve unavailable for instance({}): local scheduler service is not "
+                    "bound; refusing to continue as a plain create",
+                    traceID, requestID, scheduleReq->instance().instanceid());
+        return Status(StatusCode::ERR_INNER_SYSTEM_ERROR,
+                      "reusable snapshot resolve service unavailable; create refused (fail-closed)");
+    }
+    auto resolveReq = std::make_shared<::messages::ResolveReusableSnapshotForCreateRequest>();
+    resolveReq->set_requestid(requestID);
+    resolveReq->set_tenantid(scheduleReq->instance().tenantid());
+    resolveReq->set_snapshotid(requested->second);
+    auto scheduleReqCopy = scheduleReq;
+    return localSchedSrv_->ResolveReusableSnapshotForCreate(resolveReq)
+        .Then(litebus::Defer(
+            GetAID(),
+            [scheduleReqCopy, traceID, requestID](const ::messages::ResolveReusableSnapshotForCreateResponse &resolved)
+                -> Status {
+                if (resolved.code() != common::ERR_NONE) {
+                    YRLOG_ERROR("{}|{}|reusable snapshot resolve failed for instance({}): code({}) msg({})",
+                                traceID, requestID, scheduleReqCopy->instance().instanceid(), resolved.code(),
+                                resolved.message());
+                    return Status(StatusCode::ERR_AUTHORIZE_FAILED,
+                                  "reusable snapshot resolve failed: " + resolved.message());
+                }
+                const auto applied = ApplyResolvedReusableSnapshotForCreate(resolved, scheduleReqCopy);
+                if (applied.IsError()) {
+                    YRLOG_ERROR("{}|{}|reusable snapshot context rejected for instance({}): {}",
+                                traceID, requestID, scheduleReqCopy->instance().instanceid(),
+                                applied.RawMessage());
+                    return Status(StatusCode::ERR_AUTHORIZE_FAILED,
+                                  "reusable snapshot context rejected: " + applied.RawMessage());
+                }
+                YRLOG_INFO("{}|{}|reusable snapshot context applied for instance({}): snapshot({}) backend({})",
+                           traceID, requestID, scheduleReqCopy->instance().instanceid(),
+                           resolved.reusablesnapshotrestore().snapshotid(),
+                           resolved.reusablesnapshotrestore().artifact().storagebackend());
+                return Status::OK();
+            }));
 }
 
 Status InstanceCtrlActor::NormalizeCreateTenantID(

@@ -416,6 +416,17 @@ public:
         const std::shared_ptr<messages::ScheduleRequest> &scheduleReq,
         const std::shared_ptr<litebus::Promise<messages::ScheduleResponse>> &runtimePromise);
 
+    // Reusable-snapshot intent gate on the create path: when the schedule
+    // request carries yr.internal.reusable_snapshot.requested_id (set from
+    // CreateRequest.snapshotid at every entry), resolve the snapshot through
+    // the trusted store and apply the resolved context (template inheritance,
+    // local-artifact node affinity, trusted-restore extension) BEFORE any
+    // dispatch. Any missing piece — resolve failure, incomplete response,
+    // apply-time validation — rejects the create; a snapshot-bearing create
+    // must NEVER continue as a plain (cold) create.
+    litebus::Future<Status> ResolveReusableSnapshotIntent(const Status &priorStatus,
+        const std::shared_ptr<messages::ScheduleRequest> &scheduleReq);
+
     Status NormalizeCreateTenantID(const litebus::Option<FunctionMeta> &functionMeta,
                                    const std::shared_ptr<messages::ScheduleRequest> &scheduleReq);
 
