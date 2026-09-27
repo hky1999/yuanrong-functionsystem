@@ -291,6 +291,9 @@ private:
         // replies and resultunknown/incomplete coordination leave it false
         // so the shared slot stays busy with a same-requestID replay entrance
         bool outcomeKnown{ false };
+        // this request re-drives a previously UNKNOWN physical outcome:
+        // pre-physical/comm failures must NOT clear the unknown then
+        bool replayOfUnknown{ false };
     };
 
     /** Bounded re-query entrance for one UNKNOWN public-snapshot outcome. */
@@ -298,6 +301,7 @@ private:
         std::string requestID;
         uint64_t attempt;
         std::string runtimeID;  // original source identity fence for replay
+        bool replaying{ false };  // single-flight for the re-query itself
     };
 
     litebus::Future<KillResponse> HandleReusableSnapshot(
