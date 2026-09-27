@@ -45,11 +45,15 @@ public:
 
     litebus::Option<litebus::Future<messages::ScheduleResponse>> IsDuplicateRequest(
         const std::shared_ptr<messages::ScheduleRequest> &req,
-        const std::shared_ptr<litebus::Promise<messages::ScheduleResponse>> & /*runtimePromise*/) override
+        const std::shared_ptr<litebus::Promise<messages::ScheduleResponse>> &runtimePromise) override
     {
         ++duplicateChecks;
         lastRequest = req;
         if (shortCircuit) {
+            // complete the CALLER's promise with the exact sentinel (the
+            // real duplicate path associates futures; nobody else completes
+            // this promise for us) and return an independent completed future
+            runtimePromise->SetValue(sentinel);
             auto sentinelPromise = std::make_shared<litebus::Promise<messages::ScheduleResponse>>();
             sentinelPromise->SetValue(sentinel);
             return litebus::Option<litebus::Future<messages::ScheduleResponse>>>(
@@ -99,7 +103,8 @@ protected:
         if (withInitRequest) {
             runtime_service::CallRequest stale;
             stale.set_function("fn-gate");
-            (*stale.mutable_createoptions())["marker"] = "pre-inheritance-marker";
+            (*stale.mutable_createoptions())["marker"] = "stale-pre-inheritance";
+            stale.mutable_args()->Add("stale-arg");
             req->set_initrequest(stale.SerializeAsString());
         }
         return req;
@@ -114,19 +119,27 @@ protected:
     }
 
     static ::messages::ResolveReusableSnapshotForCreateResponse MakeResolved(
-        const std::string &snapshotID, double cpuMillicores, double memoryMb)
+        const std::string &snapshotID, double cpuMillicores, double memoryMb, bool nestedElastic = false)
     {
         ::messages::ResolveReusableSnapshotForCreateResponse rsp;
         rsp.set_code(static_cast<int32_t>(common::ErrorCode::ERR_NONE));
         auto *tmpl = rsp.mutable_instancetemplate();
         tmpl->set_function("fn-gate");  // matches the request: template adoption
+        (*tmpl->mutable_createoptions())["marker"] = "from-template";
         if (cpuMillicores > 0) {
             (*tmpl->mutable_resources()->mutable_resources())[resource_view::CPU_RESOURCE_NAME]
                 .mutable_scalar()->set_value(cpuMillicores);
         }
         if (memoryMb > 0) {
-            (*tmpl->mutable_resources()->mutable_resources())[resource_view::MEMORY_RESOURCE_NAME]
-                .mutable_scalar()->set_value(memoryMb);
+            auto *mem = (*tmpl->mutable_resources()->mutable_resources())[resource_view::MEMORY_RESOURCE_NAME]
+                           .mutable_scalar();
+            mem->set_value(memoryMb);          // initial
+            mem->set_limit(memoryMb * 4);      // ceiling (legal, finite)
+        }
+        if (nestedElastic) {
+            // REAL nested elastic intent exactly as an elastic source's
+            // template would carry it (see NormalizeElasticCreateOptions)
+            (*tmpl->mutable_createoptions())[resource_view::SCHEDULER_ELASTIC_RESOURCES] = "true";
         }
         auto *restore = rsp.mutable_reusablesnapshotrestore();
         restore->set_snapshotid(snapshotID);
@@ -205,7 +218,12 @@ TEST_F(InstanceCtrlIntentGateTest, RealEntryResolvedContextFlowsIntoCreateAndSyn
                      512.0);
     runtime_service::CallRequest synced;
     ASSERT_TRUE(synced.ParseFromString(scheduleReq->initrequest()));
-    EXPECT_EQ(synced.function(), "fn-gate");
+    // the sync REPLACED the stale payload with the inherited one: the stale
+    // marker/arg are gone and the template's values are present
+    EXPECT_EQ(synced.createoptions().count("stale-pre-inheritance"), 0U)
+        << "the stale pre-inheritance createoption must be replaced";
+    EXPECT_EQ(synced.args_size(), scheduleReq->instance().args_size())
+        << "args follow the inherited InstanceInfo, not the stale copy";
 }
 
 // HELPER, transport failure: a SetFailed resolve future becomes an explicit
@@ -221,12 +239,16 @@ TEST_F(InstanceCtrlIntentGateTest, HelperResolveFutureSetFailedRejects)
         }));
     auto runtimePromise = std::make_shared<litebus::Promise<messages::ScheduleResponse>>();
     auto future = runtimePromise->GetFuture();
-    litebus::Async(instanceCtrlActor_->GetAID(), &InstanceCtrlActor::ResolveReusableSnapshotIntent, Status::OK(),
-                   scheduleReq, runtimePromise);
+    // FULL chain (DoAuthorizeCreate): the wait covers the chain's own end,
+    // and the create-count assertion is meaningful only because this chain
+    // WOULD reach DoCreateInstance on success
+    auto chain = litebus::Async(instanceCtrlActor_->GetAID(), &InstanceCtrlActor::DoAuthorizeCreate, MakeMeta(),
+                                scheduleReq, runtimePromise);
+    ASSERT_AWAIT_READY_FOR(chain, 10000);
     ASSERT_AWAIT_READY_FOR(future, 10000);
     EXPECT_NE(future.Get().code(), static_cast<int32_t>(common::ErrorCode::ERR_NONE));
     EXPECT_NE(future.Get().message().find("resolve future failed"), std::string::npos);
-    EXPECT_EQ(probeView_->duplicateChecks, 0);
+    EXPECT_EQ(probeView_->duplicateChecks, 0) << "zero visits on the FULL chain is a real zero-dispatch proof";
 }
 
 // HELPER, watchdog: an unresolved resolve future trips the real 30s
@@ -243,30 +265,34 @@ TEST_F(InstanceCtrlIntentGateTest, HelperHungResolveTimesOutAndLateSuccessDoesNo
         }));
     auto runtimePromise = std::make_shared<litebus::Promise<messages::ScheduleResponse>>();
     auto future = runtimePromise->GetFuture();
-    litebus::Async(instanceCtrlActor_->GetAID(), &InstanceCtrlActor::ResolveReusableSnapshotIntent, Status::OK(),
-                   scheduleReq, runtimePromise);
+    auto chain = litebus::Async(instanceCtrlActor_->GetAID(), &InstanceCtrlActor::DoAuthorizeCreate, MakeMeta(),
+                                scheduleReq, runtimePromise);
     ASSERT_AWAIT_READY_FOR(future, 45000);  // real 30s watchdog + margin
+    ASSERT_AWAIT_READY_FOR(chain, 45000);
     EXPECT_NE(future.Get().message().find("timed out"), std::string::npos);
     lateResolve->SetValue(MakeResolved("snap-hang", 500.0, 512.0));
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // actor barrier: a round-trip through the SAME actor guarantees the
+    // late-resolve continuation (if any) has been processed before asserting
+    auto barrierPromise = std::make_shared<litebus::Promise<messages::ScheduleResponse>>();
+    auto barrier = litebus::Async(instanceCtrlActor_->GetAID(), &InstanceCtrlActor::ResolveReusableSnapshotIntent,
+                                  Status::OK(), MakeRequest(""), barrierPromise);
+    ASSERT_AWAIT_READY_FOR(barrier, 10000);
     EXPECT_EQ(probeView_->duplicateChecks, 0);
     EXPECT_EQ(scheduleReq->instance().scheduleoption().extension().count(TRUSTED_RESTORE_EXT), 0U)
         << "a late resolve after the watchdog must never inject context";
 }
 
-// HELPER, resources + elastic re-normalization: a template with legal
-// CPU/Memory passes the post-inheritance normalization, absent keys are
-// inherited, and an EXPLICIT override (explicit 0 included) is never
-// silently replaced.
-TEST_F(InstanceCtrlIntentGateTest, HelperLegalResourcesAndExplicitOverrideSurvive)
+// HELPER, REAL nested elastic: a template carrying elastic=true with legal
+// CPU 500 / Memory 128 initial + 512 ceiling passes the post-inheritance
+// re-normalization (not a no-op — the marker IS present) and absent keys
+// inherit the template's initial/ceiling.
+TEST_F(InstanceCtrlIntentGateTest, HelperNestedElasticLegalTemplatePassesRenormalization)
 {
-    auto scheduleReq = MakeRequest("snap-elastic");
-    (*scheduleReq->mutable_instance()->mutable_resources()->mutable_resources())
-        [resource_view::CPU_RESOURCE_NAME].mutable_scalar()->set_value(0.0);
+    auto scheduleReq = MakeRequest("snap-elastic-ok");
     EXPECT_CALL(*mockLocalSchedSrv_, ResolveReusableSnapshotForCreate)
         .WillOnce(Invoke([this](const std::shared_ptr<::messages::ResolveReusableSnapshotForCreateRequest> &req) {
             auto p = std::make_shared<litebus::Promise<::messages::ResolveReusableSnapshotForCreateResponse>>();
-            p->SetValue(MakeResolved(req->snapshotid(), 500.0, 512.0));
+            p->SetValue(MakeResolved(req->snapshotid(), 500.0, 128.0, /*nestedElastic=*/true));
             return p->GetFuture();
         }));
     auto runtimePromise = std::make_shared<litebus::Promise<messages::ScheduleResponse>>();
@@ -275,10 +301,34 @@ TEST_F(InstanceCtrlIntentGateTest, HelperLegalResourcesAndExplicitOverrideSurviv
     ASSERT_AWAIT_READY_FOR(chain, 10000);
     EXPECT_TRUE(chain.Get().IsOk()) << chain.Get().RawMessage();
     const auto &applied = scheduleReq->instance().resources().resources();
-    EXPECT_DOUBLE_EQ(applied.at(resource_view::MEMORY_RESOURCE_NAME).scalar().value(), 512.0);
-    EXPECT_DOUBLE_EQ(applied.at(resource_view::CPU_RESOURCE_NAME).scalar().value(), 0.0)
-        << "explicit zero is an override, never replaced by inheritance";
-    EXPECT_EQ(probeView_->duplicateChecks, 0);
+    ASSERT_NE(applied.find(resource_view::MEMORY_RESOURCE_NAME), applied.end());
+    EXPECT_DOUBLE_EQ(applied.at(resource_view::MEMORY_RESOURCE_NAME).scalar().value(), 128.0);
+    EXPECT_DOUBLE_EQ(applied.at(resource_view::MEMORY_RESOURCE_NAME).scalar().limit(), 512.0);
+    EXPECT_DOUBLE_EQ(applied.at(resource_view::CPU_RESOURCE_NAME).scalar().value(), 500.0);
+}
+
+// HELPER, REAL nested elastic, EXPLICIT ZERO: an elastic template merged
+// over a target carrying an explicit cpu=0 is REJECTED by the
+// re-normalization — an explicit zero is never treated as a legal elastic
+// value nor silently inherited over.
+TEST_F(InstanceCtrlIntentGateTest, HelperNestedElasticExplicitZeroIsRejected)
+{
+    auto scheduleReq = MakeRequest("snap-elastic-zero");
+    (*scheduleReq->mutable_instance()->mutable_resources()->mutable_resources())
+        [resource_view::CPU_RESOURCE_NAME].mutable_scalar()->set_value(0.0);
+    EXPECT_CALL(*mockLocalSchedSrv_, ResolveReusableSnapshotForCreate)
+        .WillOnce(Invoke([this](const std::shared_ptr<::messages::ResolveReusableSnapshotForCreateRequest> &req) {
+            auto p = std::make_shared<litebus::Promise<::messages::ResolveReusableSnapshotForCreateResponse>>();
+            p->SetValue(MakeResolved(req->snapshotid(), 500.0, 128.0, /*nestedElastic=*/true));
+            return p->GetFuture();
+        }));
+    auto runtimePromise = std::make_shared<litebus::Promise<messages::ScheduleResponse>>();
+    auto chain = litebus::Async(instanceCtrlActor_->GetAID(), &InstanceCtrlActor::ResolveReusableSnapshotIntent,
+                                Status::OK(), scheduleReq, runtimePromise);
+    ASSERT_AWAIT_READY_FOR(chain, 10000);
+    EXPECT_TRUE(chain.Get().IsError())
+        << "explicit cpu=0 under nested elastic must be rejected, never accepted";
+    EXPECT_EQ(scheduleReq->instance().scheduleoption().extension().count(TRUSTED_RESTORE_EXT), 0U);
 }
 
 }  // namespace
