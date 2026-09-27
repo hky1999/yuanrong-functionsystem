@@ -15,6 +15,7 @@
  * self-association would wait forever).
  */
 #include <gtest/gtest.h>
+#include <gmock/gmock.h>
 
 #include <chrono>
 #include <memory>
@@ -29,6 +30,9 @@
 #include "utils/future_test_helper.h"
 
 namespace functionsystem::test {
+
+using testing::Invoke;  // NOLINT — EXPECT_CALL .WillOnce(Invoke(...))
+
 namespace {
 
 using namespace functionsystem::local_scheduler;  // NOLINT
