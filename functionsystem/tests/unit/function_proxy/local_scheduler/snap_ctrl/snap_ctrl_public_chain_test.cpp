@@ -791,8 +791,8 @@ TEST_F(SnapCtrlPublicChainTest, StaleAttemptLateCompletionTouchesNothing)
     litebus::Async(actor_->GetAID(), &SnapCtrlActor::CompleteReusableSnapshotRequest,
                    lateContext, KillResponse{});
     // the real method's own promise settles exactly when the completion ran
-    auto settled = lateContext->completion->GetFuture();
-    ASSERT_AWAIT_READY(settled);
+    auto lateCompletion = lateContext->completion->GetFuture();
+    ASSERT_AWAIT_READY(lateCompletion);
     FlushActor();
 
     // 4) the live entry survived the stale completion UNCHANGED
