@@ -36,6 +36,7 @@
 #include "function_proxy/common/parked_instance_registry/parked_instance_registry.h"
 #include "local_scheduler/instance_control/instance_ctrl_message.h"
 #include "local_scheduler/local_scheduler_service/local_sched_srv.h"
+#include "local_scheduler/snap_ctrl/snap_options_policy.h"
 
 namespace functionsystem::local_scheduler {
 
@@ -226,6 +227,15 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
             errorRsp.set_message("hold token requires the expected identity tuple");
             return errorRsp;
         }
+        if (CarriesLegacyPrivateWire(options)) {
+            // pre-migration private park wire (tags 6-8) — reject outright;
+            // it must not degrade to the no-identity legacy path
+            KillResponse errorRsp;
+            errorRsp.set_code(common::ERR_PARAM_INVALID);
+            errorRsp.set_message("legacy private snapshot wire encoding rejected; "
+                                 "park fields live at tags 21-24");
+            return errorRsp;
+        }
         if (!ValidParkHoldToken(holdToken, leaveRunning)) {
             KillResponse errorRsp;
             errorRsp.set_code(common::ERR_PARAM_INVALID);
@@ -257,7 +267,26 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
     // park/hold chain below remains the private scheduler-line semantics
     // and is never entered for a public typed request.
     if (options.type() == common::SnapType::SNAPSHOT) {
-        return HandleReusableSnapshot(requestID, instanceID, instanceInfo, options);
+        if (!PublicSnapshotRequestIsPure(options)) {
+            // the public route must never bypass the private identity fence
+            KillResponse errorRsp;
+            errorRsp.set_code(common::ERR_PARAM_INVALID);
+            errorRsp.set_message("public SNAPSHOT request carries private park fields");
+            return errorRsp;
+        }
+        // SHARED per-instance single flight: the public chain registers the
+        // same attempt gate the private path uses, so public-in-flight blocks
+        // private (Busy) and vice versa; the chain releases exactly its own
+        // attempt at its single completion point.
+        const auto publicAttempt = snapshotAttempts_.Begin(instanceID);
+        if (!publicAttempt.has_value()) {
+            KillResponse busy;
+            busy.set_code(static_cast<common::ErrorCode>(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY)));
+            busy.set_message("snapshot already pending or instance parked");
+            return busy;
+        }
+        return HandleReusableSnapshot(requestID, instanceID, instanceInfo, options,
+                                      *publicAttempt);
     }
     // Conditional-path fence, still before any gate/mark/drain mutation: the
     // expected runtime must be this source's and the source must be RUNNING.
@@ -1280,11 +1309,13 @@ constexpr uint32_t SNAPSHOT_ATTEMPT_PROTOCOL_VERSION = 1;
 
 litebus::Future<KillResponse> SnapCtrlActor::HandleReusableSnapshot(
     const std::string &requestID, const std::string &instanceID,
-    const resources::InstanceInfo &instanceInfo, const SnapOptions &options)
+    const resources::InstanceInfo &instanceInfo, const SnapOptions &options,
+    uint64_t snapshotAttempt)
 {
     auto context = std::make_shared<ReusableSnapshotContext>();
     context->requestID = requestID;
     context->instanceID = instanceID;
+    context->snapshotAttempt = snapshotAttempt;
     context->name = options.name();
     context->sourceInstanceInfo = instanceInfo;
     if (options.checkpointtimeoutms() > 0) {
@@ -1711,5 +1742,12 @@ void SnapCtrlActor::CompleteReusableSnapshotRequest(
     }
     context->completed = true;
     ReleaseReusableSnapshotTunnelGate(context);
+    if (context->snapshotAttempt != 0) {
+        // release EXACTLY this request's attempt; an outcome that reached a
+        // terminal response here is known (unknown-outcome coordination is
+        // preserved inside the chain's store records, not by withholding
+        // the shared single-flight slot forever)
+        snapshotAttempts_.Finish(context->instanceID, context->snapshotAttempt, true);
+    }
     context->completion->SetValue(response);
 }

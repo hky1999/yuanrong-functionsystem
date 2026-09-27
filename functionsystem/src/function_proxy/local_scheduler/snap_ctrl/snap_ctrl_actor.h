@@ -283,13 +283,15 @@ private:
         ::messages::SnapshotArtifact artifact;
         ::core_service::SnapshotInfo publicInfo;
         std::shared_ptr<litebus::Promise<KillResponse>> completion;
+        uint64_t snapshotAttempt{ 0 };  // shared per-instance single-flight slot
         bool tunnelGateHeld{ false };
         bool completed{ false };
     };
 
     litebus::Future<KillResponse> HandleReusableSnapshot(
         const std::string &requestID, const std::string &instanceID,
-        const resources::InstanceInfo &instanceInfo, const SnapOptions &options);
+        const resources::InstanceInfo &instanceInfo, const SnapOptions &options,
+        uint64_t snapshotAttempt = 0);
     void OnReusableSnapshotBegun(
         const std::shared_ptr<ReusableSnapshotContext> &context,
         const litebus::Future<::messages::BeginReusableSnapshotResponse> &future);

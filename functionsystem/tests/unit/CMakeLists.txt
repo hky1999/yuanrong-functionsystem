@@ -132,6 +132,11 @@ add_executable(${PAUSE_RESUME_UNIT_TEST}
         function_proxy/local_scheduler/snap_ctrl/snap_ctrl_actor_test.cpp
         function_proxy/local_scheduler/snap_ctrl/snap_options_wire_test.cpp)
 
+add_executable(snap_options_policy_gate_test
+        function_proxy/local_scheduler/snap_ctrl/snap_options_policy_gate_test.cpp)
+target_compile_options(snap_options_policy_gate_test PRIVATE -Wno-error)
+add_dependencies(snap_options_policy_gate_test posix_pb)
+
 target_compile_options(${PAUSE_RESUME_UNIT_TEST} PRIVATE
         -Wno-error
         -fno-access-control
