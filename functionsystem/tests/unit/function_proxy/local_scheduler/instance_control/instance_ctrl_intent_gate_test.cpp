@@ -56,7 +56,7 @@ public:
             runtimePromise->SetValue(sentinel);
             auto sentinelPromise = std::make_shared<litebus::Promise<messages::ScheduleResponse>>();
             sentinelPromise->SetValue(sentinel);
-            return litebus::Option<litebus::Future<messages::ScheduleResponse>>>(
+            return litebus::Option<litebus::Future<messages::ScheduleResponse>>(
                 litebus::Some(sentinelPromise->GetFuture()));
         }
         return litebus::Option<litebus::Future<messages::ScheduleResponse>>{};
@@ -141,7 +141,7 @@ protected:
             // carries it: the marker lives INSIDE the opaque extra_config
             // JSON (NormalizeElasticCreateOptions parses it from there)
             (*tmpl->mutable_createoptions())["extra_config"] =
-                R"({")" + std::string(resource_view::SCHEDULER_ELASTIC_RESOURCES) + R"(":true})";
+                R"({")" + std::string(SCHEDULER_ELASTIC_RESOURCES) + R"(":true})";
         }
         auto *restore = rsp.mutable_reusablesnapshotrestore();
         restore->set_snapshotid(snapshotID);
@@ -328,17 +328,16 @@ TEST_F(InstanceCtrlIntentGateTest, HelperNestedElasticExplicitZeroIsRejected)
             p->SetValue(MakeResolved(req->snapshotid(), 500.0, 128.0, /*nestedElastic=*/true));
             return p->GetFuture();
         }));
+    // SINGLE full-chain run (no helper pre-pass: a second resolve on the
+    // same mutated request would double-resolve or let the consumed id
+    // bypass the gate). NOTE: ApplyResolved stamps the trusted extension
+    // BEFORE the re-normalizer rejects — extension absence is not the
+    // proof; the explicit elastic/resource error plus ZERO create-boundary
+    // visits on this ONE chain is.
     auto runtimePromise = std::make_shared<litebus::Promise<messages::ScheduleResponse>>();
-    auto chain = litebus::Async(instanceCtrlActor_->GetAID(), &InstanceCtrlActor::ResolveReusableSnapshotIntent,
-                                Status::OK(), scheduleReq, runtimePromise);
-    // NOTE: ApplyResolved has already stamped the trusted extension by the
-    // time the re-normalizer rejects — extension absence is NOT the proof.
-    // The rejection is proven by the chain's explicit resource error and by
-    // ZERO create-boundary visits on the full DoAuthorizeCreate chain.
-    auto fullRuntime = std::make_shared<litebus::Promise<messages::ScheduleResponse>>();
+    auto fullFuture = runtimePromise->GetFuture();
     auto fullChain = litebus::Async(instanceCtrlActor_->GetAID(), &InstanceCtrlActor::DoAuthorizeCreate,
-                                    MakeMeta(), scheduleReq, fullRuntime);
-    auto fullFuture = fullRuntime->GetFuture();
+                                    MakeMeta(), scheduleReq, runtimePromise);
     ASSERT_AWAIT_READY_FOR(fullFuture, 10000);
     ASSERT_AWAIT_READY_FOR(fullChain, 10000);
     EXPECT_NE(fullFuture.Get().message().find("elastic"), std::string::npos)

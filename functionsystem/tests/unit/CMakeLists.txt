@@ -198,6 +198,64 @@ target_link_libraries(snap_ctrl_public_chain_test PRIVATE
         pthread)
 add_test(NAME snap_ctrl_public_chain_test COMMAND snap_ctrl_public_chain_test)
 
+# Dedicated ACTUALLY-BUILT target for the reusable-snapshot intent gate
+# (pc-snapshot-8b97-2): real-entry tests through DoAuthorizeCreate plus
+# helper/watchdog supplements. Lives HERE — after the get_property(SRC_*)
+# calls — because add_subdirectory(function_proxy) at line ~29 configures
+# nested test dirs BEFORE those variables are populated (the 758f attempt
+# compiled with empty include/lib lists). Link/include mirrors the verified
+# snap_ctrl_public_chain_test.
+add_executable(instance_ctrl_intent_gate_test
+        main.cpp
+        function_proxy/local_scheduler/instance_control/instance_ctrl_intent_gate_test.cpp)
+target_compile_options(instance_ctrl_intent_gate_test PRIVATE
+        -Wno-error
+        -fno-access-control
+        -Wno-missing-field-initializers)
+add_dependencies(instance_ctrl_intent_gate_test gtest_1_10_0)
+target_include_directories(instance_ctrl_intent_gate_test PRIVATE
+        ${CLIENT_CPP_INCLUDE}
+        ${gtest_INCLUDE_DIR}
+        ${SRC_INCLUDE_DIR}
+        ${META_STORE_DIR}
+        ${SRC_BUSPROXY_INCLUDE_DIR}
+        ${SRC_LOCAL_SCHEDULER_INCLUDE_DIR}
+        ${SRC_FUNCTION_PROXY_INCLUDE_DIR}
+        ${GLOBAL_SCHEDULER_DIR}
+        ${INSTANCE_MANAGER_DIR}
+        ${FUNCTION_AGENT_DIR}
+        ${SRC_RUNTIME_MANAGER_INCLUDE_DIR})
+target_link_libraries(instance_ctrl_intent_gate_test PRIVATE
+        ${crypto_LIB}
+        ${ssl_LIB}
+        ${zlib_LIB}
+        ${protobuf_LIB}
+        ${grpcpp_LIB}
+        ${gpr_LIB}
+        ${etcdapi_LIB_A}
+        ${securec_LIB}
+        ${gtest_LIB_A}
+        ${gmock_LIB_A}
+        ${litebus_ALL_LIB}
+        ${GLOBAL_SCHEDULER_LIB}
+        ${MASTER_COMMON_LIB}
+        ${INSTANCE_MANAGER_LIB}
+        ${SNAP_MANAGER_LIB}
+        ${SYSTEM_FUNCTION_LOADER_LIB}
+        ${SCALER_LIB}
+        ${RESOURCE_GROUP_MANAGER_LIB}
+        ${FUNCTION_AGENT_LIB}
+        ${META_STORE_LIB}
+        snapshot_storage
+        busproxy_lib
+        local_scheduler_lib
+        function_proxy_common_lib
+        runtime_manager_lib
+        scheduler
+        schedule_plugin_common
+        pthread)
+add_test(NAME instance_ctrl_intent_gate_test COMMAND instance_ctrl_intent_gate_test)
+
 # Managed-checkpoint target contract (whole-contract fix for the ov24c
 # named-snapshot identity mismatch): pure-function tests, no actor. The
 # resolver's Status implementation is linked in directly — the plain-gtest
