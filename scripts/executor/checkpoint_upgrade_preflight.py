@@ -78,7 +78,28 @@ def main():
                 fail(report, f"{node}: legacy entries {legacy} — migration is a separate gap")
         report["nodes"][node] = nr
 
-    # 2)+3) real sandbox List + authoritative budget via the VERIFIED collectors
+    # 2) ACTUAL node set from the cluster: every akernel-node pod must be
+    # covered by --node (a missing node makes the check incomplete)
+    pods = run(["kubectl", "-n", "akernel", "get", "pods", "-o", "name",
+                "-l", "app=akernel-node"], 60)
+    report["node_pods_rc"] = pods["rc"]
+    actual_nodes = []
+    if pods["rc"] != 0:
+        fail(report, f"node pod listing rc={pods['rc']}: {pods['err'][:120]}")
+    else:
+        actual_nodes = [l.split("/", 1)[1] for l in pods["out"].splitlines()
+                        if l.startswith("pod/akernel-node-")]
+        if not actual_nodes:
+            fail(report, "no akernel-node pods discovered — coverage unverifiable")
+        missing = [n for n in actual_nodes if n not in args.node]
+        if missing:
+            fail(report, f"node coverage incomplete: {missing} not passed via --node")
+
+    # 3) real sandbox List + PER-NODE authoritative budget via the VERIFIED
+    # collectors. list_by_instance with an empty instance selector only
+    # matches empty-label entries — NOT a node-wide list — so the probe
+    # drives grpcurl's SandboxService/List with NO selector (the collector's
+    # transport seam) and counts every returned sandbox.
     probe_script = """
 import argparse, json, sys
 ap = argparse.ArgumentParser()
@@ -86,20 +107,26 @@ ap.add_argument("--collector-dir", required=True)
 ap.add_argument("--nodes", required=True)
 a = ap.parse_args()
 sys.path.insert(0, a.collector_dir)
-import collect_stats, sdk_lifecycle as drv
-out = {"sandboxes": {}, "budget": {}}
+import collect_stats, sdk_lifecycle as drv, json as _j
+out = {"sandboxes": {}, "budget": {}, "list_raw_counts": {}}
 for n in a.nodes.split(","):
-    out["sandboxes"][n] = len(collect_stats.list_by_instance(n, "akernel", "", 15))
-node0 = a.nodes.split(",")[0]
-probe = drv.proxy_inventory_snapshot(node0, "akernel", 120, 30)
-auth = drv.authoritative_snapshot(probe)
-snap = auth.get("snapshot", {}) if isinstance(auth, dict) else {}
-out["budget"] = {"instance_count": snap.get("instance_count"),
-                 "entries": snap.get("entries", [])}
-print(json.dumps(out))
+    # node-wide List: empty JSON selector object => server returns all
+    resp = collect_stats.grpc_call(n, "akernel", "runtime.v1.SandboxService/List", {}, 15)
+    sandboxes = resp.get("sandboxes", []) if isinstance(resp, dict) else None
+    if sandboxes is None:
+        out["sandboxes"][n] = None
+    else:
+        out["sandboxes"][n] = len(sandboxes)
+    # per-node authoritative budget inventory
+    probe = drv.proxy_inventory_snapshot(n, "akernel", 120, 30)
+    auth = drv.authoritative_snapshot(probe)
+    snap = auth.get("snapshot", {}) if isinstance(auth, dict) else {}
+    out["budget"][n] = {"instance_count": snap.get("instance_count"),
+                        "entries": snap.get("entries", [])}
+print(_j.dumps(out))
 """
     probe = run([args.venv_python, "-c", probe_script, "--collector-dir", args.collector_dir,
-                 "--nodes", ",".join(args.node)], 180)
+                 "--nodes", ",".join(args.node)], 240)
     report["collector_rc"] = probe["rc"]
     if probe["rc"] != 0:
         fail(report, f"collector probe rc={probe['rc']}: {probe['err'][:200]}")
@@ -116,11 +143,12 @@ print(json.dumps(out))
                 fail(report, f"{node}: sandbox count unknown (node not covered)")
             elif count != 0:
                 fail(report, f"{node}: {count} live sandbox(es) — parked/live records must be empty")
-        budget = data.get("budget", {})
-        if budget.get("instance_count") is None or budget.get("entries") is None:
-            fail(report, "authoritative budget inventory unknown")
-        elif budget.get("instance_count") != 0 or budget.get("entries"):
-            fail(report, f"budget not empty: {budget}")
+        for node in args.node:
+            b = (data.get("budget") or {}).get(node)
+            if b is None or b.get("instance_count") is None or b.get("entries") is None:
+                fail(report, f"{node}: authoritative budget inventory unknown")
+            elif b.get("instance_count") != 0 or b.get("entries"):
+                fail(report, f"{node}: budget not empty: {b}")
 
     # 4) persistent snapshot store
     etcd = run(["kubectl", "-n", "akernel", "exec", args.etcd_pod, "-c", "etcd", "--",
@@ -130,8 +158,14 @@ print(json.dumps(out))
     if etcd["rc"] != 0:
         fail(report, f"etcd probe rc={etcd['rc']}: {etcd['err'][:120]}")
     else:
-        keys = [l for l in etcd["out"].splitlines() if l.startswith("/yr/snapshots")]
+        # --keys-only output must be clean full-key lines; trailing stats
+        # lines or garbage mean the response format is unusable => unknown
+        lines = [l for l in etcd["out"].splitlines() if l.strip()]
+        malformed = [l for l in lines if not l.startswith("/")]
+        keys = [l for l in lines if l.startswith("/yr/snapshots")]
         report["snapshot_store"]["keys"] = keys
+        if malformed:
+            fail(report, f"etcd response format unusable ({len(malformed)} malformed lines)")
         if keys:
             fail(report, f"snapshot store holds {len(keys)} persistent record(s)")
 

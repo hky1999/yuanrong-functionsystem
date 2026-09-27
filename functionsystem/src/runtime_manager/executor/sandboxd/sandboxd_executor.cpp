@@ -630,19 +630,27 @@ litebus::Future<messages::StartInstanceResponse> SandboxdExecutor::StartByManage
     auto restoreReq = std::make_shared<runtime::v1::RestoreRequest>();
     *restoreReq->mutable_sandbox() = *startReq;
     restoreReq->set_checkpoint_dir(managedPath.string());
-    restoreReq->set_checkpoint_id(restoreID);
-    // identity/integrity fields: only when the request carries a complete
-    // snapshotinfo (all-or-nothing contract; the reusable chain restores
-    // without snapshotinfo and takes the dir-verified path here)
+    // identity/integrity fill mirrors the anonymous chain's ALL-OR-NOTHING
+    // contract exactly: checkpoint_id/sha/size are set ONLY as a complete
+    // quartet (with sandbox_id from snapshotinfo). The reusable managed
+    // request carries NO snapshotinfo, so ALL four stay empty here and
+    // sandboxd takes the legacy dir-verified branch — never a half-filled
+    // strict-path rejection (half-fill is rejected at 80004).
     const auto &snapshotInfo = info.snapshotinfo();
     if (!snapshotInfo.sandbox_id().empty() && !snapshotInfo.sha256().empty() && snapshotInfo.size() > 0) {
         restoreReq->mutable_sandbox()->set_sandbox_id(snapshotInfo.sandbox_id());
+        restoreReq->set_checkpoint_id(snapshotInfo.checkpointid());
         restoreReq->set_expected_sha256(snapshotInfo.sha256());
         restoreReq->set_expected_size(snapshotInfo.size());
     }
-    return sandboxd_->Restore(restoreReq)
-        .Then(litebus::Defer(GetAID(), &SandboxdExecutor::OnStartCompleted, info.runtimeid(),
-                             std::placeholders::_1));
+
+    StartSandboxCreateSpan(request);
+    // the REAL restore chain: DoRestore -> OnRestoreDone performs
+    // stateManager_.UpdateSandboxID(new generation), guard->Commit(),
+    // routing/port bookkeeping and Stats/Wait — nothing skipped
+    return DoRestore(request, restoreReq)
+        .Then(litebus::Defer(GetAID(), &SandboxdExecutor::OnRestoreDone, std::placeholders::_1, request,
+                             context.guard));
 }
 
 litebus::Future<messages::StartInstanceResponse> SandboxdExecutor::OnCheckpointDownloaded(
