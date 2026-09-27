@@ -85,7 +85,7 @@ std::shared_ptr<PublicStateMachineProbe> MakePublicStateMachine()
 class ControllableRuntimeClient final : public ControlInterfacePosixClient {
 public:
     litebus::Future<runtime::PrepareSnapResponse> PrepareSnap(
-        const runtime::PrepareSnapRequest &) override
+        runtime::PrepareSnapRequest &&) override
     {
         std::lock_guard<std::mutex> guard(lock_);
         auto promise = std::make_shared<litebus::Promise<runtime::PrepareSnapResponse>>();
@@ -134,9 +134,10 @@ public:
     PublicChainAgentProbe() : MockFunctionAgentMgr("public-chain-agent", nullptr) {}
 
     litebus::Future<messages::SnapshotRuntimeResponse> SnapshotRuntime(
-        const std::string &requestID, const resource_view::InstanceInfo &, int32_t) override
+        const std::string &requestID, const resource_view::InstanceInfo &, int32_t,
+        bool) override
     {
-        return ProbeResponse("three-arg overload unexpectedly used");
+        return ProbeResponse("legacy overload unexpectedly used");
     }
 
     litebus::Future<messages::SnapshotRuntimeResponse> SnapshotRuntime(
@@ -172,19 +173,19 @@ public:
         return response;
     }
 
-    // outcome the next typed checkpoint returns
-    void SetTypedOutcome(const TypedOutcome &outcome)
-    {
-        std::lock_guard<std::mutex> guard(lock_);
-        typedOutcome_ = outcome;
-    }
-
     struct TypedOutcome {
         common::ErrorCode code = common::ERR_NONE;
         bool resultUnknown = false;
         bool checkpointNotStarted = false;
         bool withLocalSnapshot = true;
     };
+
+    // outcome the next typed checkpoint returns
+    void SetTypedOutcome(const TypedOutcome &outcome)
+    {
+        std::lock_guard<std::mutex> guard(lock_);
+        typedOutcome_ = outcome;
+    }
 
     int TypedCalls() const { return typedCalls_.load(); }
     int PublishCalls() const { return publishCalls_.load(); }
@@ -322,8 +323,6 @@ public:
         agentProbe_ = std::make_shared<PublicChainAgentProbe>();
         schedProbe_ = std::make_shared<PublicChainSchedProbe>();
         instanceCtrl_ = std::make_shared<MockInstanceCtrl>();
-        ON_CALL(*instanceCtrl_, BeginPauseGate(_)).WillByDefault(Return(Status::OK()));
-        ON_CALL(*instanceCtrl_, ReleasePausedInstanceResources(_)).WillByDefault(Return(Status::OK()));
         ON_CALL(*instanceCtrl_, TransInstanceState(_, _))
             .WillByDefault(Invoke([](const std::shared_ptr<InstanceStateMachine> &machine,
                                      const TransContext &context) { return machine->TransitionTo(context); }));
