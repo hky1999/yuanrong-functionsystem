@@ -333,7 +333,11 @@ print(_j.dumps(out))
 
     # 8) persistent snapshot store: etcd JSON output, keys-only. ANY kv —
     #    including a key outside the requested prefix — is evidence or a
-    #    broken probe; both directions refuse the upgrade.
+    #    broken probe; both directions refuse the upgrade. A REAL empty
+    #    result carries ONLY the header (etcd omits kvs/count when zero —
+    #    see plan-a-ov24b-first-post-delete-etcd-and-chart-independent.json);
+    #    a bare {}, a malformed header, kvs-without-list or count mismatch
+    #    stay unusable.
     etcd = run(["kubectl", "-n", "akernel", "exec", args.etcd_pod, "-c", "etcd", "--",
                 "/opt/bitnami/etcd/bin/etcdctl", "--endpoints", args.etcd_endpoint,
                 "get", SNAPSHOT_ETCD_PREFIX, "--prefix", "--keys-only", "-w", "json"], 60)
@@ -347,27 +351,39 @@ print(_j.dumps(out))
             payload = None
             fail(report, "etcd response is not valid JSON — unusable")
         if payload is not None:
-            kvs = payload.get("kvs") if isinstance(payload, dict) else None
-            count = payload.get("count") if isinstance(payload, dict) else None
-            if not isinstance(kvs, list):
-                fail(report, "etcd JSON has no kvs list — unusable")
+            if not isinstance(payload, dict) or payload.get("error") is not None:
+                fail(report, "etcd response is not a JSON object or carries an error field — unusable")
             else:
-                if isinstance(count, int) and count != len(kvs):
-                    fail(report, f"etcd count {count} != kvs {len(kvs)} — torn response")
-                keys = []
-                for kv in kvs:
-                    try:
-                        key = base64.b64decode(kv.get("key", "")).decode("utf-8", "replace")
-                    except Exception:
-                        key = None
-                    keys.append(key)
-                report["snapshot_store"]["keys"] = keys
-                outside = [k for k in keys if k is None or not k.startswith(SNAPSHOT_ETCD_PREFIX)]
-                if outside:
-                    fail(report, f"etcd returned {len(outside)} key(s) outside {SNAPSHOT_ETCD_PREFIX} "
-                                 f"(or undecodable) — probe response unusable: {outside[:3]}")
-                if keys:
-                    fail(report, f"snapshot store holds {len(keys)} persistent record(s): {keys[:3]}")
+                header = payload.get("header")
+                if not isinstance(header, dict) \
+                        or not isinstance(header.get("revision"), int) \
+                        or not isinstance(header.get("cluster_id"), int):
+                    fail(report, "etcd response header missing/malformed (revision/cluster_id) — unusable")
+                else:
+                    report["snapshot_store"]["header"] = header
+                    kvs = payload.get("kvs")
+                    count = payload.get("count")
+                    if kvs is None and count is None:
+                        pass  # REAL empty result: header-only, kvs/count omitted
+                    elif not isinstance(kvs, list):
+                        fail(report, "etcd kvs present but not a list — unusable")
+                    else:
+                        if count is not None and (not isinstance(count, int) or count != len(kvs)):
+                            fail(report, f"etcd count {count!r} != kvs {len(kvs)} — torn response")
+                        keys = []
+                        for kv in kvs:
+                            try:
+                                key = base64.b64decode(kv.get("key", "")).decode("utf-8", "replace")
+                            except Exception:
+                                key = None
+                            keys.append(key)
+                        report["snapshot_store"]["keys"] = keys
+                        outside = [k for k in keys if k is None or not k.startswith(SNAPSHOT_ETCD_PREFIX)]
+                        if outside:
+                            fail(report, f"etcd returned {len(outside)} key(s) outside {SNAPSHOT_ETCD_PREFIX} "
+                                         f"(or undecodable) — probe response unusable: {outside[:3]}")
+                        if keys:
+                            fail(report, f"snapshot store holds {len(keys)} persistent record(s): {keys[:3]}")
 
     print(json.dumps(report, ensure_ascii=False, indent=1))
     return 0 if report["eligible"] else 1

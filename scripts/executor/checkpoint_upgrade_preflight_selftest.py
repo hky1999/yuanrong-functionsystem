@@ -77,7 +77,10 @@ if "exec" in argv and "--" in argv:
         if "-w" in tail and "json" in tail:
             out(os.environ.get(
                 "ETCD_JSON",
-                json.dumps({"count": 0, "kvs": []})) + "\n")
+                # REAL empty etcd result: header only, kvs/count omitted
+                json.dumps({"header": {"cluster_id": 10000151581698388884,
+                                       "member_id": 7993723398430708535,
+                                       "revision": 1, "raft_term": 2}})) + "\n")
         out(os.environ.get("ETCD_RAW", ""))
 
 sys.stderr.write("fake kubectl: unsupported invocation: %r\n" % (argv,))
@@ -236,6 +239,14 @@ NEW_CASES = [
          {"key": B64("/yr/snapshots/v1/t/snap-x")}]})},
      None, None, 1),
     ("etcd_not_json", {"ETCD_JSON": "not json at all"}, None, None, 1),
+    ("etcd_bare_object_rejected", {"ETCD_JSON": "{}"}, None, None, 1),
+    ("etcd_malformed_header_rejected",
+     {"ETCD_JSON": json.dumps({"header": {"revision": "bogus", "cluster_id": 1}})}, None, None, 1),
+    ("etcd_count_without_kvs_rejected",
+     {"ETCD_JSON": json.dumps({"header": {"revision": 5, "cluster_id": 1}, "count": 0})}, None, None, 1),
+    ("etcd_error_field_rejected",
+     {"ETCD_JSON": json.dumps({"header": {"revision": 5, "cluster_id": 1}, "error": "etcdserver: x"})},
+     None, None, 1),
     ("etcd_probe_failure", {"ETCD_FAIL": "1"}, None, None, 1),
     ("canonical_label_discovery_still_clean", {"CANONICAL_ONLY": "1"}, None, None, 0),
     ("coverage_missing_node", {}, NODES[:2], None, 1),
