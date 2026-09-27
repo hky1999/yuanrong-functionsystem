@@ -297,10 +297,16 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleSnapshot(const std::string &r
             // not already replaying; pin the ORIGINAL source identity and
             // re-drive under the SAME attempt slot (the store's idempotent
             // Begin/Resolve/Commit settles it authoritatively)
-            if (unknownIt->second.runtimeID != instanceInfo.runtimeid()) {
+            if (unknownIt->second.runtimeID != instanceInfo.runtimeid()
+                || unknownIt->second.name != options.name()
+                || unknownIt->second.checkpointTimeoutMs != options.checkpointtimeoutms()
+                || unknownIt->second.tenantID != instanceInfo.tenantid()) {
+                // pinned re-query: the original request parameters (name,
+                // timeout, tenant) and the ORIGINAL source must all match —
+                // changed parameters are never adopted
                 KillResponse busy;
                 busy.set_code(static_cast<common::ErrorCode>(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY)));
-                busy.set_message("reusable snapshot unknown outcome belongs to a different source runtime");
+                busy.set_message("reusable snapshot unknown outcome belongs to different request parameters or source");
                 return busy;
             }
             unknownIt->second.replaying = true;
@@ -1348,6 +1354,7 @@ litebus::Future<KillResponse> SnapCtrlActor::HandleReusableSnapshot(
             && u->second.attempt == snapshotAttempt;
     }
     context->name = options.name();
+    context->checkpointTimeoutMs = options.checkpointtimeoutms();
     context->sourceInstanceInfo = instanceInfo;
     if (options.checkpointtimeoutms() > 0) {
         (*context->sourceInstanceInfo.mutable_createoptions())["YR_CHECKPOINT_TIMEOUT_MS"] =
@@ -1403,14 +1410,14 @@ void SnapCtrlActor::OnReusableSnapshotBegun(
     }
     const auto &response = future.Get();
     if (response.code() != common::ERR_NONE) {
-        context->outcomeKnown = true;  // definite store answer
+        context->outcomeKnown = !context->replayOfUnknown;  // definite answer; on a replay it does not settle the OLD outcome
         CompleteReusableSnapshotRequest(
             context, BuildReusableSnapshotResponse(
                          static_cast<common::ErrorCode>(response.code()), response.message()));
         return;
     }
     if (response.snapshotid().empty()) {
-        context->outcomeKnown = true;  // definite store answer (malformed)
+        context->outcomeKnown = !context->replayOfUnknown;  // definite answer; on a replay it does not settle the OLD outcome
         CompleteReusableSnapshotRequest(
             context, BuildReusableSnapshotResponse(
                          common::ERR_INNER_SYSTEM_ERROR,
@@ -1438,7 +1445,7 @@ void SnapCtrlActor::OnReusableSnapshotBegun(
         return;
     }
     if (response.phase() != ::messages::REUSABLE_SNAPSHOT_PUBLISHING) {
-        context->outcomeKnown = true;  // definite store answer (invalid phase)
+        context->outcomeKnown = !context->replayOfUnknown;  // definite answer; on a replay it does not settle the OLD outcome
         CompleteReusableSnapshotRequest(
             context, BuildReusableSnapshotResponse(
                          common::ERR_INNER_SYSTEM_ERROR,
@@ -1465,7 +1472,7 @@ void SnapCtrlActor::OnReusableSnapshotResolvedForCleanup(
     if (response.code() != common::ERR_NONE
         || !response.has_reusablesnapshotrestore()
         || !response.reusablesnapshotrestore().has_artifact()) {
-        context->outcomeKnown = true;  // definite store answer
+        context->outcomeKnown = !context->replayOfUnknown;  // definite answer; on a replay it does not settle the OLD outcome
         CompleteReusableSnapshotRequest(
             context, BuildReusableSnapshotResponse(
                          response.code() == common::ERR_NONE ? common::ERR_INNER_SYSTEM_ERROR
@@ -1486,6 +1493,7 @@ void SnapCtrlActor::OnReusableSnapshotPrepared(
     if (future.IsError() || future.Get().IsError()) {
         const auto message = future.IsError() ? "reusable snapshot PrepareSnap future failed"
                                               : future.Get().RawMessage();
+        context->failOutcomeUnknown = false;  // pre-physical: checkpoint not attempted
         FailReusableSnapshot(context, common::ERR_INNER_COMMUNICATION, message);
         return;
     }
@@ -1499,13 +1507,27 @@ void SnapCtrlActor::OnReusableSnapshotCheckpointed(
     const std::shared_ptr<ReusableSnapshotContext> &context,
     const litebus::Future<::messages::SnapshotRuntimeResponse> &future)
 {
-    if (future.IsError() || future.Get().code() != common::ERR_NONE
+    if (future.IsError()) {
+        // LOST checkpoint RPC reply: the physical execution is UNKNOWN. Do
+        // NOT Fail here — ReusableSnapshotStore::Fail CAS-deletes the
+        // PUBLISHING record, which would destroy the coordination facts the
+        // deterministic replay must settle against (the stable snapshot ID
+        // is a hash of tenant+instance+request, so the SAME record is what
+        // a later re-query reconciles). Keep the record; complete UNKNOWN.
+        context->outcomeKnown = false;
+        CompleteReusableSnapshotRequest(
+            context, BuildReusableSnapshotResponse(
+                         common::ERR_INNER_COMMUNICATION,
+                         "reusable snapshot LOCAL_READY result is unknown "
+                         "(checkpoint RPC reply lost; PUBLISHING record kept)"));
+        return;
+    }
+    if (future.Get().code() != common::ERR_NONE
         || !future.Get().has_localsnapshot()) {
-    context->failOutcomeUnknown = future.IsError();  // lost checkpoint reply: execution uncertain
+        context->failOutcomeUnknown = false;  // definite agent answer: checkpoint did not complete
         FailReusableSnapshot(
             context, common::ERR_INNER_COMMUNICATION,
-            future.IsError() ? "reusable snapshot LOCAL_READY future failed"
-                             : future.Get().message());
+            future.Get().message());
         return;
     }
     clientManager_->GetControlInterfacePosixClient(context->instanceID)
@@ -1790,10 +1812,12 @@ void SnapCtrlActor::CompleteReusableSnapshotRequest(
                 unknownReusable_.emplace(
                     context->instanceID,
                     UnknownReusableEntry{context->requestID, context->snapshotAttempt,
-                                         context->sourceInstanceInfo.runtimeid(), false});
+                                         context->sourceInstanceInfo.runtimeid(),
+                                         context->name, context->checkpointTimeoutMs,
+                                         context->sourceInstanceInfo.tenantid(), false});
             }
         }
     }
     context->completion->SetValue(response);
-}    context->failOutcomeUnknown = false;  // pre-physical: checkpoint not attempted
+}
 }  // namespace functionsystem::local_scheduler

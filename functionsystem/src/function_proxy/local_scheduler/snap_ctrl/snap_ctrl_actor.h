@@ -293,6 +293,7 @@ private:
         bool outcomeKnown{ false };
         bool replayOfUnknown{ false };
         bool failOutcomeUnknown{ false };
+        uint64_t checkpointTimeoutMs{ 0 };  // pinned replay parameter
         bool tunnelGateHeld{ false };
         bool completed{ false };
     };
@@ -450,6 +451,10 @@ private:
         std::string requestID;
         uint64_t attempt;
         std::string runtimeID;
+        // pinned re-query parameters: a replay must match ALL of them
+        std::string name;
+        uint64_t checkpointTimeoutMs{ 0 };
+        std::string tenantID;
         bool replaying{ false };
     };
     std::unordered_map<std::string, UnknownReusableEntry> unknownReusable_;
