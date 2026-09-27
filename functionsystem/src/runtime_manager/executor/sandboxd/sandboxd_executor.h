@@ -257,6 +257,21 @@ private:
         const runtime::v1::RestoreResponse &response, const std::shared_ptr<messages::StartInstanceRequest> &request,
         std::shared_ptr<SandboxdStartGuard> guard);
 
+    // Managed-restore dispatch carries the REAL RPC outcome provenance —
+    // a business reply received from sandboxd vs a transport-wrapped error —
+    // so the completion never has to guess from an error-code range. Private
+    // to the executor (no proto change); only the managed path consumes it.
+    struct RestoreDispatchResult {
+        runtime::v1::RestoreResponse response;
+        bool replyReceived = false;
+    };
+    litebus::Future<RestoreDispatchResult> DoRestoreObserved(
+        const std::shared_ptr<messages::StartInstanceRequest> &request,
+        const std::shared_ptr<runtime::v1::RestoreRequest> &req);
+    litebus::Future<messages::StartInstanceResponse> OnManagedRestoreDone(
+        const RestoreDispatchResult &dispatch, const std::shared_ptr<messages::StartInstanceRequest> &request,
+        std::shared_ptr<SandboxdStartGuard> guard);
+
     // ── Stop helpers ──────────────────────────────────────────────────────────
 
     litebus::Future<Status> StopSandbox(const std::string &runtimeID, const std::string &requestID, bool oomKilled);

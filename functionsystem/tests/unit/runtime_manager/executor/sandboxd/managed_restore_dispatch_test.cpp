@@ -17,8 +17,10 @@
  *    CheckpointRequest itself has no generation field;
  *  - port-forward bookkeeping follows StartNormal semantics: mappings are
  *    allocated + recorded before dispatch, appear on the Restore RPC's
- *    sandbox, SURVIVE success, and are RELEASED in the real PortManager
- *    when the restore RPC fails (the start guard alone never frees them);
+ *    sandbox, SURVIVE success, are RELEASED in the real PortManager only on
+ *    a CONFIRMED sandboxd failure reply, and are RETAINED (explicit UNKNOWN
+ *    to the caller) when the reply is lost on the wire — provenance comes
+ *    from DoRestoreObserved's replyReceived, not error-code guessing;
  *  - a missing managed artifact fails EXPLICITLY — zero Start AND zero
  *    Restore dispatches (never a silent fresh instance);
  *  - traversal-shaped ids are rejected before any RPC;
@@ -105,6 +107,13 @@ public:
         recorded_.expectedSize = req->expected_size();
         recorded_.sandboxId = req->sandbox().sandbox_id();
         recorded_.restorePorts.assign(req->sandbox().ports().begin(), req->sandbox().ports().end());
+        if (transportFailRestore_) {
+            // the reply is lost on the wire: DoRestore wraps the channel
+            // failure as a plain error response — the physical outcome is
+            // UNKNOWN even though the request may have executed
+            ++transportFailures_;
+            return grpc::Status(grpc::StatusCode::UNAVAILABLE, "fake transport cut after dispatch");
+        }
         if (failRestore_) {
             rsp->set_code(static_cast<int32_t>(StatusCode::RUNTIME_MANAGER_CREATE_EXEC_FAILED));
             rsp->set_message("fake restore rejected");
@@ -153,10 +162,24 @@ public:
         failRestore_ = fail;
     }
 
+    void SetTransportFailRestore(bool fail)
+    {
+        const std::lock_guard<std::mutex> lock(mu_);
+        transportFailRestore_ = fail;
+    }
+
+    int TransportFailures() const
+    {
+        const std::lock_guard<std::mutex> lock(mu_);
+        return transportFailures_;
+    }
+
 private:
     mutable std::mutex mu_;
     RecordedRestore recorded_;
     bool failRestore_ = false;
+    bool transportFailRestore_ = false;
+    int transportFailures_ = 0;
 };
 
 class ManagedRestoreDispatchTest : public ::testing::Test {
@@ -180,7 +203,10 @@ protected:
                                                        nullptr);
         litebus::Spawn(executor_);
         executor_->SetHealthCheckClient(std::make_shared<HealthCheck>("hc_" + uid));
-        litebus::Async(executor_->GetAID(), &SandboxdExecutor::InitConfig).Get();
+        // InitConfig returns void (the Async wrapper has no Get()); calling
+        // it on the test thread sets sandboxd_/ckptOrch_ synchronously before
+        // any Start is issued, exactly like the other direct-call suites.
+        executor_->InitConfig();
     }
 
     void TearDown() override
@@ -447,9 +473,10 @@ TEST_F(ManagedRestoreDispatchTest, ManagedRestoreWithPortsKeepsMappingsOnSuccess
     PortManager::GetInstance().ReleasePorts("rt-port-ok");  // singleton hygiene
 }
 
-// FAILURE releases the allocation in the REAL PortManager: the guard
-// destructor only unregisters state, so without the explicit failure-path
-// release the host port would leak until process restart.
+// CONFIRMED FAILURE releases the allocation in the REAL PortManager: an
+// explicit sandboxd failure reply proves the restore produced no live
+// instance, so the host ports allocated before dispatch go back to the pool
+// (the start guard destructor alone would leak them until process restart).
 TEST_F(ManagedRestoreDispatchTest, ManagedRestoreRpcFailureReleasesAllocatedPorts)
 {
     service_.SetFailRestore(true);
@@ -469,6 +496,42 @@ TEST_F(ManagedRestoreDispatchTest, ManagedRestoreRpcFailureReleasesAllocatedPort
         << "the recorded mapping must be cleared with the allocation";
     EXPECT_TRUE(WaitUnregistered(*executor_, "rt-port-fail"))
         << "guard rollback must eventually unregister the failed runtime";
+}
+
+// TRANSPORT UNKNOWN retains ownership: the fake service takes the real
+// gRPC-level failure path (UNAVAILABLE after dispatch), so DoRestoreObserved
+// records replyReceived=false. The restore may have physically executed and a
+// live instance may still hold the ports — the response must say UNKNOWN
+// explicitly (never a plain failure that reads as "physically not executed"),
+// and the ORIGINAL owner keeps both the PortManager allocation and the
+// recorded mapping.
+TEST_F(ManagedRestoreDispatchTest, ManagedRestoreTransportFailureRetainsPortsAsUnknown)
+{
+    service_.SetTransportFailRestore(true);
+    auto request = MakeRequest("rt-port-unknown", "snap-m1");
+    AddPortForwarding(request);
+
+    const auto response = Start(request);
+    EXPECT_EQ(response.code(), static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY))
+        << "an unobserved outcome must surface as explicitly unknown, not a plain create failure";
+    EXPECT_NE(response.message().find("outcome unknown"), std::string::npos);
+    EXPECT_NE(response.message().find("port ownership retained"), std::string::npos);
+
+    EXPECT_EQ(service_.TransportFailures(), 1);
+    const auto recorded = service_.Snapshot();
+    ASSERT_EQ(recorded.restores, 1) << "the request DID leave the executor before the reply was lost";
+    ASSERT_EQ(recorded.restorePorts.size(), 1UL) << "the dispatched RPC carried the allocated mapping";
+
+    const auto held = PortManager::GetInstance().GetPorts("rt-port-unknown");
+    ASSERT_EQ(held.size(), 1UL) << "an unknown outcome must NOT free the host port";
+    EXPECT_NE(recorded.restorePorts[0].find(":" + std::to_string(held[0]) + ":"), std::string::npos)
+        << "the retained port must still be the ORIGINAL owner's dispatched allocation";
+    EXPECT_FALSE(executor_->stateManager_.GetPortMappingsJson("rt-port-unknown").empty())
+        << "the recorded mapping must stay with the retained ownership";
+    EXPECT_TRUE(WaitUnregistered(*executor_, "rt-port-unknown"))
+        << "the local registration still rolls back; only the physical resources are retained";
+
+    PortManager::GetInstance().ReleasePorts("rt-port-unknown");  // singleton hygiene
 }
 
 // LEGACY compatibility: the anonymous snapshot chain (snapshotinfo, no

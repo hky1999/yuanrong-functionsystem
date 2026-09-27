@@ -199,10 +199,13 @@ target_link_libraries(snap_ctrl_public_chain_test PRIVATE
 add_test(NAME snap_ctrl_public_chain_test COMMAND snap_ctrl_public_chain_test)
 
 # Managed-checkpoint target contract (whole-contract fix for the ov24c
-# named-snapshot identity mismatch): pure-function tests, no actor.
+# named-snapshot identity mismatch): pure-function tests, no actor. The
+# resolver's Status implementation is linked in directly — the plain-gtest
+# binary must stay independent of the litebus/observability link set.
 add_executable(managed_checkpoint_target_test
         runtime_manager/managed_checkpoint_target_test_main.cpp
-        runtime_manager/managed_checkpoint_target_test.cpp)
+        runtime_manager/managed_checkpoint_target_test.cpp
+        ${PROJECT_SOURCE_DIR}/src/common/status/status.cpp)
 target_compile_options(managed_checkpoint_target_test PRIVATE -Wno-error)
 target_include_directories(managed_checkpoint_target_test PRIVATE
         ${gtest_INCLUDE_DIR}

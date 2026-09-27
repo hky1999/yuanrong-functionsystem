@@ -657,11 +657,12 @@ litebus::Future<messages::StartInstanceResponse> SandboxdExecutor::StartByManage
     }
 
     StartSandboxCreateSpan(request);
-    // the REAL restore chain: DoRestore -> OnRestoreDone performs
-    // stateManager_.UpdateSandboxID(new generation), guard->Commit(),
-    // routing/port bookkeeping and Stats/Wait — nothing skipped
-    return DoRestore(request, restoreReq)
-        .Then(litebus::Defer(GetAID(), &SandboxdExecutor::OnRestoreDone, std::placeholders::_1, request,
+    // the REAL restore chain with outcome provenance: DoRestoreObserved marks
+    // whether a sandboxd BUSINESS reply actually arrived; OnManagedRestoreDone
+    // releases the pre-dispatch ports only on a confirmed failure reply and
+    // retains ownership (explicit UNKNOWN) when the reply was lost
+    return DoRestoreObserved(request, restoreReq)
+        .Then(litebus::Defer(GetAID(), &SandboxdExecutor::OnManagedRestoreDone, std::placeholders::_1, request,
                              context.guard));
 }
 
@@ -743,16 +744,6 @@ litebus::Future<messages::StartInstanceResponse> SandboxdExecutor::OnRestoreDone
         ReportSandboxLifecycleStatus(info, info.runtimeid(), SandboxLifecycleStatus::ABNORMAL);
         // Compensate: release the checkpoint ref we added before restore
         ckptOrch_->ReleaseRef(info.runtimeid(), info.requestid());
-        // MANAGED restore allocated host ports before dispatch (the same
-        // bookkeeping as StartNormal); the start guard destructor only
-        // unregisters state and never touches PortManager, so the allocation
-        // must be released here or it leaks until process restart. The
-        // anonymous snapshot chain never allocates in this path, so it is
-        // deliberately excluded and keeps its exact legacy behavior.
-        if (!info.restoresnapshotid().empty()) {
-            stateManager_.UpdatePortMappings(info.runtimeid(), "");
-            PortManager::GetInstance().ReleasePorts(info.runtimeid());
-        }
         // guard destructor rolls back state
         return GenFailStartInstanceResponse(request, RUNTIME_MANAGER_CREATE_EXEC_FAILED, response.message());
     }
@@ -766,6 +757,48 @@ litebus::Future<messages::StartInstanceResponse> SandboxdExecutor::OnRestoreDone
     YRLOG_INFO("{}|{}|restore success: instance({}) runtime({}) sandbox({})", info.traceid(), info.requestid(),
                info.instanceid(), info.runtimeid(), sandboxID);
     return MakeSuccessStartResponse(request, sandboxID);
+}
+
+// Managed-restore completion. The dispatch result records whether sandboxd's
+// BUSINESS reply was actually received, so the failure split is provenance,
+// not error-code guessing:
+//  - no reply (transport/deadline): the restore may have physically executed
+//    and a live instance may still hold the ports — ownership is RETAINED and
+//    the caller gets an explicit UNKNOWN, never a plain failure that would
+//    read as "physically not executed";
+//  - confirmed failure reply: no live instance exists, so the pre-dispatch
+//    port allocation and mapping record are released (the start guard
+//    destructor only unregisters state and never touches PortManager);
+//  - success: shared chain with the anonymous completion.
+litebus::Future<messages::StartInstanceResponse> SandboxdExecutor::OnManagedRestoreDone(
+    const RestoreDispatchResult &dispatch, const std::shared_ptr<messages::StartInstanceRequest> &request,
+    std::shared_ptr<SandboxdStartGuard> guard)
+{
+    const auto &info = request->runtimeinstanceinfo();
+    if (!dispatch.replyReceived) {
+        YRLOG_WARN("{}|{}|managed restore outcome UNKNOWN for runtime({}): no sandboxd reply; port ownership "
+                   "retained",
+                   info.traceid(), info.requestid(), info.runtimeid());
+        ReportSandboxLifecycleStatus(info, info.runtimeid(), SandboxLifecycleStatus::ABNORMAL);
+        // managed artifacts carry no anonymous refcount: nothing to ReleaseRef.
+        // The guard destructor still rolls back the LOCAL registration; only
+        // the physical resources (host ports) are deliberately retained.
+        return GenFailStartInstanceResponse(
+            request, StatusCode::ERR_INSTANCE_BUSY,
+            "managed restore outcome unknown: no sandboxd reply received; port ownership retained: "
+                + dispatch.response.message());
+    }
+    if (dispatch.response.code() != static_cast<int32_t>(StatusCode::SUCCESS)) {
+        YRLOG_ERROR("{}|{}|managed restore failed (confirmed reply) for runtime({}): {}", info.traceid(),
+                    info.requestid(), info.runtimeid(), dispatch.response.message());
+        ReportSandboxLifecycleStatus(info, info.runtimeid(), SandboxLifecycleStatus::ABNORMAL);
+        stateManager_.UpdatePortMappings(info.runtimeid(), "");
+        PortManager::GetInstance().ReleasePorts(info.runtimeid());
+        // guard destructor rolls back state
+        return GenFailStartInstanceResponse(request, RUNTIME_MANAGER_CREATE_EXEC_FAILED,
+                                            dispatch.response.message());
+    }
+    return OnRestoreDone(dispatch.response, request, std::move(guard));
 }
 
 // ── Start path ───────────────────────────────────────────────────────────────
@@ -1828,6 +1861,35 @@ litebus::Future<runtime::v1::RestoreResponse> SandboxdExecutor::DoRestore(
                                         request->runtimeinstanceinfo().runtimeid(), status.RawMessage()));
             YRLOG_ERROR("{}|{}", request->runtimeinstanceinfo().traceid(), err.message());
             return err;
+        });
+}
+
+// Same physical dispatch as DoRestore, but preserves the REAL RPC outcome
+// provenance: replyReceived is the CallAsyncX callback's own status.IsOk(),
+// so a lost reply can never be confused with a business failure even if the
+// numeric codes collide. Managed restores only.
+litebus::Future<SandboxdExecutor::RestoreDispatchResult> SandboxdExecutor::DoRestoreObserved(
+    const std::shared_ptr<messages::StartInstanceRequest> &request,
+    const std::shared_ptr<runtime::v1::RestoreRequest> &req)
+{
+    YRLOG_INFO("{}|{}|DoRestoreObserved: {}", request->runtimeinstanceinfo().traceid(),
+               request->runtimeinstanceinfo().requestid(), req->ShortDebugString());
+    ASSERT_IF_NULL(sandboxd_);
+    auto resp = std::make_shared<runtime::v1::RestoreResponse>();
+    return sandboxd_->CallAsyncX("Restore", *req, resp.get(), &runtime::v1::SandboxService::Stub::AsyncRestore)
+        .Then([request, resp](const Status &status) -> RestoreDispatchResult {
+            RestoreDispatchResult result;
+            result.replyReceived = status.IsOk();
+            if (status.IsOk()) {
+                result.response = *resp;
+                return result;
+            }
+            result.response.set_code(static_cast<int32_t>(status.StatusCode()));
+            result.response.set_message(fmt::format("Restore gRPC failed for runtime({}): {}",
+                                                    request->runtimeinstanceinfo().runtimeid(),
+                                                    status.RawMessage()));
+            YRLOG_ERROR("{}|{}", request->runtimeinstanceinfo().traceid(), result.response.message());
+            return result;
         });
 }
 

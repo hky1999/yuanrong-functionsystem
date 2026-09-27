@@ -10,16 +10,13 @@
  * id; HALF-passed pairs (either field alone) are rejected. Path-shape and
  * identity safety are enforced either way.
  *
- * Artifact ownership across source retirement (design note under test at
- * the service boundary, next round): the orchestrator AddRef/
- * SetCheckpointID(runtimeID->checkpointID) mapping makes StopInstance
- * ReleaseRef DECREF the file; RemoveReference only starts a TTL at zero
- * and the named chain carries ttl=0 (non-expiring), so retiring the
- * source does NOT delete the named artifact — the Agent's
- * local-snapshot store owns its lifecycle (Commit/Publish/Discard under
- * the same id). The service-boundary regression will assert: checkpoint
- * lands in the caller's staging dir under the caller's id; agent Commit
- * succeeds; source retirement leaves the artifact restorable.
+ * Artifact OWNERSHIP is not a property of this pure resolver: it comes from
+ * DIRECTORY ISOLATION — managed artifacts live under <base>/managed and the
+ * anonymous CkptFileManager (whose ttl<=0 falls back to the 1800s default)
+ * only ever scans <base>/anonymous. That isolation is proven by the real
+ * actor tests (ckpt_ownership_isolation_test.cpp: TTL cleanup and the
+ * restart scan adopt anonymous artifacts only, never the managed sibling);
+ * no constant-comparison test here can add to that proof.
  */
 #include <gtest/gtest.h>
 
@@ -95,23 +92,6 @@ TEST(ManagedCheckpointTarget, EmptyIdentityComponentShapesRejected)
     ASSERT_TRUE(ResolveManagedCheckpointTarget(request, "/cfg", "i", target).IsError());
     request.set_snapshotid("has/slash");
     ASSERT_TRUE(ResolveManagedCheckpointTarget(request, "/cfg", "i", target).IsError());
-}
-
-TEST(ManagedCheckpointTarget, NonPositiveTtlIsNonExpiringByContract)
-{
-    // IsExpired semantics pinned at the contract level: ttl<=0 with
-    // refCount 0 must NEVER report expired. (The runtime registration
-    // sets ttlActive = ttl > 0, and IsExpired guards ttlSeconds<=0 —
-    // both ends of the fix; before it, ttl=0 + ttlActive=true made
-    // elapsed >= 0 always-true, deleting the managed artifact at the
-    // next cleanup tick after source retirement.)
-    const int32_t namedTtl = 0;  // named reusable chain carries ttl=0
-    EXPECT_FALSE(namedTtl > 0);  // non-expiring branch chosen at registration
-    const bool ttlActiveAtRegistration = namedTtl > 0;
-    EXPECT_FALSE(ttlActiveAtRegistration);
-    // restart-scan decision: managed marker present => no anonymous TTL
-    // (encoded in RestoreCheckpointsFromLocal: managed => ttlActive=false,
-    // ttlSeconds=0); absent => default TTL attaches as before
 }
 
 }  // namespace
