@@ -914,7 +914,14 @@ TEST_F(AgentServiceActorTest, SnapshotRuntimeCommitsLocalMetadataBeforeSuccess)
     ASSERT_TRUE(forwardedRequest.ParseFromString(forwarded.Get()));
     EXPECT_EQ(std::filesystem::path(forwardedRequest.checkpointdir()),
               checkpointRoot / forwardedRequest.snapshotid());
-    ASSERT_TRUE(std::filesystem::is_directory(forwardedRequest.checkpointdir()));
+    // Daemon atomic-publish contract (a147bac4): the agent must dispatch the
+    // physical checkpoint with the FINAL leaf ABSENT — a pre-created
+    // directory is the "checkpoint directory is incomplete" state the
+    // daemon's PublishAt rejects. This fixture plays the daemon side, so it
+    // creates the directory itself when publishing the artifact.
+    ASSERT_FALSE(std::filesystem::exists(forwardedRequest.checkpointdir()))
+        << "the forwarded checkpoint_dir must not be pre-created by the agent";
+    std::filesystem::create_directory(std::filesystem::path(forwardedRequest.checkpointdir()));
     std::ofstream checkpoint(std::filesystem::path(forwardedRequest.checkpointdir()) / "checkpoint.img",
                              std::ios::binary);
     checkpoint << "agent-owned-local-checkpoint";

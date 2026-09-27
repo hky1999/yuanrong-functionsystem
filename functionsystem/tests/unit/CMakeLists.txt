@@ -227,6 +227,56 @@ target_include_directories(snap_options_policy_gate_test PRIVATE
 target_link_libraries(snap_options_policy_gate_test PRIVATE posix_pb)
 add_test(NAME snap_options_policy_gate_test COMMAND snap_options_policy_gate_test)
 
+# Focused local-snapshot-store leaf-contract target (a147bac4): the legacy
+# pause_resume_unit_test that also compiles this TU is REGISTERED as
+# non-compilable (Mock interface mismatch) — this minimal target exists so
+# the daemon-atomic-publish boundary tests actually build and run. It links
+# the real function_agent_lib, so the CHANGED agent sources
+# (agent_service_snapshot.cpp / local_snapshot_store.cpp) are compiled and
+# pulled in; no claim is made about the old suite's cases.
+add_executable(local_snapshot_prepare_test
+        runtime_manager/managed_checkpoint_target_test_main.cpp
+        function_agent/snapshot/local_snapshot_store_test.cpp)
+target_compile_options(local_snapshot_prepare_test PRIVATE -Wno-error -Wno-missing-field-initializers)
+target_include_directories(local_snapshot_prepare_test PRIVATE
+        ${CMAKE_CURRENT_LIST_DIR}
+        ${gtest_INCLUDE_DIR}
+        ${SRC_INCLUDE_DIR}
+        ${META_STORE_DIR}
+        ${SRC_BUSPROXY_INCLUDE_DIR}
+        ${SRC_LOCAL_SCHEDULER_INCLUDE_DIR}
+        ${SRC_FUNCTION_PROXY_INCLUDE_DIR}
+        ${GLOBAL_SCHEDULER_DIR}
+        ${INSTANCE_MANAGER_DIR}
+        ${FUNCTION_AGENT_DIR}
+        ${SRC_RUNTIME_MANAGER_INCLUDE_DIR})
+target_link_libraries(local_snapshot_prepare_test PRIVATE
+        ${crypto_LIB}
+        ${ssl_LIB}
+        ${zlib_LIB}
+        ${protobuf_LIB}
+        ${grpcpp_LIB}
+        ${gpr_LIB}
+        ${etcdapi_LIB_A}
+        ${securec_LIB}
+        ${gtest_LIB_A}
+        ${gmock_LIB_A}
+        ${litebus_ALL_LIB}
+        ${INSTANCE_MANAGER_LIB}
+        ${SNAP_MANAGER_LIB}
+        ${GLOBAL_SCHEDULER_LIB}
+        snapshot_storage
+        busproxy_lib
+        local_scheduler_lib
+        function_proxy_common_lib
+        ${FUNCTION_AGENT_LIB}
+        runtime_manager_lib
+        ${META_STORE_LIB}
+        scheduler
+        schedule_plugin_common
+        pthread)
+add_test(NAME local_snapshot_prepare_test COMMAND local_snapshot_prepare_test)
+
 target_compile_options(${PAUSE_RESUME_UNIT_TEST} PRIVATE
         -Wno-error
         -fno-access-control

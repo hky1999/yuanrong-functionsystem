@@ -249,12 +249,17 @@ TEST_F(LocalSnapshotStoreTest, LruDoesNotKeepPhantomRemoteRecord)
 
 // ── daemon atomic-publish leaf contract (sandboxd checkpoint store) ─────────
 // The daemon's PublishAt creates the final artifact directory ATOMICALLY from
-// a staging sibling and rejects a pre-existing incomplete final directory
-// with failed-precondition ("checkpoint directory is incomplete" — the
-// pc-snapshot-67e5-1 physical failure). Its own real-storage Go tests
-// (internal/checkpoint/store_test.go: PublishAt replay on complete dirs,
-// rejection on pre-existing/incomplete and foreign-identity dirs) pin the
-// daemon side; these tests pin the Agent side of that boundary.
+// a staging sibling and rejects a pre-existing final directory with
+// failed-precondition ("checkpoint directory is incomplete" — the
+// pc-snapshot-67e5-1 physical failure). Daemon-side coverage that ALREADY
+// exists in internal/checkpoint/store_test.go is narrower than this
+// contract: TestCheckpointReplayBindsPhysicalGeneration proves fresh-dir
+// publish plus old-generation replay rejection, alongside the
+// missing-resource/sidecar checks. The pre-created-empty-directory rejection
+// is verified against the REAL PublishAt in a scratch copy of the sandboxd
+// tree (BM1 evidence run; the product Go source is unchanged). These tests
+// pin the Agent side of the boundary; they claim nothing about the old
+// pause_resume_unit_test suite.
 
 TEST_F(LocalSnapshotStoreTest, PhysicalPrepareLeavesFinalLeafAbsent)
 {
