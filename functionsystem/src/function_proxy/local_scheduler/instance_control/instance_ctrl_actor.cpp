@@ -5525,7 +5525,8 @@ litebus::Future<messages::ScheduleResponse> InstanceCtrlActor::DoAuthorizeCreate
 {
     return AuthorizeCreate(functionMeta, scheduleReq, runtimePromise)
         .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::GetAffinity, _1, scheduleReq))
-        .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::ResolveReusableSnapshotIntent, _1, scheduleReq))
+        .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::ResolveReusableSnapshotIntent, _1, scheduleReq,
+                             runtimePromise))
         .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::DoCreateInstance, _1, functionMeta, scheduleReq,
                              runtimePromise));
 }
@@ -5543,8 +5544,11 @@ litebus::Future<messages::ScheduleResponse> InstanceCtrlActor::DoAuthorizeCreate
 // replaced. Upstream fabricating CPU:0/Memory:0 entries for OMITTED SDK
 // values therefore pins 0/0 — that is an upstream-entry bug to fix there,
 // not something this gate may paper over.
+constexpr uint64_t REUSABLE_SNAPSHOT_RESOLVE_TIMEOUT_MS = 30000;
+
 litebus::Future<Status> InstanceCtrlActor::ResolveReusableSnapshotIntent(
-    const Status &priorStatus, const std::shared_ptr<messages::ScheduleRequest> &scheduleReq)
+    const Status &priorStatus, const std::shared_ptr<messages::ScheduleRequest> &scheduleReq,
+    const std::shared_ptr<litebus::Promise<messages::ScheduleResponse>> &runtimePromise)
 {
     const std::string traceID = scheduleReq->traceid();
     const std::string requestID = scheduleReq->requestid();
@@ -5560,6 +5564,10 @@ litebus::Future<Status> InstanceCtrlActor::ResolveReusableSnapshotIntent(
         YRLOG_ERROR("{}|{}|reusable snapshot resolve unavailable for instance({}): local scheduler service is not "
                     "bound; refusing to continue as a plain create",
                     traceID, requestID, scheduleReq->instance().instanceid());
+        const auto response = GenScheduleResponse(
+            StatusCode::ERR_INNER_SYSTEM_ERROR,
+            "reusable snapshot resolve service unavailable; create refused (fail-closed)", *scheduleReq);
+        runtimePromise->SetValue(response);
         return Status(StatusCode::ERR_INNER_SYSTEM_ERROR,
                       "reusable snapshot resolve service unavailable; create refused (fail-closed)");
     }
@@ -5567,33 +5575,104 @@ litebus::Future<Status> InstanceCtrlActor::ResolveReusableSnapshotIntent(
     resolveReq->set_requestid(requestID);
     resolveReq->set_tenantid(scheduleReq->instance().tenantid());
     resolveReq->set_snapshotid(requested->second);
-    auto scheduleReqCopy = scheduleReq;
-    return localSchedSrv_->ResolveReusableSnapshotForCreate(resolveReq)
-        .Then(litebus::Defer(
-            GetAID(),
-            [scheduleReqCopy, traceID, requestID](const ::messages::ResolveReusableSnapshotForCreateResponse &resolved)
-                -> Status {
-                if (resolved.code() != common::ERR_NONE) {
-                    YRLOG_ERROR("{}|{}|reusable snapshot resolve failed for instance({}): code({}) msg({})",
-                                traceID, requestID, scheduleReqCopy->instance().instanceid(), resolved.code(),
-                                resolved.message());
-                    return Status(StatusCode::ERR_AUTHORIZE_FAILED,
-                                  "reusable snapshot resolve failed: " + resolved.message());
-                }
-                const auto applied = ApplyResolvedReusableSnapshotForCreate(resolved, scheduleReqCopy);
-                if (applied.IsError()) {
-                    YRLOG_ERROR("{}|{}|reusable snapshot context rejected for instance({}): {}",
-                                traceID, requestID, scheduleReqCopy->instance().instanceid(),
-                                applied.RawMessage());
-                    return Status(StatusCode::ERR_AUTHORIZE_FAILED,
-                                  "reusable snapshot context rejected: " + applied.RawMessage());
-                }
-                YRLOG_INFO("{}|{}|reusable snapshot context applied for instance({}): snapshot({}) backend({})",
-                           traceID, requestID, scheduleReqCopy->instance().instanceid(),
-                           resolved.reusablesnapshotrestore().snapshotid(),
-                           resolved.reusablesnapshotrestore().artifact().storagebackend());
-                return Status::OK();
-            }));
+    // The caller's promise MUST complete on every outcome of this step — a
+    // failed or hung resolve future can never be allowed to stall the chain
+    // with no response. A single completion slot is raced idempotently
+    // (actor strand) between the resolve completion and a bounded watchdog.
+    const auto completion = std::make_shared<litebus::Promise<Status>>();
+    const auto settled = std::make_shared<bool>(false);
+    localSchedSrv_->ResolveReusableSnapshotForCreate(resolveReq)
+        .OnComplete(litebus::Defer(GetAID(), &InstanceCtrlActor::OnReusableSnapshotIntentResolved, scheduleReq,
+                                   runtimePromise, completion, settled, std::placeholders::_1));
+    litebus::AsyncAfter(REUSABLE_SNAPSHOT_RESOLVE_TIMEOUT_MS, GetAID(),
+                        &InstanceCtrlActor::ReusableSnapshotIntentTimeout, scheduleReq, runtimePromise, completion,
+                        settled);
+    return completion->GetFuture();
+}
+
+void InstanceCtrlActor::RejectReusableSnapshotIntent(
+    const std::shared_ptr<messages::ScheduleRequest> &scheduleReq,
+    const std::shared_ptr<litebus::Promise<messages::ScheduleResponse>> &runtimePromise,
+    const std::shared_ptr<litebus::Promise<Status>> &completion, const std::shared_ptr<bool> &settled,
+    StatusCode code, const std::string &message)
+{
+    if (*settled) {
+        return;
+    }
+    *settled = true;
+    YRLOG_ERROR("{}|{}|reusable snapshot intent rejected for instance({}): {}", scheduleReq->traceid(),
+                scheduleReq->requestid(), scheduleReq->instance().instanceid(), message);
+    runtimePromise->SetValue(GenScheduleResponse(code, message, *scheduleReq));
+    completion->SetValue(Status(code, message));
+}
+
+void InstanceCtrlActor::OnReusableSnapshotIntentResolved(
+    const std::shared_ptr<messages::ScheduleRequest> &scheduleReq,
+    const std::shared_ptr<litebus::Promise<messages::ScheduleResponse>> &runtimePromise,
+    const std::shared_ptr<litebus::Promise<Status>> &completion, const std::shared_ptr<bool> &settled,
+    const litebus::Future<::messages::ResolveReusableSnapshotForCreateResponse> &result)
+{
+    if (*settled) {
+        return;  // watchdog already answered; the late resolve is dropped
+    }
+    if (!result.IsOK()) {
+        RejectReusableSnapshotIntent(scheduleReq, runtimePromise, completion, settled,
+            StatusCode::ERR_INNER_COMMUNICATION,
+            "reusable snapshot resolve future failed (grpc/transport): create refused (fail-closed)");
+        return;
+    }
+    const auto &resolved = result.Get();
+    if (resolved.code() != common::ERR_NONE) {
+        RejectReusableSnapshotIntent(scheduleReq, runtimePromise, completion, settled, StatusCode::ERR_AUTHORIZE_FAILED,
+            "reusable snapshot resolve failed: " + resolved.message());
+        return;
+    }
+    const auto applied = ApplyResolvedReusableSnapshotForCreate(resolved, scheduleReq);
+    if (applied.IsError()) {
+        RejectReusableSnapshotIntent(scheduleReq, runtimePromise, completion, settled, StatusCode::ERR_AUTHORIZE_FAILED,
+            "reusable snapshot context rejected: " + applied.RawMessage());
+        return;
+    }
+    // ApplyResolved overwrote createOptions and resources from the snapshot
+    // template: re-run the REAL elastic normalization on the merged request
+    // so inherited nested-elastic intent is validated (or rejected) exactly
+    // like a direct create — never admitted unnormalized.
+    bool elastic = false;
+    auto elasticOrigin = resource_view::ElasticOptionOrigin::NONE;
+    const auto elasticStatus =
+        resource_view::NormalizeElasticCreateOptions(scheduleReq->mutable_instance(), &elastic, &elasticOrigin);
+    if (!elasticStatus.IsOk()) {
+        RejectReusableSnapshotIntent(scheduleReq, runtimePromise, completion, settled, StatusCode::ERR_PARAM_INVALID,
+            "elastic create options rejected after snapshot inheritance: " + elasticStatus.ToString());
+        return;
+    }
+    // initrequest carries its OWN copy of createoptions/args (set at the
+    // entry transfer); sync it with the inherited InstanceInfo so later
+    // consumers (SendInitCall parses initrequest verbatim) cannot see the
+    // stale pre-inheritance values.
+    runtime_service::CallRequest callRequest;
+    if (!scheduleReq->initrequest().empty() && callRequest.ParseFromString(scheduleReq->initrequest())) {
+        *callRequest.mutable_createoptions() = scheduleReq->instance().createoptions();
+        *callRequest.mutable_args() = scheduleReq->instance().args();
+        callRequest.set_function(scheduleReq->instance().function());
+        scheduleReq->set_initrequest(callRequest.SerializeAsString());
+    }
+    *settled = true;
+    YRLOG_INFO("{}|{}|reusable snapshot context applied for instance({}): snapshot({}) backend({}) elastic({})",
+               scheduleReq->traceid(), scheduleReq->requestid(), scheduleReq->instance().instanceid(),
+               resolved.reusablesnapshotrestore().snapshotid(),
+               resolved.reusablesnapshotrestore().artifact().storagebackend(), elastic);
+    completion->SetValue(Status::OK());
+}
+
+void InstanceCtrlActor::ReusableSnapshotIntentTimeout(
+    const std::shared_ptr<messages::ScheduleRequest> &scheduleReq,
+    const std::shared_ptr<litebus::Promise<messages::ScheduleResponse>> &runtimePromise,
+    const std::shared_ptr<litebus::Promise<Status>> &completion, const std::shared_ptr<bool> &settled)
+{
+    RejectReusableSnapshotIntent(scheduleReq, runtimePromise, completion, settled,
+        StatusCode::ERR_INNER_COMMUNICATION,
+        "reusable snapshot resolve timed out; create refused (fail-closed, outcome unknown)");
 }
 
 Status InstanceCtrlActor::NormalizeCreateTenantID(

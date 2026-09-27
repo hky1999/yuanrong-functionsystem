@@ -16,6 +16,7 @@
 #include "common/constants/constants.h"
 #include "common/logs/logging.h"
 #include "function_proxy/local_scheduler/instance_control/instance_ctrl_actor.h"
+#include "common/resource_view/resource_type.h"
 
 #include <gtest/gtest.h>
 
@@ -1104,7 +1105,7 @@ TEST_F(DISABLED_InstanceCtrlActorTest, ExitWithNPUFaultTest)
 // turn it into a trusted restore context or REJECT the create — never let a
 // snapshot-bearing request continue as a plain create.
 
-TEST_F(InstanceCtrlActorTest, SnapshotIntentAbsentPassesThroughUnchanged)
+TEST_F(InstanceCtrlActorTest, SnapshotIntentHelperAbsentExtensionPassesThrough)
 {
     auto scheduleReq = std::make_shared<messages::ScheduleRequest>();
     scheduleReq->set_traceid("t-intent");
@@ -1122,7 +1123,7 @@ TEST_F(InstanceCtrlActorTest, SnapshotIntentAbsentPassesThroughUnchanged)
     EXPECT_TRUE(future.Get().IsOk());
 }
 
-TEST_F(InstanceCtrlActorTest, SnapshotIntentResolveFailureRejectsCreate)
+TEST_F(InstanceCtrlActorTest, SnapshotIntentHelperResolveFailureRejects)
 {
     auto scheduleReq = std::make_shared<messages::ScheduleRequest>();
     scheduleReq->set_traceid("t-intent2");
@@ -1160,7 +1161,7 @@ TEST_F(InstanceCtrlActorTest, SnapshotIntentResolveFailureRejectsCreate)
                   .count("yr.internal.reusable_snapshot.trusted_restore"), 0U);
 }
 
-TEST_F(InstanceCtrlActorTest, SnapshotIntentResolvedAppliesContextAndInheritsOnlyAbsentResources)
+TEST_F(InstanceCtrlActorTest, SnapshotIntentHelperResolvedAppliesContextAndInheritsOnlyAbsentResources)
 {
     auto scheduleReq = std::make_shared<messages::ScheduleRequest>();
     scheduleReq->set_traceid("t-intent3");
@@ -1171,7 +1172,8 @@ TEST_F(InstanceCtrlActorTest, SnapshotIntentResolvedAppliesContextAndInheritsOnl
     info->set_function("");
     // EXPLICIT zero stays an explicit override: inheritance fills ABSENT
     // keys only and must never replace it (no blind 0-inheritance)
-    (*info->mutable_resources()->mutable_resources())["cpu"].mutable_scalar()->set_value(0.0);
+    (*info->mutable_resources()->mutable_resources())[resource_view::CPU_RESOURCE_NAME]
+                .mutable_scalar()->set_value(0.0);
     (*info->mutable_scheduleoption()->mutable_extension())
         ["yr.internal.reusable_snapshot.requested_id"] = "snap-ok-1";
     auto localSchedSrv = std::make_shared<MockLocalSchedSrv>();
@@ -1183,8 +1185,10 @@ TEST_F(InstanceCtrlActorTest, SnapshotIntentResolvedAppliesContextAndInheritsOnl
             auto *tmpl = rsp.mutable_instancetemplate();
             tmpl->set_function("fn-from-snapshot");
             tmpl->set_restartpolicy("Never");
-            (*tmpl->mutable_resources()->mutable_resources())["cpu"].mutable_scalar()->set_value(500.0);
-            (*tmpl->mutable_resources()->mutable_resources())["memory"].mutable_scalar()->set_value(512.0);
+            (*tmpl->mutable_resources()->mutable_resources())[resource_view::CPU_RESOURCE_NAME]
+                .mutable_scalar()->set_value(500.0);
+            (*tmpl->mutable_resources()->mutable_resources())[resource_view::MEMORY_RESOURCE_NAME]
+                .mutable_scalar()->set_value(512.0);
             auto *restore = rsp.mutable_reusablesnapshotrestore();
             restore->set_snapshotid(req->snapshotid());
             restore->set_allowlogicalinstanceidrebind(true);
@@ -1210,8 +1214,9 @@ TEST_F(InstanceCtrlActorTest, SnapshotIntentResolvedAppliesContextAndInheritsOnl
     EXPECT_NE(ext.count("yr.internal.reusable_snapshot.trusted_restore"), 0U)
         << "trusted restore context must be injected for the deploy";
     // absent key inherited from the template; explicit zero preserved
-    EXPECT_DOUBLE_EQ(applied.resources().resources().at("memory").scalar().value(), 512.0);
-    EXPECT_DOUBLE_EQ(applied.resources().resources().at("cpu").scalar().value(), 0.0)
+    EXPECT_DOUBLE_EQ(applied.resources().resources().at(resource_view::MEMORY_RESOURCE_NAME).scalar().value(),
+                     512.0);
+    EXPECT_DOUBLE_EQ(applied.resources().resources().at(resource_view::CPU_RESOURCE_NAME).scalar().value(), 0.0)
         << "an explicit zero is an override, never silently replaced";
     // local artifact pins the restore to its owner node
     const auto &affinity = applied.scheduleoption().affinity().nodeaffinity().affinity();

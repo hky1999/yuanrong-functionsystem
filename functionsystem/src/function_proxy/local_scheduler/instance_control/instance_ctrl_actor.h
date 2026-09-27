@@ -424,8 +424,25 @@ public:
     // dispatch. Any missing piece — resolve failure, incomplete response,
     // apply-time validation — rejects the create; a snapshot-bearing create
     // must NEVER continue as a plain (cold) create.
-    litebus::Future<Status> ResolveReusableSnapshotIntent(const Status &priorStatus,
-        const std::shared_ptr<messages::ScheduleRequest> &scheduleReq);
+    litebus::Future<Status> ResolveReusableSnapshotIntent(
+        const Status &priorStatus, const std::shared_ptr<messages::ScheduleRequest> &scheduleReq,
+        const std::shared_ptr<litebus::Promise<messages::ScheduleResponse>> &runtimePromise);
+
+    // Intent-gate internals: every rejection path completes BOTH the chain
+    // future and the caller's schedule promise (a failed/hung resolve must
+    // never leave the create unanswered), and a bounded watchdog races the
+    // resolve so a hung store cannot stall the schedule.
+    void RejectReusableSnapshotIntent(const std::shared_ptr<messages::ScheduleRequest> &scheduleReq,
+        const std::shared_ptr<litebus::Promise<messages::ScheduleResponse>> &runtimePromise,
+        const std::shared_ptr<litebus::Promise<Status>> &completion, const std::shared_ptr<bool> &settled,
+        StatusCode code, const std::string &message);
+    void OnReusableSnapshotIntentResolved(const std::shared_ptr<messages::ScheduleRequest> &scheduleReq,
+        const std::shared_ptr<litebus::Promise<messages::ScheduleResponse>> &runtimePromise,
+        const std::shared_ptr<litebus::Promise<Status>> &completion, const std::shared_ptr<bool> &settled,
+        const litebus::Future<::messages::ResolveReusableSnapshotForCreateResponse> &result);
+    void ReusableSnapshotIntentTimeout(const std::shared_ptr<messages::ScheduleRequest> &scheduleReq,
+        const std::shared_ptr<litebus::Promise<messages::ScheduleResponse>> &runtimePromise,
+        const std::shared_ptr<litebus::Promise<Status>> &completion, const std::shared_ptr<bool> &settled);
 
     Status NormalizeCreateTenantID(const litebus::Option<FunctionMeta> &functionMeta,
                                    const std::shared_ptr<messages::ScheduleRequest> &scheduleReq);
