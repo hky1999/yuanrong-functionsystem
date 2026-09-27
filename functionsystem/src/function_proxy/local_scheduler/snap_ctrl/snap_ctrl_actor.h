@@ -284,24 +284,17 @@ private:
         ::core_service::SnapshotInfo publicInfo;
         std::shared_ptr<litebus::Promise<KillResponse>> completion;
         uint64_t snapshotAttempt{ 0 };  // shared per-instance single-flight slot
+        // terminal classification: only AUTHORITATIVE physical outcomes
+        // release the shared slot; everything else stays UNKNOWN with the
+        // replay entrance. replayOfUnknown marks a re-driven request (error
+        // replies must never clear a prior UNKNOWN). failOutcomeUnknown
+        // marks a Fail that followed a possibly-executed checkpoint (a
+        // recorded Fail does NOT prove the checkpoint never ran).
+        bool outcomeKnown{ false };
+        bool replayOfUnknown{ false };
+        bool failOutcomeUnknown{ false };
         bool tunnelGateHeld{ false };
         bool completed{ false };
-        // terminal response delivered, but the PHYSICAL outcome is only
-        // authoritative on the known-success/definite-failure paths; lost
-        // replies and resultunknown/incomplete coordination leave it false
-        // so the shared slot stays busy with a same-requestID replay entrance
-        bool outcomeKnown{ false };
-        // this request re-drives a previously UNKNOWN physical outcome:
-        // pre-physical/comm failures must NOT clear the unknown then
-        bool replayOfUnknown{ false };
-    };
-
-    /** Bounded re-query entrance for one UNKNOWN public-snapshot outcome. */
-    struct UnknownReusableEntry {
-        std::string requestID;
-        uint64_t attempt;
-        std::string runtimeID;  // original source identity fence for replay
-        bool replaying{ false };  // single-flight for the re-query itself
     };
 
     litebus::Future<KillResponse> HandleReusableSnapshot(
@@ -449,6 +442,16 @@ private:
     // the instance re-appears in the control view.
     std::unordered_map<std::string, ParkedEntry> parkedInstances_;
     SnapshotAttemptGate snapshotAttempts_;
+
+    /** Bounded re-query entrance for one UNKNOWN public-snapshot outcome:
+     *  pinned to the original requestID, the original attempt slot and the
+     *  original source runtime; the re-query itself is single-flighted. */
+    struct UnknownReusableEntry {
+        std::string requestID;
+        uint64_t attempt;
+        std::string runtimeID;
+        bool replaying{ false };
+    };
     std::unordered_map<std::string, UnknownReusableEntry> unknownReusable_;
     void FinishSnapshotAttempt(const std::string &instanceID, uint64_t attempt, bool markParked,
         const std::shared_ptr<std::atomic<bool>> &dispatched, const litebus::Future<KillResponse> &result,
