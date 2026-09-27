@@ -41,15 +41,31 @@ using functionsystem::runtime_manager::SandboxdExecutor;
 struct RecordedRestore {
     int restores = 0;
     int starts = 0;
+    int checkpoints = 0;
     std::string checkpointDir;
     std::string checkpointId;
     std::string expectedSha256;
     int64_t expectedSize = -1;
     std::string sandboxId;
+    std::string ckptSandboxId;
+    std::string ckptDir;
 };
 
 class FakeSandboxdService final : public runtime::v1::SandboxService::Service {
 public:
+    grpc::Status Checkpoint(grpc::ServerContext *, const runtime::v1::CheckpointRequest *req,
+                            runtime::v1::CheckpointResponse *rsp) override
+    {
+        const std::lock_guard<std::mutex> lock(mu_);
+        ++recorded_.checkpoints;
+        recorded_.ckptSandboxId = req->id();
+        recorded_.ckptDir = req->checkpoint_dir();
+        rsp->set_success(true);
+        // echo the fenced generation: OnCheckpointDone requires an exact match
+        rsp->set_source_generation(req->expected_generation());
+        return grpc::Status::OK;
+    }
+
     grpc::Status Restore(grpc::ServerContext *, const runtime::v1::RestoreRequest *req,
                          runtime::v1::RestoreResponse *rsp) override
     {
@@ -265,6 +281,84 @@ TEST_F(ManagedRestoreDispatchTest, TraversalIdentityRejectedBeforeAnyRpc)
     EXPECT_EQ(recorded.restores, 0);
     EXPECT_EQ(recorded.starts, 0);
     EXPECT_FALSE(executor_->stateManager_.Find("rt-managed-5").has_value());
+}
+
+// REAL TakeSnapshot chain for a MANAGED request: the agent-supplied id and
+// staging directory must survive to the physical Checkpoint RPC, and the
+// completion must return the agent's id (the ov24c-1 physical failure point).
+TEST_F(ManagedRestoreDispatchTest, ManagedTakeSnapshotCarriesAgentIdentityAndDirToCheckpointRpc)
+{
+    // register a live source sandbox with a birth generation
+    functionsystem::runtime_manager::SandboxInfo src;
+    src.runtimeID = "rt-snap-1";
+    src.sandboxID = "sbox-src-live";
+    src.resourceGeneration = "gen-live-1";
+    executor_->stateManager_.Register(std::move(src));
+
+    auto request = std::make_shared<messages::SnapshotRuntimeRequest>();
+    request->set_runtimeid("rt-snap-1");
+    request->set_requestid("req-snap-1");
+    request->set_instanceid("inst-mr");
+    request->set_snapshotid("snap-agent-77");
+    request->set_checkpointdir(base_ + "/managed/snap-agent-77");
+    request->set_expected_sandbox_id("sbox-src-live");
+    request->set_expected_resource_generation("gen-live-1");
+
+    const auto response =
+        litebus::Async(executor_->GetAID(), &SandboxdExecutor::SnapshotRuntime, request).Get();
+
+    EXPECT_EQ(response.code(), static_cast<int32_t>(StatusCode::SUCCESS));
+    EXPECT_EQ(response.snapshotinfo().checkpointid(), "snap-agent-77");
+
+    const auto recorded = service_.Snapshot();
+    EXPECT_EQ(recorded.checkpoints, 1);
+    EXPECT_EQ(recorded.ckptSandboxId, "sbox-src-live");
+    EXPECT_EQ(recorded.ckptDir, base_ + "/managed/snap-agent-77")
+        << "the physical Checkpoint RPC must use the agent's staging directory";
+    // managed completion never maps runtime->checkpoint in the state manager
+    EXPECT_TRUE(executor_->stateManager_.GetCheckpointID("rt-snap-1").empty());
+}
+
+// Half-passed managed identity (id without dir) is rejected BEFORE any RPC.
+TEST_F(ManagedRestoreDispatchTest, HalfPassedManagedSnapshotIdentityRejectedBeforeRpc)
+{
+    functionsystem::runtime_manager::SandboxInfo src;
+    src.runtimeID = "rt-snap-2";
+    src.sandboxID = "sbox-src-live2";
+    src.resourceGeneration = "gen-live-2";
+    executor_->stateManager_.Register(std::move(src));
+
+    auto request = std::make_shared<messages::SnapshotRuntimeRequest>();
+    request->set_runtimeid("rt-snap-2");
+    request->set_requestid("req-snap-2");
+    request->set_instanceid("inst-mr");
+    request->set_snapshotid("snap-half-88");  // checkpointdir deliberately empty
+    request->set_expected_sandbox_id("sbox-src-live2");
+    request->set_expected_resource_generation("gen-live-2");
+
+    const auto response =
+        litebus::Async(executor_->GetAID(), &SandboxdExecutor::SnapshotRuntime, request).Get();
+    EXPECT_EQ(response.code(), static_cast<int32_t>(StatusCode::PARAMETER_ERROR));
+
+    const auto recorded = service_.Snapshot();
+    EXPECT_EQ(recorded.checkpoints, 0) << "half-passed identity must never reach sandboxd";
+}
+
+// The executor-constructed anonymous cache root: the ckpt manager the
+// executor spawned owns <base>/anonymous, proving the member-root wiring
+// (not just a hand-passed path in the actor tests).
+TEST_F(ManagedRestoreDispatchTest, ExecutorConstructsAnonymousCacheOnAnonymousSubRoot)
+{
+    const std::string expectedRoot = base_ + "/anonymous";
+    EXPECT_EQ(executor_->anonymousRoot_.string(), expectedRoot);
+    // the spawned actor was constructed with that same root: registering an
+    // artifact there succeeds through the executor's own manager
+    const std::string anonID = "ckpt-exec-anon";
+    std::filesystem::create_directories(expectedRoot + "/" + anonID);
+    { std::ofstream f(expectedRoot + "/" + anonID + "/checkpoint.img", std::ios::binary); f << "x"; }
+    auto registered = executor_->ckptFileManager_->RegisterCheckpoint(
+        anonID, expectedRoot + "/" + anonID, anonID, 60).Get();
+    EXPECT_EQ(registered.storageUrl, anonID + ".zip");
 }
 
 }  // namespace

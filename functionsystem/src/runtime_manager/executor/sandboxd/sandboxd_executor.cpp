@@ -622,9 +622,20 @@ litebus::Future<messages::StartInstanceResponse> SandboxdExecutor::StartByManage
     params.envs      = context.envs;
     params.runtimeID = info.runtimeid();
     params.registeredTemplateIDs = registeredTemplateIDs_;
+    // port-forward bookkeeping uses EXACTLY the normal-create semantics:
+    // allocate + record before dispatch, release on any pre-dispatch failure
+    const auto portStatus = ApplyPortForwardMappings(&params, request);
+    if (portStatus.IsError()) {
+        ReportSandboxLifecycleStatus(info, info.runtimeid(), SandboxLifecycleStatus::ABNORMAL);
+        stateManager_.UpdatePortMappings(info.runtimeid(), "");
+        PortManager::GetInstance().ReleasePorts(info.runtimeid());
+        return GenFailStartInstanceResponse(request, portStatus.StatusCode(), portStatus.RawMessage());
+    }
     auto [status, startReq] = builder.Build(params);
     if (!status.IsOk()) {
         ReportSandboxLifecycleStatus(info, info.runtimeid(), SandboxLifecycleStatus::ABNORMAL);
+        stateManager_.UpdatePortMappings(info.runtimeid(), "");
+        PortManager::GetInstance().ReleasePorts(info.runtimeid());
         return GenFailStartInstanceResponse(request, status.StatusCode(), status.RawMessage());
     }
     auto restoreReq = std::make_shared<runtime::v1::RestoreRequest>();
