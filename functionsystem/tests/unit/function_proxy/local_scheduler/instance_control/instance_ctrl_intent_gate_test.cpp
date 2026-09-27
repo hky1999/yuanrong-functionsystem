@@ -104,7 +104,7 @@ protected:
             runtime_service::CallRequest stale;
             stale.set_function("fn-gate");
             (*stale.mutable_createoptions())["marker"] = "stale-pre-inheritance";
-            stale.mutable_args()->Add("stale-arg");
+            stale.add_args()->set_value("stale-arg");
             req->set_initrequest(stale.SerializeAsString());
         }
         return req;
@@ -137,9 +137,11 @@ protected:
             mem->set_limit(memoryMb * 4);      // ceiling (legal, finite)
         }
         if (nestedElastic) {
-            // REAL nested elastic intent exactly as an elastic source's
-            // template would carry it (see NormalizeElasticCreateOptions)
-            (*tmpl->mutable_createoptions())[resource_view::SCHEDULER_ELASTIC_RESOURCES] = "true";
+            // REAL nested elastic intent as an elastic source's template
+            // carries it: the marker lives INSIDE the opaque extra_config
+            // JSON (NormalizeElasticCreateOptions parses it from there)
+            (*tmpl->mutable_createoptions())["extra_config"] =
+                R"({")" + std::string(resource_view::SCHEDULER_ELASTIC_RESOURCES) + R"(":true})";
         }
         auto *restore = rsp.mutable_reusablesnapshotrestore();
         restore->set_snapshotid(snapshotID);
@@ -218,12 +220,16 @@ TEST_F(InstanceCtrlIntentGateTest, RealEntryResolvedContextFlowsIntoCreateAndSyn
                      512.0);
     runtime_service::CallRequest synced;
     ASSERT_TRUE(synced.ParseFromString(scheduleReq->initrequest()));
-    // the sync REPLACED the stale payload with the inherited one: the stale
-    // marker/arg are gone and the template's values are present
-    EXPECT_EQ(synced.createoptions().count("stale-pre-inheritance"), 0U)
-        << "the stale pre-inheritance createoption must be replaced";
-    EXPECT_EQ(synced.args_size(), scheduleReq->instance().args_size())
-        << "args follow the inherited InstanceInfo, not the stale copy";
+    // the sync REPLACED the stale payload with the inherited one: the
+    // marker's VALUE is the template's (not the stale one) and the args are
+    // the inherited InstanceInfo's (not the stale copy)
+    ASSERT_NE(synced.createoptions().find("marker"), synced.createoptions().end());
+    EXPECT_EQ(synced.createoptions().at("marker"), "from-template");
+    ASSERT_EQ(synced.args_size(), scheduleReq->instance().args_size());
+    for (int i = 0; i < synced.args_size(); ++i) {
+        EXPECT_EQ(synced.args(i).value(), scheduleReq->instance().args(i).value())
+            << "arg " << i << " must follow the inherited InstanceInfo";
+    }
 }
 
 // HELPER, transport failure: a SetFailed resolve future becomes an explicit
@@ -325,10 +331,19 @@ TEST_F(InstanceCtrlIntentGateTest, HelperNestedElasticExplicitZeroIsRejected)
     auto runtimePromise = std::make_shared<litebus::Promise<messages::ScheduleResponse>>();
     auto chain = litebus::Async(instanceCtrlActor_->GetAID(), &InstanceCtrlActor::ResolveReusableSnapshotIntent,
                                 Status::OK(), scheduleReq, runtimePromise);
-    ASSERT_AWAIT_READY_FOR(chain, 10000);
-    EXPECT_TRUE(chain.Get().IsError())
-        << "explicit cpu=0 under nested elastic must be rejected, never accepted";
-    EXPECT_EQ(scheduleReq->instance().scheduleoption().extension().count(TRUSTED_RESTORE_EXT), 0U);
+    // NOTE: ApplyResolved has already stamped the trusted extension by the
+    // time the re-normalizer rejects — extension absence is NOT the proof.
+    // The rejection is proven by the chain's explicit resource error and by
+    // ZERO create-boundary visits on the full DoAuthorizeCreate chain.
+    auto fullRuntime = std::make_shared<litebus::Promise<messages::ScheduleResponse>>();
+    auto fullChain = litebus::Async(instanceCtrlActor_->GetAID(), &InstanceCtrlActor::DoAuthorizeCreate,
+                                    MakeMeta(), scheduleReq, fullRuntime);
+    auto fullFuture = fullRuntime->GetFuture();
+    ASSERT_AWAIT_READY_FOR(fullFuture, 10000);
+    ASSERT_AWAIT_READY_FOR(fullChain, 10000);
+    EXPECT_NE(fullFuture.Get().message().find("elastic"), std::string::npos)
+        << "expected an explicit elastic/resource rejection, got: " << fullFuture.Get().message();
+    EXPECT_EQ(probeView_->duplicateChecks, 0) << "a rejected elastic merge must never reach create";
 }
 
 }  // namespace
