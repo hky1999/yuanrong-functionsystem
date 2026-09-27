@@ -15,9 +15,12 @@
  */
 #include "function_proxy/local_scheduler/snap_ctrl/snap_ctrl_actor.h"
 
+#include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -80,17 +83,33 @@ std::shared_ptr<PublicStateMachineProbe> MakePublicStateMachine()
     return stateMachine;
 }
 
-// Controllable runtime client: PrepareSnap and SnapStarted settle only when
-// the test says so.
+// Controllable runtime client: the PUBLIC chain's legacy PrepareSnap and
+// the CONDITIONAL private path's PrepareSnapForRuntime both arm ONE
+// controllable promise; SnapStarted answers immediately. Construction
+// mirrors the historical ControllablePrepareSnapClient (dual nullptr
+// bases) so the client needs no live transport.
 class ControllableRuntimeClient final : public ControlInterfacePosixClient {
 public:
+    ControllableRuntimeClient() : BaseClient(nullptr), ControlInterfacePosixClient(nullptr) {}
+
     litebus::Future<runtime::PrepareSnapResponse> PrepareSnap(
         runtime::PrepareSnapRequest &&) override
     {
-        std::lock_guard<std::mutex> guard(lock_);
-        auto promise = std::make_shared<litebus::Promise<runtime::PrepareSnapResponse>>();
-        pendingPrepare_ = promise;
-        return promise->GetFuture();
+        return ArmPendingPrepare();
+    }
+
+    litebus::Future<runtime::PrepareSnapResponse> PrepareSnapForRuntime(
+        runtime::PrepareSnapRequest &&, const std::string &expectedRuntimeID) override
+    {
+        // the pinned entry point must carry the caller's captured runtime;
+        // anything else is refused before arming anything
+        if (expectedRuntimeID != RUNTIME_ID) {
+            runtime::PrepareSnapResponse response;
+            response.set_code(common::ERR_PARAM_INVALID);
+            response.set_message("expected runtime mismatch in test client");
+            return response;
+        }
+        return ArmPendingPrepare();
     }
 
     litebus::Future<runtime::SnapStartedResponse> SnapStarted(
@@ -99,6 +118,23 @@ public:
         runtime::SnapStartedResponse response;
         response.set_code(common::ERR_NONE);
         return response;
+    }
+
+    // Block until the actor has actually entered a Prepare — a Sync alone
+    // does not prove deferred continuations reached the client.
+    bool WaitForPrepareEntered(int timeoutMs = 5000)
+    {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        while (std::chrono::steady_clock::now() < deadline) {
+            {
+                std::lock_guard<std::mutex> guard(lock_);
+                if (pendingPrepare_ != nullptr) {
+                    return true;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return false;
     }
 
     void SettlePrepare(common::ErrorCode code, const std::string &message)
@@ -123,6 +159,14 @@ public:
     }
 
 private:
+    litebus::Future<runtime::PrepareSnapResponse> ArmPendingPrepare()
+    {
+        std::lock_guard<std::mutex> guard(lock_);
+        auto promise = std::make_shared<litebus::Promise<runtime::PrepareSnapResponse>>();
+        pendingPrepare_ = promise;
+        return promise->GetFuture();
+    }
+
     std::mutex lock_;
     std::shared_ptr<litebus::Promise<runtime::PrepareSnapResponse>> pendingPrepare_;
 };
@@ -375,7 +419,21 @@ protected:
 
     void SettlePrepareOk()
     {
+        ASSERT_TRUE(runtimeClient_->WaitForPrepareEntered());
         runtimeClient_->SettlePrepare(common::ERR_NONE, "");
+    }
+
+    void SettlePrepareFail(const std::string &message)
+    {
+        ASSERT_TRUE(runtimeClient_->WaitForPrepareEntered());
+        runtimeClient_->SettlePrepare(common::ERR_INNER_COMMUNICATION, message);
+    }
+
+    void UpdateInstanceRuntimeID(const std::string &runtimeID)
+    {
+        auto info = stateMachine_->GetInstanceInfo();
+        info.set_runtimeid(runtimeID);
+        stateMachine_->UpdateInstanceInfo(info);
     }
 
     std::shared_ptr<PublicStateMachineProbe> stateMachine_;
@@ -416,7 +474,9 @@ TEST_F(SnapCtrlPublicChainTest, PrivateInFlightBlocksPublic)
     EXPECT_EQ(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY),
               static_cast<int32_t>(pub.Get().code()));
 
-    SettlePrepareOk();
+    // end the private park safely: a Prepare FAILURE lets its own chain
+    // settle without touching any real conditional checkpoint state
+    SettlePrepareFail("private park test end");
     (void)priv.WaitFor(10000);
 }
 
@@ -543,6 +603,140 @@ TEST_F(SnapCtrlPublicChainTest, ResultUnknownAndUnprovenFailureKeepPublishingRec
     ASSERT_AWAIT_READY(c);
     EXPECT_NE(common::ERR_NONE, c.Get().code());
     EXPECT_EQ(1, schedProbe_->FailCalls());  // proven never started: Fail allowed
+}
+
+TEST_F(SnapCtrlPublicChainTest, ConcurrentSameRequestReplayIsSingleFlight)
+{
+    PublicChainAgentProbe::TypedOutcome unknown;
+    unknown.code = common::ERR_INNER_COMMUNICATION;
+    unknown.resultUnknown = true;
+    agentProbe_->SetTypedOutcome(unknown);
+    auto first = PublicSnapshot("pub-1");
+    FlushActor();
+    SettlePrepareOk();
+    ASSERT_AWAIT_READY(first);
+    EXPECT_NE(common::ERR_NONE, first.Get().code());
+
+    PublicChainAgentProbe::TypedOutcome healthy;
+    agentProbe_->SetTypedOutcome(healthy);
+    auto replayA = PublicSnapshot("pub-1");
+    FlushActor();
+    ASSERT_TRUE(runtimeClient_->WaitForPrepareEntered());  // replay A in flight
+
+    auto replayB = PublicSnapshot("pub-1");  // same requestID, second re-query
+    FlushActor();
+    ASSERT_AWAIT_READY(replayB);
+    EXPECT_EQ(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY),
+              static_cast<int32_t>(replayB.Get().code()));
+
+    runtimeClient_->SettlePrepare(common::ERR_NONE, "");
+    ASSERT_AWAIT_READY(replayA);
+    EXPECT_EQ(common::ERR_NONE, replayA.Get().code());
+}
+
+TEST_F(SnapCtrlPublicChainTest, ReplayWithChangedParametersIsRefused)
+{
+    PublicChainAgentProbe::TypedOutcome unknown;
+    unknown.code = common::ERR_INNER_COMMUNICATION;
+    unknown.resultUnknown = true;
+    agentProbe_->SetTypedOutcome(unknown);
+    auto first = PublicSnapshot("pub-1", "name-original", 300000);
+    FlushActor();
+    SettlePrepareOk();
+    ASSERT_AWAIT_READY(first);
+    EXPECT_NE(common::ERR_NONE, first.Get().code());
+
+    // same requestID, DIFFERENT name/timeout: never adopted
+    auto changed = PublicSnapshot("pub-1", "name-changed", 600000);
+    FlushActor();
+    ASSERT_AWAIT_READY(changed);
+    EXPECT_EQ(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY),
+              static_cast<int32_t>(changed.Get().code()));
+    EXPECT_EQ(1, schedProbe_->BeginCalls());  // no second Begin was driven
+}
+
+TEST_F(SnapCtrlPublicChainTest, ReplayWithChangedSourceRuntimeIsRefused)
+{
+    PublicChainAgentProbe::TypedOutcome unknown;
+    unknown.code = common::ERR_INNER_COMMUNICATION;
+    unknown.resultUnknown = true;
+    agentProbe_->SetTypedOutcome(unknown);
+    auto first = PublicSnapshot("pub-1");
+    FlushActor();
+    SettlePrepareOk();
+    ASSERT_AWAIT_READY(first);
+    EXPECT_NE(common::ERR_NONE, first.Get().code());
+
+    UpdateInstanceRuntimeID("runtime-replaced-2");
+    auto replay = PublicSnapshot("pub-1");
+    FlushActor();
+    ASSERT_AWAIT_READY(replay);
+    EXPECT_EQ(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY),
+              static_cast<int32_t>(replay.Get().code()));
+    EXPECT_EQ(1, schedProbe_->BeginCalls());
+}
+
+TEST_F(SnapCtrlPublicChainTest, ReplayProvenNotStartedRetainsUnknownAndNeverFails)
+{
+    PublicChainAgentProbe::TypedOutcome unknown;
+    unknown.code = common::ERR_INNER_COMMUNICATION;
+    unknown.resultUnknown = true;
+    agentProbe_->SetTypedOutcome(unknown);
+    auto first = PublicSnapshot("pub-1");
+    FlushActor();
+    SettlePrepareOk();
+    ASSERT_AWAIT_READY(first);
+    EXPECT_NE(common::ERR_NONE, first.Get().code());
+
+    // the replay's checkpoint is PROVEN not started — that only describes
+    // this attempt; the OLD unknown outcome and its record must survive
+    PublicChainAgentProbe::TypedOutcome provenNotStarted;
+    provenNotStarted.code = common::ERR_INNER_COMMUNICATION;
+    provenNotStarted.checkpointNotStarted = true;
+    agentProbe_->SetTypedOutcome(provenNotStarted);
+    auto replay = PublicSnapshot("pub-1");
+    FlushActor();
+    SettlePrepareOk();
+    ASSERT_AWAIT_READY(replay);
+    EXPECT_NE(common::ERR_NONE, replay.Get().code());
+    EXPECT_EQ(0, schedProbe_->FailCalls());
+
+    auto other = PublicSnapshot("pub-9");
+    FlushActor();
+    ASSERT_AWAIT_READY(other);
+    EXPECT_EQ(static_cast<int32_t>(StatusCode::ERR_INSTANCE_BUSY),
+              static_cast<int32_t>(other.Get().code()));
+}
+
+TEST_F(SnapCtrlPublicChainTest, SettledReplayFreesBothGateAndReplayEntrance)
+{
+    PublicChainAgentProbe::TypedOutcome unknown;
+    unknown.code = common::ERR_INNER_COMMUNICATION;
+    unknown.resultUnknown = true;
+    agentProbe_->SetTypedOutcome(unknown);
+    auto first = PublicSnapshot("pub-1");
+    FlushActor();
+    SettlePrepareOk();
+    ASSERT_AWAIT_READY(first);
+    EXPECT_NE(common::ERR_NONE, first.Get().code());
+
+    PublicChainAgentProbe::TypedOutcome healthy;
+    agentProbe_->SetTypedOutcome(healthy);
+    auto replay = PublicSnapshot("pub-1");
+    FlushActor();
+    SettlePrepareOk();
+    ASSERT_AWAIT_READY(replay);
+    EXPECT_EQ(common::ERR_NONE, replay.Get().code());
+
+    // after the authoritative settlement the SAME requestID is an ordinary
+    // NEW public request (fresh attempt, fresh Begin) and succeeds — the
+    // stale attempt/entrance cannot linger
+    auto again = PublicSnapshot("pub-1");
+    FlushActor();
+    SettlePrepareOk();
+    ASSERT_AWAIT_READY(again);
+    EXPECT_EQ(common::ERR_NONE, again.Get().code());
+    EXPECT_EQ(3, schedProbe_->BeginCalls());  // first + replay + fresh
 }
 
 }  // namespace

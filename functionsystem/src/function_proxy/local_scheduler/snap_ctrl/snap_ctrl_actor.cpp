@@ -1557,7 +1557,21 @@ void SnapCtrlActor::OnReusableSnapshotCheckpointed(
                              "checkpointNotStarted proof; PUBLISHING record kept"));
             return;
         }
-        context->failOutcomeUnknown = false;  // proven never started
+        if (context->replayOfUnknown) {
+            // checkpointNotStarted=true proves only THAT this replay attempt
+            // never started; it says nothing about the OLD physical outcome
+            // the re-query is meant to settle. Failing here would
+            // CAS-delete the old PUBLISHING record and destroy the
+            // coordination facts. Retain the UNKNOWN.
+            context->outcomeKnown = false;
+            CompleteReusableSnapshotRequest(
+                context, BuildReusableSnapshotResponse(
+                             common::ERR_INNER_COMMUNICATION,
+                             "reusable snapshot replay proven not started; "
+                             "prior UNKNOWN outcome retained"));
+            return;
+        }
+        context->failOutcomeUnknown = false;  // proven never started (first attempt)
         FailReusableSnapshot(
             context, common::ERR_INNER_COMMUNICATION,
             future.Get().message());
