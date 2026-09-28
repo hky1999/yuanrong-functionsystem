@@ -19,9 +19,12 @@
 #include <gmock/gmock.h>
 
 #include <chrono>
+#include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 
+#include "common/resource_view/memory_elasticity_fence.h"
 #include "common/resource_view/restore_admission.h"
 #include "common/resource_view/view_utils.h"
 #include "common/schedule_plugin/filter/usage_aware_filter/usage_aware_filter.h"
@@ -551,9 +554,10 @@ TEST_F(NamedRestoreBaselineTest, WrongRuntimeIdentityDeferred)
     EXPECT_EQ(result, ResourceViewActor::RecoveryBaselineResult::Deferred);
 }
 
-// Entry with matching identity, confirmed (observed=true), correct revision,
-// but confirmedRevision doesn't match sample revision → still a mismatch scenario
-// (revision=2 in entry but sample has revision=1).
+// Entry with matching identity and sufficient credit (512MiB against the
+// 412MiB requirement), but confirmed at revision 2 while the sample carries
+// revision 1. The entry describes a different physical fact than the sample;
+// the coverage check must NOT release the admission against it → Deferred.
 TEST_F(NamedRestoreBaselineTest, RevisionMismatchDeferred)
 {
     auto actor = std::make_shared<ResourceViewActor>("baseline-revmis", "baseline-revmis-id", param_);
@@ -574,20 +578,12 @@ TEST_F(NamedRestoreBaselineTest, RevisionMismatchDeferred)
     stub.confirmedRevision = 2;  // confirmed at revision 2
     actor->resizeBudget_.emplace(stub.request.requestid(), std::move(stub));
 
-    // Sample carries revision 1 → EntryOutstanding is computed from the entry's
-    // own state (cap - max(expected, peak)) which gives 512 MiB.
-    // But required credit = 512 - 100 = 412. Since 512 >= 412, this returns
-    // Established regardless of revision. Revision mismatch is NOT checked in
-    // the idempotent branch — it should be, to prevent releasing on a stale
-    // entry. This test DOCUMENTS the current behavior.
+    // MakeSample carries revision=1. Credit alone would pass (512 >= 412);
+    // the revision gate must keep the reservation (Deferred), because the
+    // entry was confirmed at revision 2, not at this sample's revision 1.
     auto sample = MakeSample("sbx-revmis", "rt-revmis", "gen-revmis", 512 * 1024 * 1024, true, 100 * 1024 * 1024);
-    // Set sample revision to 1 (entry has 2)
-    // Note: MakeSample sets revision=1 by default; entry has 2
     auto result = actor->EstablishRecoveryBaseline("unit-revmis", inst, sample);
-    // Current behavior: credit check passes (512 >= 412), so Established.
-    // TODO: the coverage check should also verify the entry's confirmed
-    // revision matches the sample's revision to prevent stale-release.
-    EXPECT_EQ(result, ResourceViewActor::RecoveryBaselineResult::Established);
+    EXPECT_EQ(result, ResourceViewActor::RecoveryBaselineResult::Deferred);
 }
 
 // Existing entry with sufficient credit AND matching identity → Established (idempotent).
@@ -618,5 +614,116 @@ TEST_F(NamedRestoreBaselineTest, CorrectIdentitySufficientCreditEstablished)
     auto result = actor->EstablishRecoveryBaseline("unit-ok", inst, sample);
     // Required credit = 512 - 100 = 412. Existing credit = 512 - max(100, 100) = 412. 412 >= 412 → Established.
     EXPECT_EQ(result, ResourceViewActor::RecoveryBaselineResult::Established);
+}
+
+// ===================== PUBLISH (UpdateResourceUnitActual) =====================
+// Real actor + real view: two Stats rounds through UpdateResourceUnitActual
+// drive the admission→baseline handoff exactly as the collector delivers it.
+// Round 1 (no physical sample yet) registers the admission window; round 2
+// carries the restore-time sample. Established clears resource_admission_
+// pending and holds the credit in a recovery-baseline entry; Deferred keeps
+// the reservation and still syncs the top-level instance index.
+class NamedRestorePublishTest : public ::testing::Test {
+protected:
+    void SetUp() override { SetMemoryElasticityFenceForTest(true); }
+    void TearDown() override { ResetMemoryElasticityFenceOverride(); }
+    const ResourceViewActor::Param param_ {.isLocal = true,
+        .enableTenantAffinity = false, .tenantPodReuseTimeWindow = 1};
+
+    static int64_t NowMs()
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    // Actor with a real view: fragment unit + top-level instance index entry.
+    // The view-level actualuse rollup starts equal to the unit's actualuse or
+    // the subtraction guard rejects every later report.
+    std::shared_ptr<ResourceViewActor> MakeViewActor()
+    {
+        auto actor = std::make_shared<ResourceViewActor>("publish", "publish-view", param_);
+        actor->view_ = std::make_shared<ResourceUnit>(InitResource("publish-view"));
+        auto unit = MakeUnit(2000, 600);
+        unit.set_id("unit-pub");
+        (*unit.mutable_instances())["publish-inst-1"] = MakeElasticInstance(128, 512, true, false);
+        (*unit.mutable_instances())["publish-inst-1"].set_runtimeid("rt-pub");
+        (*actor->view_->mutable_fragment())["unit-pub"] = unit;
+        auto top = MakeElasticInstance(128, 512, true, false);
+        top.set_runtimeid("rt-pub");
+        top.set_unitid("unit-pub");
+        (*actor->view_->mutable_instances())["publish-inst-1"] = top;
+        (*actor->view_->mutable_actualuse()) = unit.actualuse();
+        return actor;
+    }
+
+    // A collector report for the unit; withSample adds the physical reading.
+    ResourceUnit MakeReport(int64_t atMs, bool withSample, bool limitKnown = true)
+    {
+        auto report = MakeUnit(2000, 600);
+        report.set_id("unit-pub");
+        report.set_memory_sample_unix_ms(atMs);
+        report.set_cpu_sample_unix_ms(atMs);
+        auto *reported = (*report.mutable_instances())["publish-inst-1"];
+        reported->set_instanceid("publish-inst-1");
+        reported->set_runtimeid("rt-pub");
+        if (withSample) {
+            auto sample = MakeSample("sbx-pub", "rt-pub", "gen-pub", 512 * 1024 * 1024,
+                                     true, 100 * 1024 * 1024);
+            sample.set_cpu_usage_known(true);
+            sample.set_cpu_usage_cores(0.05);
+            sample.set_sampled_at_unix_ms(atMs - 100);
+            if (!limitKnown) { sample.set_memory_limit_known(false); }
+            *reported->mutable_sandbox_resource_sample() = sample;
+        }
+        return report;
+    }
+};
+
+// Round 2 with a complete sample: baseline Established → the admission flag
+// clears, the window entry is erased, and the credit lands in a synthetic
+// recovery-baseline budget entry instead of vanishing.
+TEST_F(NamedRestorePublishTest, SecondStatsRoundClearsPendingWhenBaselineEstablished)
+{
+    auto actor = MakeViewActor();
+    actor->UpdateResourceUnitActual(std::make_shared<ResourceUnit>(MakeReport(NowMs(), false)));
+    // Round 1 registered the admission window; nothing released yet.
+    EXPECT_EQ(actor->resourceAdmissionTimes_.count("publish-inst-1"), 1u);
+    EXPECT_TRUE(actor->view_->fragment().at("unit-pub").instances().at("publish-inst-1")
+        .resource_admission_pending());
+    // The release gate needs a sample strictly newer than the admission time.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    actor->UpdateResourceUnitActual(std::make_shared<ResourceUnit>(MakeReport(NowMs(), true)));
+    const auto &after = actor->view_->fragment().at("unit-pub").instances().at("publish-inst-1");
+    EXPECT_FALSE(after.resource_admission_pending());
+    EXPECT_TRUE(after.snapshotinfo().checkpointid().empty());
+    EXPECT_EQ(actor->resourceAdmissionTimes_.count("publish-inst-1"), 0u);
+    // Top-level index synced (not skipped by the release path).
+    EXPECT_FALSE(actor->view_->instances().at("publish-inst-1").resource_admission_pending());
+    // The ceiling credit is held by the synthetic baseline entry, not dropped.
+    ASSERT_EQ(actor->resizeBudget_.size(), 1u);
+    const auto &key = actor->resizeBudget_.begin()->first;
+    EXPECT_EQ(key.compare(0, strlen("recovery-baseline:"), "recovery-baseline:"), 0);
+    EXPECT_NEAR(actor->EntryOutstanding(actor->resizeBudget_.begin()->second).memoryMb, 412.0, 0.5);
+}
+
+// Round 2 with an incomplete sample (memory limit unknown): the baseline
+// defers → the pending reservation is RETAINED, no budget entry is created,
+// and the top-level sync still runs (Deferred must not skip it).
+TEST_F(NamedRestorePublishTest, DeferredBaselineRetainsPendingReservation)
+{
+    auto actor = MakeViewActor();
+    actor->UpdateResourceUnitActual(std::make_shared<ResourceUnit>(MakeReport(NowMs(), false)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    actor->UpdateResourceUnitActual(
+        std::make_shared<ResourceUnit>(MakeReport(NowMs(), true, /*limitKnown=*/false)));
+    const auto &after = actor->view_->fragment().at("unit-pub").instances().at("publish-inst-1");
+    EXPECT_TRUE(after.resource_admission_pending());
+    EXPECT_EQ(actor->resourceAdmissionTimes_.count("publish-inst-1"), 1u);
+    EXPECT_TRUE(actor->resizeBudget_.empty());
+    // The sample itself was still merged into both indexes.
+    EXPECT_EQ(after.sandbox_resource_sample().sandbox_id(), "sbx-pub");
+    const auto &top = actor->view_->instances().at("publish-inst-1");
+    EXPECT_TRUE(top.resource_admission_pending());
+    EXPECT_EQ(top.sandbox_resource_sample().sandbox_id(), "sbx-pub");
 }
 }  // namespace functionsystem::test

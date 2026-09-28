@@ -573,6 +573,15 @@ ResourceViewActor::RecoveryBaselineResult ResourceViewActor::EstablishRecoveryBa
             if (item.second.shrink || !item.second.observed) {
                 return RecoveryBaselineResult::Deferred;
             }
+            // The covering entry must be confirmed at the sample's own
+            // revision: an entry confirmed at a different revision describes
+            // a different physical fact (a stale sample, or a revision this
+            // view never dispatched). Releasing the admission against it
+            // would drop a reservation measured for the wrong reading;
+            // keep the reservation and retry on the next Stats round.
+            if (item.second.confirmedRevision != sample.resource_revision()) {
+                return RecoveryBaselineResult::Deferred;
+            }
             // What a NEW baseline from THIS sample would hold:
             //   cap = sample.memory_limit_bytes()
             //   floor = usage (unknown → 0, per the establishment code)
