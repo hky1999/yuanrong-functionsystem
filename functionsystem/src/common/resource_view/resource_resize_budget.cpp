@@ -558,14 +558,13 @@ ResourceViewActor::RecoveryBaselineResult ResourceViewActor::EstablishRecoveryBa
     for (const auto &item : resizeBudget_) {
         if (item.second.request.instanceid() == instance.instanceid()
             && item.second.request.resize().resource_generation() == sample.resource_generation()) {
-            // Idempotent only when the existing entry is on the same unit,
-            // references the same runtime and sandbox, is confirmed
-            // (observed), is not a pending shrink, and its actual
-            // outstanding credit covers the headroom we are about to
-            // release: the admission held ceiling - current_booked, and
-            // the entry's cap - max(expected, peak) must be at least that.
-            // A cap-512/expected-512 entry has zero credit; a 1MiB credit
-            // does not cover a 384MiB headroom. Both must stay Deferred.
+            // Idempotent only when the existing entry is the same
+            // incarnation (unit, runtime, sandbox) and is confirmed. The
+            // coverage check uses the SAME formula as a newly-created
+            // baseline for this sample: credit = cap - max(usage, 0).
+            // A cap-512/expected-512 entry has 0 credit; a 384MiB credit
+            // against a 412MiB requirement (cap 512, usage 100) is
+            // insufficient. Both must stay Deferred.
             if (item.second.unitID != unitID
                 || item.second.request.runtimeid() != sample.runtime_id()
                 || item.second.request.resize().sandbox_id() != sample.sandbox_id()) {
@@ -574,18 +573,18 @@ ResourceViewActor::RecoveryBaselineResult ResourceViewActor::EstablishRecoveryBa
             if (item.second.shrink || !item.second.observed) {
                 return RecoveryBaselineResult::Deferred;
             }
-            // The headroom the admission was holding: the sample's memory
-            // limit (the physical ceiling) minus the instance's current
-            // declared memory (the normal booking). Both are in bytes.
-            const auto &memDecl = instance.resources().resources().find(MEMORY_RESOURCE_NAME);
-            if (memDecl == instance.resources().resources().end() || !memDecl->second.has_scalar()) {
-                return RecoveryBaselineResult::Deferred;
-            }
-            const double heldHeadroomMb =
-                (static_cast<double>(sample.memory_limit_bytes())
-                 - memDecl->second.scalar().value() * 1024.0 * 1024.0) / (1024.0 * 1024.0);
-            const auto outstanding = EntryOutstanding(item.second);
-            if (outstanding.memoryMb >= heldHeadroomMb) {
+            // What a NEW baseline from THIS sample would hold:
+            //   cap = sample.memory_limit_bytes()
+            //   floor = usage (unknown → 0, per the establishment code)
+            //   requiredCreditMb = (cap - floor) / (1024*1024)
+            const uint64_t newFloorBytes = sample.memory_usage_known()
+                ? sample.memory_current_bytes() : 0;
+            const double requiredCreditMb =
+                sample.memory_limit_bytes() > newFloorBytes
+                    ? static_cast<double>(sample.memory_limit_bytes() - newFloorBytes)
+                        / (1024.0 * 1024.0)
+                    : 0.0;
+            if (EntryOutstanding(item.second).memoryMb >= requiredCreditMb) {
                 return RecoveryBaselineResult::Established;
             }
             return RecoveryBaselineResult::Deferred;
