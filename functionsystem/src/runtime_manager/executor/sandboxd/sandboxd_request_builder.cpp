@@ -1103,6 +1103,15 @@ Status SandboxdRequestBuilder::ApplyElasticResources(
     }
     const auto &resources = request->runtimeinstanceinfo().runtimeconfig().resources().resources();
     nlohmann::json policy = {{"version", 1}};
+    // A named reusable-snapshot restore carries a restoreSnapshotID on the
+    // runtime instance info. Its physical restore loading (sentry page
+    // loading, gofer, kernel state deserialization) transiently needs more
+    // memory than the steady-state working set; the authorized elastic
+    // ceiling was already reserved by the scheduler's admission. Create the
+    // physical cgroup at that ceiling. The elastic policy label still
+    // records the ORIGINAL initial/ceiling: the existing shrink path
+    // returns the limit to initial after the restore completes.
+    const bool isNamedRestore = !request->runtimeinstanceinfo().restoresnapshotid().empty();
     for (const auto &name : {CPU_RESOURCE_NAME, MEMORY_RESOURCE_NAME}) {
         auto it = resources.find(name);
         if (it == resources.end() || it->second.type() != ValueType::Value_Type_SCALAR
@@ -1116,7 +1125,22 @@ Status SandboxdRequestBuilder::ApplyElasticResources(
             || std::floor(initial) != initial || std::floor(ceiling) != ceiling) {
             return Status(StatusCode::ERR_PARAM_INVALID, "elastic resource limits must be positive integers with ceiling >= initial");
         }
-        (*start->mutable_resources())[name] = initial;
+        if (isNamedRestore && name == MEMORY_RESOURCE_NAME) {
+            if (ceiling == initial) {
+                // The elastic policy has no headroom above initial; the
+                // conservative ceiling-provisioned restore cannot operate.
+                // This is a scheduling-policy rejection (the admission
+                // contract requires finite headroom), not a physical
+                // failure prediction.
+                return Status(StatusCode::ERR_RESOURCE_CONFIG_ERROR,
+                    "named restore with elastic memory requires a finite ceiling above initial "
+                    "(initial=" + std::to_string(static_cast<int64_t>(initial)) + "MiB, "
+                    "ceiling=" + std::to_string(static_cast<int64_t>(ceiling)) + "MiB)");
+            }
+            (*start->mutable_resources())[name] = ceiling;
+        } else {
+            (*start->mutable_resources())[name] = initial;
+        }
         policy[name] = {{"initial", initial}, {"ceiling", ceiling}};
     }
     // Persist with sandbox metadata and checkpoints; limits are not lost when

@@ -490,10 +490,17 @@ private:
     std::unordered_map<std::string, ResizeBudgetEntry> resizeBudget_;
     AdmissionReserve OutstandingResize(const std::string &unitID) const;
     void ReconcileResize(const ResourceUnit &unit);
+    // Tri-state result of the admission-to-baseline handoff.
+    // Established: a synthetic credit entry now holds the observed max.
+    // NotNeeded: the instance is at/below its initial floor; no extra credit
+    //   required and the admission reservation can be released.
+    // Deferred: unknownness or a condition mismatch; keep the reservation.
+    enum class RecoveryBaselineResult { Established, NotNeeded, Deferred };
     // Restarts lose the grow ledger; hold the full current max as a baseline
-    // commitment until peaks or a confirmed shrink release it.
-    void EstablishRecoveryBaseline(const std::string &unitID, const InstanceInfo &instance,
-                                   const resources::SandboxResourceSample &sample);
+    // commitment until peaks or a confirmed shrink release it. Returns the
+    // handoff state so the caller gates the admission-flag release on it.
+    RecoveryBaselineResult EstablishRecoveryBaseline(const std::string &unitID, const InstanceInfo &instance,
+                                                    const resources::SandboxResourceSample &sample);
     // A revision newer than the stored one is only authoritative when it maps
     // to an operation this view dispatched for the same incarnation.
     bool MapsToDispatchedResize(const std::string &instanceID, const std::string &generation,

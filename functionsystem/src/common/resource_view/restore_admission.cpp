@@ -35,6 +35,22 @@ double Reserve(const InstanceInfo &instance, double floor)
     const auto &scalar = memory->second.scalar();
     if (!std::isfinite(scalar.value()) || scalar.value() <= 0 || !std::isfinite(scalar.limit()) || scalar.limit() < 0) { return -1; }
     if (!instance.snapshotinfo().checkpointid().empty()) { return std::max(scalar.value(), scalar.limit()); }
+    // Named reusable-snapshot restores carry the trusted_restore schedule
+    // extension (see instance_ctrl_message.h; the public Create boundary in
+    // struct_transfer.h strips yr.internal.reusable_snapshot.* so only the
+    // internal resolve path can set it). Their physical restore loading
+    // needs the full authorized elastic ceiling, not the steady-state initial.
+    // Gate on resource_admission_pending so the ceiling reservation applies
+    // only during the admission window: once the Stats-based release path
+    // clears the pending flag (after the recovery baseline holds the credit),
+    // the lingering extension no longer forces ceiling accounting.
+    if (instance.resource_admission_pending()) {
+        const auto trustedRestore = instance.scheduleoption().extension().find(
+            "yr.internal.reusable_snapshot.trusted_restore");
+        if (trustedRestore != instance.scheduleoption().extension().end()) {
+            return std::max(scalar.value(), scalar.limit());
+        }
+    }
     return UsesElasticAdmission(instance) ? scalar.value() : std::min(floor, scalar.value());
 }
 double ReserveCPU(const InstanceInfo &instance)

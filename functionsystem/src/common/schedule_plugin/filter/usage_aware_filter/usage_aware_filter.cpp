@@ -76,9 +76,20 @@ schedule_framework::Filtered UsageAwareFilter::Filter(const std::shared_ptr<sche
                                              false, -1 };
     }
 
+    // Named restores pending admission use the trusted_restore schedule
+    // extension (set only by the internal resolve path; the public Create
+    // boundary strips yr.internal.reusable_snapshot.*). They hold the same
+    // ceiling-level restore reservation as checkpointid restores.
+    const auto isNamedRestorePending = [](const resource_view::InstanceInfo &info) {
+        return info.resource_admission_pending()
+            && info.scheduleoption().extension().find(
+                   "yr.internal.reusable_snapshot.trusted_restore")
+               != info.scheduleoption().extension().end();
+    };
     double visibleRestoreReserve = 0.0;
     for (const auto &entry : resourceUnit.instances()) {
-        if (entry.second.snapshotinfo().checkpointid().empty()) { continue; }
+        if (entry.second.snapshotinfo().checkpointid().empty()
+            && !isNamedRestorePending(entry.second)) { continue; }
         hasPendingRestores = true;
         const auto memory = entry.second.resources().resources().find(resource_view::MEMORY_RESOURCE_NAME);
         if (memory == entry.second.resources().resources().end() || !memory->second.has_scalar()
@@ -89,7 +100,8 @@ schedule_framework::Filtered UsageAwareFilter::Filter(const std::shared_ptr<sche
         }
         visibleRestoreReserve += std::max(memory->second.scalar().value(), memory->second.scalar().limit());
     }
-    const bool restoring = !instance.snapshotinfo().checkpointid().empty();
+    const bool restoring = !instance.snapshotinfo().checkpointid().empty()
+        || isNamedRestorePending(instance);
     if (restoring || hasPendingRestores) {
         const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();

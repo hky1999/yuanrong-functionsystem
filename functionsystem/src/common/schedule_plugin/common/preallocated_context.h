@@ -106,7 +106,11 @@ struct PreAllocatedContext : public schedule_framework::ScheduleContext {
 
     void RememberRestoreMemory(const resource_view::InstanceInfo &instance)
     {
-        if (instance.snapshotinfo().checkpointid().empty()) {
+        const bool namedRestorePending = instance.resource_admission_pending()
+            && instance.scheduleoption().extension().find(
+                   "yr.internal.reusable_snapshot.trusted_restore")
+               != instance.scheduleoption().extension().end();
+        if (instance.snapshotinfo().checkpointid().empty() && !namedRestorePending) {
             preAllocatedRestoreMemory.erase(instance.instanceid());
             return;
         }

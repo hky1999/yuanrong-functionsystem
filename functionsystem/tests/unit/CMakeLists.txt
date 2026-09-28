@@ -125,6 +125,7 @@ add_executable(${PAUSE_RESUME_UNIT_TEST}
         common/etcd_service/etcd_watch_service.cpp
         common/etcd_service/etcd_watch_srv_actor.cpp
         common/resource_view/view_utils.cpp
+        common/resource_view/restore_ceiling_admission_test.cpp
         common/snapshot_storage/snapshot_storage_test.cpp
         function_agent/snapshot/local_snapshot_store_test.cpp
         function_master/snap_manager/reusable_snapshot_proto_test.cpp

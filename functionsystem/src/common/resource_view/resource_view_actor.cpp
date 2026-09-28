@@ -1861,14 +1861,26 @@ void ResourceViewActor::UpdateResourceUnitActual(const std::shared_ptr<ResourceU
                 && memoryObservedMs >= sample.sampled_at_unix_ms()) {
                 // Physical Stats and both node CPU/Memory windows postdate admission.
                 // Release the temporary restore ceiling, not the normal booking.
-                viewInst->second.clear_snapshotinfo();
-                viewInst->second.set_resource_admission_pending(false);
-                resourceAdmissionTimes_.erase(admitted);
+                // Ordering: the admission handoff must complete BEFORE the flags
+                // are cleared. EstablishRecoveryBaseline returns a tri-state:
+                //   Established  — a synthetic credit entry now holds the ceiling
+                //   NotNeeded    — the instance is at/below its initial floor;
+                //                   no extra credit is required, release is safe
+                //   Deferred     — unknown generation/revision/limits or a
+                //                   condition mismatch; KEEP the reservation and
+                //                   retry on the next Stats round. The budget must
+                //                   never be released while the physical cgroup
+                //                   still carries the restore ceiling. Deferred
+                //                   does NOT skip the top-level sync below.
+                bool releaseAdmission = true;
                 if (MemoryElasticityFenceEnabled()) {
-                    // Restart recovery: the grow ledger is gone, so hold the
-                    // full current max as a conservative commitment instead of
-                    // re-issuing the headroom to other instances.
-                    EstablishRecoveryBaseline(value->id(), viewInst->second, sample);
+                    const auto baseline = EstablishRecoveryBaseline(value->id(), viewInst->second, sample);
+                    releaseAdmission = (baseline != RecoveryBaselineResult::Deferred);
+                }
+                if (releaseAdmission) {
+                    viewInst->second.clear_snapshotinfo();
+                    viewInst->second.set_resource_admission_pending(false);
+                    resourceAdmissionTimes_.erase(admitted);
                 }
             }
         }

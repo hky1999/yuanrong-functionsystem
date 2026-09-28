@@ -139,8 +139,18 @@ Status ResourceViewActor::ReserveResize(const messages::ResizeSandboxRequest &re
         || resizeBudget_.count(request.requestid()) != 0) { return reject("invalid or duplicate resize reservation"); }
     if (request.shrink() && !fenced) { return reject("shrink requires the memory elasticity contract"); }
     const auto instance = view_->instances().find(request.instanceid());
+    // Named restores pending their admission-to-baseline handoff must not be
+    // resized (shrunk): the ceiling reservation is still holding their credit.
+    // The trusted extension alone is insufficient (it persists after release);
+    // gate on resource_admission_pending so only the pre-handoff window blocks.
+    const bool namedRestorePending = instance != view_->instances().end()
+        && instance->second.resource_admission_pending()
+        && instance->second.scheduleoption().extension().find(
+               "yr.internal.reusable_snapshot.trusted_restore")
+               != instance->second.scheduleoption().extension().end();
     if (instance == view_->instances().end() || !UsesElasticAdmission(instance->second)
-        || !instance->second.snapshotinfo().checkpointid().empty()) {
+        || !instance->second.snapshotinfo().checkpointid().empty()
+        || namedRestorePending) {
         return reject("resize requires an elastic instance outside restoration");
     }
     const auto &info = instance->second;
@@ -528,19 +538,35 @@ void ResourceViewActor::TrimInstanceGrowCredits(const std::string &instanceID, c
                after.memoryMb, before.memoryMb - after.memoryMb, operationID, revision);
 }
 
-void ResourceViewActor::EstablishRecoveryBaseline(const std::string &unitID, const InstanceInfo &instance,
-                                                  const resources::SandboxResourceSample &sample)
+ResourceViewActor::RecoveryBaselineResult ResourceViewActor::EstablishRecoveryBaseline(
+    const std::string &unitID, const InstanceInfo &instance,
+    const resources::SandboxResourceSample &sample)
 {
     // A restart loses the grow ledger, but a missing record must not become a
     // zero commitment: hold the full observed max above current usage until
     // peaks or a confirmed shrink release it.
+    // Unknownness is Deferred (keep the admission reservation); an instance
+    // already at/below its initial floor is NotNeeded (release is safe); a
+    // successfully created entry is Established.
     if (sample.resource_generation().empty() || !sample.resource_revision_known() || !sample.cpu_limits_known()
-        || !sample.memory_limit_known() || sample.memory_limit_bytes() == 0) { return; }
+        || !sample.memory_limit_known() || sample.memory_limit_bytes() == 0) {
+        return RecoveryBaselineResult::Deferred;
+    }
     const uint64_t floorBytes = InstanceMemoryFloorBytes(instance);
-    if (floorBytes == 0 || sample.memory_limit_bytes() <= floorBytes) { return; }
+    if (floorBytes == 0) { return RecoveryBaselineResult::Deferred; }
+    if (sample.memory_limit_bytes() <= floorBytes) { return RecoveryBaselineResult::NotNeeded; }
     for (const auto &item : resizeBudget_) {
         if (item.second.request.instanceid() == instance.instanceid()
-            && item.second.request.resize().resource_generation() == sample.resource_generation()) { return; }
+            && item.second.request.resize().resource_generation() == sample.resource_generation()) {
+            // Idempotent only when the existing entry holds actual remaining
+            // credit: EntryOutstanding computes cap - max(expected, peak).
+            // A cap-512/expected-512 entry has zero credit and provides no
+            // protection — the admission reservation must stay held.
+            if (!item.second.shrink && EntryOutstanding(item.second).memoryMb > 0) {
+                return RecoveryBaselineResult::Established;
+            }
+            return RecoveryBaselineResult::Deferred;
+        }
     }
     ResizeBudgetEntry entry;
     entry.baseline = true;
@@ -576,6 +602,7 @@ void ResourceViewActor::EstablishRecoveryBaseline(const std::string &unitID, con
                "expectedBytes={} outstandingMemoryMb={:.3f}",
                instance.instanceid(), unitID, sample.resource_generation(), sample.resource_revision(),
                sample.memory_limit_bytes(), sample.memory_current_bytes(), heldMb);
+    return RecoveryBaselineResult::Established;
 }
 
 bool ResourceViewActor::HasResizeBudgetEntries(const std::string &instanceID) const
