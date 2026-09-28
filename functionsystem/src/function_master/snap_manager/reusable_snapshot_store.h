@@ -103,6 +103,13 @@ public:
         const ::messages::CompleteDeleteReusableSnapshotRequest &request);
     litebus::Future<::messages::DeleteReusableSnapshotResponse> Delete(
         const ::messages::DeleteReusableSnapshotRequest &request);
+    // Source-exit retention scan. A named reusable Snapshot owns its own
+    // lifecycle: this path NEVER deletes records bound to the exited source
+    // (READY survives for explicit Delete; PUBLISHING keeps ownership for a
+    // later Commit; DELETING stays with its authorized delete attempt — a
+    // key re-read from here cannot be identity-pinned to that attempt).
+    // Only persistence readability is validated; anonymous/park checkpoint
+    // cleanup lives outside this store and is unaffected.
     litebus::Future<Status> DeleteLocalSnapshotsForSource(
         const std::string &tenantID, const std::string &sourceInstanceID);
 

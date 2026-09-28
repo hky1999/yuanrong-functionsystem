@@ -193,6 +193,15 @@ protected:
 
     std::shared_ptr<MemoryReusableSnapshotPersistence> persistence;
     std::shared_ptr<ReusableSnapshotStore> store;
+
+    std::string CommitReadyLocal()
+    {
+        const auto begin = Begin();
+        auto commit = CommitRequest(begin.snapshotid());
+        *commit.mutable_artifact() = LocalArtifact();
+        EXPECT_EQ(store->Commit(commit).Get().code(), 0);
+        return begin.snapshotid();
+    }
 };
 
 TEST_F(ReusableSnapshotStoreTest, UsesExactlyOneTenantScopedEtcdKey)
@@ -593,12 +602,142 @@ TEST_F(ReusableSnapshotStoreTest, DeleteUsesPhysicalSeamThenCompletesExactRecord
     EXPECT_TRUE(persistence->values.empty());
 }
 
-TEST_F(ReusableSnapshotStoreTest, DeletedSourceCleansOnlyItsLocalSnapshots)
+namespace {
+
+::messages::DeleteReusableSnapshotArtifactResponse OkArtifactDelete(
+    const ::messages::DeleteReusableSnapshotArtifactRequest &request)
 {
-    const auto localBegin = Begin();
-    auto localCommit = CommitRequest(localBegin.snapshotid());
-    *localCommit.mutable_artifact() = LocalArtifact();
-    ASSERT_EQ(store->Commit(localCommit).Get().code(), 0);
+    ::messages::DeleteReusableSnapshotArtifactResponse response;
+    response.set_requestid(request.requestid());
+    return response;
+}
+
+std::vector<std::string> InstallRecordingDeleter(
+    const std::shared_ptr<ReusableSnapshotStore> &target)
+{
+    std::vector<std::string> deleted;
+    target->SetArtifactDeleter([&deleted](const ::messages::DeleteReusableSnapshotArtifactRequest &request) {
+        deleted.emplace_back(request.snapshotid());
+        return litebus::Future<::messages::DeleteReusableSnapshotArtifactResponse>(
+            OkArtifactDelete(request));
+    });
+    return deleted;
+}
+
+}  // namespace
+
+// Source-exit retention contract: a named reusable Snapshot owns its own
+// lifecycle. DeleteLocalSnapshotsForSource must never issue a delete — the
+// pc-snapshot-term-1 physical case proved the old cascade destroyed the only
+// READY restore source 17s before the restore create resolved it.
+
+TEST_F(ReusableSnapshotStoreTest, SourceExitKeepsReadyLocalSnapshotResolvable)
+{
+    const auto snapshotID = CommitReadyLocal();
+    auto deleted = InstallRecordingDeleter(store);
+
+    EXPECT_TRUE(store->DeleteLocalSnapshotsForSource("tenant-a", "source-logical").Get().IsOk());
+
+    EXPECT_TRUE(deleted.empty());
+    const auto record = store->ReadForTest("tenant-a", snapshotID).Get();
+    ASSERT_TRUE(record.has_value());
+    EXPECT_EQ(record->phase(), ::messages::REUSABLE_SNAPSHOT_READY);
+    ::messages::ResolveReusableSnapshotForCreateRequest resolve;
+    resolve.set_requestid("resolve-after-exit");
+    resolve.set_tenantid("tenant-a");
+    resolve.set_snapshotid(snapshotID);
+    const auto resolved = store->Resolve(resolve).Get();
+    EXPECT_EQ(resolved.code(), 0);
+    EXPECT_EQ(resolved.snapshotinfo().snapshotid(), snapshotID);
+}
+
+TEST_F(ReusableSnapshotStoreTest, ExplicitDeleteRemovesReadyLocalSnapshotAfterSourceExit)
+{
+    const auto snapshotID = CommitReadyLocal();
+    auto deleted = InstallRecordingDeleter(store);
+
+    EXPECT_TRUE(store->DeleteLocalSnapshotsForSource("tenant-a", "source-logical").Get().IsOk());
+    ::messages::DeleteReusableSnapshotRequest request;
+    request.set_requestid("explicit-delete");
+    request.set_tenantid("tenant-a");
+    request.set_snapshotid(snapshotID);
+    EXPECT_EQ(store->Delete(request).Get().code(), 0);
+
+    ASSERT_EQ(deleted.size(), 1U);
+    EXPECT_EQ(deleted.front(), snapshotID);
+    EXPECT_FALSE(store->ReadForTest("tenant-a", snapshotID).Get().has_value());
+}
+
+TEST_F(ReusableSnapshotStoreTest, SourceExitKeepsPublishingRecordForLaterCommit)
+{
+    const auto begin = Begin();
+    auto deleted = InstallRecordingDeleter(store);
+
+    EXPECT_TRUE(store->DeleteLocalSnapshotsForSource("tenant-a", "source-logical").Get().IsOk());
+
+    EXPECT_TRUE(deleted.empty());
+    auto record = store->ReadForTest("tenant-a", begin.snapshotid()).Get();
+    ASSERT_TRUE(record.has_value());
+    EXPECT_EQ(record->phase(), ::messages::REUSABLE_SNAPSHOT_PUBLISHING);
+
+    auto commit = CommitRequest(begin.snapshotid());
+    *commit.mutable_artifact() = LocalArtifact();
+    EXPECT_EQ(store->Commit(commit).Get().code(), 0);
+    record = store->ReadForTest("tenant-a", begin.snapshotid()).Get();
+    ASSERT_TRUE(record.has_value());
+    EXPECT_EQ(record->phase(), ::messages::REUSABLE_SNAPSHOT_READY);
+}
+
+TEST_F(ReusableSnapshotStoreTest, SourceExitLeavesDeletingRecordToExplicitRetry)
+{
+    const auto snapshotID = CommitReadyLocal();
+    ::messages::BeginDeleteReusableSnapshotRequest beginDelete;
+    beginDelete.set_requestid("authorized-delete");
+    beginDelete.set_tenantid("tenant-a");
+    beginDelete.set_snapshotid(snapshotID);
+    ASSERT_EQ(store->BeginDelete(beginDelete).Get().code(), 0);
+
+    auto deleted = InstallRecordingDeleter(store);
+    EXPECT_TRUE(store->DeleteLocalSnapshotsForSource("tenant-a", "source-logical").Get().IsOk());
+    EXPECT_TRUE(deleted.empty());
+    auto record = store->ReadForTest("tenant-a", snapshotID).Get();
+    ASSERT_TRUE(record.has_value());
+    EXPECT_EQ(record->phase(), ::messages::REUSABLE_SNAPSHOT_DELETING);
+
+    // The authorized attempt completes via explicit retry, not via the
+    // source-exit scan (whose re-read cannot be identity-pinned to it).
+    ::messages::DeleteReusableSnapshotRequest retry;
+    retry.set_requestid("explicit-retry");
+    retry.set_tenantid("tenant-a");
+    retry.set_snapshotid(snapshotID);
+    EXPECT_EQ(store->Delete(retry).Get().code(), 0);
+    ASSERT_EQ(deleted.size(), 1U);
+    EXPECT_FALSE(store->ReadForTest("tenant-a", snapshotID).Get().has_value());
+}
+
+TEST_F(ReusableSnapshotStoreTest, SourceExitIssuesNoWritesWhenCommitMayStillLand)
+{
+    // The stale-race shape from pc-snapshot-term-1: the scan observes a
+    // PUBLISHING record, a legal Commit lands afterwards. With zero writes
+    // from the scan the concurrently-committed READY must survive.
+    const auto begin = Begin();
+    InstallRecordingDeleter(store);
+    const auto casWritesBefore = persistence->casKeys.size();
+
+    EXPECT_TRUE(store->DeleteLocalSnapshotsForSource("tenant-a", "source-logical").Get().IsOk());
+    EXPECT_EQ(persistence->casKeys.size(), casWritesBefore);
+
+    auto commit = CommitRequest(begin.snapshotid());
+    *commit.mutable_artifact() = LocalArtifact();
+    EXPECT_EQ(store->Commit(commit).Get().code(), 0);
+    const auto record = store->ReadForTest("tenant-a", begin.snapshotid()).Get();
+    ASSERT_TRUE(record.has_value());
+    EXPECT_EQ(record->phase(), ::messages::REUSABLE_SNAPSHOT_READY);
+}
+
+TEST_F(ReusableSnapshotStoreTest, SourceExitRetainsLocalDistributedAndForeignSourceRecords)
+{
+    const auto localID = CommitReadyLocal();
 
     auto distributedBeginRequest = BeginRequest();
     distributedBeginRequest.set_requestid("distributed-snapshot-request");
@@ -607,19 +746,53 @@ TEST_F(ReusableSnapshotStoreTest, DeletedSourceCleansOnlyItsLocalSnapshots)
     distributedCommit.set_requestid(distributedBeginRequest.requestid());
     ASSERT_EQ(store->Commit(distributedCommit).Get().code(), 0);
 
-    std::vector<std::string> deleted;
-    store->SetArtifactDeleter([&deleted](const ::messages::DeleteReusableSnapshotArtifactRequest &request) {
-        deleted.emplace_back(request.snapshotid());
+    auto foreignBeginRequest = BeginRequest();
+    foreignBeginRequest.set_requestid("foreign-source-request");
+    foreignBeginRequest.set_sourceinstanceid("another-source");
+    const auto foreignBegin = store->Begin(foreignBeginRequest).Get();
+    auto foreignCommit = CommitRequest(foreignBegin.snapshotid());
+    foreignCommit.set_requestid(foreignBeginRequest.requestid());
+    *foreignCommit.mutable_artifact() = LocalArtifact();
+    ASSERT_EQ(store->Commit(foreignCommit).Get().code(), 0);
+
+    auto deleted = InstallRecordingDeleter(store);
+    EXPECT_TRUE(store->DeleteLocalSnapshotsForSource("tenant-a", "source-logical").Get().IsOk());
+
+    EXPECT_TRUE(deleted.empty());
+    EXPECT_TRUE(store->ReadForTest("tenant-a", localID).Get().has_value());
+    EXPECT_TRUE(store->ReadForTest("tenant-a", distributedBegin.snapshotid()).Get().has_value());
+    EXPECT_TRUE(store->ReadForTest("tenant-a", foreignBegin.snapshotid()).Get().has_value());
+    EXPECT_EQ(persistence->listPrefixes.size(), 1U);
+    EXPECT_EQ(persistence->listPrefixes.front(), ReusableSnapshotStore::TenantPrefix("tenant-a"));
+}
+
+TEST_F(ReusableSnapshotStoreTest, FailedPhysicalDeleteKeepsRecordDeletingAndRetrySucceeds)
+{
+    const auto snapshotID = CommitReadyLocal();
+    store->SetArtifactDeleter([](const ::messages::DeleteReusableSnapshotArtifactRequest &request) {
         ::messages::DeleteReusableSnapshotArtifactResponse response;
         response.set_requestid(request.requestid());
+        response.set_code(common::ERR_INNER_COMMUNICATION);
+        response.set_message("physical delete failed");
         return litebus::Future<::messages::DeleteReusableSnapshotArtifactResponse>(response);
     });
+    ::messages::DeleteReusableSnapshotRequest request;
+    request.set_requestid("failing-delete");
+    request.set_tenantid("tenant-a");
+    request.set_snapshotid(snapshotID);
+    EXPECT_NE(store->Delete(request).Get().code(), 0);
+    auto record = store->ReadForTest("tenant-a", snapshotID).Get();
+    ASSERT_TRUE(record.has_value());
+    EXPECT_EQ(record->phase(), ::messages::REUSABLE_SNAPSHOT_DELETING);
 
-    EXPECT_TRUE(store->DeleteLocalSnapshotsForSource("tenant-a", "source-logical").Get().IsOk());
+    auto deleted = InstallRecordingDeleter(store);
+    ::messages::DeleteReusableSnapshotRequest retry;
+    retry.set_requestid("retry-delete");
+    retry.set_tenantid("tenant-a");
+    retry.set_snapshotid(snapshotID);
+    EXPECT_EQ(store->Delete(retry).Get().code(), 0);
     ASSERT_EQ(deleted.size(), 1U);
-    EXPECT_EQ(deleted.front(), localBegin.snapshotid());
-    EXPECT_FALSE(store->ReadForTest("tenant-a", localBegin.snapshotid()).Get().has_value());
-    EXPECT_TRUE(store->ReadForTest("tenant-a", distributedBegin.snapshotid()).Get().has_value());
+    EXPECT_FALSE(store->ReadForTest("tenant-a", snapshotID).Get().has_value());
 }
 
 }  // namespace

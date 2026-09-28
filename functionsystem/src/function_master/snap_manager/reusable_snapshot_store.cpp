@@ -759,35 +759,24 @@ litebus::Future<Status> ReusableSnapshotStore::DeleteLocalSnapshotsForSource(
             Invalid("tenantID and sourceInstanceID are required for local Snapshot cleanup"));
     }
     return persistence_->List(TenantPrefix(tenantID))
-        .Then([this, tenantID, sourceInstanceID](const ReusableSnapshotListRecordsResult &records)
+        .Then([tenantID, sourceInstanceID](const ReusableSnapshotListRecordsResult &records)
             -> litebus::Future<Status> {
             if (records.status.IsError()) {
                 return litebus::Future<Status>(records.status);
             }
-            litebus::Future<Status> cleanup(Status::OK());
-            for (const auto &value : records.values) {
-                ::messages::ReusableSnapshotMetadata metadata;
-                if (!ParseMetadata(value, &metadata)
-                    || metadata.sourceinstanceid() != sourceInstanceID
-                    || metadata.artifact().storagebackend() != "local") {
-                    continue;
-                }
-                ::messages::DeleteReusableSnapshotRequest request;
-                request.set_requestid("instance-delete/" + sourceInstanceID + "/" + metadata.snapshotid());
-                request.set_tenantid(tenantID);
-                request.set_snapshotid(metadata.snapshotid());
-                cleanup = cleanup.Then([this, request](const Status &previous) -> litebus::Future<Status> {
-                    return Delete(request).Then([previous](
-                        const ::messages::DeleteReusableSnapshotResponse &response) {
-                        if (previous.IsError()) {
-                            return previous;
-                        }
-                        return response.code() == common::ERR_NONE ? Status::OK()
-                            : Status(StatusCode::FAILED, response.message());
-                    });
-                });
-            }
-            return cleanup;
+            // A named reusable Snapshot owns its lifecycle independently of its
+            // source instance. Source-exit cleanup must NOT delete it:
+            //   - READY survives until an explicit Delete (the only sanctioned
+            //     removal); no TTL GC currently covers /yr/snapshots/v1/.
+            //   - PUBLISHING keeps its record/ownership so a legal Commit can
+            //     still publish READY after the source is gone.
+            //   - DELETING belongs to its already-authorized delete attempt.
+            //     Re-reading the key from here cannot distinguish a fresh
+            //     recreate-and-READY from the record this scan saw, so this
+            //     path must not issue any identity-less delete; the explicit
+            //     Delete retry drives completion instead.
+            (void)sourceInstanceID;
+            return litebus::Future<Status>(Status::OK());
         });
 }
 
