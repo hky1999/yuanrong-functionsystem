@@ -67,7 +67,7 @@ InstanceInfo MakeElasticInstance(const std::string &id, double initialMiB, doubl
 {
     InstanceInfo info;
     info.set_instanceid(id);
-    (*info.mutable_createoptions())["scheduler.elastic_resources"] = "true";
+    (*info.mutable_createoptions())["scheduler_elastic_resources"] = "true";
     auto &mem = (*info.mutable_resources()->mutable_resources())["Memory"];
     mem.mutable_scalar()->set_value(initialMiB);
     mem.mutable_scalar()->set_limit(ceilingMiB);
@@ -104,6 +104,7 @@ TEST_F(NamedRestoreCeilingAdmission, PendingNamedRestoreRejectedWhenBudgetFitsIn
 TEST_F(NamedRestoreCeilingAdmission, NormalElasticAdmittedWithSameBudget) {
     auto unit = MakeUnit(1000, 600);
     auto normal = MakeElasticInstance("inst-normal", 128, 512, true, false);
+    ASSERT_TRUE(UsesElasticAdmission(normal)) << "test fixture must be elastic, not fallback";
     const auto verdict = CheckRestoreAllocation(normal, unit, {});
     EXPECT_TRUE(verdict.IsOk()) << "normal elastic reserves 128 and 400 is available";
 }
@@ -113,6 +114,7 @@ TEST_F(NamedRestoreCeilingAdmission, NormalElasticAdmittedWithSameBudget) {
 TEST_F(NamedRestoreCeilingAdmission, ReleasedNamedRestoreAdmittedAtInitial) {
     auto unit = MakeUnit(1000, 600);
     auto released = MakeElasticInstance("inst-released", 128, 512, false, true);
+    ASSERT_TRUE(UsesElasticAdmission(released)) << "test fixture must be elastic, not fallback";
     const auto verdict = CheckRestoreAllocation(released, unit, {});
     EXPECT_TRUE(verdict.IsOk()) << "released restore (pending=false) reserves 128";
 }

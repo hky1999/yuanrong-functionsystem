@@ -1126,17 +1126,11 @@ Status SandboxdRequestBuilder::ApplyElasticResources(
             return Status(StatusCode::ERR_PARAM_INVALID, "elastic resource limits must be positive integers with ceiling >= initial");
         }
         if (isNamedRestore && name == MEMORY_RESOURCE_NAME) {
-            if (ceiling == initial) {
-                // The elastic policy has no headroom above initial; the
-                // conservative ceiling-provisioned restore cannot operate.
-                // This is a scheduling-policy rejection (the admission
-                // contract requires finite headroom), not a physical
-                // failure prediction.
-                return Status(StatusCode::ERR_RESOURCE_CONFIG_ERROR,
-                    "named restore with elastic memory requires a finite ceiling above initial "
-                    "(initial=" + std::to_string(static_cast<int64_t>(initial)) + "MiB, "
-                    "ceiling=" + std::to_string(static_cast<int64_t>(ceiling)) + "MiB)");
-            }
+            // ceiling==initial is a valid finite policy: provisioning at
+            // ceiling is the same as provisioning at initial in that case.
+            // No additional rejection here — scheduling-side admission
+            // already applies the standard positive/finite/ceiling>=initial
+            // contract uniformly at entry.
             (*start->mutable_resources())[name] = ceiling;
         } else {
             (*start->mutable_resources())[name] = initial;

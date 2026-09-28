@@ -125,13 +125,36 @@ add_executable(${PAUSE_RESUME_UNIT_TEST}
         common/etcd_service/etcd_watch_service.cpp
         common/etcd_service/etcd_watch_srv_actor.cpp
         common/resource_view/view_utils.cpp
-        common/resource_view/restore_ceiling_admission_test.cpp
         common/snapshot_storage/snapshot_storage_test.cpp
         function_agent/snapshot/local_snapshot_store_test.cpp
         function_master/snap_manager/reusable_snapshot_proto_test.cpp
         function_master/snap_manager/reusable_snapshot_store_test.cpp
         function_proxy/local_scheduler/snap_ctrl/snap_ctrl_actor_test.cpp
         function_proxy/local_scheduler/snap_ctrl/snap_options_wire_test.cpp)
+
+# Independent named-restore ceiling admission test target: not in
+# pause_resume_unit_test (which carries a registered legacy fixture that
+# cannot compile). Minimal link surface: only the admission TU + main.
+add_executable(restore_ceiling_admission_test
+        main.cpp
+        common/resource_view/restore_ceiling_admission_test.cpp)
+target_compile_options(restore_ceiling_admission_test PRIVATE
+        -Wno-error
+        -fno-access-control
+        -Wno-missing-field-initializers)
+add_dependencies(restore_ceiling_admission_test gtest_1_10_0)
+target_include_directories(restore_ceiling_admission_test PRIVATE
+        ${CLIENT_CPP_INCLUDE}
+        ${gtest_INCLUDE_DIR}
+        ${SRC_INCLUDE_DIR})
+target_link_libraries(restore_ceiling_admission_test PRIVATE
+        ${crypto_LIB} ${ssl_LIB} ${zlib_LIB} ${protobuf_LIB}
+        ${grpcpp_LIB} ${gpr_LIB} ${securec_LIB}
+        ${gtest_LIB_A} ${gmock_LIB_A}
+        ${litebus_ALL_LIB}
+        pthread)
+add_test(NAME restore_ceiling_admission_test
+        COMMAND restore_ceiling_admission_test --gtest_filter=*.*)
 
 # Real SnapCtrlActor public-chain fixture tests (restored type=SNAPSHOT
 # chain): the actor is instantiated and driven through litebus; only the

@@ -76,15 +76,22 @@ schedule_framework::Filtered UsageAwareFilter::Filter(const std::shared_ptr<sche
                                              false, -1 };
     }
 
-    // Named restores pending admission use the trusted_restore schedule
-    // extension (set only by the internal resolve path; the public Create
-    // boundary strips yr.internal.reusable_snapshot.*). They hold the same
-    // ceiling-level restore reservation as checkpointid restores.
-    const auto isNamedRestorePending = [](const resource_view::InstanceInfo &info) {
-        return info.resource_admission_pending()
-            && info.scheduleoption().extension().find(
+    // Named restores carry the trusted_restore schedule extension (set only
+    // by the internal resolve path; the public Create boundary strips
+    // yr.internal.reusable_snapshot.*). Two detection shapes:
+    //   - the INCOMING request: extension present (pending is false on a
+    //     new request; it becomes true only when SimplifyInstanceInfo runs
+    //     at allocation time)
+    //   - a VISIBLE already-allocated instance: pending + extension (the
+    //     extension persists after the initial admission; pending is cleared
+    //     by the Stats-driven release path)
+    const auto hasTrustedRestoreExtension = [](const resource_view::InstanceInfo &info) {
+        return info.scheduleoption().extension().find(
                    "yr.internal.reusable_snapshot.trusted_restore")
                != info.scheduleoption().extension().end();
+    };
+    const auto isNamedRestorePending = [&hasTrustedRestoreExtension](const resource_view::InstanceInfo &info) {
+        return info.resource_admission_pending() && hasTrustedRestoreExtension(info);
     };
     double visibleRestoreReserve = 0.0;
     for (const auto &entry : resourceUnit.instances()) {
@@ -100,8 +107,10 @@ schedule_framework::Filtered UsageAwareFilter::Filter(const std::shared_ptr<sche
         }
         visibleRestoreReserve += std::max(memory->second.scalar().value(), memory->second.scalar().limit());
     }
+    // For the incoming request: detect by extension alone (pending is not
+    // yet set on a new ScheduleRequest instance).
     const bool restoring = !instance.snapshotinfo().checkpointid().empty()
-        || isNamedRestorePending(instance);
+        || hasTrustedRestoreExtension(instance);
     if (restoring || hasPendingRestores) {
         const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
