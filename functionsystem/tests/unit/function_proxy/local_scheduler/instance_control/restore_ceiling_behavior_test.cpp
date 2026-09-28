@@ -637,43 +637,47 @@ protected:
     }
 
     // Actor with a real view: fragment unit + top-level instance index entry.
+    // ONE instance object with a deterministic identity is copied into both
+    // indexes (two MakeElasticInstance calls would produce different random
+    // instanceids, disagreeing with the map key and with each other).
     // The view-level actualuse rollup starts equal to the unit's actualuse or
     // the subtraction guard rejects every later report.
-    std::shared_ptr<ResourceViewActor> MakeViewActor()
+    std::shared_ptr<ResourceViewActor> MakeViewActor(double initial, double ceiling, bool trusted)
     {
         auto actor = std::make_shared<ResourceViewActor>("publish", "publish-view", param_);
         actor->view_ = std::make_shared<ResourceUnit>(InitResource("publish-view"));
+        InstanceInfo inst = MakeElasticInstance(initial, ceiling, true, trusted);
+        inst.set_instanceid("publish-inst-1");
+        inst.set_runtimeid("rt-pub");
+        inst.set_unitid("unit-pub");
         auto unit = MakeUnit(2000, 600);
         unit.set_id("unit-pub");
-        (*unit.mutable_instances())["publish-inst-1"] = MakeElasticInstance(128, 512, true, false);
-        (*unit.mutable_instances())["publish-inst-1"].set_runtimeid("rt-pub");
+        (*unit.mutable_instances())["publish-inst-1"] = inst;
         (*actor->view_->mutable_fragment())["unit-pub"] = unit;
-        auto top = MakeElasticInstance(128, 512, true, false);
-        top.set_runtimeid("rt-pub");
-        top.set_unitid("unit-pub");
-        (*actor->view_->mutable_instances())["publish-inst-1"] = top;
+        (*actor->view_->mutable_instances())["publish-inst-1"] = inst;
         (*actor->view_->mutable_actualuse()) = unit.actualuse();
         return actor;
     }
 
     // A collector report for the unit; withSample adds the physical reading.
-    ResourceUnit MakeReport(int64_t atMs, bool withSample, bool limitKnown = true)
+    ResourceUnit MakeReport(int64_t atMs, bool withSample, bool limitKnown = true,
+                            uint64_t limitBytes = 512ULL * 1024 * 1024)
     {
         auto report = MakeUnit(2000, 600);
         report.set_id("unit-pub");
         report.set_memory_sample_unix_ms(atMs);
         report.set_cpu_sample_unix_ms(atMs);
-        auto *reported = (*report.mutable_instances())["publish-inst-1"];
-        reported->set_instanceid("publish-inst-1");
-        reported->set_runtimeid("rt-pub");
+        auto &reported = (*report.mutable_instances())["publish-inst-1"];  // map operator[] is a reference
+        reported.set_instanceid("publish-inst-1");
+        reported.set_runtimeid("rt-pub");
         if (withSample) {
-            auto sample = MakeSample("sbx-pub", "rt-pub", "gen-pub", 512 * 1024 * 1024,
+            auto sample = MakeSample("sbx-pub", "rt-pub", "gen-pub", limitBytes,
                                      true, 100 * 1024 * 1024);
             sample.set_cpu_usage_known(true);
             sample.set_cpu_usage_cores(0.05);
             sample.set_sampled_at_unix_ms(atMs - 100);
             if (!limitKnown) { sample.set_memory_limit_known(false); }
-            *reported->mutable_sandbox_resource_sample() = sample;
+            *reported.mutable_sandbox_resource_sample() = sample;
         }
         return report;
     }
@@ -681,10 +685,11 @@ protected:
 
 // Round 2 with a complete sample: baseline Established → the admission flag
 // clears, the window entry is erased, and the credit lands in a synthetic
-// recovery-baseline budget entry instead of vanishing.
+// recovery-baseline budget entry instead of vanishing. The generated entry
+// must carry EXACTLY this instance's identity.
 TEST_F(NamedRestorePublishTest, SecondStatsRoundClearsPendingWhenBaselineEstablished)
 {
-    auto actor = MakeViewActor();
+    auto actor = MakeViewActor(128, 512, /*trusted=*/true);
     actor->UpdateResourceUnitActual(std::make_shared<ResourceUnit>(MakeReport(NowMs(), false)));
     // Round 1 registered the admission window; nothing released yet.
     EXPECT_EQ(actor->resourceAdmissionTimes_.count("publish-inst-1"), 1u);
@@ -699,11 +704,18 @@ TEST_F(NamedRestorePublishTest, SecondStatsRoundClearsPendingWhenBaselineEstabli
     EXPECT_EQ(actor->resourceAdmissionTimes_.count("publish-inst-1"), 0u);
     // Top-level index synced (not skipped by the release path).
     EXPECT_FALSE(actor->view_->instances().at("publish-inst-1").resource_admission_pending());
-    // The ceiling credit is held by the synthetic baseline entry, not dropped.
+    // The ceiling credit is held by the synthetic baseline entry, not dropped,
+    // and the entry's full identity is this instance's incarnation.
     ASSERT_EQ(actor->resizeBudget_.size(), 1u);
     const auto &key = actor->resizeBudget_.begin()->first;
     EXPECT_EQ(key.compare(0, strlen("recovery-baseline:"), "recovery-baseline:"), 0);
-    EXPECT_NEAR(actor->EntryOutstanding(actor->resizeBudget_.begin()->second).memoryMb, 412.0, 0.5);
+    const auto &entry = actor->resizeBudget_.begin()->second;
+    EXPECT_EQ(entry.request.instanceid(), "publish-inst-1");
+    EXPECT_EQ(entry.request.runtimeid(), "rt-pub");
+    EXPECT_EQ(entry.request.resize().sandbox_id(), "sbx-pub");
+    EXPECT_EQ(entry.request.resize().resource_generation(), "gen-pub");
+    EXPECT_EQ(entry.unitID, "unit-pub");
+    EXPECT_NEAR(actor->EntryOutstanding(entry).memoryMb, 412.0, 0.5);
 }
 
 // Round 2 with an incomplete sample (memory limit unknown): the baseline
@@ -711,7 +723,7 @@ TEST_F(NamedRestorePublishTest, SecondStatsRoundClearsPendingWhenBaselineEstabli
 // and the top-level sync still runs (Deferred must not skip it).
 TEST_F(NamedRestorePublishTest, DeferredBaselineRetainsPendingReservation)
 {
-    auto actor = MakeViewActor();
+    auto actor = MakeViewActor(128, 512, /*trusted=*/true);
     actor->UpdateResourceUnitActual(std::make_shared<ResourceUnit>(MakeReport(NowMs(), false)));
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     actor->UpdateResourceUnitActual(
@@ -725,5 +737,25 @@ TEST_F(NamedRestorePublishTest, DeferredBaselineRetainsPendingReservation)
     const auto &top = actor->view_->instances().at("publish-inst-1");
     EXPECT_TRUE(top.resource_admission_pending());
     EXPECT_EQ(top.sandbox_resource_sample().sandbox_id(), "sbx-pub");
+}
+
+// Normal start whose ceiling equals the initial request (128/128): the
+// sample lands exactly at the floor, the baseline is NotNeeded, and the
+// admission flag still clears — with NO budget entry created.
+TEST_F(NamedRestorePublishTest, InitialCeilingNotNeededClearsPendingWithoutEntry)
+{
+    auto actor = MakeViewActor(128, 128, /*trusted=*/false);
+    actor->UpdateResourceUnitActual(std::make_shared<ResourceUnit>(MakeReport(NowMs(), false)));
+    EXPECT_EQ(actor->resourceAdmissionTimes_.count("publish-inst-1"), 1u);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // Sample limit == 128MiB floor → NotNeeded → release without any entry.
+    actor->UpdateResourceUnitActual(
+        std::make_shared<ResourceUnit>(MakeReport(NowMs(), true, /*limitKnown=*/true,
+                                                  128ULL * 1024 * 1024)));
+    const auto &after = actor->view_->fragment().at("unit-pub").instances().at("publish-inst-1");
+    EXPECT_FALSE(after.resource_admission_pending());
+    EXPECT_EQ(actor->resourceAdmissionTimes_.count("publish-inst-1"), 0u);
+    EXPECT_TRUE(actor->resizeBudget_.empty());
+    EXPECT_FALSE(actor->view_->instances().at("publish-inst-1").resource_admission_pending());
 }
 }  // namespace functionsystem::test
