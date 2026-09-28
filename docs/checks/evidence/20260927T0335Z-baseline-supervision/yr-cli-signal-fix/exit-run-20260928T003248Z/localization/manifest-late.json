@@ -1,0 +1,235 @@
+{
+ "t": "late",
+ "files": [
+  {
+   "name": "00-run-info.json",
+   "size": 1327,
+   "sha256": "5e65ba852d86cc2bc86130e5f5fc5e1429f57c1f074450f55afe7dd247aeae45"
+  },
+  {
+   "name": "A2-uid.json",
+   "size": 192,
+   "sha256": "9fc9d07c97e998d0bbaee1431b2fdc202559f354b48feb402ce1430491b551fa"
+  },
+  {
+   "name": "A3-identity.json",
+   "size": 739,
+   "sha256": "ecc963d6ecb46f8e199880755305d9f7391f721843a6a157db2c557b94ed3c1c"
+  },
+  {
+   "name": "A4-key-summary.json",
+   "size": 598,
+   "sha256": "e2c7e740bd084929f4f87324d6b589181590e166b3450a445ed3bc1cdada6201"
+  },
+  {
+   "name": "A4-key.json",
+   "size": 751,
+   "sha256": "80581c63ef0e70c79a79f2bcf9b814c685774d3ada68d82ece1431189aadbe8c"
+  },
+  {
+   "name": "A5-lease-summary.json",
+   "size": 679,
+   "sha256": "1c1c983ae46e5d1b3dbf4bb23bc3081ae084d653cd183d15dfc9388a949b0138"
+  },
+  {
+   "name": "A5-lease.json",
+   "size": 166,
+   "sha256": "43f4aa0a33ed072c5132fdd97572ab62f80c334a461040e999145dba6b7be4da"
+  },
+  {
+   "name": "A6-fault-check.json",
+   "size": 177,
+   "sha256": "d8bcb2ef53291400f7913a61ce0e8cbbdb9e140130762454cd474c162fb5aeb0"
+  },
+  {
+   "name": "B1-observer-alive.json",
+   "size": 241,
+   "sha256": "9d72edc6a68a75f6342725d3946f898db7ac4f5b3ca931671655ad3002912288"
+  },
+  {
+   "name": "B2-recheck.json",
+   "size": 205,
+   "sha256": "50dc72cd850931ad5b1a54460dc5b9eeea2e7776ea5e99218336d7f54a3ca761"
+  },
+  {
+   "name": "C-delete.json",
+   "size": 456,
+   "sha256": "41780e019b5d55adb4de64006f28dd64b9d7f30ab0eb12b1c51b2e8ada303898"
+  },
+  {
+   "name": "D-end.json",
+   "size": 160,
+   "sha256": "fe19e85123ce7c397ca650a526a3309d012a5c929ab4583d392beb452628d245"
+  },
+  {
+   "name": "D-exitlogs-1.json",
+   "size": 184,
+   "sha256": "769df771a8c8ed029b48553d1eb9155439d280503f5daa44a54604b1981c3a76"
+  },
+  {
+   "name": "D-exitlogs-2.json",
+   "size": 186,
+   "sha256": "160bb9c65725970b2ca6a01533b7f193a41051fa3b0571382dd8804f70239197"
+  },
+  {
+   "name": "D-exitlogs-3.json",
+   "size": 185,
+   "sha256": "0e628700199e08f5d3a599005676bbd82db55506c35c1a5e2f92f0cb5e344b27"
+  },
+  {
+   "name": "E1-key-final.json",
+   "size": 980,
+   "sha256": "00c76c8b95c79d8a4a15ddc1f84c7411d719bfe7e97a545e4b0f2b4fd2992c0d"
+  },
+  {
+   "name": "E2-newpod.json",
+   "size": 1073,
+   "sha256": "741c04039669bd2e9a06cc3d81a8f4cdee1fa11bc9de46dbdf217ef80b7e572f"
+  },
+  {
+   "name": "E3-preflight-post.err",
+   "size": 1,
+   "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+  },
+  {
+   "name": "E3-preflight-post.json",
+   "size": 6987,
+   "sha256": "f1d8c452247d059d25cc701e67feb54b28eba24ec6f83122b2832df38e1ee5c0"
+  },
+  {
+   "name": "E3-preflight-post.rc",
+   "size": 2,
+   "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+  },
+  {
+   "name": "E3-preflight-summary.json",
+   "size": 952,
+   "sha256": "9a59b667a4fdeda93d91b05aed08cc0f88781a53af9c92a9f90a98b01b1ce873"
+  },
+  {
+   "name": "E4-fault-check-post.json",
+   "size": 177,
+   "sha256": "d8bcb2ef53291400f7913a61ce0e8cbbdb9e140130762454cd474c162fb5aeb0"
+  },
+  {
+   "name": "exit_run_v2.py",
+   "size": 24138,
+   "sha256": "266ca6b487bfaeeb9a8127fb060c1f74ca9235d4c3133fd47e887e24644aa505"
+  },
+  {
+   "name": "expected-identity.json",
+   "size": 805,
+   "sha256": "ec3366c6f53449d2e8bd48d07e1712771f5d2e0d63acaeb168c75b2051b2c3f1"
+  },
+  {
+   "name": "key-polls.jsonl",
+   "size": 2207,
+   "sha256": "a8b7812b1ba86f96938d52ede661db656f2d40938a2c71a89cfeff7cc6ac47e9"
+  },
+  {
+   "name": "key-watch.jsonl",
+   "size": 0,
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+   "name": "late-check-time.txt",
+   "size": 21,
+   "sha256": "b15f566e4c692b87fde44822285693bea9af0c4d765ddcf0f48685e5c2819df1"
+  },
+  {
+   "name": "late1-oldkey.err",
+   "size": 70,
+   "sha256": "cb46d7c06582b568e55cc4d9eeea61eb68428f7b253b25bbf2c3281af1c9327f"
+  },
+  {
+   "name": "late1-oldkey.json",
+   "size": 750,
+   "sha256": "88d0ec6678e319a826afbc5c2b9f236020b44a423c5715892b3e1ed974e90e65"
+  },
+  {
+   "name": "late10-allkeys-postexpiry.txt",
+   "size": 311,
+   "sha256": "5565385c22ef4784841cff2b2ecaac966228d1b5166f286bbeb11be56ec2b7d7"
+  },
+  {
+   "name": "late11-watcher-nvbs8-lines.txt",
+   "size": 0,
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+   "name": "late2-newkey.err",
+   "size": 70,
+   "sha256": "cb46d7c06582b568e55cc4d9eeea61eb68428f7b253b25bbf2c3281af1c9327f"
+  },
+  {
+   "name": "late2-newkey.json",
+   "size": 111,
+   "sha256": "c743fdbd9f8609975bad037903d03101edbd6f71411d6eecaad42789115553e7"
+  },
+  {
+   "name": "late3-frontend-watcher.err",
+   "size": 68,
+   "sha256": "37c18023db0462338b01bd883e71a68315f949e04fba84f5f56b8af69cef517f"
+  },
+  {
+   "name": "late3-frontend-watcher.txt",
+   "size": 0,
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+   "name": "late4-events.txt",
+   "size": 744,
+   "sha256": "ba85cf183f94c0e68a831cbd27f029756bdb8a96736cb829b035e8c15c281aa8"
+  },
+  {
+   "name": "late5-allkeys.txt",
+   "size": 454,
+   "sha256": "0a04d533a144e7430990a613a0c4237d36824a3182bba204013cc8636ed64977"
+  },
+  {
+   "name": "late6-oldpod-now.err",
+   "size": 80,
+   "sha256": "348bb3cdf8a9495ad136ccd1a24f9a6e6508b1c8c581e7134d26e941e21f8bca"
+  },
+  {
+   "name": "late7-postexpiry-oldkey.err",
+   "size": 70,
+   "sha256": "cb46d7c06582b568e55cc4d9eeea61eb68428f7b253b25bbf2c3281af1c9327f"
+  },
+  {
+   "name": "late7-postexpiry-oldkey.json",
+   "size": 111,
+   "sha256": "bc124427ecdd2938855386f11e388dbd4274e9c9386121b7fab2c1092ea3d1e1"
+  },
+  {
+   "name": "late7-time.txt",
+   "size": 21,
+   "sha256": "bf79e3a32f83b7103e270c7c09854d12a49e35160c7751e83c72bb5c9139c7d8"
+  },
+  {
+   "name": "late8-lease-postexpiry.json",
+   "size": 162,
+   "sha256": "e55dadaab58d07b7e4036c93f37fd4905d216f5813770018026ad9b00c16cca7"
+  },
+  {
+   "name": "late9-newkey-postexpiry.json",
+   "size": 111,
+   "sha256": "bc124427ecdd2938855386f11e388dbd4274e9c9386121b7fab2c1092ea3d1e1"
+  },
+  {
+   "name": "pod-status.jsonl",
+   "size": 5164,
+   "sha256": "290975891c8ae9e573bb140dd917663c1c99d2e587e26b5736f63576e8d1a2c5"
+  },
+  {
+   "name": "run-pins.json",
+   "size": 525,
+   "sha256": "674d9fef5f616b3c9ab1f4f03730b4ca167fb4fed34db3805b263776c3f644f0"
+  },
+  {
+   "name": "run.log",
+   "size": 1320,
+   "sha256": "7a548699fdde0dfd88c776f5d811dcbb654a2506c2a99c5441b097d7e1777a17"
+  }
+ ]
+}

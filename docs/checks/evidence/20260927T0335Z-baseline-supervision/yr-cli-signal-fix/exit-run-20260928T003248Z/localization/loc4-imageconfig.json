@@ -1,0 +1,8 @@
+{
+ "StopSignal": "SIGRTMIN+3",
+ "Entrypoint": null,
+ "Cmd": [
+  "/bin/bash"
+ ],
+ "Init": null
+}

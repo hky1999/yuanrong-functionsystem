@@ -1,0 +1,12 @@
+akernel-bm1/all-in-one:canon-df2e-yr-signalfix StopSignal=SIGRTMIN+3
+akernel-bm1/all-in-one:canon-df2e-frontend-diag StopSignal=SIGRTMIN+3
+akernel-bm1/all-in-one:canon-df2e-rel StopSignal=SIGRTMIN+3
+akernel-bm1/all-in-one:canon-8b97-rel StopSignal=SIGRTMIN+3
+akernel-bm1/all-in-one:canon-67e549c1-rel StopSignal=SIGRTMIN+3
+akernel-bm1/all-in-one:canon-8c53bdd-ov24c StopSignal=SIGRTMIN+3
+akernel-bm1/all-in-one:canon-8c53bdd-ov24 StopSignal=SIGRTMIN+3
+akernel-bm1/all-in-one:canon-8c53bdd-ov24b StopSignal=SIGRTMIN+3
+akernel-bm1/all-in-one:canon-8c53bdd-ov23 StopSignal=SIGRTMIN+3
+akernel-bm1/all-in-one:canon-8c53bdd-ov22 StopSignal=SIGRTMIN+3
+akernel-bm1/all-in-one:canon-8c53bdd-ov21 StopSignal=SIGRTMIN+3
+akernel-bm1/all-in-one:canon-8c53bdd-ov20 StopSignal=SIGRTMIN+3
