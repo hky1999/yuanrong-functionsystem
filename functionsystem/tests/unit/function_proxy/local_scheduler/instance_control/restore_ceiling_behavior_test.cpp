@@ -37,6 +37,10 @@ using namespace functionsystem::schedule_plugin;
 using namespace functionsystem::schedule_framework;  // PreAllocatedContext
 using namespace functionsystem::runtime_manager;
 using namespace functionsystem::test::view_utils;
+// ResizeBudgetEntry is a nested type of ResourceViewActor. -fno-access-control
+// waives the access check but does not do name lookup for the bare name —
+// bind it once here for every stub below.
+using ResourceViewActor::ResizeBudgetEntry;
 
 namespace {
 constexpr const char *TRUSTED_EXT = "yr.internal.reusable_snapshot.trusted_restore";
