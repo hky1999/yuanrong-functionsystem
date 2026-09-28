@@ -375,3 +375,150 @@ TEST_F(NamedRestoreBaselineTest, SameIdentitySecondCallIdempotent)
 }
 
 }  // namespace functionsystem::test
+
+// ===================== BASELINE NEGATIVE CASES =====================
+// These exercise the coverage check's rejection paths with REAL actor state.
+
+// Pre-existing entry with insufficient credit (1MiB) against required 412MiB
+// → Deferred (keep the admission reservation).
+TEST_F(NamedRestoreBaselineTest, InsufficientCredit1MiBReturnsDeferred)
+{
+    auto actor = std::make_shared<ResourceViewActor>("baseline-insuf1", "baseline-insuf1-id", param_);
+    auto inst = MakeElasticInstance(128, 512, true, false);
+    inst.set_runtimeid("rt-insuf1");
+    auto sample = MakeSample("sbx-insuf1", "rt-insuf1", "gen-insuf1", 512 * 1024 * 1024,
+                              true, 100 * 1024 * 1024);
+    // Manually create a pre-existing entry with 1MiB credit (cap=512, expected=511)
+    ResizeBudgetEntry stub;
+    stub.unitID = "unit-insuf1";
+    stub.request.set_requestid("recovery-baseline:" + inst.instanceid() + ":gen-insuf1");
+    stub.request.set_instanceid(inst.instanceid());
+    stub.request.set_runtimeid("rt-insuf1");
+    stub.request.mutable_resize()->set_sandbox_id("sbx-insuf1");
+    stub.request.mutable_resize()->set_resource_generation("gen-insuf1");
+    stub.landed.set_memory_limit_bytes(512 * 1024 * 1024);
+    stub.request.mutable_resize()->mutable_expected()->set_memory_limit_bytes(511 * 1024 * 1024);
+    stub.capMemoryBytes = 512 * 1024 * 1024;
+    stub.peakMemoryBytes = 0;
+    stub.observed = true;
+    stub.expectedRevision = 1;
+    stub.confirmedRevision = 1;
+    actor->resizeBudget_.emplace(stub.request.requestid(), std::move(stub));
+
+    // Required credit = 512 - max(100, 0) = 412MiB. Existing entry credit
+    // = 512 - max(511, 0) = 1MiB. 1 < 412 → Deferred.
+    auto result = actor->EstablishRecoveryBaseline("unit-insuf1", inst, sample);
+    EXPECT_EQ(result, ResourceViewActor::RecoveryBaselineResult::Deferred);
+}
+
+// Pre-existing entry with 384MiB credit < required 412MiB → Deferred.
+TEST_F(NamedRestoreBaselineTest, InsufficientCredit384MiBReturnsDeferred)
+{
+    auto actor = std::make_shared<ResourceViewActor>("baseline-insuf384", "baseline-insuf384-id", param_);
+    auto inst = MakeElasticInstance(128, 512, true, false);
+    inst.set_runtimeid("rt-insuf384");
+    auto sample = MakeSample("sbx-insuf384", "rt-insuf384", "gen-insuf384", 512 * 1024 * 1024,
+                              true, 100 * 1024 * 1024);
+    // Pre-existing entry with 384MiB credit (cap=512, expected=128=initial)
+    ResizeBudgetEntry stub;
+    stub.unitID = "unit-insuf384";
+    stub.request.set_requestid("recovery-baseline:" + inst.instanceid() + ":gen-insuf384");
+    stub.request.set_instanceid(inst.instanceid());
+    stub.request.set_runtimeid("rt-insuf384");
+    stub.request.mutable_resize()->set_sandbox_id("sbx-insuf384");
+    stub.request.mutable_resize()->set_resource_generation("gen-insuf384");
+    stub.landed.set_memory_limit_bytes(512 * 1024 * 1024);
+    stub.request.mutable_resize()->mutable_expected()->set_memory_limit_bytes(128 * 1024 * 1024);
+    stub.capMemoryBytes = 512 * 1024 * 1024;
+    stub.peakMemoryBytes = 0;
+    stub.observed = true;
+    stub.expectedRevision = 1;
+    stub.confirmedRevision = 1;
+    actor->resizeBudget_.emplace(stub.request.requestid(), std::move(stub));
+
+    // Required = 412MiB. Existing credit = 512 - max(128, 0) = 384MiB. 384 < 412 → Deferred.
+    auto result = actor->EstablishRecoveryBaseline("unit-insuf384", inst, sample);
+    EXPECT_EQ(result, ResourceViewActor::RecoveryBaselineResult::Deferred);
+}
+
+// Wrong sandbox identity: same instanceid+generation but different sandbox_id
+// → the loop continues (wrong identity), then the new entry has the same
+// deterministic key → emplace conflict → Deferred (not phantom Established).
+TEST_F(NamedRestoreBaselineTest, WrongSandboxIdentityCausesKeyConflictDeferred)
+{
+    auto actor = std::make_shared<ResourceViewActor>("baseline-wrongsbx", "baseline-wrongsbx-id", param_);
+    auto inst = MakeElasticInstance(128, 512, true, false);
+    inst.set_runtimeid("rt-wrongsbx");
+    // Pre-existing entry with the SAME instanceid+generation but a DIFFERENT sandbox
+    ResizeBudgetEntry stub;
+    stub.unitID = "unit-wrongsbx";
+    stub.request.set_requestid("recovery-baseline:" + inst.instanceid() + ":gen-wrongsbx");
+    stub.request.set_instanceid(inst.instanceid());
+    stub.request.set_runtimeid("rt-wrongsbx");
+    stub.request.mutable_resize()->set_sandbox_id("sbx-OTHER");  // wrong identity
+    stub.request.mutable_resize()->set_resource_generation("gen-wrongsbx");
+    stub.landed.set_memory_limit_bytes(512 * 1024 * 1024);
+    stub.request.mutable_resize()->mutable_expected()->set_memory_limit_bytes(0);
+    stub.capMemoryBytes = 512 * 1024 * 1024;
+    stub.peakMemoryBytes = 0;
+    stub.observed = true;
+    stub.expectedRevision = 1;
+    stub.confirmedRevision = 1;
+    actor->resizeBudget_.emplace(stub.request.requestid(), std::move(stub));
+
+    // Sample with the CORRECT sandbox → loop continues past the wrong entry,
+    // then tries to create a new entry with the same deterministic key →
+    // emplace fails → Deferred
+    auto sample = MakeSample("sbx-correct", "rt-wrongsbx", "gen-wrongsbx", 512 * 1024 * 1024,
+                              true, 100 * 1024 * 1024);
+    auto result = actor->EstablishRecoveryBaseline("unit-wrongsbx", inst, sample);
+    EXPECT_EQ(result, ResourceViewActor::RecoveryBaselineResult::Deferred);
+}
+
+// Wrong unit: entry has a different unitID → loop continues, key conflict → Deferred.
+TEST_F(NamedRestoreBaselineTest, WrongUnitDeferred)
+{
+    auto actor = std::make_shared<ResourceViewActor>("baseline-wrongunit", "baseline-wrongunit-id", param_);
+    auto inst = MakeElasticInstance(128, 512, true, false);
+    inst.set_runtimeid("rt-wu");
+    ResizeBudgetEntry stub;
+    stub.unitID = "unit-OTHER";  // wrong unit
+    stub.request.set_requestid("recovery-baseline:" + inst.instanceid() + ":gen-wu");
+    stub.request.set_instanceid(inst.instanceid());
+    stub.request.set_runtimeid("rt-wu");
+    stub.request.mutable_resize()->set_sandbox_id("sbx-wu");
+    stub.request.mutable_resize()->set_resource_generation("gen-wu");
+    stub.landed.set_memory_limit_bytes(512 * 1024 * 1024);
+    stub.request.mutable_resize()->mutable_expected()->set_memory_limit_bytes(0);
+    stub.capMemoryBytes = 512 * 1024 * 1024;
+    stub.peakMemoryBytes = 0;
+    stub.observed = true;
+    stub.expectedRevision = 1;
+    stub.confirmedRevision = 1;
+    actor->resizeBudget_.emplace(stub.request.requestid(), std::move(stub));
+
+    auto sample = MakeSample("sbx-wu", "rt-wu", "gen-wu", 512 * 1024 * 1024, true, 100 * 1024 * 1024);
+    auto result = actor->EstablishRecoveryBaseline("unit-CORRECT", inst, sample);
+    EXPECT_EQ(result, ResourceViewActor::RecoveryBaselineResult::Deferred);
+}
+
+// Unconfirmed (not observed) entry with matching identity → Deferred.
+TEST_F(NamedRestoreBaselineTest, UnconfirmedEntryDeferred)
+{
+    auto actor = std::make_shared<ResourceViewActor>("baseline-unconf", "baseline-unconf-id", param_);
+    auto inst = MakeElasticInstance(128, 512, true, false);
+    inst.set_runtimeid("rt-uc");
+    ResizeBudgetEntry stub;
+    stub.unitID = "unit-uc";
+    stub.request.set_requestid("recovery-baseline:" + inst.instanceid() + ":gen-uc");
+    stub.request.set_instanceid(inst.instanceid());
+    stub.request.set_runtimeid("rt-uc");
+    stub.request.mutable_resize()->set_sandbox_id("sbx-uc");
+    stub.request.mutable_resize()->set_resource_generation("gen-uc");
+    stub.observed = false;  // NOT confirmed
+    actor->resizeBudget_.emplace(stub.request.requestid(), std::move(stub));
+
+    auto sample = MakeSample("sbx-uc", "rt-uc", "gen-uc", 512 * 1024 * 1024, true, 100 * 1024 * 1024);
+    auto result = actor->EstablishRecoveryBaseline("unit-uc", inst, sample);
+    EXPECT_EQ(result, ResourceViewActor::RecoveryBaselineResult::Deferred);
+}
