@@ -251,6 +251,10 @@ target_link_libraries(instance_ctrl_intent_gate_test PRIVATE
         resource_view
         snapshot_storage
         busproxy_lib
+        # the ceiling test calls filter::UsageAwareFilter::Filter directly;
+        # PLUGIN_LIB (incl. usage_aware_filter) is linked only into the
+        # function_proxy executable, so the test target needs it explicitly
+        usage_aware_filter
         local_scheduler_lib
         function_proxy_common_lib
         runtime_manager_lib
