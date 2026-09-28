@@ -207,7 +207,8 @@ add_test(NAME snap_ctrl_public_chain_test COMMAND snap_ctrl_public_chain_test)
 # snap_ctrl_public_chain_test.
 add_executable(instance_ctrl_intent_gate_test
         main.cpp
-        function_proxy/local_scheduler/instance_control/instance_ctrl_intent_gate_test.cpp)
+        function_proxy/local_scheduler/instance_control/instance_ctrl_intent_gate_test.cpp
+        function_proxy/local_scheduler/instance_control/restore_ceiling_behavior_test.cpp)
 target_compile_options(instance_ctrl_intent_gate_test PRIVATE
         -Wno-error
         -fno-access-control
