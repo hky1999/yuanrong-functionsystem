@@ -383,3 +383,60 @@ target_link_libraries(${PAUSE_RESUME_UNIT_TEST} PRIVATE
 
 add_test(NAME ${PAUSE_RESUME_UNIT_TEST}
         COMMAND ${PAUSE_RESUME_UNIT_TEST} --gtest_filter=*.*)
+
+# Minimal store-only target for the source-exit retention contract: the
+# full ORIGINAL reusable_snapshot_store_test.cpp plus main.cpp, nothing
+# else. The pause_resume_unit_test aggregate cannot compile as-is (its
+# legacy snap_ctrl_actor_test.cpp references mocks removed upstream —
+# registered above); this target keeps the store suite buildable and
+# runnable without touching that legacy fixture or trimming any store
+# test. Include dirs and link libraries mirror PAUSE_RESUME_UNIT_TEST.
+add_executable(reusable_snapshot_store_unit_test
+        main.cpp
+        function_master/snap_manager/reusable_snapshot_store_test.cpp)
+target_compile_options(reusable_snapshot_store_unit_test PRIVATE
+        -Wno-error
+        -fno-access-control
+        -Wno-missing-field-initializers
+        -fvisibility=hidden)
+add_dependencies(reusable_snapshot_store_unit_test gtest_1_10_0)
+target_include_directories(reusable_snapshot_store_unit_test PRIVATE
+        ${CLIENT_CPP_INCLUDE}
+        ${gtest_INCLUDE_DIR}
+        ${SRC_INCLUDE_DIR}
+        ${META_STORE_DIR}
+        ${SRC_BUSPROXY_INCLUDE_DIR}
+        ${SRC_LOCAL_SCHEDULER_INCLUDE_DIR}
+        ${SRC_FUNCTION_PROXY_INCLUDE_DIR}
+        ${GLOBAL_SCHEDULER_DIR}
+        ${INSTANCE_MANAGER_DIR}
+        ${FUNCTION_AGENT_DIR}
+        ${SRC_RUNTIME_MANAGER_INCLUDE_DIR})
+target_link_libraries(reusable_snapshot_store_unit_test PRIVATE
+        ${crypto_LIB}
+        ${ssl_LIB}
+        ${zlib_LIB}
+        ${protobuf_LIB}
+        ${grpcpp_LIB}
+        ${gpr_LIB}
+        ${etcdapi_LIB_A}
+        ${securec_LIB}
+        ${gtest_LIB_A}
+        ${gmock_LIB_A}
+        ${litebus_ALL_LIB}
+        ${INSTANCE_MANAGER_LIB}
+        ${SNAP_MANAGER_LIB}
+        ${GLOBAL_SCHEDULER_LIB}
+        snapshot_storage
+        busproxy_lib
+        local_scheduler_lib
+        function_proxy_common_lib
+        ${FUNCTION_AGENT_LIB}
+        runtime_manager_lib
+        ${META_STORE_LIB}
+        scheduler
+        schedule_plugin_common
+        pthread)
+
+add_test(NAME reusable_snapshot_store_unit_test
+        COMMAND reusable_snapshot_store_unit_test --gtest_filter=ReusableSnapshotStoreTest.*)
