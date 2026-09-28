@@ -207,6 +207,7 @@ add_test(NAME snap_ctrl_public_chain_test COMMAND snap_ctrl_public_chain_test)
 # snap_ctrl_public_chain_test.
 add_executable(instance_ctrl_intent_gate_test
         main.cpp
+        common/resource_view/view_utils.cpp
         function_proxy/local_scheduler/instance_control/instance_ctrl_intent_gate_test.cpp
         function_proxy/local_scheduler/instance_control/restore_ceiling_behavior_test.cpp)
 target_compile_options(instance_ctrl_intent_gate_test PRIVATE
@@ -247,6 +248,7 @@ target_link_libraries(instance_ctrl_intent_gate_test PRIVATE
         ${RESOURCE_GROUP_MANAGER_LIB}
         ${FUNCTION_AGENT_LIB}
         ${META_STORE_LIB}
+        resource_view
         snapshot_storage
         busproxy_lib
         local_scheduler_lib

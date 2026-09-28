@@ -619,7 +619,15 @@ ResourceViewActor::RecoveryBaselineResult ResourceViewActor::EstablishRecoveryBa
     entry.capMemoryBytes = sample.memory_limit_bytes();
     entry.peakMemoryBytes = usageBytes; // the establishing reading is the first peak
     const double heldMb = EntryOutstanding(entry).memoryMb;
-    resizeBudget_.emplace(entry.request.requestid(), std::move(entry));
+    const auto [it, inserted] = resizeBudget_.emplace(entry.request.requestid(), std::move(entry));
+    if (!inserted) {
+        // A different entry already holds the deterministic recovery-baseline
+        // key for this instance+generation. Logging success without a real
+        // entry would be a phantom handoff; report Deferred.
+        YRLOG_WARN("recovery baseline key conflict instance={} generation={} requestID={}",
+                   instance.instanceid(), sample.resource_generation(), "recovery-baseline-key");
+        return RecoveryBaselineResult::Deferred;
+    }
     YRLOG_INFO("recovery baseline reserved instance={} unit={} generation={} revision={} capBytes={} "
                "expectedBytes={} outstandingMemoryMb={:.3f}",
                instance.instanceid(), unitID, sample.resource_generation(), sample.resource_revision(),
