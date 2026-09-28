@@ -759,7 +759,7 @@ litebus::Future<Status> ReusableSnapshotStore::DeleteLocalSnapshotsForSource(
             Invalid("tenantID and sourceInstanceID are required for local Snapshot cleanup"));
     }
     return persistence_->List(TenantPrefix(tenantID))
-        .Then([tenantID, sourceInstanceID](const ReusableSnapshotListRecordsResult &records)
+        .Then([](const ReusableSnapshotListRecordsResult &records)
             -> litebus::Future<Status> {
             if (records.status.IsError()) {
                 return litebus::Future<Status>(records.status);
@@ -775,7 +775,6 @@ litebus::Future<Status> ReusableSnapshotStore::DeleteLocalSnapshotsForSource(
             //     recreate-and-READY from the record this scan saw, so this
             //     path must not issue any identity-less delete; the explicit
             //     Delete retry drives completion instead.
-            (void)sourceInstanceID;
             return litebus::Future<Status>(Status::OK());
         });
 }
