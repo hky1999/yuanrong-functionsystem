@@ -25,6 +25,7 @@
 #include <thread>
 
 #include "common/resource_view/memory_elasticity_fence.h"
+#include "common/resource_view/resource_view_actor.h"
 #include "common/resource_view/restore_admission.h"
 #include "common/resource_view/view_utils.h"
 #include "common/schedule_plugin/filter/usage_aware_filter/usage_aware_filter.h"
