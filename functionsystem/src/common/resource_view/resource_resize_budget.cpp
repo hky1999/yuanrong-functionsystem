@@ -603,6 +603,12 @@ ResourceViewActor::RecoveryBaselineResult ResourceViewActor::EstablishRecoveryBa
     entry.baseline = true;
     entry.unitID = unitID;
     entry.request.set_requestid("recovery-baseline:" + instance.instanceid() + ":" + sample.resource_generation());
+    // The synthetic reservation IS an operation from the settlement's point
+    // of view: give it the same deterministic id so ApplyPhysicalRetirement's
+    // per-entry line carries a non-empty operationId and the reviewed
+    // settlement matcher (which requires per-entry operationIds for any
+    // non-zero credit) can correlate the release at retirement.
+    entry.operationId = entry.request.requestid();
     entry.request.set_instanceid(instance.instanceid());
     entry.request.set_runtimeid(sample.runtime_id());
     auto *command = entry.request.mutable_resize();
