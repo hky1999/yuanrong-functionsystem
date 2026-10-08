@@ -189,7 +189,24 @@ Status LocalSchedDriver::Create()
         [view = instanceCtrl_->GetInstanceControlView()](const std::string &instanceID,
                                                          const std::string &runtimeID) -> std::string {
             const auto snapshot = view->GetIncarnationSnapshot(instanceID);
-            return (runtimeID.empty() || snapshot.first != runtimeID) ? std::string{} : snapshot.second;
+            if (snapshot.second.empty()) {
+                return std::string{};  // no creation generation: unknown
+            }
+            if (!snapshot.first.empty()) {
+                // Runtime published: the connector must BE that runtime.
+                return (runtimeID.empty() || snapshot.first != runtimeID) ? std::string{}
+                                                                          : snapshot.second;
+            }
+            // FIRST-CREATION window (root creation-order evidence): the IAM
+            // entry exists before the deploy response publishes the runtime
+            // id, so the runtime's stream may arrive while the machine's
+            // runtimeid is still EMPTY. This connector IS the generation
+            // being created — bind the creation requestid. No verification
+            // is lost: every save re-checks runtime equality against the
+            // view at EXECUTION time (SaveStateGuarded), so a stale
+            // previous-generation stream that snuck into this window can
+            // never write.
+            return snapshot.second;
         });
     // EXECUTION-POINT state executors: the ownership check and the
     // synchronous store operation run under the control view's lock — the

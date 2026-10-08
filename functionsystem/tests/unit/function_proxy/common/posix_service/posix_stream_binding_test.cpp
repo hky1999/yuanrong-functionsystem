@@ -80,8 +80,15 @@ protected:
         posixService_->SetStreamIdentityResolver(
             [view = view_](const std::string &instanceID, const std::string &runtimeID) {
                 const auto snapshot = view->GetIncarnationSnapshot(instanceID);
-                return (runtimeID.empty() || snapshot.first != runtimeID) ? std::string{}
-                                                                          : snapshot.second;
+                if (snapshot.second.empty()) { return std::string{}; }
+                if (!snapshot.first.empty()) {
+                    return (runtimeID.empty() || snapshot.first != runtimeID) ? std::string{}
+                                                                              : snapshot.second;
+                }
+                // FIRST-CREATION window: machine has the creation request
+                // but no runtime yet — bind the generation (saves still
+                // re-check runtime equality at execution time).
+                return snapshot.second;
             });
         builder_.RegisterService(posixService_.get());
         int port = 0;
@@ -187,6 +194,94 @@ TEST_F(PosixStreamBindingFixture, RealStreamSaveLandsOnComposedGenerationKey)
     ASSERT_AWAIT_READY(rsp);
     EXPECT_EQ(rsp.Get().saversp().code(), common::ERR_NONE) << rsp.Get().saversp().message();
     EXPECT_EQ(rsp.Get().saversp().checkpointid(), composed);
+}
+
+// FIRST-CREATION ordering (root creation-order evidence): the stream
+// connects while the machine is CREATING (runtimeid empty, requestid
+// present) — the accept binds the creation generation; when the deploy
+// response publishes THIS runtime, the still-connected stream's save lands
+// on the composed key. A stale previous-generation runtime sneaking into
+// the same window is refused at execution time (runtime mismatch).
+TEST_F(PosixStreamBindingFixture, EarlyConnectionDuringCreationSavesAfterRuntimePublish)
+{
+    // Re-create the machine in the CREATING shape: requestid, EMPTY runtime.
+    resources::InstanceInfo creating;
+    creating.set_instanceid("inst-stream");
+    creating.set_runtimeid("");
+    creating.set_requestid("req-gen-2");
+    view_->GenerateStateMachine("inst-stream", creating);
+
+    client_ = Connect("inst-stream", "rt-9");
+    ASSERT_NE(client_, nullptr);
+
+    auto msg = SaveMessage("creation-state");
+    awaitedMessageId_ = msg->messageid();
+    responsePromise_ = std::make_shared<litebus::Promise<runtime_rpc::StreamingMessage>>();
+    EXPECT_CALL(*client_, MockReceiver(_))
+        .WillRepeatedly(Invoke([this](const std::shared_ptr<runtime_rpc::StreamingMessage> &recv) {
+            if (recv->messageid() == awaitedMessageId_) {
+                responsePromise_->SetValue(*recv);
+            }
+        }));
+
+    // The deploy response publishes the runtime of the SAME generation.
+    resources::InstanceInfo published;
+    published.set_instanceid("inst-stream");
+    published.set_runtimeid("rt-9");
+    published.set_requestid("req-gen-2");
+    view_->Update("inst-stream", published, true);
+
+    const std::string composed = StateClient::ComposeStateKey("inst-stream", "req-gen-2");
+    EXPECT_CALL(*cache_, Set(Matcher<const std::string &>(composed), Matcher<const std::string &>(_)))
+        .WillOnce(Return(Status::OK()));
+    auto sent = client_->Send(msg);
+    ASSERT_AWAIT_READY(sent);
+    EXPECT_TRUE(sent.Get());
+    auto rsp = responsePromise_->GetFuture();
+    ASSERT_AWAIT_READY(rsp);
+    EXPECT_EQ(rsp.Get().saversp().code(), common::ERR_NONE) << rsp.Get().saversp().message();
+    EXPECT_EQ(rsp.Get().saversp().checkpointid(), composed);
+}
+
+// Same window, hostile variant: a stream from the OLD runtime (rt-1)
+// connects while the machine is CREATING rt-9 — the binding may hold, but
+// execution-time runtime verification refuses every write (zero Set).
+TEST_F(PosixStreamBindingFixture, StaleRuntimeInCreationWindowRefusedAtExecution)
+{
+    resources::InstanceInfo creating;
+    creating.set_instanceid("inst-stream");
+    creating.set_runtimeid("");
+    creating.set_requestid("req-gen-3");
+    view_->GenerateStateMachine("inst-stream", creating);
+
+    client_ = Connect("inst-stream", "rt-stale");
+    ASSERT_NE(client_, nullptr);
+
+    auto msg = SaveMessage("stale-creation");
+    awaitedMessageId_ = msg->messageid();
+    responsePromise_ = std::make_shared<litebus::Promise<runtime_rpc::StreamingMessage>>();
+    EXPECT_CALL(*client_, MockReceiver(_))
+        .WillRepeatedly(Invoke([this](const std::shared_ptr<runtime_rpc::StreamingMessage> &recv) {
+            if (recv->messageid() == awaitedMessageId_) {
+                responsePromise_->SetValue(*recv);
+            }
+        }));
+
+    resources::InstanceInfo published;
+    published.set_instanceid("inst-stream");
+    published.set_runtimeid("rt-real");
+    published.set_requestid("req-gen-3");
+    view_->Update("inst-stream", published, true);
+
+    EXPECT_CALL(*cache_, Set(Matcher<const std::string &>(_), Matcher<const std::string &>(_))).Times(0);
+    auto sent = client_->Send(msg);
+    ASSERT_AWAIT_READY(sent);
+    EXPECT_TRUE(sent.Get());
+    auto rsp = responsePromise_->GetFuture();
+    ASSERT_AWAIT_READY(rsp);
+    EXPECT_NE(rsp.Get().saversp().code(), common::ERR_NONE)
+        << "the stale runtime's save must be refused at execution time";
+    EXPECT_THAT(rsp.Get().saversp().message(), HasSubstr("runtime replaced"));
 }
 
 // In-place failover swaps the machine to rt-2; the STILL-CONNECTED old
