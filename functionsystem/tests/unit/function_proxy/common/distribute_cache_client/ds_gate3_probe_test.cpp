@@ -67,7 +67,7 @@ TEST(DsGate3Probe, PhaseARealSetGetDelPositiveControl)
     datasystem::ConnectOptions connect{};
     connect.host = host;
     connect.port = std::stoi(workerPort);
-    datasystem::RouterConnectOptions router{};
+    functionsystem::RouterConnectOptions router{};
     router.azName = "ds-exp";
     router.etcdAddress = routerEtcd;
 
