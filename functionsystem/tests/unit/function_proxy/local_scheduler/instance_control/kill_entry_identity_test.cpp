@@ -1183,7 +1183,16 @@ TEST_F(KillEntryIdentityFixture, FirstRealKillFrontendSettlesRealBudgetOnce)
         double safety = UsageAwareFilter::GetSafety();
         double floor = UsageAwareFilter::GetFloorMb();
         int32_t cap = UsageAwareFilter::GetMaxInstances();
-        ~ConfigGuard() { UsageAwareFilter::SetConfig(safety, floor, cap); }
+        int fenceEntry = resource_view::MemoryElasticityFenceOverrideState();
+        ~ConfigGuard()
+        {
+            UsageAwareFilter::SetConfig(safety, floor, cap);
+            if (fenceEntry < 0) {
+                resource_view::ResetMemoryElasticityFenceOverride();
+            } else {
+                resource_view::SetMemoryElasticityFenceForTest(fenceEntry != 0);
+            }
+        }
     } guard;
     UsageAwareFilter::SetConfig(0.9, 2048, 0);
     resource_view::SetMemoryElasticityFenceForTest(true);
@@ -1271,8 +1280,13 @@ TEST_F(KillEntryIdentityFixture, FirstRealKillFrontendSettlesRealBudgetOnce)
     ASSERT_NO_FATAL_FAILURE(mkOwner(instA, "rt-budget", "sbox-budget", "gen-budget", MiB * 512, MiB * 269));
     ASSERT_NO_FATAL_FAILURE(mkOwner("inst-nbr", "rt-nbr", "sbox-nbr", "gen-nbr", MiB * 384, MiB * 269));
 
+    // HARD PRECONDITION: non-zero credit for BOTH identities must exist
+    // BEFORE the kill — a zero-credit run can never count as a positive
+    // retirement and must abort the test here.
     const auto beforeOutstanding = realView->GetOutstandingResizeForTest(agentID);
-    EXPECT_NEAR(beforeOutstanding.memoryMb, (512 - 269) + (384 - 269), 0.01);
+    ASSERT_GT(beforeOutstanding.memoryMb, 0.0);
+    ASSERT_NEAR(beforeOutstanding.memoryMb, (512 - 269) + (384 - 269), 0.01);
+    ASSERT_EQ(realView->GetResizeBudgetEntryCountForTest(), size_t{2});
 
     // Control view machine (RUNNING) + etcd-shaped FakeEvalTxn store so the
     // REAL EXITING transition persists and the control delete really runs.
@@ -1294,6 +1308,15 @@ TEST_F(KillEntryIdentityFixture, FirstRealKillFrontendSettlesRealBudgetOnce)
     entry.set_function("default/0-test-helloWorld/$latest");
     entry.set_tenantid("tenant-budget");
     entry.mutable_instancestatus()->set_code(static_cast<int32_t>(InstanceState::RUNNING));
+    // Real-shaped durable metadata: seed the instance record key in the
+    // fake etcd and stamp the machine with the matching version so the
+    // control delete's version compare MATCHES — then verify below that
+    // the delete REALLY removed the seeded bytes (never masked by an
+    // always-success response).
+    const std::string recordKey = InstanceStateMachine::GetInstanceRecordKey(entry, false);
+    ASSERT_FALSE(recordKey.empty());
+    store->Put(recordKey, "instance-record|rt-budget|req-" + instA);
+    entry.set_version(static_cast<int64_t>(store->version[recordKey]));
     harnessView->GenerateStateMachine(instA, entry);
 
     // RUNNING kills gate on the agent's recovery state: the mock must
@@ -1329,6 +1352,14 @@ TEST_F(KillEntryIdentityFixture, FirstRealKillFrontendSettlesRealBudgetOnce)
     killReq->set_signal(SHUT_DOWN_SIGNAL);
     auto first = actor_->KillFrontend("tenant-budget", killReq);
     ASSERT_AWAIT_READY(first);
+    // FIRST-RESPONSE CONTRACT: the physical kill and settlement SUCCEEDED
+    // but the state cleanup FAILED — the frontend sees the failure (NOT
+    // success, NOT a route/authorize error): the state-deletion reason.
+    EXPECT_NE(static_cast<int>(first.Get().code()), static_cast<int>(common::ERR_NONE))
+        << "a failed state cleanup must surface, not report success";
+    EXPECT_THAT(first.Get().message(), testing::HasSubstr("state deletion failed"))
+        << "the failure must be the cleanup one, not an unrelated error: "
+        << first.Get().message();
 
     // The physical kill really happened with the trusted identity.
     ASSERT_EQ(killRequests.size(), 1u);
@@ -1347,8 +1378,14 @@ TEST_F(KillEntryIdentityFixture, FirstRealKillFrontendSettlesRealBudgetOnce)
         EXPECT_EQ(current.Get()->instances().count("inst-nbr"), 1u);
     }
 
-    // The machine is gone; the pending record holds the full identity.
+    // The machine is gone AND the SEEDED durable metadata was really
+    // deleted from the store (execution proof, not response masking).
     EXPECT_EQ(harnessView->GetInstance(instA), nullptr);
+    {
+        bool found = false;
+        (void)store->Get(recordKey, &found);
+        EXPECT_FALSE(found) << "the seeded instance record must be gone after the control delete";
+    }
     {
         const auto pending = actor_->settledCleanupPending_.find(instA);
         ASSERT_NE(pending, actor_->settledCleanupPending_.end());
@@ -1382,7 +1419,21 @@ TEST_F(KillEntryIdentityFixture, FirstRealKillFrontendSettlesRealBudgetOnce)
     const auto finalOutstanding = realView->GetOutstandingResizeForTest(agentID);
     EXPECT_NEAR(finalOutstanding.memoryMb, 384.0 - 269.0, 0.01);
     EXPECT_EQ(realView->GetResizeBudgetEntryCountForTest(), size_t{1});
-    resource_view::ResetMemoryElasticityFenceOverride();
+    // EXACTLY ONE physical dispatch across all three frontend calls.
+    ASSERT_EQ(killRequests.size(), 1u);
+    // The NEIGHBOUR keeps its complete identity AND its resource sample.
+    {
+        auto current = realView->GetResourceView();
+        ASSERT_AWAIT_READY(current);
+        const auto it = current.Get()->instances().find("inst-nbr");
+        ASSERT_NE(it, current.Get()->instances().end());
+        EXPECT_EQ(it->second.runtimeid(), "rt-nbr");
+        ASSERT_TRUE(it->second.has_sandbox_resource_sample());
+        EXPECT_EQ(it->second.sandbox_resource_sample().sandbox_id(), "sbox-nbr");
+        EXPECT_EQ(it->second.sandbox_resource_sample().resource_generation(), "gen-nbr");
+        EXPECT_EQ(it->second.sandbox_resource_sample().memory_limit_bytes(), 384ULL * 1024 * 1024);
+    }
+    // (fence restored by the RAII guard — early ASSERT exits included)
 }
 
 // ── SAME-REQUEST DIFFERENT-RUNTIME WINDOW (root 16:48/16:5x follow-up) ───────

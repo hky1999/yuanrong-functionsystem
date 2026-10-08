@@ -113,15 +113,16 @@ public:
         for (const auto &op : thenOps) {
             ::etcdserverpb::RequestOp pb;
             op.Build(pb, "");
-            Apply(*store_, pb, commitRevision);
-            // Per-op responses in the REAL etcd shape — InstanceOperator's
-            // parsers size-check responses against the key count and read
-            // DeleteResponse.deleted / PutResponse fields.
+            const int64_t affected = Apply(*store_, pb, commitRevision);
+            // Per-op responses in the REAL etcd shape with the ACTUAL
+            // execution result (deleted/matched counts) — the parsers
+            // size-check responses and read these fields; a fixed value
+            // would mask a non-executed operation.
             functionsystem::TxnOperationResponse opRsp;
             if (pb.has_request_delete_range()) {
                 opRsp.operationType = functionsystem::TxnOperationType::OPERATION_DELETE;
                 functionsystem::DeleteResponse del;
-                del.deleted = 1;
+                del.deleted = affected;
                 opRsp.response = del;
             } else if (pb.has_request_put()) {
                 opRsp.operationType = functionsystem::TxnOperationType::OPERATION_PUT;
@@ -129,11 +130,15 @@ public:
             } else {
                 opRsp.operationType = functionsystem::TxnOperationType::OPERATION_GET;
                 functionsystem::GetResponse get;
-                get.count = 0;
+                get.count = affected;
                 opRsp.response = get;
             }
             response->responses.emplace_back(std::move(opRsp));
         }
+        // Advance the global revision (Apply does NOT do this): consecutive
+        // transactions must never share a revision — the generation-compare
+        // model depends on it.
+        store_->globalRevision = commitRevision;
         return response;
     }
 
@@ -164,7 +169,10 @@ private:
         return pb.result() == ::etcdserverpb::Compare::EQUAL && equal;
     }
 
-    static void Apply(FakeStore &store, const ::etcdserverpb::RequestOp &pb, int64_t commitRevision)
+    // Returns the number of keys the op actually affected (deleted for
+    // delete-range, matched for range-get) — the response fields are the
+    // EXECUTION RESULT, never a fixed value.
+    static int64_t Apply(FakeStore &store, const ::etcdserverpb::RequestOp &pb, int64_t commitRevision)
     {
         if (pb.has_request_put()) {
             const auto &put = pb.request_put();
@@ -172,12 +180,36 @@ private:
             store.kv[key] = std::string(put.value());
             store.version[key] = store.version[key] + 1;
             store.modRevision[key] = commitRevision;
-        } else if (pb.has_request_delete_range()) {
+            return 1;
+        }
+        if (pb.has_request_delete_range()) {
             const auto &del = pb.request_delete_range();
             const std::string begin(del.key());
             const std::string end(del.range_end().empty() ? begin + '\x01' : std::string(del.range_end()));
-            store.EraseRange(begin, end);
+            int64_t removed = 0;
+            for (auto it = store.kv.begin(); it != store.kv.end();) {
+                if (it->first >= begin && it->first < end) {
+                    store.version.erase(it->first);
+                    store.modRevision.erase(it->first);
+                    it = store.kv.erase(it);
+                    removed++;
+                } else {
+                    ++it;
+                }
+            }
+            return removed;
         }
+        if (pb.has_request_range()) {
+            const auto &get = pb.request_range();
+            const std::string begin(get.key());
+            const std::string end(get.range_end().empty() ? begin + '\x01' : std::string(get.range_end()));
+            int64_t matched = 0;
+            for (const auto &kv : store.kv) {
+                if (kv.first >= begin && kv.first < end) { matched++; }
+            }
+            return matched;
+        }
+        return 0;
     }
 
     std::shared_ptr<FakeStore> store_;
