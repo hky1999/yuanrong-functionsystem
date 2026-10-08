@@ -19,30 +19,3 @@ aux_source_directory(${CMAKE_CURRENT_LIST_DIR}/idle IDLE_TEST_SRCS)
 target_sources(${UNIT_TEST_MODULE} PRIVATE ${INSTANCE_CONTROL_TEST_SRCS} ${POSIX_API_HANDLER_TEST_SRC} ${IDLE_TEST_SRCS})
 
 
-# Focused binary for the real-entry kill-identity tests (2026-10 fix chain).
-add_executable(kill_identity_test_bin
-    ${PROJECT_SOURCE_DIR}/tests/unit/main.cpp
-    kill_entry_identity_test.cpp
-)
-target_compile_options(kill_identity_test_bin
-    PRIVATE
-    -Wno-error
-    -fno-access-control
-    -Wno-missing-field-initializers
-)
-target_include_directories(kill_identity_test_bin PRIVATE
-    ${CMAKE_CURRENT_LIST_DIR}
-    ${PROJECT_SOURCE_DIR}/src
-    ${SRC_INCLUDE_DIR}
-    ${gtest_INCLUDE_DIR}
-    ${PROJECT_SOURCE_DIR}/tests/unit
-)
-target_link_libraries(kill_identity_test_bin PRIVATE
-    local_scheduler_lib function_proxy_common_lib
-    ${grpcpp_LIB}
-    ${gpr_LIB}
-    ${gtest_LIB_A}
-    ${gmock_LIB_A}
-    pthread
-)
-add_test(NAME kill_identity_test_bin COMMAND kill_identity_test_bin)

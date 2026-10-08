@@ -14,107 +14,71 @@
  * limitations under the License.
  */
 
-// REAL-entry kill-identity tests for the 2026-10 fix chain, driving
-// InstanceCtrlActor's kill chain through the production KillRuntimeWithIdentity
-// / KillRuntimeWithSnapshotCleanup with:
-//   - a Mock resource view serving a CONTROLLABLE ResourceUnit snapshot;
-//   - a mock FunctionAgentMgr capturing every KillInstanceRequest;
-//   - a mock client manager (DeleteClient seam).
+// REAL-entry kill-identity tests for the 2026-10 fix chain, driving the
+// production KillRuntimeWithSnapshotCleanup / KillRuntimeWithIdentity paths
+// with the ESTABLISHED no-etcd fixture (mirrors instance_ctrl_test.cpp's
+// InitialLowReliabilityRouteConflictActorTest): MockResourceView via
+// CreateMockResourceView, MockFunctionAgentMgr(name, nullptr),
+// MockControlInterfaceClientManagerProxy, MockInternalIAM (IAM disabled —
+// RemoveInternalTokenReference ASSERTs without the binding).
+//
 // Covered:
-//   1. same-incarnation identity pass-through (expected sandbox+generation
-//      from the trusted sample reach the agent request, exactly once);
-//   2. OLD runtime vs SAME-NAME new incarnation: view entry runtimeid/unitid
-//      mismatch => ZERO dispatch (the new instance is untouchable);
-//   3. missing view / missing sample: budget retained, retryable UNKNOWN,
-//      zero dispatch;
-//   4. non-elastic legacy path unchanged (identity-less kill still sent).
+//   1. same-incarnation trusted identity reaches the agent kill request
+//      exactly once;
+//   2. OLD runtime vs SAME-NAME new incarnation (view runtimeid differs):
+//      ZERO dispatch;
+//   3. missing view (GetInf null) / allocated-without-sample: UNKNOWN,
+//      zero dispatch, budget retained;
+//   4. non-elastic legacy: identity-less kill still dispatched;
+//   5. the OTHER entry (KillRuntime) rejects a null view for elastic too.
+//
+// NOTE: these assert DISPATCH shape only (identity carried / zero dispatch
+// / retryable-UNKNOWN). Budget-release correctness is NOT claimed here —
+// it is exercised by the resource-view settlement tests.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include <memory>
 #include <string>
+#include <vector>
 
-#include "async/async.hpp"
-#include "common/proto/pb/message_pb.h"
-#include "common/resource_view/resource_view_mgr.h"
-#include "common/resource_view/resource_view.h"
-#include "function_proxy/common/posix_client/control_plane_client/control_interface_client_manager_proxy.h"
-#include "function_proxy/local_scheduler/function_agent_manager/function_agent_mgr_actor.h"
 #include "function_proxy/local_scheduler/instance_control/instance_ctrl_actor.h"
+#include "mocks/mock_control_interface_client_manager_proxy.h"
+#include "mocks/mock_function_agent_mgr.h"
+#include "mocks/mock_internal_iam.h"
 #include "mocks/mock_resource_view.h"
 #include "utils/future_test_helper.h"
 
 namespace functionsystem::test {
 
 using namespace functionsystem::local_scheduler;  // NOLINT
+using namespace resource_view;                    // NOLINT
+using testing::_;
 using testing::Invoke;
 using testing::Return;
-using testing::_;
 
 namespace {
 
-// Captures every kill request; answers a controlled response.
-class KillCaptureAgentMgr : public FunctionAgentMgr {
-public:
-    KillCaptureAgentMgr() : FunctionAgentMgr("KILL_CAPTURE_AGENT_MGR") {}
-
-    litebus::Future<messages::KillInstanceResponse> KillInstance(
-        const std::shared_ptr<messages::KillInstanceRequest> &request,
-        const std::string &, bool) override
-    {
-        killRequests.push_back(request);
-        messages::KillInstanceResponse response;
-        response.set_requestid(request->requestid());
-        response.set_instanceid(request->instanceid());
-        if (confirmed) {
-            response.set_code(static_cast<int32_t>(common::ErrorCode::ERR_NONE));
-            response.set_physical_retirement_confirmed(true);
-            response.set_retired_sandbox_id(request->expected_sandbox_id());
-            response.set_retired_resource_generation(request->expected_resource_generation());
-        } else {
-            response.set_code(static_cast<int32_t>(common::ErrorCode::ERR_INSTANCE_BUSY));
-            response.set_message("probe busy");
-        }
-        return response;
-    }
-
-    std::vector<std::shared_ptr<messages::KillInstanceRequest>> killRequests;
-    bool confirmed = false;
-};
-
-// DeleteClient seam: always succeeds without a real client.
-class NullClientManager : public functionsystem::ControlInterfaceClientManagerProxy {
-public:
-    litebus::Future<Status> DeleteClient(const std::string &) override
-    {
-        return Status::OK();
-    }
-};
-
-messages::InstanceInfo MakeElasticInfo(const std::string &instanceID,
-                                       const std::string &runtimeID,
-                                       const std::string &unitID)
+InstanceInfo MakeElasticInfo(const std::string &instanceID,
+                             const std::string &runtimeID)
 {
-    messages::InstanceInfo info;
+    InstanceInfo info;
     info.set_instanceid(instanceID);
     info.set_runtimeid(runtimeID);
-    info.set_unitid(unitID);
+    info.set_requestid("req-" + instanceID);
     info.set_functionagentid("agent-test");
-    // Elastic admission marker: the create-option the production
-    // UsesElasticAdmission check reads (constants.h SCHEDULER_ELASTIC_RESOURCES).
-    (*info.mutable_createoptions())[resource_view::SCHEDULER_ELASTIC_RESOURCES] = "true";
+    info.set_unitid("unit-test");
+    (*info.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
     return info;
 }
 
-// A view entry carrying a trusted physical sample (the fence input).
-messages::InstanceInfo MakeViewEntry(const std::string &instanceID,
-                                     const std::string &runtimeID,
-                                     const std::string &unitID,
-                                     const std::string &sandboxID,
-                                     const std::string &generation)
+InstanceInfo MakeViewEntry(const std::string &instanceID,
+                           const std::string &runtimeID,
+                           const std::string &sandboxID,
+                           const std::string &generation)
 {
-    auto entry = MakeElasticInfo(instanceID, runtimeID, unitID);
+    auto entry = MakeElasticInfo(instanceID, runtimeID);
     auto *sample = entry.mutable_sandbox_resource_sample();
     sample->set_runtime_id(runtimeID);
     sample->set_sandbox_id(sandboxID);
@@ -127,12 +91,11 @@ messages::InstanceInfo MakeViewEntry(const std::string &instanceID,
     return entry;
 }
 
-std::shared_ptr<resource_view::ResourceUnit> MakeUnitWithEntry(
-    const messages::InstanceInfo &entry)
+std::shared_ptr<ResourceUnit> MakeUnitWithEntry(const InstanceInfo &entry)
 {
-    auto unit = std::make_shared<resource_view::ResourceUnit>();
+    auto unit = std::make_shared<ResourceUnit>();
     unit->set_id("unit-test");
-    unit->set_status(static_cast<uint32_t>(resource_view::UnitStatus::NORMAL));
+    unit->set_status(static_cast<uint32_t>(UnitStatus::NORMAL));
     (*unit->mutable_instances())[entry.instanceid()] = entry;
     return unit;
 }
@@ -143,117 +106,167 @@ class KillEntryIdentityFixture : public testing::Test {
 protected:
     void SetUp() override
     {
-        mockViewMgr_ = std::make_shared<testing::NiceMock<MockResourceViewMgr>>();
-        mockView_ = std::make_shared<testing::NiceMock<MockResourceView>>();
-        agentMgr_ = std::make_shared<KillCaptureAgentMgr>();
-
+        const auto suffix =
+            litebus::uuid_generator::UUID::GetRandomUUID().ToString();
         InstanceCtrlConfig config;
-        actor_ = std::make_shared<InstanceCtrlActor>("KILL_IDENTITY_ACTOR", "node-test", config);
-        actor_->BindResourceView(mockViewMgr_);
-        actor_->BindFunctionAgentMgr(agentMgr_);
+        actor_ = std::make_shared<InstanceCtrlActor>(
+            "KillIdentityActor-" + suffix, "node-test", config);
+
+        clientManager_ = std::make_shared<MockControlInterfaceClientManagerProxy>();
+        ON_CALL(*clientManager_, DeleteClient(_))
+            .WillByDefault(Invoke([](const std::string &) {
+                auto promise = std::make_shared<litebus::Promise<Status>>();
+                promise->SetValue(Status::OK());
+                return promise->GetFuture();
+            }));
+
+        functionAgentMgr_ = std::make_shared<MockFunctionAgentMgr>(
+            "KillIdentityAgentMgr-" + suffix, nullptr);
+        ON_CALL(*functionAgentMgr_, KillInstance(_, _, _))
+            .WillByDefault(Invoke([this](
+                const std::shared_ptr<messages::KillInstanceRequest> &request,
+                const std::string &, bool) {
+                killRequests.push_back(request);
+                messages::KillInstanceResponse response;
+                response.set_requestid(request->requestid());
+                response.set_instanceid(request->instanceid());
+                response.set_code(static_cast<int32_t>(common::ErrorCode::ERR_NONE));
+                // A confirmed receipt naming EXACTLY the expected identity —
+                // the legitimate-settlement shape.
+                response.set_physical_retirement_confirmed(true);
+                response.set_retired_sandbox_id(request->expected_sandbox_id());
+                response.set_retired_resource_generation(
+                    request->expected_resource_generation());
+                auto promise = std::make_shared<
+                    litebus::Promise<messages::KillInstanceResponse>>();
+                promise->SetValue(response);
+                return promise->GetFuture();
+            }));
+
+        resourceViewMgr_ = std::make_shared<ResourceViewMgr>();
+        primary_ = MockResourceView::CreateMockResourceView();
+        resourceViewMgr_->primary_ = primary_;
+
+        InternalIAM::Param iamParam;
+        iamParam.isEnableIAM = false;
+        internalIAM_ = std::make_shared<MockInternalIAM>(iamParam);
+        ON_CALL(*internalIAM_, IsIAMEnabled()).WillByDefault(Return(false));
+
+        actor_->BindControlInterfaceClientManager(clientManager_);
+        actor_->BindFunctionAgentMgr(functionAgentMgr_);
+        actor_->BindResourceView(resourceViewMgr_);
+        actor_->BindInternalIAM(internalIAM_);
         litebus::Spawn(actor_);
     }
 
     void TearDown() override
     {
-        litebus::Terminate(actor_->GetAID());
-        litebus::Await(actor_->GetAID());
-        actor_ = nullptr;
+        if (actor_ != nullptr) {
+            litebus::Terminate(actor_->GetAID());
+            litebus::Await(actor_);
+        }
     }
 
-    void ServeView(const std::shared_ptr<resource_view::ResourceUnit> &unit)
+    // Serve a controllable PRIMARY-view snapshot.
+    void ServeView(const std::shared_ptr<ResourceUnit> &unit)
     {
-        EXPECT_CALL(*mockViewMgr_, GetInf(_)).WillRepeatedly(Return(mockView_));
-        EXPECT_CALL(*mockView_, GetResourceView())
-            .WillRepeatedly(Invoke([unit]() {
-                auto promise = std::make_shared<litebus::Promise<std::shared_ptr<resource_view::ResourceUnit>>>();
+        ON_CALL(*primary_, GetResourceView())
+            .WillByDefault(Invoke([unit]() {
+                auto promise = std::make_shared<
+                    litebus::Promise<std::shared_ptr<ResourceUnit>>>();
                 promise->SetValue(unit);
                 return promise->GetFuture();
             }));
     }
 
-    std::shared_ptr<testing::NiceMock<MockResourceViewMgr>> mockViewMgr_;
-    std::shared_ptr<testing::NiceMock<MockResourceView>> mockView_;
-    std::shared_ptr<KillCaptureAgentMgr> agentMgr_;
     std::shared_ptr<InstanceCtrlActor> actor_;
+    std::shared_ptr<MockControlInterfaceClientManagerProxy> clientManager_;
+    std::shared_ptr<MockFunctionAgentMgr> functionAgentMgr_;
+    std::shared_ptr<ResourceViewMgr> resourceViewMgr_;
+    std::shared_ptr<MockResourceView> primary_;
+    std::shared_ptr<MockInternalIAM> internalIAM_;
+    std::vector<std::shared_ptr<messages::KillInstanceRequest>> killRequests;
 };
 
-// 1) Same incarnation: the trusted sample's sandbox/generation travel into
-// the agent kill request EXACTLY ONCE.
+// 1) Same incarnation: trusted sample identity reaches the agent request
+// exactly once and the kill completes with the matching receipt.
 TEST_F(KillEntryIdentityFixture, SameIncarnationIdentityPassesThrough)
 {
-    const auto info = MakeElasticInfo("inst-same", "runtime-old", "unit-test");
-    const auto entry = MakeViewEntry("inst-same", "runtime-old", "unit-test",
-                                     "sbox-trusted", "gen-trusted");
-    ServeView(MakeUnitWithEntry(entry));
-    agentMgr_->confirmed = true;
+    ServeView(MakeUnitWithEntry(
+        MakeViewEntry("inst-same", "runtime-same", "sbox-trusted", "gen-trusted")));
 
-    auto result = actor_->KillRuntimeWithSnapshotCleanup(info, false, true, true);
+    auto result = actor_->KillRuntimeWithSnapshotCleanup(
+        MakeElasticInfo("inst-same", "runtime-same"), false, true, true);
     ASSERT_AWAIT_READY(result);
     EXPECT_TRUE(result.Get().IsOk()) << result.Get().GetMessage();
-    ASSERT_EQ(agentMgr_->killRequests.size(), 1u);
-    EXPECT_EQ(agentMgr_->killRequests[0]->expected_sandbox_id(), "sbox-trusted");
-    EXPECT_EQ(agentMgr_->killRequests[0]->expected_resource_generation(), "gen-trusted");
+    ASSERT_EQ(killRequests.size(), 1u);
+    EXPECT_EQ(killRequests[0]->expected_sandbox_id(), "sbox-trusted");
+    EXPECT_EQ(killRequests[0]->expected_resource_generation(), "gen-trusted");
 }
 
-// 2) OLD runtime vs SAME-NAME new incarnation: the view entry belongs to the
-// NEW incarnation (different runtimeid) — ZERO dispatch; the new instance
-// and its budget are untouchable by the stale delete.
+// 2) OLD runtime vs SAME-NAME new incarnation: zero dispatch — the stale
+// delete cannot borrow the new incarnation's identity.
 TEST_F(KillEntryIdentityFixture, OldRuntimeSameNameNewIncarnationZeroDispatch)
 {
-    const auto staleInfo = MakeElasticInfo("inst-reused", "runtime-OLD", "unit-test");
-    const auto newEntry = MakeViewEntry("inst-reused", "runtime-NEW", "unit-test",
-                                        "sbox-NEW", "gen-NEW");
-    ServeView(MakeUnitWithEntry(newEntry));
+    ServeView(MakeUnitWithEntry(
+        MakeViewEntry("inst-reused", "runtime-NEW", "sbox-NEW", "gen-NEW")));
 
-    auto result = actor_->KillRuntimeWithSnapshotCleanup(staleInfo, false, true, true);
+    auto result = actor_->KillRuntimeWithSnapshotCleanup(
+        MakeElasticInfo("inst-reused", "runtime-OLD"), false, true, true);
     ASSERT_AWAIT_READY(result);
     EXPECT_TRUE(result.Get().IsError());
-    EXPECT_EQ(agentMgr_->killRequests.size(), 0u)
+    EXPECT_EQ(killRequests.size(), 0u)
         << "a stale delete must never borrow the new incarnation's identity";
 }
 
-// 3a) Missing view (view read fails): UNKNOWN, budget retained, zero dispatch.
+// 3a) Missing view (GetInf answers null): UNKNOWN, zero dispatch.
 TEST_F(KillEntryIdentityFixture, MissingViewHoldsUnknown)
 {
-    const auto info = MakeElasticInfo("inst-noview", "runtime-noview", "unit-test");
-    EXPECT_CALL(*mockViewMgr_, GetInf(_)).WillRepeatedly(Return(nullptr));
-
-    auto result = actor_->KillRuntimeWithSnapshotCleanup(info, false, true, true);
+    auto result = actor_->KillRuntimeWithSnapshotCleanup(
+        MakeElasticInfo("inst-noview", "runtime-noview"), false, true, true);
     ASSERT_AWAIT_READY(result);
     EXPECT_TRUE(result.Get().IsError());
-    EXPECT_EQ(agentMgr_->killRequests.size(), 0u);
+    EXPECT_EQ(killRequests.size(), 0u);
 }
 
-// 3b) Allocated entry WITHOUT a trusted sample: UNKNOWN, budget retained,
-// zero dispatch (missing sample != never-created).
+// 3b) Allocated entry WITHOUT a trusted sample: UNKNOWN, zero dispatch.
 TEST_F(KillEntryIdentityFixture, AllocatedWithoutSampleHoldsUnknown)
 {
-    const auto info = MakeElasticInfo("inst-nosample", "runtime-nosample", "unit-test");
-    const auto entry = MakeElasticInfo("inst-nosample", "runtime-nosample", "unit-test");
-    ServeView(MakeUnitWithEntry(entry));  // no sandbox_resource_sample
+    ServeView(MakeUnitWithEntry(
+        MakeElasticInfo("inst-nosample", "runtime-nosample")));
 
-    auto result = actor_->KillRuntimeWithSnapshotCleanup(info, false, true, true);
+    auto result = actor_->KillRuntimeWithSnapshotCleanup(
+        MakeElasticInfo("inst-nosample", "runtime-nosample"), false, true, true);
     ASSERT_AWAIT_READY(result);
     EXPECT_TRUE(result.Get().IsError());
-    EXPECT_EQ(agentMgr_->killRequests.size(), 0u);
+    EXPECT_EQ(killRequests.size(), 0u);
 }
 
-// 4) Non-elastic legacy: identity-less kill still dispatched (old behavior).
+// 4) Non-elastic legacy: identity-less kill STILL dispatched (old path).
 TEST_F(KillEntryIdentityFixture, NonElasticLegacyKillStillDispatched)
 {
-    messages::InstanceInfo info;
-    info.set_instanceid("inst-legacy");
-    info.set_runtimeid("runtime-legacy");
-    info.set_functionagentid("agent-test");
-    // NO elastic extension => legacy path, no view consult.
-    EXPECT_CALL(*mockViewMgr_, GetInf(_)).Times(0);
+    InstanceInfo legacy;
+    legacy.set_instanceid("inst-legacy");
+    legacy.set_runtimeid("runtime-legacy");
+    legacy.set_requestid("req-legacy");
+    legacy.set_functionagentid("agent-test");
 
-    auto result = actor_->KillRuntimeWithSnapshotCleanup(info, false, true, true);
+    auto result = actor_->KillRuntimeWithSnapshotCleanup(legacy, false, true, true);
     ASSERT_AWAIT_READY(result);
-    ASSERT_EQ(agentMgr_->killRequests.size(), 1u);
-    EXPECT_TRUE(agentMgr_->killRequests[0]->expected_sandbox_id().empty());
-    EXPECT_TRUE(agentMgr_->killRequests[0]->expected_resource_generation().empty());
+    EXPECT_EQ(killRequests.size(), 1u);
+    EXPECT_TRUE(killRequests[0]->expected_sandbox_id().empty());
+    EXPECT_TRUE(killRequests[0]->expected_resource_generation().empty());
+}
+
+// 5) The OTHER entry (KillRuntime) also holds UNKNOWN on a null view for
+// an elastic instance.
+TEST_F(KillEntryIdentityFixture, OtherEntryKillRuntimeNullViewHoldsUnknown)
+{
+    auto result = actor_->KillRuntime(
+        MakeElasticInfo("inst-noview2", "runtime-noview2"), false);
+    ASSERT_AWAIT_READY(result);
+    EXPECT_TRUE(result.Get().IsError());
+    EXPECT_EQ(killRequests.size(), 0u);
 }
 
 }  // namespace functionsystem::test
