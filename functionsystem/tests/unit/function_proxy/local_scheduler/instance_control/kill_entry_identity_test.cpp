@@ -487,7 +487,9 @@ TEST_F(KillEntryIdentityFixture, SameGenerationControlDeleteProceeds)
     auto machine = std::make_shared<MockInstanceStateMachine>("node-test");
     const auto info = MakeElasticInfo("inst-ok", "runtime-ok");
     ON_CALL(*machine, GetInstanceInfo()).WillByDefault(Return(info));
-    ON_CALL(*machine, GetRequestID()).WillByDefault(Return("req-ok"));
+    // request generation MUST equal the retiring chain's requestid —
+    // MakeElasticInfo sets "req-" + instanceID; reuse info.requestid().
+    ON_CALL(*machine, GetRequestID()).WillByDefault(Return(info.requestid()));
     ON_CALL(*controlView, GetInstance("inst-ok")).WillByDefault(Return(machine));
     ON_CALL(*controlView, DelInstance("inst-ok"))
         .WillByDefault(Invoke([](const std::string &) {
