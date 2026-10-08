@@ -71,6 +71,18 @@ TEST(DsGate3HoldOrder, ControlledDetentionOrderObservation)
     const std::string runId = EnvOr("DS_GATE3_RUNID", std::to_string(NowMs()));
     ASSERT_FALSE(armFile.empty()) << "DS_GATE3_ARM required (hold gate)";
     ASSERT_FALSE(releaseFile.empty()) << "DS_GATE3_RELEASE required";
+    // Scope guard: ANY exit (assert/skip/return) releases the hold gate and
+    // records the cleanup — the proxy never stays wedged behind this test.
+    struct GateGuard {
+        std::string release;
+        ~GateGuard()
+        {
+            if (!release.empty()) {
+                std::ofstream r(release);
+                r << NowMs();
+            }
+        }
+    } gateGuard{releaseFile};
     std::ofstream jsonl(outFile, std::ios::app);
     auto W = [&](const std::string &op, const std::string &extra = "") {
         jsonl << "{\"op\":\"" << op << "\",\"t_ms\":" << NowMs()
@@ -107,32 +119,24 @@ TEST(DsGate3HoldOrder, ControlledDetentionOrderObservation)
     { std::ofstream a(armFile); a << NowMs(); }
     W("armed");
 
-    // The ONE designated OLD Set — on its own thread; we do NOT wait on it
-    // with an ASSERT. The client object stays alive for the whole test.
-    std::atomic<bool> oldReturned{false};
-    std::string oldCode = "<in-flight>";
-    std::thread oldSet([&]() {
-        const auto s = main->Set(key, oldValue);
-        oldCode = std::to_string(static_cast<int>(s.StatusCode()));
-        oldReturned.store(true);
-        W("old_set_returned", ",\"code\":\"" + oldCode + "\"");
-    });
-
-    // B. healthy channel (direct to the worker, bypassing the proxy) while
-    // the old Set is still detained (well past its 9s deadline).
-    std::this_thread::sleep_for(std::chrono::seconds(12));
-    W("old_deadline_elapsed", ",\"old_returned\":" +
-        std::string(oldReturned.load() ? "true" : "false"));
-    // (If it already returned the fault window collapsed — record and stop.)
-    if (oldReturned.load()) {
-        oldSet.join();
-        W("aborted_window_collapsed");
-        // release + final read anyway so the proxy never stays wedged
-        { std::ofstream r(releaseFile); r << NowMs(); }
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-        GTEST_SKIP() << "old Set returned before the new write — window "
-                        "collapsed, evidence recorded";
-    }
+    // The ONE designated OLD Set — SYNCHRONOUS on this thread. The proxy
+    // detains the request (hold), the SDK call returns its 9s deadline
+    // Status; we CAPTURE it (code + message + elapsed) without ASSERTing
+    // and without destructing `main` — the detained request stays detained
+    // and the client stays alive. ONLY a RETURNED old call opens the
+    // window for the new write (an in-flight one could not prove order).
+    const auto oldStart = NowMs();
+    const auto oldStatus = main->Set(key, oldValue);
+    const auto oldMs = NowMs() - oldStart;
+    W("old_set_returned",
+      ",\"code\":" + std::to_string(static_cast<int>(oldStatus.StatusCode()))
+      + ",\"ms\":" + std::to_string(oldMs)
+      + ",\"msg\":\"" + oldStatus.GetMsg() + "\"");
+    std::cout << "DS_GATE3_ORDER old Set code="
+              << static_cast<int>(oldStatus.StatusCode()) << " ms=" << oldMs
+              << std::endl;
+    // Observation harness: whatever the code, the call RETURNED — the
+    // window is open. A non-timeout return is recorded, not fatal.
 
     datasystem::ConnectOptions direct{};
     direct.host = host;
@@ -151,15 +155,12 @@ TEST(DsGate3HoldOrder, ControlledDetentionOrderObservation)
     ASSERT_TRUE(healthy->Get(key, newBack).IsOk());
     W("new_readback", ",\"value\":\"" + newBack + "\"");
 
-    // C. release the detained OLD request, wait for it to land.
+    // C. release the detained OLD request, wait for the proxy to forward
+    // it (bounded), then adjudicate.
     { std::ofstream r(releaseFile); r << NowMs(); }
     W("released");
-    for (int i = 0; i < 100 && !oldReturned.load(); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
-    W("old_joined", ",\"old_returned\":" +
-        std::string(oldReturned.load() ? "true" : "false"));
-    if (oldSet.joinable()) { oldSet.join(); }
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    W("post_release_settled");
 
     // Final adjudication through the INDEPENDENT raw SDK verifier (direct).
     datasystem::KVClient raw(direct);
