@@ -87,6 +87,11 @@ protected:
         ASSERT_NE(server_, nullptr);
         target_ = "127.0.0.1:" + std::to_string(port);
 
+        // Production marks the instance CONNECTABLE (AddTokenReference →
+        // IAM verified set) when its client is created; the accept path
+        // enforces this. Mirror it for the machine under test.
+        internalIAM_->Insert("inst-stream");
+
         // The machine the stream must bind to.
         resources::InstanceInfo info;
         info.set_instanceid("inst-stream");
