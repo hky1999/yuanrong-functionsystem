@@ -571,6 +571,29 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
     if (!instanceInfo.groupid().empty() && groupInstanceClear_ != nullptr) {
         groupInstanceClear_(instanceInfo);
     }
+    // LATE-RECEIPT IDENTITY GUARD (before ANY control-delete side effect):
+    // the control-view machine under this instanceID may now belong to a
+    // SAME-NAME NEW incarnation (old kill dispatched, instance replaced,
+    // old receipt arriving late). DelInstance deletes the CURRENT machine's
+    // metadata by its latest version and OnDelInstance's requestID check
+    // only runs AFTER that — too late. Compare the machine's incarnation
+    // identity HERE: a runtimeid/request mismatch means this delete belongs
+    // to the old incarnation and must not touch the new one's state.
+    {
+        const auto machine = instanceControlView_->GetInstance(instanceInfo.instanceid());
+        if (machine != nullptr) {
+            const auto &current = machine->GetInstanceInfo();
+            if (current.runtimeid() != instanceInfo.runtimeid()) {
+                YRLOG_WARN("{}|control-view instance({}) now belongs to runtime({}) but the "
+                           "retiring incarnation was runtime({}); refusing to delete the new "
+                           "incarnation's state (late-receipt guard)",
+                           instanceInfo.requestid(), instanceInfo.instanceid(),
+                           current.runtimeid(), instanceInfo.runtimeid());
+                return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
+                    "control view bound to another incarnation; late delete refused"));
+            }
+        }
+    }
     YRLOG_INFO("{}|delete instance({}) in control view", instanceInfo.requestid(), instanceInfo.instanceid());
     return instanceControlView_->DelInstance(instanceInfo.instanceid())
         .Then([insCtrlView(instanceControlView_), instanceID(instanceInfo.instanceid()),
