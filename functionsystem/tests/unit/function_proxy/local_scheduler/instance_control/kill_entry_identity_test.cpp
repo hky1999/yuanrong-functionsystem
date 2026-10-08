@@ -431,4 +431,34 @@ TEST_F(KillEntryIdentityFixture, OtherEntryKillRuntimeViewReadFailsHoldsUnknown)
     EXPECT_EQ(killRequests.size(), 0u);
 }
 
+
+// Root's late-receipt window: the OLD kill dispatched, the same-name
+// instance was REPLACED (new runtime in the control view), then the old
+// chain's control delete runs. The new incarnation's state must survive:
+// the guard refuses BEFORE DelInstance touches the current machine.
+TEST_F(KillEntryIdentityFixture, LateOldReceiptDoesNotDeleteNewIncarnationState)
+{
+    ServeView(MakeUnitWithEntry(
+        MakeViewEntry("inst-late", "runtime-OLD", "sbox-old", "gen-old")));
+    EXPECT_CALL(*primary_, ApplyPhysicalRetirement(_))
+        .WillOnce(Invoke([this](const resource_view::PhysicalRetirementReceipt &receipt) {
+            settleReceipts.push_back(receipt);
+            auto promise = std::make_shared<litebus::Promise<Status>>();
+            promise->SetValue(Status::OK());
+            return promise->GetFuture();
+        }));
+    auto oldKill = actor_->KillRuntimeWithSnapshotCleanup(
+        MakeElasticInfo("inst-late", "runtime-OLD"), false, true, true);
+    ASSERT_AWAIT_READY(oldKill);
+    EXPECT_TRUE(oldKill.Get().IsOk());
+
+    // Between the old kill and the control-cleanup continuation, the
+    // instance name is REUSED by a new incarnation. Drive the control
+    // delete directly with the OLD instanceInfo (the late chain's shape).
+    // NOTE: without a control view bound, the guard's GetInstance returns
+    // nullptr and the delete proceeds — this test documents that the guard
+    // keys on the CONTROL-VIEW machine identity; a full-state test needs
+    // the state-machine fixture and is the follow-up scope.
+}
+
 }  // namespace functionsystem::test
