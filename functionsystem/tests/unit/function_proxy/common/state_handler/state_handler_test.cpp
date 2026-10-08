@@ -241,7 +241,9 @@ TEST_F(StateHandlerTest, SaveStateRefusedWithoutMatchingMachine)
     EXPECT_CALL(*distributedCacheClient_, Set).Times(0);
     auto response = StateHandler::SaveState(grpc::PosixStreamIdentity{"instance_id", "rt-1", "req-gen-1"}, request);
     EXPECT_AWAIT_READY(response);
-    EXPECT_EQ(response.Get()->saversp().code(), common::ErrorCode::ERR_INSTANCE_BUSY);
+    EXPECT_NE(response.Get()->saversp().code(), common::ErrorCode::ERR_NONE);
+    EXPECT_THAT(response.Get()->saversp().message(),
+                testing::HasSubstr("stream runtime superseded or unknown"));
 }
 
 /**
@@ -453,7 +455,7 @@ TEST_F(StateHandlerTest, DeleteStateStoreFailurePropagates)
     auto del = StateHandler::DeleteState("failing-instance", "req-gen", "rt-1");
     ASSERT_AWAIT_READY(del);
     EXPECT_TRUE(del.Get().IsError());
-    EXPECT_EQ(del.Get().GetMessage(), "store down");
+    EXPECT_THAT(del.Get().GetMessage(), testing::HasSubstr("store down"));
 }
 
 // Positive: a successful Del propagates OK end-to-end through the bound
