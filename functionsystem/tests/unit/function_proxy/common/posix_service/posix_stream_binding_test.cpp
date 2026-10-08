@@ -77,7 +77,7 @@ protected:
             });
         builder_.RegisterService(posixService_.get());
         int port = 0;
-        builder_.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+        builder_.AddListeningPort("127.0.0.1:0", ::grpc::InsecureServerCredentials(), &port);
         server_ = builder_.BuildAndStart();
         ASSERT_NE(server_, nullptr);
         target_ = "127.0.0.1:" + std::to_string(port);
@@ -101,11 +101,11 @@ protected:
         }
     }
 
-    std::shared_ptr<grpc::ControlClient> Connect(const std::string &instanceID, const std::string &runtimeID)
+    std::shared_ptr<::grpc::ControlClient> Connect(const std::string &instanceID, const std::string &runtimeID)
     {
-        grpc::ControlClientConfig config;
+        ::grpc::ControlClientConfig config;
         config.target = target_;
-        config.creds = grpc::InsecureChannelCredentials();
+        config.creds = ::grpc::InsecureChannelCredentials();
         config.timeoutSec = 5;
         config.maxGrpcSize = 4;
         auto client = std::make_shared<grpc::ControlClient>(instanceID, runtimeID, config);
@@ -125,9 +125,9 @@ protected:
     std::shared_ptr<StateActor> stateActor_;
     std::shared_ptr<InstanceControlView> view_;
     std::shared_ptr<PosixService> posixService_;
-    grpc::ServerBuilder builder_;
-    std::unique_ptr<grpc::Server> server_;
-    std::shared_ptr<grpc::ControlClient> client_;
+    ::grpc::ServerBuilder builder_;
+    std::unique_ptr<::grpc::Server> server_;
+    std::shared_ptr<::grpc::ControlClient> client_;
     std::string target_;
 };
 
