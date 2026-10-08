@@ -131,7 +131,7 @@ TEST(DsGate3HoldOrder, ControlledDetentionOrderObservation)
     W("old_set_returned",
       ",\"code\":" + std::to_string(static_cast<int>(oldStatus.StatusCode()))
       + ",\"ms\":" + std::to_string(oldMs)
-      + ",\"msg\":\"" + oldStatus.GetMsg() + "\"");
+      + ",\"msg\":\"" + oldStatus.GetMessage() + "\"");
     std::cout << "DS_GATE3_ORDER old Set code="
               << static_cast<int>(oldStatus.StatusCode()) << " ms=" << oldMs
               << std::endl;
