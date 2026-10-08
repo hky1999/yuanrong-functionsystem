@@ -179,6 +179,18 @@ protected:
             }));
     }
 
+    // The REACHABLE view-read failure: GetInf raising on a null primary is
+    // a crash-level invariant (ASSERT_IF_NULL -> SIGINT); the retryable
+    // UNKNOWN path is the READ answering no unit at all.
+    void ServeNullUnit()
+    {
+        ON_CALL(*primary_, GetResourceView())
+            .WillByDefault(Invoke([]() {
+                return litebus::Future<std::shared_ptr<ResourceUnit>>(
+                    std::shared_ptr<ResourceUnit>{});
+            }));
+    }
+
     std::shared_ptr<InstanceCtrlActor> actor_;
     std::shared_ptr<MockControlInterfaceClientManagerProxy> clientManager_;
     std::shared_ptr<MockFunctionAgentMgr> functionAgentMgr_;
@@ -235,10 +247,12 @@ TEST_F(KillEntryIdentityFixture, OldRuntimeSameNameNewIncarnationZeroDispatch)
 }
 
 // 3a) Missing view (GetInf answers null): UNKNOWN, zero dispatch.
-TEST_F(KillEntryIdentityFixture, MissingViewHoldsUnknown)
+TEST_F(KillEntryIdentityFixture, ViewReadFailsHoldsUnknown)
 {
-    // SetUp binds a primary view; the MISSING-VIEW input requires it gone.
-    resourceViewMgr_->primary_ = nullptr;
+    // The reachable view-read failure: the read completes with NO unit
+    // (a null primary_ would ASSERT/SIGINT inside GetInf — that invariant
+    // violation is not a retryable input).
+    ServeNullUnit();
     auto result = actor_->KillRuntimeWithSnapshotCleanup(
         MakeElasticInfo("inst-noview", "runtime-noview"), false, true, true);
     ASSERT_AWAIT_READY(result);
@@ -288,9 +302,9 @@ TEST_F(KillEntryIdentityFixture, NonElasticLegacyKillStillDispatched)
 
 // 5) The OTHER entry (KillRuntime) also holds UNKNOWN on a null view for
 // an elastic instance.
-TEST_F(KillEntryIdentityFixture, OtherEntryKillRuntimeNullViewHoldsUnknown)
+TEST_F(KillEntryIdentityFixture, OtherEntryKillRuntimeViewReadFailsHoldsUnknown)
 {
-    resourceViewMgr_->primary_ = nullptr;
+    ServeNullUnit();
     auto result = actor_->KillRuntime(
         MakeElasticInfo("inst-noview2", "runtime-noview2"), false);
     ASSERT_AWAIT_READY(result);
