@@ -1779,14 +1779,30 @@ litebus::Future<Status> InstanceCtrlActor::KillRuntimeWithIdentity(const Instanc
             "elastic instance absent from view snapshot; absence unverified"));
     }
     TrustedPhysicalIdentity(allocatedIt->second, &expectedSandboxID, &expectedGeneration);
-    // An ALLOCATED elastic instance without a trusted physical sample must
+    // 2) generation binding: the view entry must still belong to THIS
+    // caller incarnation (runtime + unit). A late delete for an OLD runtime
+    // whose instance name was REUSED by a new incarnation would otherwise
+    // borrow the new sandbox/generation and — via the missing-runtime
+    // replay — delete the NEW physical instance. Identity mismatch means
+    // zero dispatch.
+    if (allocatedIt->second.runtimeid() != instanceInfo.runtimeid()
+        || (!instanceInfo.unitid().empty()
+            && allocatedIt->second.unitid() != instanceInfo.unitid())) {
+        YRLOG_WARN("{}|elastic instance({}) view entry belongs to another incarnation "
+                   "(view runtime {} / unit {} vs caller runtime {} / unit {}); "
+                   "kill held as UNKNOWN (zero dispatch)",
+                   instanceInfo.requestid(), instanceInfo.instanceid(),
+                   allocatedIt->second.runtimeid(), allocatedIt->second.unitid(),
+                   instanceInfo.runtimeid(), instanceInfo.unitid());
+        return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
+            "elastic view entry bound to another incarnation"));
+    }
+    // An allocated elastic instance without a trusted physical sample must
     // never degrade to an identity-less kill: that could delete the
     // physical runtime while carrying no receipt, leaving the allocation
     // unreleasable. A missing sample is not proof of never-created — it is
-    // an UNKNOWN that keeps the budget and stays retryable. Only a
-    // provably-absent instance falls through to the legacy identity-less
-    // path (nothing left to fence).
-    if (allocated && expectedSandboxID.empty()) {
+    // an UNKNOWN that keeps the budget and stays retryable.
+    if (expectedSandboxID.empty()) {
         YRLOG_WARN("{}|elastic instance({}) is allocated but carries no trusted "
                    "physical identity; kill held as UNKNOWN (budget retained)",
                    instanceInfo.requestid(), instanceInfo.instanceid());
