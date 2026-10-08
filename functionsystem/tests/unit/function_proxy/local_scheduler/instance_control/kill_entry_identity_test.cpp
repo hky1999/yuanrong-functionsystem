@@ -66,6 +66,7 @@
 #include "mocks/mock_instance_control_view.h"
 #include "mocks/mock_instance_state_machine.h"
 #include "mocks/mock_internal_iam.h"
+#include "mocks/fake_etcd_store.h"
 #include "mocks/mock_meta_storage_accessor.h"
 #include "function_proxy/common/state_handler/state_handler.h"
 #include "common/state_machine/instance_control_view.h"
@@ -1356,6 +1357,112 @@ TEST_F(KillEntryIdentityFixture, SameRequestBarrierBlocksInPlaceRuntimeSwapDelet
     ASSERT_AWAIT_READY(newDel);
     EXPECT_TRUE(newDel.Get().IsOk());
     EXPECT_EQ(delCount->load(), 2);
+}
+
+// ── REAL RegisterTraefikRoute ENTRY (root 16:35/follow-ups) ──────────────────
+// Real actor entry over the shared fake etcd: normal create publishes the
+// route+marker; a stale (old-runtime) request re-registering after an
+// in-place failover swap must carry the SNAPSHOT identity (new runtime),
+// not the stale payload's; an owner change to another proxy refuses; a
+// valid empty refresh cleans the old keys; a corrupt payload (mixed valid
+// and invalid entries) changes NOTHING.
+TEST_F(KillEntryIdentityFixture, RegisterTraefikRouteRealEntryFourStates)
+{
+    auto store = std::make_shared<FakeStore>();
+    auto metaClient = std::make_shared<MockMetaStoreClient>("127.0.0.1:1");
+    ON_CALL(*metaClient, BeginTransaction).WillByDefault(Invoke([store]() {
+        return std::shared_ptr<functionsystem::meta_store::TxnTransaction>(
+            std::make_shared<FakeEvalTxn>(store));
+    }));
+    auto accessor = std::make_shared<MockMetaStorageAccessor>(metaClient);
+    ON_CALL(*accessor, Put(_, _)).WillByDefault(Invoke([store](const std::string &k, const std::string &v) {
+        store->Put(k, v);
+        return Status::OK();
+    }));
+    ON_CALL(*accessor, Get(_)).WillByDefault(Invoke([store](const std::string &k) {
+        bool found = false;
+        const std::string value = store->Get(k, &found);
+        return found ? litebus::Option<std::string>(litebus::Some(value)) : litebus::Option<std::string>();
+    }));
+    ON_CALL(*accessor, GetAllWithPrefix(_)).WillByDefault(Invoke([store](const std::string &prefix) {
+        std::vector<std::pair<std::string, std::string>> out;
+        std::lock_guard<std::mutex> lock(store->mutex);
+        for (const auto &kv : store->kv) {
+            if (kv.first.rfind(prefix, 0) == 0) { out.emplace_back(kv.first, kv.second); }
+        }
+        return litebus::Option<std::vector<std::pair<std::string, std::string>>>(litebus::Some(out));
+    }));
+    actor_->SetTraefikRegistry(std::make_shared<TraefikRegistry>(accessor, "yr/tk", "web", false, ""));
+
+    auto harness = MakeRealView();
+    actor_->BindInstanceControlView(harness.view);
+    const std::string ext = R"(["http:40001:8080"])";
+    auto info = MakeElasticInfo("inst-rt4", "runtime-R1");
+    info.set_functionproxyid("node-test");
+    info.set_function("default/0-test-helloWorld/$latest");
+    (*info.mutable_extensions())[PORT_FORWARD_KEY] = ext;
+    harness.view->GenerateStateMachine("inst-rt4", info);
+    harness.view->GetInstance("inst-rt4")->SetModRevision(10);
+
+    // 1) Normal create: route + marker land under the SNAPSHOT identity.
+    auto created = actor_->RegisterTraefikRoute(info);
+    ASSERT_AWAIT_READY(created);
+    EXPECT_TRUE(created.Get().IsOk()) << created.Get().GetMessage();
+    EXPECT_EQ(store->kv.count("yr/tk/http/routers/inst-rt4-p8080/rule"), 1u);
+    const auto marker1 = TraefikRegistry::ParseMarker(
+        store->kv.at("yr/tk/http/instances/inst-rt4/generation"));
+    ASSERT_TRUE(marker1.valid);
+    EXPECT_EQ(marker1.runtimeID, "runtime-R1");
+
+    // 2) Failover (same request, new runtime) published IN PLACE; the OLD
+    //    payload re-registers — the snapshot identity (R2) must be used.
+    auto swapped = MakeElasticInfo("inst-rt4", "runtime-R2");
+    swapped.set_functionproxyid("node-test");
+    swapped.set_function("default/0-test-helloWorld/$latest");
+    (*swapped.mutable_extensions())[PORT_FORWARD_KEY] = ext;
+    harness.view->Update("inst-rt4", swapped, true);
+    harness.view->GetInstance("inst-rt4")->SetModRevision(11);
+    auto staleRegister = actor_->RegisterTraefikRoute(info);  // OLD payload
+    ASSERT_AWAIT_READY(staleRegister);
+    EXPECT_TRUE(staleRegister.Get().IsOk()) << staleRegister.Get().GetMessage();
+    const auto marker2 = TraefikRegistry::ParseMarker(
+        store->kv.at("yr/tk/http/instances/inst-rt4/generation"));
+    ASSERT_TRUE(marker2.valid);
+    EXPECT_EQ(marker2.runtimeID, "runtime-R2") << "the snapshot identity wins, not the stale payload";
+
+    // 3) Owner migrated to another proxy: refused, routes untouched.
+    auto migrated = swapped;
+    migrated.set_functionproxyid("other-proxy");
+    harness.view->Update("inst-rt4", migrated, true);
+    harness.view->GetInstance("inst-rt4")->SetModRevision(12);
+    auto foreignOwner = actor_->RegisterTraefikRoute(swapped);
+    ASSERT_AWAIT_READY(foreignOwner);
+    EXPECT_TRUE(foreignOwner.Get().IsError());
+    EXPECT_EQ(store->kv.count("yr/tk/http/routers/inst-rt4-p8080/rule"), 1u);
+    harness.view->Update("inst-rt4", swapped, true);  // restore ownership
+    harness.view->GetInstance("inst-rt4")->SetModRevision(13);
+
+    // 4) Valid empty refresh: the old key list is atomically cleaned.
+    auto zeroed = swapped;
+    (*zeroed.mutable_extensions())[PORT_FORWARD_KEY] = "[]";
+    harness.view->Update("inst-rt4", zeroed, true);
+    harness.view->GetInstance("inst-rt4")->SetModRevision(14);
+    auto emptied = actor_->RegisterTraefikRoute(zeroed);
+    ASSERT_AWAIT_READY(emptied);
+    EXPECT_TRUE(emptied.Get().IsOk()) << emptied.Get().GetMessage();
+    EXPECT_EQ(store->kv.count("yr/tk/http/routers/inst-rt4-p8080/rule"), 0u)
+        << "a valid empty refresh must clean the previous own-key list";
+    EXPECT_EQ(store->kv.count("yr/tk/http/instances/inst-rt4/generation"), 1u);
+
+    // 5) Corrupt payload (mixed valid + invalid entries): nothing changes.
+    (*swapped.mutable_extensions())[PORT_FORWARD_KEY] = R"(["http:40002:8081","garbage"])";
+    harness.view->Update("inst-rt4", swapped, true);
+    harness.view->GetInstance("inst-rt4")->SetModRevision(15);
+    const auto before = store->kv;
+    auto corrupt = actor_->RegisterTraefikRoute(swapped);
+    ASSERT_AWAIT_READY(corrupt);
+    EXPECT_TRUE(corrupt.Get().IsError()) << "a mixed payload must be rejected whole";
+    EXPECT_EQ(store->kv, before) << "existing routes are kept untouched";
 }
 
 // ── MACHINE-LEVEL FENCE (#1, root 15:12): identity at the metadata read ─────
