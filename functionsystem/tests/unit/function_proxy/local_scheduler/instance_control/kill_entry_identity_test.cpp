@@ -56,6 +56,7 @@
 #include <future>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "function_proxy/local_scheduler/instance_control/instance_ctrl_actor.h"
@@ -232,10 +233,19 @@ protected:
             functionsystem::function_proxy::StateActor>(stateClient_);
         litebus::Spawn(stateActor_);
         functionsystem::function_proxy::StateHandler::BindStateActor(stateActor_);
-        // Commit-point ownership fence resolver (root 16:48): call-time view
-        // lookup so per-test BindInstanceControlView is honored.
-        stateActor_->SetOwnershipResolver([this](const std::string &instanceID) {
-            return actor_->GetInstanceControlView()->GetIncarnationSnapshot(instanceID).first;
+        // EXECUTION-POINT executors (root 16:5x): call-time view binding so
+        // per-test BindInstanceControlView is honored; the guarded store
+        // operation runs under the view lock — same lock as generation
+        // changes.
+        stateActor_->SetSaveExecutor([this](const std::string &instanceID,
+                                            const std::string &expectedRuntimeID,
+                                            const functionsystem::function_proxy::StateActor::GuardedStoreOp &op) {
+            return actor_->GetInstanceControlView()->SaveStateGuarded(instanceID, expectedRuntimeID, op);
+        });
+        stateActor_->SetDeleteExecutor([this](const std::string &instanceID,
+                                              const std::string &expectedRuntimeID,
+                                              const functionsystem::function_proxy::StateActor::GuardedStoreOp &op) {
+            return actor_->GetInstanceControlView()->DeleteStateGuarded(instanceID, expectedRuntimeID, op);
         });
         litebus::Spawn(actor_);
     }
@@ -1153,76 +1163,116 @@ TEST_F(KillEntryIdentityFixture, LateFailureCallbackDoesNotOverwriteRewrittenRec
 }
 
 
-// ── SAME-REQUEST DIFFERENT-RUNTIME WINDOW (root 16:48) ───────────────────────
+// ── SAME-REQUEST DIFFERENT-RUNTIME WINDOW (root 16:48/16:5x) ─────────────────
 
 // Failover keeps the CREATION REQUEST but replaces the RUNTIME — both
-// compose the SAME state key. Through the REAL StateHandler → StateActor
-// chain with the ownership resolver bound: the NEW runtime's save lands;
-// a LATE save from the OLD stream is refused at the commit point with
-// zero writes (no relabeling onto the current runtime); the stored value
-// stays the successor's.
-TEST_F(KillEntryIdentityFixture, SameRequestLateOldRuntimeSaveRefusedZeroWrites)
+// compose the SAME state key. The BARRIER sits at the backend Set INSIDE
+// the view-guarded execution: the old stream's save passes its ownership
+// check (R1 current) and blocks at the store; the NEW runtime's publish
+// (GenerateStateMachine, same view lock) must be BLOCKED meanwhile; the
+// release lets the old save finish, then the publish lands, then the new
+// save writes — and the FINAL value is the successor's. A later old-stream
+// save is refused with zero writes.
+TEST_F(KillEntryIdentityFixture, SameRequestBarrierProvesLockSerialization)
 {
     auto harness = MakeRealView();
     actor_->BindInstanceControlView(harness.view);
 
-    auto info = MakeElasticInfo("inst-rt", "runtime-NEW");
-    info.set_functionproxyid("node-test");
-    info.set_function("default/0-test-helloWorld/$latest");
-    harness.view->GenerateStateMachine("inst-rt", info);
+    auto infoOld = MakeElasticInfo("inst-bar", "runtime-R1");
+    infoOld.set_functionproxyid("node-test");
+    infoOld.set_function("default/0-test-helloWorld/$latest");
+    harness.view->GenerateStateMachine("inst-bar", infoOld);  // machine = R1/q
 
-    const std::string key = StateClient::ComposeStateKey("inst-rt", "req-inst-rt");
+    const std::string key = StateClient::ComposeStateKey("inst-bar", "req-inst-bar");
     auto stored = std::make_shared<std::string>();
+    auto reached = std::make_shared<std::promise<void>>();
+    auto release = std::make_shared<std::promise<void>>();
     EXPECT_CALL(*cacheClient_, Set(Matcher<const std::string &>(key), _))
+        .WillOnce(Invoke([stored, reached, release](const std::string &, const std::string &val) {
+            reached->set_value();
+            release->get_future().wait();  // backend barrier, under the view lock
+            *stored = val;
+            return Status::OK();
+        }))
         .WillOnce(Invoke([stored](const std::string &, const std::string &val) {
             *stored = val;
             return Status::OK();
         }));
 
+    auto oldMsg = std::make_shared<runtime_rpc::StreamingMessage>();
+    oldMsg->mutable_savereq()->set_state("OLD-STATE");
+    auto oldSave = std::make_shared<litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>>>(
+        function_proxy::StateHandler::SaveState(
+            grpc::PosixStreamIdentity{ "inst-bar", "runtime-R1", "req-inst-bar" }, oldMsg));
+    ASSERT_EQ(reached->get_future().wait_for(std::chrono::seconds(5)), std::future_status::ready);
+
+    // The NEW generation's publish takes the SAME view lock: it must be
+    // BLOCKED while the old save's store operation is in flight.
+    auto published = std::make_shared<std::atomic<bool>>(false);
+    auto infoNew = MakeElasticInfo("inst-bar", "runtime-R2");
+    infoNew.set_functionproxyid("node-test");
+    infoNew.set_function("default/0-test-helloWorld/$latest");
+    std::thread publisher([harness, infoNew, published]() {
+        harness.view->GenerateStateMachine("inst-bar", infoNew);
+        published->store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_FALSE(published->load()) << "the publish must be blocked by the in-flight guarded store op";
+
+    release->set_value();  // old save completes under the lock
+    publisher.join();
+    EXPECT_TRUE(published->load());
+    EXPECT_EQ(*stored, "OLD-STATE");  // ordering: old save happened-before publish
+
+    // The successor's save lands AFTER the publish — final value is NEW.
     auto newMsg = std::make_shared<runtime_rpc::StreamingMessage>();
     newMsg->mutable_savereq()->set_state("NEW-STATE");
     auto newSave = function_proxy::StateHandler::SaveState(
-        grpc::PosixStreamIdentity{ "inst-rt", "runtime-NEW", "req-inst-rt" }, newMsg);
+        grpc::PosixStreamIdentity{ "inst-bar", "runtime-R2", "req-inst-bar" }, newMsg);
     ASSERT_AWAIT_READY(newSave);
     EXPECT_EQ(newSave.Get()->saversp().code(), common::ERR_NONE);
-    EXPECT_EQ(newSave.Get()->saversp().checkpointid(), key)
-        << "the save must return the VERSIONED checkpoint id";
     EXPECT_EQ(*stored, "NEW-STATE");
 
-    // The LATE OLD stream (same creation request, superseded runtime).
-    auto oldMsg = std::make_shared<runtime_rpc::StreamingMessage>();
-    oldMsg->mutable_savereq()->set_state("OLD-STATE");
-    auto oldSave = function_proxy::StateHandler::SaveState(
-        grpc::PosixStreamIdentity{ "inst-rt", "runtime-OLD", "req-inst-rt" }, oldMsg);
-    ASSERT_AWAIT_READY(oldSave);
-    EXPECT_NE(oldSave.Get()->saversp().code(), common::ERR_NONE)
-        << "the superseded runtime's save must be refused";
-    EXPECT_EQ(*stored, "NEW-STATE") << "zero writes: the successor's state survives";
+    // Any LATER old-stream save is refused at the execution point: zero
+    // writes, the successor's value survives.
+    auto staleMsg = std::make_shared<runtime_rpc::StreamingMessage>();
+    staleMsg->mutable_savereq()->set_state("STALE-STATE");
+    auto staleSave = function_proxy::StateHandler::SaveState(
+        grpc::PosixStreamIdentity{ "inst-bar", "runtime-R1", "req-inst-bar" }, staleMsg);
+    ASSERT_AWAIT_READY(staleSave);
+    EXPECT_NE(staleSave.Get()->saversp().code(), common::ERR_NONE);
+    EXPECT_EQ(*stored, "NEW-STATE");
 }
 
-// Same-window DELETE leg: the retiring chain of the OLD runtime against a
-// machine now running the NEW runtime under the SAME request generation is
-// refused by the entry guard — the shared key's state survives.
-TEST_F(KillEntryIdentityFixture, SameRequestOldRuntimeDeleteRefused)
+// DELETE leg of the same window: with a machine running R2 under the SAME
+// request, the OLD chain's state delete is refused at the execution point
+// (zero Del on the shared key); with NO machine (retire completion) the
+// delete proceeds.
+TEST_F(KillEntryIdentityFixture, SameRequestOldRuntimeDeleteGuarded)
 {
     auto harness = MakeRealView();
     actor_->BindInstanceControlView(harness.view);
 
-    auto info = MakeElasticInfo("inst-rtd", "runtime-NEW");
+    auto info = MakeElasticInfo("inst-gd", "runtime-R2");
     info.set_functionproxyid("node-test");
     info.set_function("default/0-test-helloWorld/$latest");
-    harness.view->GenerateStateMachine("inst-rtd", info);
+    harness.view->GenerateStateMachine("inst-gd", info);
 
-    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>(
-        StateClient::ComposeStateKey("inst-rtd", "req-inst-rtd")))).Times(0);
+    const std::string key = StateClient::ComposeStateKey("inst-gd", "req-inst-gd");
+    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>(key))).Times(0);
+    auto refused = function_proxy::StateHandler::DeleteState("inst-gd", "req-inst-gd", "runtime-R1");
+    ASSERT_AWAIT_READY(refused);
+    EXPECT_TRUE(refused.Get().IsError());
+    EXPECT_EQ(refused.Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY);
 
-    auto oldInfo = MakeElasticInfo("inst-rtd", "runtime-OLD");
-    auto result = actor_->DeleteInstanceInControlView(Status::OK(), oldInfo);
-    ASSERT_AWAIT_READY(result);
-    EXPECT_TRUE(result.Get().IsError());
-    EXPECT_EQ(result.Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY);
-    // The machine is untouched, still the NEW runtime.
-    EXPECT_EQ(harness.view->GetInstance("inst-rtd")->GetInstanceInfo().runtimeid(), "runtime-NEW");
+    // Retire completion (machine absent): the delete of the retiring
+    // chain's OWN key executes.
+    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>(key))).WillOnce(Return(Status::OK()));
+    harness.view->OnDelInstance("inst-gd", "req-inst-gd", true);
+    ASSERT_EQ(harness.view->GetInstance("inst-gd"), nullptr);
+    auto done = function_proxy::StateHandler::DeleteState("inst-gd", "req-inst-gd", "runtime-R1");
+    ASSERT_AWAIT_READY(done);
+    EXPECT_TRUE(done.Get().IsOk());
 }
 
 // ── MACHINE-LEVEL FENCE (#1, root 15:12): identity at the metadata read ─────

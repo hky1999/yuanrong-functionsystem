@@ -51,24 +51,38 @@ public:
     // the migration contract.
     litebus::Future<StateLoadResponse> LoadState(const std::shared_ptr<StateLoadRequest> &request);
 
-    // Retire-side delete: the retiring chain's OWN creation generation.
-    litebus::Future<Status> DeleteState(const std::string &instanceId, const std::string &generation);
-
     void InitStateClient();
 
-    // Commit-point ownership fence (#S, root 16:48): answers the CURRENT
-    // machine's runtimeid for an instanceID ("" = no machine). A save whose
-    // stream was bound to a SUPERSEDED runtime (failover keeps the creation
-    // request but replaces the runtime — both would otherwise compose the
-    // SAME key) is refused here, at the store boundary, with zero writes.
-    // The resolver reads the control view under its own lock (thread-safe);
-    // an empty answer is an explicit refusal (unknown ≠ authorized).
-    void SetOwnershipResolver(
-        std::function<std::string(const std::string &instanceID)> resolver);
+    // EXECUTION-POINT serialization (#S, root 16:5x): the ownership check
+    // and the SYNCHRONOUS store operation run together under the caller-
+    // supplied executor, which must hold the SAME lock the control view
+    // uses for generation changes (observer in-place updates). A resolver-
+    // style pre-check is check-then-act by construction and is NOT used:
+    // the publish of a replacement runtime cannot interleave between the
+    // check and the write. Empty/absent executors REFUSE (unknown ≠ pass).
+    using GuardedStoreOp = std::function<Status()>;
+    using SaveExecutor = std::function<Status(const std::string &instanceID,
+                                              const std::string &expectedRuntimeID,
+                                              const GuardedStoreOp &op)>;
+    using DeleteExecutor = std::function<Status(const std::string &instanceID,
+                                                const std::string &expectedRuntimeID,
+                                                const GuardedStoreOp &op)>;
+    void SetSaveExecutor(SaveExecutor executor);
+    void SetDeleteExecutor(DeleteExecutor executor);
+
+    // Retire-side delete: the retiring chain's OWN identity (creation
+    // generation + runtime). The delete of the shared (instance, request)
+    // key executes under the delete executor: a machine that now runs a
+    // DIFFERENT runtime refuses; a machine absent allows (the retire
+    // chain's completion), serialized against same-name inserts.
+    litebus::Future<Status> DeleteState(const std::string &instanceId,
+                                        const std::string &generation,
+                                        const std::string &expectedRuntimeID);
 
 private:
     std::shared_ptr<StateClient> stateClient_;
-    std::function<std::string(const std::string &instanceID)> ownershipResolver_;
+    SaveExecutor saveExecutor_;
+    DeleteExecutor deleteExecutor_;
 };
 
 }  // namespace functionsystem::function_proxy

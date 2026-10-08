@@ -190,14 +190,28 @@ Status LocalSchedDriver::Create()
             const auto snapshot = view->GetIncarnationSnapshot(instanceID);
             return (runtimeID.empty() || snapshot.first != runtimeID) ? std::string{} : snapshot.second;
         });
-    // Commit-point state-ownership resolver: the state actor refuses saves
-    // from streams whose bound runtime is no longer the machine's current
-    // runtime (failover keeps the creation request — both would otherwise
-    // compose the same state key).
-    function_proxy::StateHandler::BindOwnershipResolver(
-        [view = instanceCtrl_->GetInstanceControlView()](const std::string &instanceID) -> std::string {
-            return view->GetIncarnationSnapshot(instanceID).first;
-        });
+    // EXECUTION-POINT state executors: the ownership check and the
+    // synchronous store operation run under the control view's lock — the
+    // SAME lock generation changes (observer in-place updates, machine
+    // inserts) take — so a replacement runtime's publish cannot interleave
+    // between the check and the write/delete. Saves require the machine's
+    // current runtime to equal the stream's bound runtime; deletes require
+    // it to equal the retiring chain's runtime when a machine exists (an
+    // absent machine allows the retire completion, serialized against
+    // same-name inserts by the same lock).
+    {
+        const auto view = instanceCtrl_->GetInstanceControlView();
+        function_proxy::StateHandler::BindSaveExecutor(
+            [view](const std::string &instanceID, const std::string &expectedRuntimeID,
+                   const function_proxy::StateActor::GuardedStoreOp &op) -> Status {
+                return view->SaveStateGuarded(instanceID, expectedRuntimeID, op);
+            });
+        function_proxy::StateHandler::BindDeleteExecutor(
+            [view](const std::string &instanceID, const std::string &expectedRuntimeID,
+                   const function_proxy::StateActor::GuardedStoreOp &op) -> Status {
+                return view->DeleteStateGuarded(instanceID, expectedRuntimeID, op);
+            });
+    }
     PosixAPIHandler::BindInstanceCtrl(instanceCtrl_);
     PosixAPIHandler::BindControlClientManager(param_.controlInterfacePosixMgr);
     PosixAPIHandler::BindLocalSchedSrv(localSchedSrv_);

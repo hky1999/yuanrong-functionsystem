@@ -27,10 +27,11 @@ public:
     virtual ~StateHandler();
 
     static void BindStateActor(const std::shared_ptr<StateActor> &stateActor);
-    // Bind the commit-point ownership resolver onto the LIVE state actor
-    // (driver startup; answers the current machine runtimeid per instance).
-    static void BindOwnershipResolver(
-        const std::function<std::string(const std::string &)> &resolver);
+    // Bind the EXECUTION-POINT executors onto the LIVE state actor (driver
+    // startup). Each executor must run its GuardedStoreOp under the control
+    // view's lock — the same lock generation changes take.
+    static void BindSaveExecutor(const StateActor::SaveExecutor &executor);
+    static void BindDeleteExecutor(const StateActor::DeleteExecutor &executor);
     // The posix handler signature: the STREAM-BOUND identity (creation
     // generation fixed at accept) travels with the message; an unbound
     // stream is refused by the actor, never silently degraded.
@@ -41,8 +42,9 @@ public:
         const grpc::PosixStreamIdentity &identity, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
 
     // Proxy-internal retire-side delete carrying the retiring chain's OWN
-    // creation generation.
-    static litebus::Future<Status> DeleteState(const std::string &instanceId, const std::string &generation);
+    // identity (creation generation + runtime).
+    static litebus::Future<Status> DeleteState(const std::string &instanceId, const std::string &generation,
+                                               const std::string &expectedRuntimeID);
 
 protected:
     [[maybe_unused]] static void ClearStateActor();

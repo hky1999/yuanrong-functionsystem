@@ -43,23 +43,22 @@ litebus::Future<StateSaveResponse> StateActor::SaveState(const std::string &inst
         return GenStateSaveResponse(common::ErrorCode::ERR_PARAM_INVALID,
                                     "save state failed: unbound stream identity");
     }
-    // Commit-point ownership fence: the same creation request under a
-    // SUPERSEDED runtime must not overwrite the successor's state (the
-    // accept-time binding cannot catch a replacement that lands AFTER the
-    // stream was accepted). Refused with zero writes; no relabeling of the
-    // old message onto the current runtime.
-    if (ownershipResolver_) {
-        const std::string currentRuntime = ownershipResolver_(instanceId);
-        if (currentRuntime.empty() || currentRuntime != boundRuntimeID) {
-            YRLOG_ERROR("refused to save state for instance({}): stream bound to runtime({}) "
-                        "but the current machine runs runtime({})",
-                        instanceId, boundRuntimeID, currentRuntime.empty() ? "<none>" : currentRuntime);
-            return GenStateSaveResponse(common::ErrorCode::ERR_INSTANCE_BUSY,
-                                        "save state refused: stream runtime superseded");
-        }
+    // EXECUTION-POINT fence: no executor bound ⇒ explicit refusal (an
+    // unbound deployment never silently writes). With one bound, the
+    // ownership check and the synchronous Set run together under the
+    // executor's lock — the same lock the control view takes for
+    // generation changes — so a replacement runtime's publish CANNOT land
+    // between the check and the write (a pre-check would allow exactly
+    // that). No relabeling of the old message onto the current runtime.
+    if (!saveExecutor_) {
+        YRLOG_ERROR("refused to save state for instance({}): no save executor bound "
+                    "(unbound deployment refuses rather than silently writing)", instanceId);
+        return GenStateSaveResponse(common::ErrorCode::ERR_INNER_SYSTEM_ERROR,
+                                    "save state refused: save executor not bound");
     }
     const std::string key = StateClient::ComposeStateKey(instanceId, boundRequestID);
-    auto status = stateClient_->Set(key, request->state());
+    auto status = saveExecutor_(instanceId, boundRuntimeID,
+        [this, &key, &request]() { return stateClient_->Set(key, request->state()); });
     if (status.IsError()) {
         YRLOG_ERROR("failed to save state, status: {}", status.ToString());
         return GenStateSaveResponse(common::ErrorCode::ERR_INNER_SYSTEM_ERROR,
@@ -103,19 +102,33 @@ litebus::Future<StateLoadResponse> StateActor::LoadState(const std::shared_ptr<S
     return GenStateLoadResponse(common::ErrorCode::ERR_NONE, "", state);
 }
 
-litebus::Future<Status> StateActor::DeleteState(const std::string &instanceId, const std::string &generation)
+litebus::Future<Status> StateActor::DeleteState(const std::string &instanceId, const std::string &generation,
+                                                 const std::string &expectedRuntimeID)
 {
-    if (generation.empty()) {
-        YRLOG_ERROR("refused to delete state for instance({}): no creation generation carried", instanceId);
+    if (generation.empty() || expectedRuntimeID.empty()) {
+        YRLOG_ERROR("refused to delete state for instance({}): incomplete identity "
+                    "(generation empty={} runtime empty={})",
+                    instanceId, generation.empty(), expectedRuntimeID.empty());
         return Status(StatusCode::ERR_INSTANCE_INFO_INVALID,
-                      "delete state failed: no creation generation carried");
+                      "delete state failed: incomplete identity");
     }
-    return stateClient_->Del(StateClient::ComposeStateKey(instanceId, generation));
+    if (!deleteExecutor_) {
+        YRLOG_ERROR("refused to delete state for instance({}): no delete executor bound", instanceId);
+        return Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "delete state failed: delete executor not bound");
+    }
+    const std::string key = StateClient::ComposeStateKey(instanceId, generation);
+    return deleteExecutor_(instanceId, expectedRuntimeID,
+        [this, &key]() { return stateClient_->Del(key); });
 }
 
-void StateActor::SetOwnershipResolver(std::function<std::string(const std::string &)> resolver)
+void StateActor::SetSaveExecutor(SaveExecutor executor)
 {
-    ownershipResolver_ = std::move(resolver);
+    saveExecutor_ = std::move(executor);
+}
+
+void StateActor::SetDeleteExecutor(DeleteExecutor executor)
+{
+    deleteExecutor_ = std::move(executor);
 }
 
 void StateActor::InitStateClient()

@@ -35,14 +35,22 @@ void StateHandler::BindStateActor(const std::shared_ptr<StateActor> &stateActor)
     litebus::Async(stateActorAid_, &StateActor::InitStateClient);
 }
 
-void StateHandler::BindOwnershipResolver(
-    const std::function<std::string(const std::string &)> &resolver)
+void StateHandler::BindSaveExecutor(const StateActor::SaveExecutor &executor)
 {
     if (stateActorAid_.Name().empty()) {
-        YRLOG_ERROR("failed to bind ownership resolver: don't init state actor");
+        YRLOG_ERROR("failed to bind save executor: don't init state actor");
         return;
     }
-    litebus::Async(stateActorAid_, &StateActor::SetOwnershipResolver, resolver);
+    litebus::Async(stateActorAid_, &StateActor::SetSaveExecutor, executor);
+}
+
+void StateHandler::BindDeleteExecutor(const StateActor::DeleteExecutor &executor)
+{
+    if (stateActorAid_.Name().empty()) {
+        YRLOG_ERROR("failed to bind delete executor: don't init state actor");
+        return;
+    }
+    litebus::Async(stateActorAid_, &StateActor::SetDeleteExecutor, executor);
 }
 
 litebus::Future<std::shared_ptr<StreamingMessage>> StateHandler::SaveState(
@@ -103,13 +111,15 @@ litebus::Future<std::shared_ptr<StreamingMessage>> StateHandler::LoadState(
         });
 }
 
-litebus::Future<Status> StateHandler::DeleteState(const std::string &instanceId, const std::string &generation)
+litebus::Future<Status> StateHandler::DeleteState(const std::string &instanceId, const std::string &generation,
+                                                   const std::string &expectedRuntimeID)
 {
-    YRLOG_INFO("state handler receive delete state from instance({}) generation({})", instanceId, generation);
-    if (instanceId.empty() || generation.empty()) {
-        YRLOG_ERROR("failed to delete state: empty instance id or generation");
+    YRLOG_INFO("state handler receive delete state from instance({}) generation({}) runtime({})",
+               instanceId, generation, expectedRuntimeID);
+    if (instanceId.empty() || generation.empty() || expectedRuntimeID.empty()) {
+        YRLOG_ERROR("failed to delete state: empty instance id, generation or runtime");
         return Status(StatusCode::ERR_INSTANCE_INFO_INVALID,
-                      "delete state failed: empty instance id or generation");
+                      "delete state failed: incomplete identity");
     }
 
     if (stateActorAid_.Name().empty()) {
@@ -117,7 +127,8 @@ litebus::Future<Status> StateHandler::DeleteState(const std::string &instanceId,
         return Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "delete state failed: don't init state actor");
     }
 
-    return litebus::Async(stateActorAid_, &StateActor::DeleteState, instanceId, generation);
+    return litebus::Async(stateActorAid_, &StateActor::DeleteState, instanceId, generation,
+                          expectedRuntimeID);
 }
 
 }  // namespace functionsystem::function_proxy

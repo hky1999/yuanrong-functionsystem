@@ -739,7 +739,7 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
                 // resolving thread must never mutate settledCleanupPending_
                 // concurrently with actor-thread users).
                 return function_proxy::StateHandler::DeleteState(
-                    instanceInfo.instanceid(), instanceInfo.requestid())
+                    instanceInfo.instanceid(), instanceInfo.requestid(), instanceInfo.runtimeid())
                     .Then(litebus::Defer(GetAID(),
                         &InstanceCtrlActor::OnRetireStateDeleteComplete,
                         instanceInfo, std::placeholders::_1));
@@ -1155,7 +1155,8 @@ litebus::Future<KillResponse> InstanceCtrlActor::KillFrontend(const std::string 
             // Completion marshalled back onto THIS actor: the resolving
             // thread is the StateActor/store thread, and the callback
             // mutates actor-owned settledCleanupPending_.
-            function_proxy::StateHandler::DeleteState(killReq->instanceid(), recorded.requestID)
+            function_proxy::StateHandler::DeleteState(killReq->instanceid(), recorded.requestID,
+                                                       recorded.runtimeID)
                 .OnComplete(litebus::Defer(GetAID(),
                     &InstanceCtrlActor::OnPendingCleanupStateDeleteComplete,
                     killReq, promise, recorded, std::placeholders::_1));
@@ -3062,7 +3063,7 @@ void InstanceCtrlActor::CleanupFailedSnapStart(const std::shared_ptr<messages::S
         })
         .Then([instanceID, requestID](const Status &status) {
             if (status.IsOk()) {
-                function_proxy::StateHandler::DeleteState(instanceID, requestID);
+                function_proxy::StateHandler::DeleteState(instanceID, requestID, instanceInfo.runtimeid());
             }
             return Status::OK();
         });

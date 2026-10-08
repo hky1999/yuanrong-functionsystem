@@ -338,6 +338,41 @@ litebus::Future<Status> InstanceControlView::DelInstance(const std::string &inst
         });
 }
 
+Status InstanceControlView::SaveStateGuarded(const std::string &instanceID,
+                                             const std::string &expectedRuntimeID,
+                                             const std::function<Status()> &op)
+{
+    std::lock_guard<std::mutex> guard(lock_);
+    auto it = machines_.find(instanceID);
+    if (it == machines_.end()
+        || it->second->GetInstanceInfo().runtimeid() != expectedRuntimeID) {
+        const std::string current = (it == machines_.end()) ? std::string("<none>")
+                                                            : it->second->GetInstanceInfo().runtimeid();
+        YRLOG_WARN("state save refused for instance({}): stream bound to runtime({}) but the "
+                   "machine currently runs runtime({})", instanceID, expectedRuntimeID, current);
+        return Status(StatusCode::ERR_INSTANCE_BUSY,
+            "state save refused: stream runtime superseded or unknown");
+    }
+    return op();
+}
+
+Status InstanceControlView::DeleteStateGuarded(const std::string &instanceID,
+                                               const std::string &expectedRuntimeID,
+                                               const std::function<Status()> &op)
+{
+    std::lock_guard<std::mutex> guard(lock_);
+    auto it = machines_.find(instanceID);
+    if (it != machines_.end()
+        && it->second->GetInstanceInfo().runtimeid() != expectedRuntimeID) {
+        YRLOG_WARN("state delete refused for instance({}): retiring chain runtime({}) but the "
+                   "machine currently runs runtime({})",
+                   instanceID, expectedRuntimeID, it->second->GetInstanceInfo().runtimeid());
+        return Status(StatusCode::ERR_INSTANCE_BUSY,
+            "state delete refused: machine bound to another runtime");
+    }
+    return op();
+}
+
 std::pair<std::string, std::string> InstanceControlView::GetIncarnationSnapshot(
     const std::string &instanceID)
 {

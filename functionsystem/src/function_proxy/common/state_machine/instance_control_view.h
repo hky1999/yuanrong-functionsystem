@@ -57,6 +57,19 @@ public:
                                                 const std::string &expectedRequestID);
     // Lock-held identity snapshot for post-delete re-verification (#2).
     virtual std::pair<std::string, std::string> GetIncarnationSnapshot(const std::string &instanceID);
+    // EXECUTION-POINT state guards (#S, root 16:5x): the ownership check
+    // and the caller's SYNCHRONOUS store operation run together under the
+    // VIEW lock — the same lock generation changes take (Update /
+    // GenerateStateMachine / OnDelInstance) — so a replacement runtime's
+    // publish cannot interleave between check and write/delete. Save
+    // requires the machine's current runtime to equal the stream's bound
+    // runtime (absent machine = unknown = refuse); delete requires it to
+    // equal the retiring chain's runtime when a machine exists (absent
+    // allows the retire completion, serialized against same-name inserts).
+    Status SaveStateGuarded(const std::string &instanceID, const std::string &expectedRuntimeID,
+                            const std::function<Status()> &op);
+    Status DeleteStateGuarded(const std::string &instanceID, const std::string &expectedRuntimeID,
+                              const std::function<Status()> &op);
     void OnDelInstance(const std::string &instanceID, const std::string &requestID, bool needErase);
 
     void Update(const std::string &instanceID, const resources::InstanceInfo &instanceInfo,
