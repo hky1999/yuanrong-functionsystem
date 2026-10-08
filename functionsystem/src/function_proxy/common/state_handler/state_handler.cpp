@@ -35,6 +35,16 @@ void StateHandler::BindStateActor(const std::shared_ptr<StateActor> &stateActor)
     litebus::Async(stateActorAid_, &StateActor::InitStateClient);
 }
 
+void StateHandler::BindOwnershipResolver(
+    const std::function<std::string(const std::string &)> &resolver)
+{
+    if (stateActorAid_.Name().empty()) {
+        YRLOG_ERROR("failed to bind ownership resolver: don't init state actor");
+        return;
+    }
+    litebus::Async(stateActorAid_, &StateActor::SetOwnershipResolver, resolver);
+}
+
 litebus::Future<std::shared_ptr<StreamingMessage>> StateHandler::SaveState(
     const grpc::PosixStreamIdentity &identity, const std::shared_ptr<StreamingMessage> &request)
 {

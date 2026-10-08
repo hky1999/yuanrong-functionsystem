@@ -37,8 +37,8 @@ public:
     MOCK_METHOD(litebus::Future<Status>, Delete, (const std::string &key, bool isPrefix), (override));
     MOCK_METHOD(litebus::Future<Status>, Revoke, (const std::string &key), (override));
     MOCK_METHOD(litebus::Option<std::string>, Get, (const std::string &key), (override));
-    MOCK_METHOD(litebus::Future<Status>, Txn,
-                (const std::vector<std::pair<std::string, std::string>> &kvs), (override));
+    using TxnKvs = const std::vector<std::pair<std::string, std::string>> &;
+    MOCK_METHOD(litebus::Future<Status>, Txn, (TxnKvs), (override));
 };
 
 }  // namespace functionsystem::test

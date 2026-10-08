@@ -27,6 +27,10 @@ public:
     virtual ~StateHandler();
 
     static void BindStateActor(const std::shared_ptr<StateActor> &stateActor);
+    // Bind the commit-point ownership resolver onto the LIVE state actor
+    // (driver startup; answers the current machine runtimeid per instance).
+    static void BindOwnershipResolver(
+        const std::function<std::string(const std::string &)> &resolver);
     // The posix handler signature: the STREAM-BOUND identity (creation
     // generation fixed at accept) travels with the message; an unbound
     // stream is refused by the actor, never silently degraded.

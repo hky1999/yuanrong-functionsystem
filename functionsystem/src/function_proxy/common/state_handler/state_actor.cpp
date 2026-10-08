@@ -43,6 +43,21 @@ litebus::Future<StateSaveResponse> StateActor::SaveState(const std::string &inst
         return GenStateSaveResponse(common::ErrorCode::ERR_PARAM_INVALID,
                                     "save state failed: unbound stream identity");
     }
+    // Commit-point ownership fence: the same creation request under a
+    // SUPERSEDED runtime must not overwrite the successor's state (the
+    // accept-time binding cannot catch a replacement that lands AFTER the
+    // stream was accepted). Refused with zero writes; no relabeling of the
+    // old message onto the current runtime.
+    if (ownershipResolver_) {
+        const std::string currentRuntime = ownershipResolver_(instanceId);
+        if (currentRuntime.empty() || currentRuntime != boundRuntimeID) {
+            YRLOG_ERROR("refused to save state for instance({}): stream bound to runtime({}) "
+                        "but the current machine runs runtime({})",
+                        instanceId, boundRuntimeID, currentRuntime.empty() ? "<none>" : currentRuntime);
+            return GenStateSaveResponse(common::ErrorCode::ERR_INSTANCE_BUSY,
+                                        "save state refused: stream runtime superseded");
+        }
+    }
     const std::string key = StateClient::ComposeStateKey(instanceId, boundRequestID);
     auto status = stateClient_->Set(key, request->state());
     if (status.IsError()) {
@@ -96,6 +111,11 @@ litebus::Future<Status> StateActor::DeleteState(const std::string &instanceId, c
                       "delete state failed: no creation generation carried");
     }
     return stateClient_->Del(StateClient::ComposeStateKey(instanceId, generation));
+}
+
+void StateActor::SetOwnershipResolver(std::function<std::string(const std::string &)> resolver)
+{
+    ownershipResolver_ = std::move(resolver);
 }
 
 void StateActor::InitStateClient()

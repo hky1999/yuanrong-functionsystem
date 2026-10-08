@@ -190,6 +190,14 @@ Status LocalSchedDriver::Create()
             const auto snapshot = view->GetIncarnationSnapshot(instanceID);
             return (runtimeID.empty() || snapshot.first != runtimeID) ? std::string{} : snapshot.second;
         });
+    // Commit-point state-ownership resolver: the state actor refuses saves
+    // from streams whose bound runtime is no longer the machine's current
+    // runtime (failover keeps the creation request — both would otherwise
+    // compose the same state key).
+    function_proxy::StateHandler::BindOwnershipResolver(
+        [view = instanceCtrl_->GetInstanceControlView()](const std::string &instanceID) -> std::string {
+            return view->GetIncarnationSnapshot(instanceID).first;
+        });
     PosixAPIHandler::BindInstanceCtrl(instanceCtrl_);
     PosixAPIHandler::BindControlClientManager(param_.controlInterfacePosixMgr);
     PosixAPIHandler::BindLocalSchedSrv(localSchedSrv_);

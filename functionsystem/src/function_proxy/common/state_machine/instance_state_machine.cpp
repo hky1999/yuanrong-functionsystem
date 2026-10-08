@@ -427,7 +427,9 @@ InstanceStateMachine::RegistrationAuthority InstanceStateMachine::GetRegistratio
 {
     std::lock_guard<std::recursive_mutex> guard(lock_);
     RegistrationAuthority authority;
-    RETURN_IF_NULL(instanceContext_, authority);
+    if (instanceContext_ == nullptr) {
+        return authority;  // invalid by default
+    }
     authority.info = instanceContext_->GetInstanceInfo();
     authority.modRevision = GetModRevision();
     authority.recordKey = GetInstanceRecordKey(authority.info, isMetaStoreEnable);

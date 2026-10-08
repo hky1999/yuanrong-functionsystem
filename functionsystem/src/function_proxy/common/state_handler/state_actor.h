@@ -56,8 +56,19 @@ public:
 
     void InitStateClient();
 
+    // Commit-point ownership fence (#S, root 16:48): answers the CURRENT
+    // machine's runtimeid for an instanceID ("" = no machine). A save whose
+    // stream was bound to a SUPERSEDED runtime (failover keeps the creation
+    // request but replaces the runtime — both would otherwise compose the
+    // SAME key) is refused here, at the store boundary, with zero writes.
+    // The resolver reads the control view under its own lock (thread-safe);
+    // an empty answer is an explicit refusal (unknown ≠ authorized).
+    void SetOwnershipResolver(
+        std::function<std::string(const std::string &instanceID)> resolver);
+
 private:
     std::shared_ptr<StateClient> stateClient_;
+    std::function<std::string(const std::string &instanceID)> ownershipResolver_;
 };
 
 }  // namespace functionsystem::function_proxy
