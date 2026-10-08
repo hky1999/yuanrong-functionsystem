@@ -1019,17 +1019,11 @@ TEST_F(KillEntryIdentityFixture, RealKillFrontendRetryCompletesPendingCleanup)
 // pending record RETAINED.
 TEST_F(KillEntryIdentityFixture, PendingCleanupTenantGateRefused)
 {
-    auto realView = std::make_shared<InstanceControlView>("node-test", false);
-    auto mockMetaClient = std::make_shared<MockMetaStoreClient>("127.0.0.1:1");
-    realView->BindMetaStoreClient(mockMetaClient);
-    auto mockTxn = std::make_shared<MockTxnTransaction>(litebus::AID());
-    EXPECT_CALL(*mockMetaClient, BeginTransaction).WillRepeatedly(Return(mockTxn));
-    auto deleteOk = std::make_shared<TxnResponse>();
-    deleteOk->success = true;
-    deleteOk->responses.emplace_back(TxnOperationResponse());
-    deleteOk->responses.emplace_back(TxnOperationResponse());
-    EXPECT_CALL(*mockTxn, Commit).WillRepeatedly(
-        Return(litebus::Future<std::shared_ptr<TxnResponse>>(deleteOk)));
+    // Real delete-shaped transaction responses (the DelInstanceTest
+    // recipe): the machine delete must SUCCEED so the tenant-gated retry
+    // path is the one under test.
+    auto harness = MakeRealView();
+    auto realView = harness.view;
 
     auto info = MakeElasticInfo("inst-tg", "runtime-tg");
     info.set_functionproxyid("node-test");
@@ -1236,8 +1230,7 @@ TEST_F(KillEntryIdentityFixture, SameRequestBarrierBlocksInPlaceRuntimeSwapSave)
 
     // The REAL in-place runtime publish (machine lock only — the bypass
     // path root identified) must be BLOCKED by the guarded store op. The
-    // publisher CONFIRMS it has started before the blocked-assertion; the
-    // join is guaranteed on every exit path.
+    // publisher CONFIRMS it has started before the blocked-assertion.
     auto published = std::make_shared<std::atomic<bool>>(false);
     auto publisherStarted = std::make_shared<std::promise<void>>();
     auto infoNew = MakeElasticInfo("inst-bar", "runtime-R2");
@@ -1255,7 +1248,13 @@ TEST_F(KillEntryIdentityFixture, SameRequestBarrierBlocksInPlaceRuntimeSwapSave)
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     EXPECT_FALSE(published->load()) << "the in-place runtime swap must be blocked by the guarded op";
 
+    // NORMAL PATH: release, then WAIT for BOTH the old op's completion and
+    // the publisher's completion BEFORE asserting any state.
     releaser.Release();
+    ASSERT_AWAIT_READY(*oldSave);
+    ASSERT_EQ(publisherStarted->get_future().wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    while (!published->load()) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
     EXPECT_TRUE(barrierWaitOk->load()) << "the barrier wait itself must not have timed out";
     EXPECT_TRUE(published->load());
     EXPECT_EQ(machine->GetInstanceInfo().runtimeid(), "runtime-R2");
@@ -1336,7 +1335,10 @@ TEST_F(KillEntryIdentityFixture, SameRequestBarrierBlocksInPlaceRuntimeSwapDelet
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     EXPECT_FALSE(published->load()) << "the in-place runtime swap must be blocked by the guarded Del";
 
+    // NORMAL PATH: release, wait for BOTH completions, THEN assert.
     releaser.Release();
+    ASSERT_AWAIT_READY(*oldDel);
+    while (!published->load()) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
     EXPECT_TRUE(barrierWaitOk->load()) << "the barrier wait itself must not have timed out";
     EXPECT_TRUE(published->load());
     (void)joiner;

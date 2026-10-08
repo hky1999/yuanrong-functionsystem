@@ -9276,12 +9276,30 @@ litebus::Future<Status> InstanceCtrlActor::RegisterTraefikRouteAttempt(const Ins
         return Status(StatusCode::ERR_INSTANCE_BUSY,
             "traefik registration refused: captured request is not the current generation");
     }
-    // Ports from the SAME snapshot (empty = a record legitimately at zero
-    // ports: the marker transaction still runs and atomically cleans the
-    // previous own-key list).
+    // HOST-ADDRESS AUTHORITY (root follow-up #1): routes carry THIS proxy's
+    // external IP, so the record must be owned by THIS proxy — a record
+    // migrated to another proxy must not get new ports pinned to our IP.
+    if (authority.info.functionproxyid() != nodeID_) {
+        YRLOG_WARN("refused traefik registration for instance({}): record owned by proxy({}), "
+                   "this proxy is ({})", instanceInfo.instanceid(),
+                   authority.info.functionproxyid(), nodeID_);
+        return Status(StatusCode::ERR_INSTANCE_BUSY,
+            "traefik registration refused: record owned by another proxy");
+    }
+    // Payload triage (root follow-up #2): NO key / empty value = the
+    // ordinary no-port instance — compatible skip. A PRESENT-but-corrupt
+    // payload keeps existing routes and errors visibly. A valid `[]` (or
+    // an array whose entries all parse) is a legitimate refresh — the
+    // marker transaction runs even for `[]` and atomically cleans the old
+    // own-key list. An array whose entries are ALL invalid is corrupt, not
+    // an empty refresh.
     const auto portIt = authority.info.extensions().find(PORT_FORWARD_KEY);
-    const std::string portMappingsJson =
-        (portIt == authority.info.extensions().end()) ? std::string() : portIt->second;
+    if (portIt == authority.info.extensions().end() || portIt->second.empty()) {
+        YRLOG_DEBUG("Instance {} has no port mappings on record, skip Traefik registration",
+                    instanceInfo.instanceid());
+        return Status::OK();
+    }
+    const std::string& portMappingsJson = portIt->second;
 
     // Helper to parse IP from address (ip:port format)
     auto parseIP = [](const std::string& addr) -> std::string {
@@ -9300,8 +9318,17 @@ litebus::Future<Status> InstanceCtrlActor::RegisterTraefikRouteAttempt(const Ins
 
     // Parse port mappings from JSON: ["https:40001:8080", "tcp:40002:443"] or legacy format ["40001:8080"]
     std::vector<TraefikRegistry::PortMapping> portMappings;
+    size_t invalidEntries = 0;
     try {
         nlohmann::json portJson = nlohmann::json::parse(portMappingsJson);
+        if (!portJson.is_array()) {
+            // A PRESENT payload that is not an array is corrupt: keep the
+            // existing routes, error visibly.
+            YRLOG_ERROR("traefik registration for instance({}): port payload is not a JSON array",
+                        instanceInfo.instanceid());
+            return Status(StatusCode::ERR_INSTANCE_INFO_INVALID,
+                          "traefik registration: port payload is not an array");
+        }
         if (portJson.is_array()) {
             for (const auto& entry : portJson) {
                 if (entry.is_string()) {
@@ -9325,6 +9352,7 @@ litebus::Future<Status> InstanceCtrlActor::RegisterTraefikRouteAttempt(const Ins
                             YRLOG_DEBUG("Parsed port mapping: protocol={}, sandbox_port={}, host_port={}",
                                         protocol, sandboxPort, hostPort);
                         } catch (const std::exception& e) {
+                            invalidEntries++;
                             YRLOG_WARN("Failed to parse port mapping from '{}': {}", mapping, e.what());
                         }
                     } else if (parts.size() == legacyFormatParts) {
@@ -9338,22 +9366,32 @@ litebus::Future<Status> InstanceCtrlActor::RegisterTraefikRouteAttempt(const Ins
                                         "host_port={}, defaulting to 'http'",
                                         sandboxPort, hostPort);
                         } catch (const std::exception& e) {
+                            invalidEntries++;
                             YRLOG_WARN("Failed to parse legacy port mapping from '{}': {}", mapping, e.what());
                         }
                     }
+                } else {
+                    invalidEntries++;
                 }
             }
         }
     } catch (const nlohmann::json::exception& e) {
         // The payload came from the durable record: a parse failure is a
-        // corrupt record — visible error, never a silent skip.
+        // corrupt record — keep existing routes, error visibly.
         YRLOG_ERROR("Failed to parse port mappings JSON for instance({}): {}",
                     instanceInfo.instanceid(), e.what());
         return Status(StatusCode::ERR_INSTANCE_INFO_INVALID,
                       "traefik registration: port payload unparseable");
     }
-
-    // NOTE: an EMPTY mapping list is not an early-OK — a record at zero
+    if (portMappings.empty() && invalidEntries > 0) {
+        // Entries existed but NONE parsed: corrupt payload, not an empty
+        // refresh — existing routes stay.
+        YRLOG_ERROR("traefik registration for instance({}): all {} port entries invalid",
+                    instanceInfo.instanceid(), invalidEntries);
+        return Status(StatusCode::ERR_INSTANCE_INFO_INVALID,
+                      "traefik registration: port payload entries all invalid");
+    }
+    // NOTE: a VALID empty array is NOT an early-OK — a record at zero
     // ports still runs the marker transaction so the previous own-key list
     // is atomically cleaned (root 16:35 #2).
 
