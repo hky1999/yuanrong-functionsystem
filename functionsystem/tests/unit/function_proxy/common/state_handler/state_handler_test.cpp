@@ -15,7 +15,7 @@
  */
 
 #include "function_proxy/common/state_handler/state_handler.h"
-#include "common/state_machine/instance_control_view.h"
+#include "function_proxy/common/state_machine/instance_control_view.h"
 
 #include "common/hex/hex.h"
 #include "common/utils/files.h"
@@ -208,7 +208,10 @@ TEST_F(StateHandlerTest, SaveThenLoadByCheckpointReferenceRoundTrip)
     EXPECT_CALL(*distributedCacheClient_,
                 Get(Matcher<const std::string &>(composed), Matcher<std::string &>(_)))
         .WillOnce(DoAll(SetArgReferee<1>(saved), Return(Status::OK())));
-    auto load = StateHandler::LoadState(grpc::PosixStreamIdentity{"instance_id", "rt-1", "req-gen-1"}, loadMsg);
+    // A SUCCESSOR generation (new runtime AND new request) recovers the
+    // ORIGINALLY SAVED reference: loads are reference-driven, the caller
+    // identity is not a read restriction (the explicit-reference contract).
+    auto load = StateHandler::LoadState(grpc::PosixStreamIdentity{"instance_id", "rt-2", "req-gen-2"}, loadMsg);
     EXPECT_AWAIT_READY(load);
     EXPECT_EQ(load.Get()->loadrsp().code(), common::ErrorCode::ERR_NONE);
     EXPECT_EQ(load.Get()->loadrsp().state(), "checkpoint-bytes");
@@ -223,7 +226,7 @@ TEST_F(StateHandlerTest, LoadBareLegacyReferenceRefusedPendingMigration)
     StateLoadRequest loadReq{};
     loadReq.set_checkpointid("instance_id");
     *loadMsg->mutable_loadreq() = std::move(loadReq);
-    EXPECT_CALL(*distributedCacheClient_, Get(_, _)).Times(0);
+    EXPECT_CALL(*distributedCacheClient_, Get(Matcher<const std::string &>(_), Matcher<std::string &>(_))).Times(0);
     auto load = StateHandler::LoadState(grpc::PosixStreamIdentity{"instance_id", "rt-1", "req-gen-1"}, loadMsg);
     EXPECT_AWAIT_READY(load);
     EXPECT_EQ(load.Get()->loadrsp().code(), common::ErrorCode::ERR_PARAM_INVALID);
@@ -366,7 +369,7 @@ TEST_F(StateHandlerTest, DeleteStateSuccess)
         StateClient::ComposeStateKey("DeleteStateSuccess_instance_id", "req-gen"))))
             .WillOnce(Return(Status::OK()));
 
-    auto status = StateHandler::DeleteState("DeleteStateSuccess_instance_id", "req-gen");
+    auto status = StateHandler::DeleteState("DeleteStateSuccess_instance_id", "req-gen", "rt-1");
     EXPECT_TRUE(status.Get().IsOk());
 }
 
@@ -383,7 +386,7 @@ TEST_F(StateHandlerTest, DeleteStateSuccess)
  */
 TEST_F(StateHandlerTest, DeleteStateFailed)
 {
-    auto status = StateHandler::DeleteState("", "req-gen");
+    auto status = StateHandler::DeleteState("", "req-gen", "rt-1");
     EXPECT_AWAIT_READY(status);
     EXPECT_FALSE(status.Get());
 
@@ -391,7 +394,7 @@ TEST_F(StateHandlerTest, DeleteStateFailed)
         StateClient::ComposeStateKey("DeleteStateFailed_instance_id", "req-gen"))))
     .WillOnce(Return(Status(StatusCode::FAILED, "something was wrong")));
 
-    status = StateHandler::DeleteState("DeleteStateFailed_instance_id", "req-gen");
+    status = StateHandler::DeleteState("DeleteStateFailed_instance_id", "req-gen", "rt-1");
     EXPECT_AWAIT_READY(status);
     EXPECT_EQ(status.Get().StatusCode(), StatusCode::FAILED);
 
@@ -412,7 +415,7 @@ TEST_F(StateHandlerTest, DeleteStateFailed)
     {
         StateHandlerHelper::ClearStateActorHelper();
 
-        auto status = StateHandler::DeleteState("instance_id", "req-gen");
+        auto status = StateHandler::DeleteState("instance_id", "req-gen", "rt-1");
 
         EXPECT_AWAIT_READY(status);
         EXPECT_EQ(status.Get().StatusCode(), StatusCode::ERR_INNER_SYSTEM_ERROR);
@@ -431,9 +434,10 @@ TEST_F(StateHandlerTest, DeleteStateFailed)
 TEST_F(StateHandlerTest, DeleteStateForwardsStoreNotFoundVerbatim)
 {
     const Status notFound(StatusCode::ERR_ETCD_OPERATION_ERROR, "key not exist");
-    EXPECT_CALL(*distributedCacheClient_, Del(Matcher<const std::string &>("absent-instance")))
+    EXPECT_CALL(*distributedCacheClient_, Del(Matcher<const std::string &>(
+        StateClient::ComposeStateKey("absent-instance", "req-gen"))))
         .WillOnce(Return(notFound));
-    auto del = StateHandler::DeleteState("absent-instance");
+    auto del = StateHandler::DeleteState("absent-instance", "req-gen", "rt-1");
     ASSERT_AWAIT_READY(del);
     EXPECT_TRUE(del.Get().IsError());
     EXPECT_EQ(del.Get().StatusCode(), notFound.StatusCode());
@@ -443,9 +447,10 @@ TEST_F(StateHandlerTest, DeleteStateForwardsStoreNotFoundVerbatim)
 // A genuine store failure propagates (the kill chain must retry).
 TEST_F(StateHandlerTest, DeleteStateStoreFailurePropagates)
 {
-    EXPECT_CALL(*distributedCacheClient_, Del(Matcher<const std::string &>("failing-instance")))
+    EXPECT_CALL(*distributedCacheClient_, Del(Matcher<const std::string &>(
+        StateClient::ComposeStateKey("failing-instance", "req-gen"))))
         .WillOnce(Return(Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "store down")));
-    auto del = StateHandler::DeleteState("failing-instance");
+    auto del = StateHandler::DeleteState("failing-instance", "req-gen", "rt-1");
     ASSERT_AWAIT_READY(del);
     EXPECT_TRUE(del.Get().IsError());
     EXPECT_EQ(del.Get().GetMessage(), "store down");
@@ -455,9 +460,10 @@ TEST_F(StateHandlerTest, DeleteStateStoreFailurePropagates)
 // actor.
 TEST_F(StateHandlerTest, DeleteStateSuccessPropagates)
 {
-    EXPECT_CALL(*distributedCacheClient_, Del(Matcher<const std::string &>("present-instance")))
+    EXPECT_CALL(*distributedCacheClient_, Del(Matcher<const std::string &>(
+        StateClient::ComposeStateKey("present-instance", "req-gen"))))
         .WillOnce(Return(Status::OK()));
-    auto del = StateHandler::DeleteState("present-instance");
+    auto del = StateHandler::DeleteState("present-instance", "req-gen", "rt-1");
     ASSERT_AWAIT_READY(del);
     EXPECT_TRUE(del.Get().IsOk()) << del.Get().ToString();
 }
