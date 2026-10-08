@@ -77,6 +77,7 @@
 #include "mocks/mock_resource_view.h"
 #include "common/resource_view/view_utils.h"
 #include "common/resource_view/memory_elasticity_fence.h"
+#include "common/resource_view/memory_elasticity_config.h"
 #include "common/constants/signal.h"
 #include "mocks/mock_observer.h"
 #include "common/schedule_plugin/filter/usage_aware_filter/usage_aware_filter.h"
@@ -1195,11 +1196,12 @@ TEST_F(KillEntryIdentityFixture, FirstRealKillFrontendSettlesRealBudgetOnce)
         .enableTenantAffinity = true,
         .tenantPodReuseTimeWindow = 1
     };
-    auto realView = resource_view::ResourceView::CreateResourceView("kill-budget", budgetParam);
+    auto realView = std::shared_ptr<resource_view::ResourceView>(
+        resource_view::ResourceView::CreateResourceView("kill-budget", budgetParam).release());
     auto unit = view_utils::Get1DResourceUnit(agentID);
     for (auto *resources : {unit.mutable_capacity(), unit.mutable_allocatable()}) {
-        (*resources->mutable_resources())[resource_view::RESOURCE_CPU_NAME].mutable_scalar()->set_value(32000);
-        (*resources->mutable_resources())[resource_view::RESOURCE_MEM_NAME].mutable_scalar()->set_value(32768);
+        (*resources->mutable_resources())[view_utils::RESOURCE_CPU_NAME].mutable_scalar()->set_value(32000);
+        (*resources->mutable_resources())[view_utils::RESOURCE_MEM_NAME].mutable_scalar()->set_value(32768);
     }
     {
         auto added = realView->AddResourceUnit(unit);
@@ -1220,7 +1222,7 @@ TEST_F(KillEntryIdentityFixture, FirstRealKillFrontendSettlesRealBudgetOnce)
         info.mutable_schedulerchain()->Clear();
         *info.mutable_schedulerchain()->Add() = agentID;
         (*info.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
-        auto *cpu = (*info.mutable_resources()->mutable_resources())[resource_view::RESOURCE_CPU_NAME].mutable_scalar();
+        auto *cpu = (*info.mutable_resources()->mutable_resources())[view_utils::RESOURCE_CPU_NAME].mutable_scalar();
         cpu->set_value(500);
         cpu->set_limit(8000);
         auto addFuture = realView->AddInstances({ { id, { info, nullptr } } });
