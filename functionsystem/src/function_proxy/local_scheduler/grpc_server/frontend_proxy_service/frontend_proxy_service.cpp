@@ -466,7 +466,11 @@ litebus::Future<SharedStreamMsg> DispatchInvoke(const FrontendProxyServiceParam 
     if (param.invokeDispatcher) {
         return param.invokeDispatcher(frontendCallerID, invokeRequest);
     }
-    return InvocationHandler::Invoke(frontendCallerID, invokeRequest);
+    // Synthesized stream identity: this frontend dispatch has no posix
+    // stream, so no generation binding is possible — empty boundRequestID;
+    // the state actor refuses state ops on such identities by design.
+    return InvocationHandler::Invoke(grpc::PosixStreamIdentity{ frontendCallerID, "", "" },
+                                     invokeRequest);
 }
 
 std::optional<litebus::Future<::frontend_proxy::CreateInstanceResponse>> DispatchReadyCreate(

@@ -675,7 +675,8 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
         // route's recorded incarnation, so this async unregister cannot
         // strip a same-name new generation's route.
         (void)litebus::Async(GetAID(), &InstanceCtrlActor::UnregisterTraefikRouteFenced,
-            instanceInfo.instanceid(), instanceInfo.runtimeid(), instanceInfo.requestid());
+            instanceInfo.instanceid(), instanceInfo.tenantid(), instanceInfo.runtimeid(),
+            instanceInfo.requestid());
     }
     // Delete the reserved resource information corresponding to the group instance bound to the local node.
     if (!instanceInfo.groupid().empty() && groupInstanceClear_ != nullptr) {
