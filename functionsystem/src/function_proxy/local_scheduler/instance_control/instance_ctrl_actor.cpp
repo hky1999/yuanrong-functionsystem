@@ -632,6 +632,20 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
                         return Status(StatusCode::ERR_INSTANCE_BUSY,
                             "state delete refused: incarnation replaced");
                     }
+                    // SAME runtime but a NEW request generation (the name was
+                    // reused within one runtime's lifecycle): the old chain's
+                    // state delete must still not fire.
+                    const auto currentRequest = machine->GetRequestID();
+                    if (!currentRequest.empty()
+                        && !instanceInfo.requestid().empty()
+                        && currentRequest != instanceInfo.requestid()) {
+                        YRLOG_WARN("state delete refused: instance({}) request "
+                                   "generation is ({}) but the retiring chain carried ({})",
+                                   instanceInfo.instanceid(), currentRequest,
+                                   instanceInfo.requestid());
+                        return Status(StatusCode::ERR_INSTANCE_BUSY,
+                            "state delete refused: request generation replaced");
+                    }
                 }
                 function_proxy::StateHandler::DeleteState(instanceInfo.instanceid());
             }
