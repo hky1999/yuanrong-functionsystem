@@ -466,8 +466,8 @@ void RuntimeManager::StopInstance(const litebus::AID &from, std::string && /* na
         messages::StopInstanceResponse response;
         response.set_requestid(request->requestid());
         response.set_runtimeid(request->runtimeid());
-        response->set_code(static_cast<int32_t>(RUNTIME_MANAGER_PARAMS_INVALID));
-        response->set_message("stop requires both expected sandbox and generation or neither");
+        response.set_code(static_cast<int32_t>(RUNTIME_MANAGER_PARAMS_INVALID));
+        response.set_message("stop requires both expected sandbox and generation or neither");
         Send(from, "StopInstanceResponse", response.SerializeAsString());
         return;
     }
