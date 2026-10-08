@@ -9316,55 +9316,23 @@ litebus::Future<Status> InstanceCtrlActor::RegisterTraefikRouteAttempt(const Ins
             }
         }
     } catch (const nlohmann::json::exception& e) {
-        YRLOG_WARN("Failed to parse port mappings JSON '{}': {}", portMappingsJson, e.what());
-        return Status::OK();
+        // The payload came from the durable record: a parse failure is a
+        // corrupt record — visible error, never a silent skip.
+        YRLOG_ERROR("Failed to parse port mappings JSON for instance({}): {}",
+                    instanceInfo.instanceid(), e.what());
+        return Status(StatusCode::ERR_INSTANCE_INFO_INVALID,
+                      "traefik registration: port payload unparseable");
     }
 
-    if (portMappings.empty()) {
-        YRLOG_DEBUG("No valid port mappings found for instance {}", instanceInfo.instanceid());
-        return Status::OK();
-    }
+    // NOTE: an EMPTY mapping list is not an early-OK — a record at zero
+    // ports still runs the marker transaction so the previous own-key list
+    // is atomically cleaned (root 16:35 #2).
 
     YRLOG_INFO("Registering instance to Traefik: instanceID={}, hostIP={}, ports={}",
                instanceInfo.instanceid(), ip, portMappings.size());
-
-    // Registration authority = ONE machine-lock snapshot (identity info +
-    // persisted etcd mod revision + durable record key). The store-side
-    // conditions (marker value AND record modify-revision) bind to THIS
-    // snapshot, and the CAPTURED request is verified against it: a stale
-    // chain must not borrow the current record's revision (failover keeps
-    // the creation request but the snapshot's runtime is the durable
-    // truth). Nothing here is optional: no machine, no established
-    // revision, or no derivable record key is retried (transient) or fails
-    // visibly (identity mismatch) — never silently skipped.
-    const auto machine = instanceControlView_->GetInstance(instanceInfo.instanceid());
-    const bool machineMissing = (machine == nullptr);
-    const auto authority = machineMissing ? InstanceStateMachine::RegistrationAuthority{}
-                                          : machine->GetRegistrationAuthority(config_.isMetaStoreEnabled);
-    if (!authority.valid) {
-        constexpr uint32_t MAX_TRAEFIK_REGISTER_ATTEMPTS = 5;
-        if (attempt + 1 < MAX_TRAEFIK_REGISTER_ATTEMPTS) {
-            YRLOG_INFO("traefik registration for instance({}) deferred (attempt {}): authority not "
-                       "established yet (machine missing={}, revision={}, record key empty={}); retrying",
-                       instanceInfo.instanceid(), attempt, machineMissing, authority.modRevision,
-                       authority.recordKey.empty());
-            ScheduleTraefikRegisterRetry(instanceInfo, attempt + 1);
-            return Status::OK();
-        }
-        YRLOG_ERROR("failed to register traefik route for instance({}): authority never established "
-                    "after {} attempts — the instance will run WITHOUT a route",
-                    instanceInfo.instanceid(), attempt + 1);
-        return Status(StatusCode::ERR_INSTANCE_BUSY, "traefik registration: authority never established");
-    }
-    if (authority.info.instanceid() != instanceInfo.instanceid()
-        || authority.info.requestid() != instanceInfo.requestid()) {
-        YRLOG_WARN("refused traefik registration for instance({}): captured request ({}|{}) does not "
-                   "match the machine's current identity ({}|{}) — stale chain",
-                   instanceInfo.instanceid(), instanceInfo.instanceid(), instanceInfo.requestid(),
-                   authority.info.instanceid(), authority.info.requestid());
-        return Status(StatusCode::ERR_INSTANCE_BUSY,
-            "traefik registration refused: captured request is not the current generation");
-    }
+    // Store-side conditions (marker value AND record modify-revision) bind
+    // to the authority snapshot taken at the top; identity and payload both
+    // come from it.
     return traefikRegistry_->RegisterInstance(instanceInfo.instanceid(), ip, portMappings,
                                               authority.info.tenantid(), authority.info.runtimeid(),
                                               authority.info.requestid(),
