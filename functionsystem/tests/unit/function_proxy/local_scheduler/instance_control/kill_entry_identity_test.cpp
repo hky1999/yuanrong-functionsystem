@@ -50,7 +50,7 @@
 #include "mocks/mock_instance_state_machine.h"
 #include "mocks/mock_internal_iam.h"
 #include "function_proxy/common/state_handler/state_handler.h"
-#include "common/state_handler/state_handler_helper.h"
+#include "function_proxy/common/state_handler/state_handler_helper.h"
 #include "mocks/mock_distributed_cache_client.h"
 #include "mocks/mock_resource_view.h"
 #include "utils/future_test_helper.h"
@@ -188,7 +188,7 @@ protected:
             stateActor_ = nullptr;
             // BindStateActor(nullptr) returns early and does NOT clear the
             // static AID — the established helper does.
-            functionsystem::function_proxy::test::StateHandlerHelper::ClearStateActorHelper();
+            StateHandlerHelper::ClearStateActorHelper();
             stateClient_ = nullptr;
             cacheClient_ = nullptr;
         }
