@@ -1549,11 +1549,19 @@ litebus::Future<Status> InstanceCtrlActor::KillRuntimeWithSnapshotCleanup(
     // fail-closed forever. Identity fence and receipt contract unchanged.
     if (resource_view::UsesElasticAdmission(instanceInfo)) {
         auto view = resourceViewMgr_ ? resourceViewMgr_->GetInf(resource_view::GetResourceType(instanceInfo)) : nullptr;
-        if (view != nullptr) {
-            return view->GetResourceView().Then(litebus::Defer(GetAID(),
-                &InstanceCtrlActor::KillRuntimeWithIdentity, instanceInfo, isRecovering,
-                std::placeholders::_1));
+        if (view == nullptr) {
+            // A missing view is NOT proof of verified absence: an elastic
+            // allocation could still exist somewhere. Hold the kill as a
+            // retryable UNKNOWN and keep the budget.
+            YRLOG_WARN("{}|resource view unavailable for elastic instance({}); "
+                       "kill held as UNKNOWN (budget retained)",
+                       instanceInfo.requestid(), instanceInfo.instanceid());
+            return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
+                "resource view unavailable for elastic instance kill"));
         }
+        return view->GetResourceView().Then(litebus::Defer(GetAID(),
+            &InstanceCtrlActor::KillRuntimeWithIdentity, instanceInfo, isRecovering,
+            std::placeholders::_1));
     }
     return SendKillRequestToAgent(instanceInfo, isRecovering)
         .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::RecordFrontendKillRuntimeResult, instanceInfo, _1,
@@ -1723,10 +1731,17 @@ litebus::Future<Status> InstanceCtrlActor::KillRuntime(const InstanceInfo &insta
     // identity-less path.
     if (resource_view::UsesElasticAdmission(instanceInfo)) {
         auto view = resourceViewMgr_ ? resourceViewMgr_->GetInf(resource_view::GetResourceType(instanceInfo)) : nullptr;
-        if (view != nullptr) {
-            return view->GetResourceView().Then(litebus::Defer(GetAID(), &InstanceCtrlActor::KillRuntimeWithIdentity,
-                instanceInfo, isRecovering, std::placeholders::_1));
+        if (view == nullptr) {
+            // Same contract as the snapshot-cleanup entry: a missing view is
+            // an UNKNOWN, never a license for an identity-less kill.
+            YRLOG_WARN("{}|resource view unavailable for elastic instance({}); "
+                       "kill held as UNKNOWN (budget retained)",
+                       instanceInfo.requestid(), instanceInfo.instanceid());
+            return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
+                "resource view unavailable for elastic instance kill"));
         }
+        return view->GetResourceView().Then(litebus::Defer(GetAID(), &InstanceCtrlActor::KillRuntimeWithIdentity,
+            instanceInfo, isRecovering, std::placeholders::_1));
     }
     return SendKillRequestToAgent(instanceInfo, isRecovering)
         .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::RecordFrontendKillRuntimeResult, instanceInfo, _1,
@@ -1738,13 +1753,20 @@ litebus::Future<Status> InstanceCtrlActor::KillRuntimeWithIdentity(const Instanc
 {
     std::string expectedSandboxID;
     std::string expectedGeneration;
-    bool allocated = false;
-    if (current != nullptr) {
-        const auto allocatedIt = current->instances().find(instanceInfo.instanceid());
-        if (allocatedIt != current->instances().end()) {
-            allocated = true;
-            TrustedPhysicalIdentity(allocatedIt->second, &expectedSandboxID, &expectedGeneration);
-        }
+    if (current == nullptr) {
+        // The view read itself failed: absence was never verified. An
+        // identity-less kill here could delete a live runtime with no
+        // receipt — hold as a retryable UNKNOWN.
+        YRLOG_WARN("{}|resource view read failed for elastic instance({}); "
+                   "kill held as UNKNOWN (budget retained)",
+                   instanceInfo.requestid(), instanceInfo.instanceid());
+        return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
+            "resource view read failed for elastic instance kill"));
+    }
+    const auto allocatedIt = current->instances().find(instanceInfo.instanceid());
+    const bool allocated = allocatedIt != current->instances().end();
+    if (allocated) {
+        TrustedPhysicalIdentity(allocatedIt->second, &expectedSandboxID, &expectedGeneration);
     }
     // An ALLOCATED elastic instance without a trusted physical sample must
     // never degrade to an identity-less kill: that could delete the

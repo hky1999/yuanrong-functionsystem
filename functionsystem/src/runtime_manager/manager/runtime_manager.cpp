@@ -456,13 +456,27 @@ void RuntimeManager::StopInstance(const litebus::AID &from, std::string && /* na
             request->traceid(), request->requestid(), request->runtimeid());
         return;
     }
+    // A one-sided expected identity (sandbox without generation or vice
+    // versa) can never fence a physical generation: reject BEFORE any
+    // executor dispatch — a partial fence must not reach a physical delete.
+    if (request->expected_sandbox_id().empty()
+        != request->expected_resource_generation().empty()) {
+        YRLOG_ERROR("{}|{}|stop runtime({}) refused: one-sided expected physical identity",
+                    request->traceid(), request->requestid(), request->runtimeid());
+        messages::StopInstanceResponse response;
+        response->set_requestid(request->requestid());
+        response.set_runtimeid(request->runtimeid());
+        response->set_code(static_cast<int32_t>(RUNTIME_MANAGER_PARAMS_INVALID));
+        response->set_message("stop requires both expected sandbox and generation or neither");
+        Send(from, "StopInstanceResponse", response.SerializeAsString());
+        return;
+    }
     const auto executorType = ResolveStopExecutorType(request);
-    // A stop carrying the complete expected physical identity belongs to the
+    // A stop carrying the COMPLETE expected physical identity belongs to the
     // sandboxd executor even when the local runtime map was already cleared:
     // the executor replays the durable retirement receipt by sandbox/
     // generation, which the plain RUNTIME executor cannot do.
-    const auto effectiveType = (request->expected_sandbox_id().empty()
-        || request->expected_resource_generation().empty())
+    const auto effectiveType = request->expected_sandbox_id().empty()
         ? executorType : ContainerExecutorType();
     auto executor = FindExecutor(effectiveType);
     if (executor == nullptr) {
