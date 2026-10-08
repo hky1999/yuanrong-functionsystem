@@ -607,7 +607,10 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
         groupInstanceClear_(instanceInfo);
     }
     YRLOG_INFO("{}|delete instance({}) in control view", instanceInfo.requestid(), instanceInfo.instanceid());
-    return instanceControlView_->DelInstance(instanceInfo.instanceid())
+    // The fenced overload re-verifies runtime+request INSIDE the view's
+    // lock (this entry's pre-check races with direct observer updates).
+    return instanceControlView_->DelInstance(instanceInfo.instanceid(),
+        instanceInfo.runtimeid(), instanceInfo.requestid())
         .Then([insCtrlView(instanceControlView_), instanceID(instanceInfo.instanceid()),
                requestID(instanceInfo.requestid())](const Status &status) {
             insCtrlView->OnDelInstance(instanceID, requestID, status.IsOk());
@@ -620,14 +623,15 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
                 // continuation, and StateHandler::DeleteState keys on the
                 // bare instanceID — a same-name replacement between the
                 // DelInstance dispatch and here must not lose its state.
-                const auto machine = instanceControlView_->GetInstance(
+                const auto snapshot = instanceControlView_->GetIncarnationSnapshot(
                     instanceInfo.instanceid());
-                if (machine != nullptr) {
-                    const auto &current = machine->GetInstanceInfo();
-                    if (current.runtimeid() != instanceInfo.runtimeid()) {
+                if (!snapshot.first.empty()) {
+                    const auto &currentRuntime = snapshot.first;
+                    const auto &currentRequest = snapshot.second;
+                    if (currentRuntime != instanceInfo.runtimeid()) {
                         YRLOG_WARN("state delete refused: instance({}) now belongs to "
                                    "runtime({}), retiring chain was runtime({})",
-                                   instanceInfo.instanceid(), current.runtimeid(),
+                                   instanceInfo.instanceid(), currentRuntime,
                                    instanceInfo.runtimeid());
                         return Status(StatusCode::ERR_INSTANCE_BUSY,
                             "state delete refused: incarnation replaced");
@@ -635,7 +639,6 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
                     // SAME runtime but a NEW request generation (the name was
                     // reused within one runtime's lifecycle): the old chain's
                     // state delete must still not fire.
-                    const auto currentRequest = machine->GetRequestID();
                     if (!currentRequest.empty()
                         && !instanceInfo.requestid().empty()
                         && currentRequest != instanceInfo.requestid()) {
