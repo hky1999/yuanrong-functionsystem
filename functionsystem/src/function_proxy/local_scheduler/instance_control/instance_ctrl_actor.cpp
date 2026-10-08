@@ -613,9 +613,27 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
             insCtrlView->OnDelInstance(instanceID, requestID, status.IsOk());
             return status;
         })
-        .Then([instanceID(instanceInfo.instanceid())](const Status &status) {
+        .Then([this, instanceInfo](const Status &status) {
             if (status.IsOk()) {
-                function_proxy::StateHandler::DeleteState(instanceID);
+                // Re-verify the guard BEFORE the state delete: OnDelInstance
+                // refusing an old request generation does NOT stop this
+                // continuation, and StateHandler::DeleteState keys on the
+                // bare instanceID — a same-name replacement between the
+                // DelInstance dispatch and here must not lose its state.
+                const auto machine = instanceControlView_->GetInstance(
+                    instanceInfo.instanceid());
+                if (machine != nullptr) {
+                    const auto &current = machine->GetInstanceInfo();
+                    if (current.runtimeid() != instanceInfo.runtimeid()) {
+                        YRLOG_WARN("state delete refused: instance({}) now belongs to "
+                                   "runtime({}), retiring chain was runtime({})",
+                                   instanceInfo.instanceid(), current.runtimeid(),
+                                   instanceInfo.runtimeid());
+                        return Status(StatusCode::ERR_INSTANCE_BUSY,
+                            "state delete refused: incarnation replaced");
+                    }
+                }
+                function_proxy::StateHandler::DeleteState(instanceInfo.instanceid());
             }
             return status;
         });
