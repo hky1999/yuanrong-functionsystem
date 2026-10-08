@@ -1257,6 +1257,12 @@ public:
         std::string killRequestID;
         std::string instanceRequestID;
         std::string state;
+        // Settled-credential fields: filled when a confirmed retirement
+        // receipt naming the expected identity arrives — the ONLY basis for
+        // an idempotent view-absent close-out retry.
+        std::string retiredSandboxID;
+        std::string retiredResourceGeneration;
+        std::string runtimeID;
     };
     std::unordered_map<std::string, FrontendKillRuntimeEvidence> frontendKillRuntimeEvidence_;
 

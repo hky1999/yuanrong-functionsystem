@@ -306,16 +306,73 @@ TEST_F(KillEntryIdentityFixture, SettledRetryCompletesWithZeroNewDispatch)
     EXPECT_TRUE(first.Get().IsOk()) << first.Get().GetMessage();
     ASSERT_EQ(killRequests.size(), 1u);
 
-    // Settlement removed the allocation from the authoritative view: the
-    // retry now sees an entry-less snapshot and must close idempotently.
+    // Settlement removed the allocation from the authoritative view. The
+    // retry sees an entry-less snapshot; the recorded CONFIRMED receipt
+    // (full identity) is the settled credential, so the retry REPLAYS the
+    // kill carrying that identity — the agent re-confirms idempotently —
+    // and the chain settles AGAIN (durable receipts are idempotent).
     ServeView(MakeUnitWithEntry(MakeElasticInfo("inst-other", "runtime-other")));
+    EXPECT_CALL(*primary_, ApplyPhysicalRetirement(_))
+        .WillOnce(Invoke([this](const resource_view::PhysicalRetirementReceipt &receipt) {
+            settleReceipts.push_back(receipt);
+            auto promise = std::make_shared<litebus::Promise<Status>>();
+            promise->SetValue(Status::OK());
+            return promise->GetFuture();
+        }));
     auto retry = actor_->KillRuntimeWithSnapshotCleanup(
         MakeElasticInfo("inst-settled", "runtime-settled"), false, true, true);
     ASSERT_AWAIT_READY(retry);
     EXPECT_TRUE(retry.Get().IsOk()) << retry.Get().GetMessage();
-    EXPECT_EQ(killRequests.size(), 1u)
-        << "the settled retry must not dispatch a new physical kill";
-    EXPECT_EQ(settleReceipts.size(), 1u);
+    // exactly ONE replay dispatch, carrying the RECORDED identity
+    ASSERT_EQ(killRequests.size(), 2u);
+    EXPECT_EQ(killRequests[1]->expected_sandbox_id(), "sbox-settled");
+    EXPECT_EQ(killRequests[1]->expected_resource_generation(), "gen-settled");
+    EXPECT_EQ(settleReceipts.size(), 2u);
+}
+
+// Root counterexample: NO successful receipt was ever recorded (the first
+// kill never confirmed) + consecutive empty view snapshots => stays BUSY,
+// ZERO dispatch, no cleanup, budget retained.
+TEST_F(KillEntryIdentityFixture, NoRecordedReceiptConsecutiveEmptyViewStaysBusy)
+{
+    // No ApplyPhysicalRetirement expectation: none may be reached.
+    ServeView(MakeUnitWithEntry(MakeElasticInfo("inst-other", "runtime-other")));
+    auto result = actor_->KillRuntimeWithSnapshotCleanup(
+        MakeElasticInfo("inst-ghost2", "runtime-ghost2"), false, true, true);
+    ASSERT_AWAIT_READY(result);
+    EXPECT_TRUE(result.Get().IsError());
+    EXPECT_EQ(killRequests.size(), 0u);
+    EXPECT_EQ(settleReceipts.size(), 0u);
+}
+
+// Root counterexample: a recorded receipt for a DIFFERENT runtime (an old
+// incarnation) must NOT close out the current one — BUSY, zero dispatch.
+TEST_F(KillEntryIdentityFixture, RecordedReceiptForOtherRuntimeStaysBusy)
+{
+    ServeView(MakeUnitWithEntry(
+        MakeViewEntry("inst-mix", "runtime-CURRENT", "sbox-cur", "gen-cur")));
+    EXPECT_CALL(*primary_, ApplyPhysicalRetirement(_))
+        .WillOnce(Invoke([this](const resource_view::PhysicalRetirementReceipt &receipt) {
+            settleReceipts.push_back(receipt);
+            auto promise = std::make_shared<litebus::Promise<Status>>();
+            promise->SetValue(Status::OK());
+            return promise->GetFuture();
+        }));
+    auto first = actor_->KillRuntimeWithSnapshotCleanup(
+        MakeElasticInfo("inst-mix", "runtime-CURRENT"), false, true, true);
+    ASSERT_AWAIT_READY(first);
+    EXPECT_TRUE(first.Get().IsOk());
+
+    // Same instance name now returns as a NEW incarnation.
+    ServeView(MakeUnitWithEntry(
+        MakeViewEntry("inst-mix", "runtime-NEW3", "sbox-NEW3", "gen-NEW3")));
+    auto retry = actor_->KillRuntimeWithSnapshotCleanup(
+        MakeElasticInfo("inst-mix", "runtime-NEW3"), false, true, true);
+    // The new incarnation HAS a view entry with its own identity: the kill
+    // proceeds on the CURRENT identity (never the recorded old one).
+    ASSERT_AWAIT_READY(retry);
+    ASSERT_EQ(killRequests.size(), 2u);
+    EXPECT_EQ(killRequests[1]->expected_sandbox_id(), "sbox-NEW3");
 }
 
 // 3d) Stale first snapshot: absent there, PRESENT on the fresh read (the

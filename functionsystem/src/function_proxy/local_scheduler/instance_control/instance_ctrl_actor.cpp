@@ -1765,33 +1765,38 @@ litebus::Future<Status> InstanceCtrlActor::KillRuntimeWithIdentity(const Instanc
     }
     const auto allocatedIt = current->instances().find(instanceInfo.instanceid());
     if (allocatedIt == current->instances().end()) {
-        // Not in THIS snapshot. A stale snapshot and a settled retirement
-        // look identical, so settle the question with a FRESH authoritative
-        // read — the same verification DeleteInstanceInResourceView uses
-        // ("verify absence instead of issuing a generic delete"). Absence
-        // confirmed on the fresh read = the physical settlement question is
-        // closed for this incarnation (ApplyPhysicalRetirement already
-        // removed the allocation, or it never reached the physical layer
-        // and the view's own guardrail refused any ledger entry): proceed
-        // to the logical cleanup idempotently. Still present = the first
-        // snapshot was stale; hold UNKNOWN so the retry rebinds below (an
-        // old runtime must never touch a same-name new incarnation).
-        return view->GetResourceView().Then(
-            [instanceInfo, view](const std::shared_ptr<resource_view::ResourceUnit> &fresh)
-                -> litebus::Future<Status> {
-                if (fresh != nullptr
-                    && fresh->instances().find(instanceInfo.instanceid()) != fresh->instances().end()) {
-                    YRLOG_WARN("{}|elastic instance({}) reappeared on the fresh read; "
-                               "kill held as UNKNOWN (snapshot was stale; retry rebinds)",
-                               instanceInfo.requestid(), instanceInfo.instanceid());
-                    return Status(StatusCode::ERR_INSTANCE_BUSY,
-                        "elastic instance present on fresh view read; retry with rebinding");
-                }
-                YRLOG_INFO("{}|elastic instance({}) absent from the fresh authoritative "
-                           "read; physical settlement closed, logical cleanup proceeds",
-                           instanceInfo.requestid(), instanceInfo.instanceid());
-                return Status::OK();
-            });
+        // Not in THIS snapshot. Absence alone is NOT a settlement
+        // credential (a stale snapshot, a mid-reconciliation window and a
+        // settled retirement are indistinguishable here). The ONLY
+        // credential that may close this out idempotently is a RECORDED
+        // CONFIRMED receipt naming THIS incarnation's full identity: replay
+        // the kill with that identity so the durable-receipt path on the
+        // agent re-verifies it. No recorded confirmation, or a runtimeid
+        // mismatch, stays BUSY (UNKNOWN, budget retained).
+        const auto evidence = frontendKillRuntimeEvidence_.find(instanceInfo.instanceid());
+        if (evidence != frontendKillRuntimeEvidence_.end()
+            && evidence->second.state == "terminated"
+            && !evidence->second.retiredSandboxID.empty()
+            && !evidence->second.retiredResourceGeneration.empty()
+            && evidence->second.runtimeID == instanceInfo.runtimeid()) {
+            YRLOG_INFO("{}|elastic instance({}) absent from the view but a confirmed "
+                       "receipt for this incarnation was recorded; replaying the durable "
+                       "receipt for idempotent close-out",
+                       instanceInfo.requestid(), instanceInfo.instanceid());
+            return SendKillRequestToAgent(instanceInfo, isRecovering, false,
+                                          evidence->second.retiredSandboxID,
+                                          evidence->second.retiredResourceGeneration)
+                .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::RecordFrontendKillRuntimeResult,
+                                      instanceInfo, _1,
+                                      evidence->second.retiredSandboxID,
+                                      evidence->second.retiredResourceGeneration));
+        }
+        YRLOG_WARN("{}|elastic instance({}) absent from the view snapshot with no recorded "
+                   "confirmed receipt for this incarnation; kill held as UNKNOWN "
+                   "(budget retained)",
+                   instanceInfo.requestid(), instanceInfo.instanceid());
+        return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
+            "elastic instance absent from view without settled evidence"));
     }
     TrustedPhysicalIdentity(allocatedIt->second, &expectedSandboxID, &expectedGeneration);
     // 2) generation binding: the view entry must still belong to THIS
@@ -1880,6 +1885,17 @@ litebus::Future<Status> InstanceCtrlActor::RecordFrontendKillRuntimeResult(
     if (evidence != frontendKillRuntimeEvidence_.end()
         && evidence->second.instanceRequestID == instanceInfo.requestid()) {
         evidence->second.state = "terminated";
+        if (!expectedSandboxID.empty() && !expectedGeneration.empty()
+            && response.physical_retirement_confirmed()
+            && response.retired_sandbox_id() == expectedSandboxID
+            && response.retired_resource_generation() == expectedGeneration) {
+            // Settled credential: this confirmed receipt (full identity
+            // match) is the ONLY basis for a later view-absent retry to
+            // close out idempotently via the durable-receipt replay.
+            evidence->second.retiredSandboxID = expectedSandboxID;
+            evidence->second.retiredResourceGeneration = expectedGeneration;
+            evidence->second.runtimeID = instanceInfo.runtimeid();
+        }
     }
     return Status(static_cast<StatusCode>(response.code()), response.message());
 }
