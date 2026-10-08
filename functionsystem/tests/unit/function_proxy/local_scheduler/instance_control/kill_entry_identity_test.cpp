@@ -1489,10 +1489,10 @@ TEST_F(KillEntryIdentityFixture, RealWindowInPlaceUpdateDuringGatedMachineDelete
 // (with a REAL ApplyPhysicalRetirement, not the mock used here).
 TEST_F(KillEntryIdentityFixture, RealFirstKillEntryThroughExitHandlerRecordsPending)
 {
-    // Install the production exit handler (static wiring) — the actor's
-    // Init is what production runs at startup.
-    actor_->Init();
-
+    // The production exit handler (static wiring) is ALREADY installed for
+    // THIS fixture actor: litebus::Spawn runs Init at startup, which binds
+    // exitHandler_ to the live actor. Calling Init() again here would
+    // double-register the Receive handlers and abort the actor framework.
     auto harness = MakeRealView();
     actor_->BindInstanceControlView(harness.view);
 
