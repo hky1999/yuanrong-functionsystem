@@ -50,6 +50,7 @@
 #include "mocks/mock_instance_state_machine.h"
 #include "mocks/mock_internal_iam.h"
 #include "function_proxy/common/state_handler/state_handler.h"
+#include "state_handler_helper.h"
 #include "mocks/mock_distributed_cache_client.h"
 #include "mocks/mock_resource_view.h"
 #include "utils/future_test_helper.h"
@@ -59,6 +60,7 @@ namespace functionsystem::test {
 using namespace functionsystem::local_scheduler;  // NOLINT
 using namespace resource_view;                    // NOLINT
 using testing::_;
+using testing::Matcher;
 using testing::Invoke;
 using testing::Return;
 
@@ -166,8 +168,7 @@ protected:
         // actual async deletion and its result propagation.
         cacheClient_ = std::make_shared<MockDistributedCacheClient>();
         EXPECT_CALL(*cacheClient_, Init).WillOnce(Return(Status::OK()));
-        stateClient_ = std::make_shared<
-            functionsystem::function_proxy::StateClient>(cacheClient_);
+        stateClient_ = std::make_shared<functionsystem::StateClient>(cacheClient_);
         stateActor_ = std::make_shared<
             functionsystem::function_proxy::StateActor>(stateClient_);
         litebus::Spawn(stateActor_);
@@ -185,7 +186,9 @@ protected:
             litebus::Terminate(stateActor_->GetAID());
             litebus::Await(stateActor_->GetAID());
             stateActor_ = nullptr;
-            functionsystem::function_proxy::StateHandler::BindStateActor(nullptr);
+            // BindStateActor(nullptr) returns early and does NOT clear the
+            // static AID — the established helper does.
+            functionsystem::function_proxy::test::StateHandlerHelper::ClearStateActorHelper();
             stateClient_ = nullptr;
             cacheClient_ = nullptr;
         }
@@ -227,7 +230,7 @@ protected:
     std::vector<resource_view::PhysicalRetirementReceipt> settleReceipts;
     std::shared_ptr<InstanceStateMachine> machineSlot_ = nullptr;
     std::shared_ptr<MockDistributedCacheClient> cacheClient_;
-    std::shared_ptr<functionsystem::function_proxy::StateClient> stateClient_;
+    std::shared_ptr<functionsystem::StateClient> stateClient_;
     std::shared_ptr<functionsystem::function_proxy::StateActor> stateActor_;
 };
 
