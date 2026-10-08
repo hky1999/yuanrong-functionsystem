@@ -252,7 +252,7 @@ TEST(FrontendProxyServiceTest, InvokeTerminalSuccessReturnsDirectResult)
         result->mutable_callresultreq()->set_code(common::ERR_NONE);
         result->mutable_callresultreq()->set_requestid(request->invokereq().requestid());
         result->mutable_callresultreq()->set_instanceid(request->invokereq().instanceid());
-        (void)InvocationHandler::CallResultAdapter(request->invokereq().instanceid(), result);
+        (void)InvocationHandler::CallResultAdapter(grpc::PosixStreamIdentity{ request->invokereq().instanceid(), "", "" }, result);
         auto response = std::make_shared<runtime_rpc::StreamingMessage>();
         response->mutable_invokersp()->set_code(common::ERR_NONE);
         return litebus::Future<SharedStreamMsg>(response);
@@ -284,19 +284,19 @@ TEST(FrontendProxyServiceTest, InvokeStreamForwardsEventsBeforeFinalResult)
         auto event = std::make_shared<runtime_rpc::StreamingMessage>();
         event->mutable_eventreq()->set_requestid(request->invokereq().requestid());
         event->mutable_eventreq()->set_message(std::string(16, '\0') + "first-event");
-        (void)InvocationHandler::EventAdapter("runtime-instance", event);
+        (void)InvocationHandler::EventAdapter(grpc::PosixStreamIdentity{ "runtime-instance", "", "" }, event);
 
         auto eof = std::make_shared<runtime_rpc::StreamingMessage>();
         eof->mutable_eventreq()->set_requestid(request->invokereq().requestid());
         eof->mutable_eventreq()->set_message(std::string(16, '\0') + "yuanrong_event_EOF");
-        (void)InvocationHandler::EventAdapter("runtime-instance", eof);
+        (void)InvocationHandler::EventAdapter(grpc::PosixStreamIdentity{ "runtime-instance", "", "" }, eof);
 
         auto result = std::make_shared<runtime_rpc::StreamingMessage>();
         result->mutable_callresultreq()->set_code(common::ERR_NONE);
         result->mutable_callresultreq()->set_requestid(request->invokereq().requestid());
         result->mutable_callresultreq()->set_instanceid(request->invokereq().instanceid());
         result->mutable_callresultreq()->add_smallobjects()->set_value("final-result");
-        (void)InvocationHandler::CallResultAdapter(request->invokereq().instanceid(), result);
+        (void)InvocationHandler::CallResultAdapter(grpc::PosixStreamIdentity{ request->invokereq().instanceid(), "", "" }, result);
 
         auto response = std::make_shared<runtime_rpc::StreamingMessage>();
         response->mutable_invokersp()->set_code(common::ERR_NONE);
@@ -421,7 +421,7 @@ TEST(FrontendProxyServiceTest, InvokeTerminalSuccessUsesRuntimeSenderWhenResultO
         auto result = std::make_shared<runtime_rpc::StreamingMessage>();
         result->mutable_callresultreq()->set_code(common::ERR_NONE);
         result->mutable_callresultreq()->set_requestid(request->invokereq().requestid());
-        (void)InvocationHandler::CallResultAdapter(request->invokereq().instanceid(), result);
+        (void)InvocationHandler::CallResultAdapter(grpc::PosixStreamIdentity{ request->invokereq().instanceid(), "", "" }, result);
         auto response = std::make_shared<runtime_rpc::StreamingMessage>();
         response->mutable_invokersp()->set_code(common::ERR_NONE);
         return litebus::Future<SharedStreamMsg>(response);
@@ -776,7 +776,7 @@ TEST(FrontendProxyServiceTest, InvokeRuntimeResultFailureIsSeparatedFromProxySta
         result->mutable_callresultreq()->set_code(common::ERR_INSTANCE_EXITED);
         result->mutable_callresultreq()->set_message("runtime exited during invoke");
         result->mutable_callresultreq()->set_requestid(request->invokereq().requestid());
-        (void)InvocationHandler::CallResultAdapter(request->invokereq().instanceid(), result);
+        (void)InvocationHandler::CallResultAdapter(grpc::PosixStreamIdentity{ request->invokereq().instanceid(), "", "" }, result);
         auto response = std::make_shared<runtime_rpc::StreamingMessage>();
         response->mutable_invokersp()->set_code(common::ERR_NONE);
         return litebus::Future<SharedStreamMsg>(response);
