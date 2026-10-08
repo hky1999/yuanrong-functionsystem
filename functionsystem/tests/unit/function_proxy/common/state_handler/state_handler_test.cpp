@@ -327,4 +327,31 @@ TEST_F(StateHandlerTest, DeleteStateFailed)
         EXPECT_EQ(status.Get().StatusCode(), StatusCode::ERR_INNER_SYSTEM_ERROR);
     }
 
+
+// Root-directed 2026-10-08: the stateless-instance compatibility contract
+// lives HERE (store-level idempotent Del), not at the kill-chain layer.
+
+// Absent state deletes are IDEMPOTENT-OK: Del of a key with no stored
+// state succeeds (a stateless instance deletes cleanly).
+TEST_F(StateHandlerTest, DeleteStateAbsentIsIdempotentOk)
+{
+    EXPECT_CALL(*distributedCacheClient_, Del(Matcher<const std::string &>("stateless-instance")))
+        .WillOnce(Return(Status(StatusCode::ERR_STATE_NOT_FOUND, "no such state")));
+    auto del = StateHandler::DeleteState("stateless-instance");
+    // The store answers not-found: the delete is complete (nothing to
+    // remove), so the chain sees OK.
+    ASSERT_AWAIT_READY(del);
+    EXPECT_TRUE(del.Get().IsOk()) << del.Get().ToString();
+}
+
+// A genuine store FAILURE propagates (the kill chain must retry).
+TEST_F(StateHandlerTest, DeleteStateStoreFailurePropagates)
+{
+    EXPECT_CALL(*distributedCacheClient_, Del(Matcher<const std::string &>("failing-instance")))
+        .WillOnce(Return(Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "store down")));
+    auto del = StateHandler::DeleteState("failing-instance");
+    ASSERT_AWAIT_READY(del);
+    EXPECT_TRUE(del.Get().IsError());
+}
+
 }  // namespace functionsystem::function_proxy::test

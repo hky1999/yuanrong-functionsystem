@@ -542,8 +542,11 @@ TEST_F(KillEntryIdentityFixture, MidFlightRuntimeReplacementKeepsNewState)
     gate->SetValue(Status::OK());
 
     ASSERT_AWAIT_READY(result);
-    EXPECT_TRUE(result.Get().IsError())
-        << "the mid-flight replaced incarnation's state must be kept";
+    ASSERT_TRUE(result.Get().IsError());
+    EXPECT_EQ(result.Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY);
+    EXPECT_NE(result.Get().GetMessage().find("incarnation replaced"), std::string::npos)
+        << "reason must name the incarnation guard: "
+        << result.Get().GetMessage();
 }
 
 // Mid-flight replacement, REQUEST-generation change on the SAME runtime.
@@ -571,16 +574,21 @@ TEST_F(KillEntryIdentityFixture, MidFlightRequestReplacementKeepsNewState)
     auto result = actor_->DeleteInstanceInControlView(Status::OK(), oldInfo);
 
     auto newMachine = std::make_shared<MockInstanceStateMachine>("m-req-new");
-    const auto newInfo = MakeElasticInfo("inst-req", "runtime-SAME");
+    auto newInfo = MakeElasticInfo("inst-req", "runtime-SAME");
+    // GENUINELY new request generation: overwrite the requestid.
+    newInfo.set_requestid("req-inst-req-GENERATION-2");
     ON_CALL(*newMachine, GetInstanceInfo()).WillByDefault(Return(newInfo));
-    // Same runtime, NEW request generation.
     ON_CALL(*newMachine, GetRequestID()).WillByDefault(Return(newInfo.requestid()));
     machineSlot_ = newMachine;
     gate->SetValue(Status::OK());
 
     ASSERT_AWAIT_READY(result);
-    EXPECT_TRUE(result.Get().IsError())
-        << "the same-runtime new request generation's state must be kept";
+    ASSERT_TRUE(result.Get().IsError());
+    EXPECT_EQ(result.Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY)
+        << "the refusal must come from the guard, not an unrelated failure";
+    EXPECT_NE(result.Get().GetMessage().find("request generation"), std::string::npos)
+        << "reason must name the request-generation guard: "
+        << result.Get().GetMessage();
 }
 
 }  // namespace functionsystem::test
