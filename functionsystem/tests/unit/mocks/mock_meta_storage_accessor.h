@@ -36,9 +36,11 @@ public:
     // Prefix delete + Txn are what TraefikRegistry's route retire path uses.
     MOCK_METHOD(litebus::Future<Status>, Delete, (const std::string &key, bool isPrefix), (override));
     MOCK_METHOD(litebus::Future<Status>, Revoke, (const std::string &key), (override));
-    MOCK_METHOD(litebus::Option<std::string>, Get, (const std::string &key), (override));
     using TxnKvs = const std::vector<std::pair<std::string, std::string>> &;
     MOCK_METHOD(litebus::Future<Status>, Txn, (TxnKvs), (override));
+    using PrefixKvs = std::vector<std::pair<std::string, std::string>>;
+    MOCK_METHOD(litebus::Option<PrefixKvs>, GetAllWithPrefix, (const std::string &prefix), (override));
+    MOCK_METHOD(litebus::Option<std::string>, Get, (const std::string &key), (override));
 };
 
 }  // namespace functionsystem::test

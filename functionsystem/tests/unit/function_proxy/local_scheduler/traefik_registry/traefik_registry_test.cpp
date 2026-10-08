@@ -205,7 +205,7 @@ protected:
         ON_CALL(*accessor_, Get(_)).WillByDefault(Invoke([this](const std::string &k) {
             bool found = false;
             const std::string value = store_->Get(k, &found);
-            return found ? litebus::Some(value) : litebus::None<std::string>();
+            return found ? litebus::Option<std::string>(litebus::Some(value)) : litebus::Option<std::string>();
         }));
         ON_CALL(*accessor_, GetAllWithPrefix(_)).WillByDefault(Invoke([this](const std::string &prefix) {
             std::vector<std::pair<std::string, std::string>> out;
