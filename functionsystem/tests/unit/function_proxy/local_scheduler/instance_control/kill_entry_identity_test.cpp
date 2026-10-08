@@ -1203,6 +1203,15 @@ TEST_F(KillEntryIdentityFixture, FirstRealKillFrontendSettlesRealBudgetOnce)
         (*resources->mutable_resources())[view_utils::RESOURCE_CPU_NAME].mutable_scalar()->set_value(32000);
         (*resources->mutable_resources())[view_utils::RESOURCE_MEM_NAME].mutable_scalar()->set_value(32768);
     }
+    // Baseline actual-use + FRESH sample timestamps BEFORE AddResourceUnit
+    // (the PhysicalRetirementTest::Setup shape — without them no resize
+    // credit opens on publish).
+    (*unit.mutable_actualuse()->mutable_resources())[view_utils::RESOURCE_CPU_NAME].mutable_scalar()->set_value(1000);
+    (*unit.mutable_actualuse()->mutable_resources())[view_utils::RESOURCE_MEM_NAME].mutable_scalar()->set_value(512);
+    const int64_t setupMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    unit.set_cpu_sample_unix_ms(setupMs);
+    unit.set_memory_sample_unix_ms(setupMs);
     {
         auto added = realView->AddResourceUnit(unit);
         ASSERT_AWAIT_READY(added);
@@ -1227,6 +1236,7 @@ TEST_F(KillEntryIdentityFixture, FirstRealKillFrontendSettlesRealBudgetOnce)
         cpu->set_limit(8000);
         auto addFuture = realView->AddInstances({ { id, { info, nullptr } } });
         ASSERT_AWAIT_READY(addFuture);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));  // freshness
         // Revision-known sample creates the credit (max - current).
         auto report = std::make_shared<ResourceUnit>(unit);
         const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1282,6 +1292,10 @@ TEST_F(KillEntryIdentityFixture, FirstRealKillFrontendSettlesRealBudgetOnce)
     entry.mutable_instancestatus()->set_code(static_cast<int32_t>(InstanceState::RUNNING));
     harnessView->GenerateStateMachine(instA, entry);
 
+    // RUNNING kills gate on the agent's recovery state: the mock must
+    // answer a READY false or the chain parks on an unresolved future.
+    ON_CALL(*functionAgentMgr_, IsFuncAgentRecovering(_))
+        .WillByDefault(Return(litebus::Future<bool>(false)));
     auto observer = std::make_shared<MockObserver>();
     actor_->BindObserver(observer);
 
