@@ -89,9 +89,10 @@ static const uint32_t FRONTEND_KILL_EVIDENCE_TTL_MS = 60000;
 
 // The scheduler's last trusted physical observation of an elastic incarnation:
 // only a sandbox sample bound to the instance's current runtime with a complete
-// sandbox/generation identity may fence a physical retirement. Elastic
-// instances without such a sample never reached the physical layer and keep
-// their legacy lifecycle.
+// sandbox/generation identity may fence a physical retirement. A missing
+// sample is NOT proof the incarnation never reached the physical layer:
+// callers must treat it as an UNKNOWN (retryable, budget retained) and only
+// verified absence may take the identity-less legacy path.
 static bool TrustedPhysicalIdentity(const InstanceInfo &instance, std::string *sandboxID,
                                     std::string *resourceGeneration)
 {
