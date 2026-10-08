@@ -79,7 +79,7 @@
 #include "common/resource_view/memory_elasticity_fence.h"
 #include "common/constants/signal.h"
 #include "mocks/mock_observer.h"
-#include "schedule_plugin/filter/usage_aware_filter.h"
+#include "schedule_plugin/filter/usage_aware_filter/usage_aware_filter.h"
 #include "utils/future_test_helper.h"
 
 namespace functionsystem::test {
