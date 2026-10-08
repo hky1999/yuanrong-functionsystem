@@ -873,4 +873,106 @@ TEST_F(KillEntryIdentityFixture, RealKillFrontendRetryCompletesPendingCleanup)
               static_cast<int>(common::ERR_INSTANCE_NOT_FOUND));
 }
 
+
+// Root-required negatives for the missing-machine retry branch:
+// empty tenant and wrong tenant are REFUSED with zero cache Del and the
+// pending record RETAINED.
+TEST_F(KillEntryIdentityFixture, PendingCleanupTenantGateRefused)
+{
+    auto realView = std::make_shared<InstanceControlView>("node-test", false);
+    auto mockMetaClient = std::make_shared<MockMetaStoreClient>("127.0.0.1:1");
+    realView->BindMetaStoreClient(mockMetaClient);
+    auto mockTxn = std::make_shared<MockTxnTransaction>(litebus::AID());
+    EXPECT_CALL(*mockMetaClient, BeginTransaction).WillRepeatedly(Return(mockTxn));
+    auto deleteOk = std::make_shared<TxnResponse>();
+    deleteOk->success = true;
+    deleteOk->responses.emplace_back(TxnOperationResponse());
+    deleteOk->responses.emplace_back(TxnOperationResponse());
+    EXPECT_CALL(*mockTxn, Commit).WillRepeatedly(
+        Return(litebus::Future<std::shared_ptr<TxnResponse>>(deleteOk)));
+
+    auto info = MakeElasticInfo("inst-tg", "runtime-tg");
+    info.set_functionproxyid("node-test");
+    info.set_function("default/0-test-helloWorld/$latest");
+    info.set_tenantid("tenant-real");
+    realView->GenerateStateMachine(info.instanceid(), info);
+    actor_->BindInstanceControlView(realView);
+
+    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>("inst-tg")))
+        .WillOnce(Return(Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "store down")))
+        .WillOnce(Return(Status::OK()));
+
+    auto first = actor_->DeleteInstanceInControlView(Status::OK(), info);
+    ASSERT_AWAIT_READY(first);
+    ASSERT_TRUE(first.Get().IsError());
+    EXPECT_EQ(realView->GetInstance("inst-tg"), nullptr);
+
+    auto killReq = std::make_shared<KillRequest>();
+    killReq->set_instanceid("inst-tg");
+    killReq->set_requestid("req-tg");
+
+    // EMPTY tenant: refused, zero extra cache Del, record retained.
+    auto empty = actor_->KillFrontend("", killReq);
+    ASSERT_AWAIT_READY(empty);
+    EXPECT_EQ(static_cast<int>(empty.Get().code()),
+              static_cast<int>(common::ERR_AUTHORIZE_FAILED));
+
+    // WRONG tenant: same refusal.
+    auto wrong = actor_->KillFrontend("tenant-other", killReq);
+    ASSERT_AWAIT_READY(wrong);
+    EXPECT_EQ(static_cast<int>(wrong.Get().code()),
+              static_cast<int>(common::ERR_AUTHORIZE_FAILED));
+
+    // Exactly ONE cache Del so far (the failed first attempt): the two
+    // refusals dispatched nothing.
+    // (Mock count check via the sequence expectation below.)
+
+    // The CORRECT tenant converges.
+    auto ok = actor_->KillFrontend("tenant-real", killReq);
+    ASSERT_AWAIT_READY(ok);
+    EXPECT_EQ(static_cast<int>(ok.Get().code()), static_cast<int>(common::ERR_NONE));
+}
+
+// Late old callback must NOT erase a record rewritten during the wait.
+TEST_F(KillEntryIdentityFixture, LateOldCallbackDoesNotEraseRewrittenRecord)
+{
+    // Drive DeleteInstanceInControlView with a gated state delete; rewrite
+    // the pending record mid-flight; resolve: the REWRITTEN record survives.
+    auto realView = std::make_shared<InstanceControlView>("node-test", false);
+    auto mockMetaClient = std::make_shared<MockMetaStoreClient>("127.0.0.1:1");
+    realView->BindMetaStore(mockMetaClient);
+    auto mockTxn = std::make_shared<MockTxnTransaction>(litebus::AID());
+    EXPECT_CALL(*mockMetaClient, BeginTransaction).WillRepeatedly(Return(mockTxn));
+    auto deleteOk = std::make_shared<TxnResponse>();
+    deleteOk->success = true;
+    deleteOk->responses.emplace_back(TxnOperationResponse());
+    deleteOk->responses.emplace_back(TxnOperationResponse());
+    EXPECT_CALL(*mockTxn, Commit).WillRepeatedly(
+        Return(litebus::Future<std::shared_ptr<TxnResponse>>(deleteOk)));
+
+    auto info = MakeElasticInfo("inst-late", "runtime-late");
+    info.set_functionproxyid("node-test");
+    info.set_function("default/0-test-helloWorld/$latest");
+    info.set_tenantid("tenant-late");
+    realView->GenerateStateMachine(info.instanceid(), info);
+    actor_->BindInstanceControlView(realView);
+
+    auto gate = std::make_shared<litebus::Promise<Status>>();
+    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>("inst-late")))
+        .WillOnce(Invoke([gate](const std::string &) { return gate->GetFuture(); }));
+
+    auto result = actor_->DeleteInstanceInControlView(Status::OK(), info);
+
+    // Rewrite the record mid-flight (a NEW generation's failed cleanup).
+    actor_->settledCleanupPending_["inst-late"] = {
+        "tenant-late", "runtime-NEW", "req-CREATION-NEW", "rewritten"};
+    gate->SetValue(Status::OK());
+
+    ASSERT_AWAIT_READY(result);
+    // The REWRITTEN record survives the old chain's callback.
+    const auto &after = actor_->settledCleanupPending_["inst-late"];
+    EXPECT_EQ(after.runtimeID, "runtime-NEW");
+    EXPECT_EQ(after.requestID, "req-CREATION-NEW");
+}
+
 }  // namespace functionsystem::test
