@@ -9213,6 +9213,16 @@ void InstanceCtrlActor::BindSnapCtrl(const std::shared_ptr<SnapCtrl> &snapCtrl)
 
 litebus::Future<Status> InstanceCtrlActor::RegisterTraefikRoute(const InstanceInfo& instanceInfo)
 {
+    return RegisterTraefikRouteAttempt(instanceInfo, 0);
+}
+
+// BOUNDED internal retry: the call sites dispatch this chain fire-and-forget,
+// so "retry by the caller" does not exist — a transiently-unestablished
+// record (revision not yet persisted) is retried HERE until the route is
+// eventually available or the bound is exhausted.
+litebus::Future<Status> InstanceCtrlActor::RegisterTraefikRouteAttempt(const InstanceInfo& instanceInfo,
+                                                                       uint32_t attempt)
+{
     if (!traefikRegistry_) {
         return Status::OK();
     }
@@ -9300,43 +9310,49 @@ litebus::Future<Status> InstanceCtrlActor::RegisterTraefikRoute(const InstanceIn
     YRLOG_INFO("Registering instance to Traefik: instanceID={}, hostIP={}, ports={}",
                instanceInfo.instanceid(), ip, portMappings.size());
 
-    // Identity-bearing registration (#T): route keys and the ownership
-    // marker land in ONE store transaction, conditioned at COMMIT TIME on
-    // the caller's instance record still carrying the exact etcd modify
-    // revision captured here (extensions[INSTANCE_MOD_REVISION] — NOT the
-    // state-machine version, which restarts low for a NEW generation).
-    // Authority comes from the CURRENT machine of the same identity: the
-    // view's machine is the live, observer-synced record holder. A machine
-    // without an established revision fails VISIBLY (the caller retries —
-    // normal creation is never silently left route-less).
+    // Registration authority = ONE machine-lock snapshot (identity info +
+    // persisted etcd mod revision + durable record key). The store-side
+    // conditions (marker value AND record modify-revision) bind to THIS
+    // snapshot, and the CAPTURED request is verified against it: a stale
+    // chain must not borrow the current record's revision (failover keeps
+    // the creation request but the snapshot's runtime is the durable
+    // truth). Nothing here is optional: no machine, no established
+    // revision, or no derivable record key is retried (transient) or fails
+    // visibly (identity mismatch) — never silently skipped.
     const auto machine = instanceControlView_->GetInstance(instanceInfo.instanceid());
-    if (machine == nullptr) {
-        YRLOG_WARN("skip traefik registration for instance({}): no local machine to prove the "
-                   "generation's authority", instanceInfo.instanceid());
-        return Status::OK();
+    const bool machineMissing = (machine == nullptr);
+    const auto authority = machineMissing ? InstanceStateMachine::RegistrationAuthority{}
+                                          : machine->GetRegistrationAuthority(config_.isMetaStoreEnabled);
+    if (!authority.valid) {
+        constexpr uint32_t MAX_TRAEFIK_REGISTER_ATTEMPTS = 5;
+        if (attempt + 1 < MAX_TRAEFIK_REGISTER_ATTEMPTS) {
+            constexpr uint64_t TRAEFIK_REGISTER_RETRY_MS = 1000;
+            YRLOG_INFO("traefik registration for instance({}) deferred (attempt {}): authority not "
+                       "established yet (machine missing={}, revision={}, record key empty={}); retrying",
+                       instanceInfo.instanceid(), attempt, machineMissing, authority.modRevision,
+                       authority.recordKey.empty());
+            return litebus::AsyncAfter(TRAEFIK_REGISTER_RETRY_MS, GetAID(),
+                &InstanceCtrlActor::RegisterTraefikRouteAttempt, instanceInfo, attempt + 1);
+        }
+        YRLOG_ERROR("failed to register traefik route for instance({}): authority never established "
+                    "after {} attempts — the instance will run WITHOUT a route",
+                    instanceInfo.instanceid(), attempt + 1);
+        return Status(StatusCode::ERR_INSTANCE_BUSY, "traefik registration: authority never established");
     }
-    const int64_t modRevision = machine->GetModRevision();
-    if (modRevision <= 0) {
-        YRLOG_ERROR("failed to register traefik route for instance({}): machine carries no "
-                    "persisted etcd mod revision yet; registration will be retried by the caller",
-                    instanceInfo.instanceid());
-        return Status(StatusCode::ERR_INSTANCE_BUSY, "traefik registration: authority revision not established");
-    }
-    // The durable instance-record key (same identity) for the commit-time
-    // still-current check — a retired replay's record is deleted/rewritten
-    // and fails the compare.
-    const std::string recordKey = InstanceStateMachine::GetInstanceRecordKey(
-        instanceInfo, config_.isMetaStoreEnabled);
-    if (recordKey.empty()) {
-        YRLOG_ERROR("failed to register traefik route for instance({}): cannot derive the durable "
-                    "instance-record key", instanceInfo.instanceid());
-        return Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "traefik registration: record key unavailable");
+    if (authority.info.instanceid() != instanceInfo.instanceid()
+        || authority.info.requestid() != instanceInfo.requestid()) {
+        YRLOG_WARN("refused traefik registration for instance({}): captured request ({}|{}) does not "
+                   "match the machine's current identity ({}|{}) — stale chain",
+                   instanceInfo.instanceid(), instanceInfo.instanceid(), instanceInfo.requestid(),
+                   authority.info.instanceid(), authority.info.requestid());
+        return Status(StatusCode::ERR_INSTANCE_BUSY,
+            "traefik registration refused: captured request is not the current generation");
     }
     return traefikRegistry_->RegisterInstance(instanceInfo.instanceid(), ip, portMappings,
-                                              instanceInfo.tenantid(), instanceInfo.runtimeid(),
-                                              instanceInfo.requestid(),
-                                              static_cast<uint64_t>(modRevision),
-                                              recordKey)
+                                              authority.info.tenantid(), authority.info.runtimeid(),
+                                              authority.info.requestid(),
+                                              static_cast<uint64_t>(authority.modRevision),
+                                              authority.recordKey)
         .Then([instanceID = instanceInfo.instanceid()](const Status& status) -> Status {
             if (!status.IsOk()) {
                 YRLOG_ERROR("failed to register traefik route for instance({}): {}",

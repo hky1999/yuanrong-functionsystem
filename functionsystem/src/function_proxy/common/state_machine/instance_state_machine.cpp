@@ -422,6 +422,20 @@ std::string InstanceStateMachine::GetInstanceRecordKey(const resources::Instance
     return instancePutInfo->key;
 }
 
+InstanceStateMachine::RegistrationAuthority InstanceStateMachine::GetRegistrationAuthority(
+    bool isMetaStoreEnable)
+{
+    std::lock_guard<std::recursive_mutex> guard(lock_);
+    RegistrationAuthority authority;
+    RETURN_IF_NULL(instanceContext_, authority);
+    authority.info = instanceContext_->GetInstanceInfo();
+    authority.modRevision = GetModRevision();
+    authority.recordKey = GetInstanceRecordKey(authority.info, isMetaStoreEnable);
+    authority.valid = !authority.recordKey.empty() && authority.modRevision > 0
+        && !authority.info.runtimeid().empty() && !authority.info.requestid().empty();
+    return authority;
+}
+
 litebus::Future<Status> InstanceStateMachine::DelInstance(const std::string &instanceID,
                                                           const std::string &expectedRuntimeID,
                                                           const std::string &expectedRequestID)

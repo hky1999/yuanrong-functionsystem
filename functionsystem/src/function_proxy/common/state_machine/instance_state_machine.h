@@ -96,6 +96,24 @@ public:
     virtual litebus::Future<Status> DelInstance(const std::string &instanceID,
                                                 const std::string &expectedRuntimeID,
                                                 const std::string &expectedRequestID);
+    // The durable instance-record etcd key for this identity ("" on
+    // derivation failure) — PUBLIC: external callers (e.g. the traefik
+    // registration) need a commit-time still-current condition on the
+    // record; must compile WITHOUT -fno-access-control.
+    static std::string GetInstanceRecordKey(const resources::InstanceInfo &instanceInfo, bool isMetaStoreEnable);
+
+    // One-lock registration-authority snapshot: the CURRENT instance info,
+    // its persisted etcd mod revision, and the durable record key — read
+    // under the machine lock so a concurrent in-place update cannot split
+    // identity from revision (a stale caller's captured request is verified
+    // against this snapshot by the caller).
+    struct RegistrationAuthority {
+        resources::InstanceInfo info;
+        int64_t modRevision = 0;
+        std::string recordKey;
+        bool valid = false;
+    };
+    RegistrationAuthority GetRegistrationAuthority(bool isMetaStoreEnable);
     virtual litebus::Future<TransitionResult> TransitionTo(const TransContext &context);
     virtual litebus::Future<Status> ForceDelInstance();
     void BindMetaStoreClient(const std::shared_ptr<MetaStoreClient> &client);
@@ -266,10 +284,6 @@ private:
                                     std::shared_ptr<StoreInfo> &routePutInfo,
                                     const PersistenceType persistence,
                                     std::string &key);
-    // The durable instance-record etcd key for this identity ("" on
-    // derivation failure) — for callers that need a commit-time
-    // still-current condition on the record.
-    static std::string GetInstanceRecordKey(const resources::InstanceInfo &instanceInfo, bool isMetaStoreEnable);
     static Status TransToStoredData(const resources::InstanceInfo &instanceInfo,
                                     std::shared_ptr<StoreInfo> &instancePutInfo,
                                     std::shared_ptr<StoreInfo> &routePutInfo, const PersistenceType persistence,
