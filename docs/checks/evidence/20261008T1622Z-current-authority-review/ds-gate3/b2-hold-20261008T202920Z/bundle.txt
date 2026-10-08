@@ -1,0 +1,181 @@
+{"op":"del_main_init","t_ms":1791491364884,"runid":"20261008T202920Z"}
+{"op":"del_seed_ok","t_ms":1791491364885,"runid":"20261008T202920Z"}
+{"op":"del_armed","t_ms":1791491364885,"runid":"20261008T202920Z"}
+{"op":"old_del_returned","t_ms":1791491373885,"runid":"20261008T202920Z","code":10000,"ms":9000,"msg":"[code: [RPC deadline exceeded], msg: [DeleteAllCopy->[127.0.0.1:31592] RPC timed out [brpc errno=1008 RPC call is timed out] [E1008]Reached timeout=9000ms @127.0.0.1:31592, traceId: 2e67cf73-ff04-4467-a8c6-1a4f2a401a96. RPC Retry detail: [ RPC deadline exceeded * 1 ] with 0 times in 9000 ms.]]"}
+{"op":"del_new_readback","t_ms":1791491373889,"runid":"20261008T202920Z","value":"NEW-20261008T202920Z"}
+{"op":"del_released","t_ms":1791491373889,"runid":"20261008T202920Z"}
+{"op":"del_post_release_settled","t_ms":1791491376889,"runid":"20261008T202920Z"}
+{"op":"del_final_read","t_ms":1791491376892,"runid":"20261008T202920Z","raw_rc":3,"value":"","genuine_miss":true,"deleted_new":true,"new_survives":false}
+WARNING: Ignore register validator for flag minloglevel: validator already registered
+fs: async thread start
+I1008 20:29:24.865441 1034050 main.cpp:66] 1034050,main]node,model]Initialize litebus on network port: 60098
+D1008 20:29:24.865489 1034050 litebus.cpp:260] 1034050,InitializeImp]node,model]litebus starts ......
+D1008 20:29:24.865703 1034050 evloop.cpp:179] 1034050,Init]node,model]set pthread name success, name:HARES_LB_TMer,loopThread:132466467677888
+D1008 20:29:24.865716 1034050 timertools.cpp:229] 1034050,StartWatchTimer]node,model]start watch timer success, id=6
+D1008 20:29:24.865718 1034050 timertools.cpp:262] 1034050,Initialize]node,model]Timer init succ.
+D1008 20:29:24.865721 1034050 litebus.cpp:212] 1034050,SetThreadCount]node,model]litebus thread count is:20
+D1008 20:29:24.865886 1034059 actorthread.cpp:97] 1034050,Run]node,model]set pthread name success, threadID:132466387973824
+D1008 20:29:24.866022 1034060 actorthread.cpp:97] 1034050,Run]node,model]set pthread name success, threadID:132466379581120
+D1008 20:29:24.866169 1034061 actorthread.cpp:97] 1034050,Run]node,model]set pthread name success, threadID:132466371188416
+D1008 20:29:24.866287 1034062 actorthread.cpp:97] 1034050,Run]node,model]set pthread name success, threadID:132466362795712
+D1008 20:29:24.866407 1034063 actorthread.cpp:97] 1034050,Run]node,model]set pthread name success, threadID:132466354403008
+D1008 20:29:24.866533 1034064 actorthread.cpp:97] 1034050,Run]node,model]set pthread name success, threadID:132466346010304
+D1008 20:29:24.866651 1034065 actorthread.cpp:97] 1034050,Run]node,model]set pthread name success, threadID:132466337617600
+D1008 20:29:24.866766 1034066 actorthread.cpp:97] 1034050,Run]node,model]set pthread name success, threadID:132466329224896
+D1008 20:29:24.866887 1034067 actorthread.cpp:97] 1034050,Run]node,model]set pthread name success, threadID:132466320832192
+D1008 20:29:24.867017 1034068 actorthread.cpp:97] 1034050,Run]node,model]set pthread name success, threadID:132466312439488
+D1008 20:29:24.867134 1034069 actorthread.cpp:97] 1034050,Run]node,model]set pthread name success, threadID:132466304046784
+D1008 20:29:24.867258 1034070 actorthread.cpp:97] 1034050,Run]node,model]set pthread name success, threadID:132466295654080
+D1008 20:29:24.867382 1034071 actorthread.cpp:97] 1034050,Run]node,model]set pthread name success, threadID:132466287261376
+D1008 20:29:24.867499 1034072 actorthread.cpp:97] 1034050,Run]node,model]set pthread name success, threadID:132466278868672
+D1008 20:29:24.867623 1034073 actorthread.cpp:97] 1034050,Run]node,model]set pthread name success, threadID:132466270475968
+D1008 20:29:24.867741 1034074 actorthread.cpp:97] 1034050,Run]node,model]set pthread name success, threadID:132466262083264
+D1008 20:29:24.867862 1034075 actorthread.cpp:97] 1034050,Run]node,model]set pthread name success, threadID:132466253690560
+D1008 20:29:24.867996 1034076 actorthread.cpp:97] 1034050,Run]node,model]set pthread name success, threadID:132466245297856
+D1008 20:29:24.868127 1034077 actorthread.cpp:97] 1034050,Run]node,model]set pthread name success, threadID:132466236905152
+D1008 20:29:24.868238 1034078 actorthread.cpp:97] 1034050,Run]node,model]set pthread name success, threadID:132466228512448
+D1008 20:29:24.868392 1034050 evloop.cpp:179] 1034050,Init]node,model]set pthread name success, name:HARES_LB_Htp,loopThread:132466220119744
+D1008 20:29:24.868398 1034050 litebus.cpp:287] 1034050,InitializeImp]node,model]start IOMgr with. Url=udp://127.0.0.1:60098,advertiseUrl=
+D1008 20:29:24.868415 1034050 litebus.cpp:123] 1034050,SetServerIo]node,model]create udp iomgr. Url=udp://127.0.0.1:60098,advertiseUrl=udp://127.0.0.1:60098
+D1008 20:29:24.868667 1034050 evloop.cpp:179] 1034050,Init]node,model]set pthread name success, name:HARES_LB_Udp,loopThread:132466211727040
+D1008 20:29:24.868671 1034050 udpmgr.cpp:425] 1034050,Init]node,model]init succ
+D1008 20:29:24.868699 1034050 udpmgr.cpp:537] 1034050,StartIOServer]node,model]start server succ,url:udp://127.0.0.1:60098,advertiseUrl:udp://127.0.0.1:60098
+D1008 20:29:24.868701 1034050 litebus.cpp:296] 1034050,InitializeImp]node,model]start IOMgr with. Url=tcp://127.0.0.1:60098,advertiseUrl=
+D1008 20:29:24.868733 1034050 litebus.cpp:103] 1034050,SetServerIo]node,model]create tcp iomgr. Url=tcp://127.0.0.1:60098,advertiseUrl=127.0.0.1:60098
+D1008 20:29:24.868742 1034050 http_sysmgr.hpp:40] 1034050,Init]node,model]Initialize Vlog Manager
+D1008 20:29:24.868745 1034050 http_actor.cpp:46] 1034050,AddRoute]node,model]Add endpoint, name:/toggle
+D1008 20:29:24.868920 1034050 evloop.cpp:179] 1034050,Init]node,model]set pthread name success, name:HARES_LB_TcpR,loopThread:132466203334336
+D1008 20:29:24.869097 1034050 evloop.cpp:179] 1034050,Init]node,model]set pthread name success, name:HARES_LB_TcpS,loopThread:132465985320640
+D1008 20:29:24.869103 1034050 tcpmgr.cpp:334] 1034050,Init]node,model]init succ, LITEBUS_HTTPKMSG_ENABLED:false
+D1008 20:29:24.869106 1034050 tcpmgr.cpp:281] 1034050,InitRemoteLinkMaxSetting]node,model]remote link max set:20000
+D1008 20:29:24.869134 1034050 tcpmgr.cpp:377] 1034050,StartIOServer]node,model]start server succ, fd:16,url:tcp://127.0.0.1:60098,advertiseUrl:127.0.0.1:60098
+D1008 20:29:24.869142 1034050 sysmgr_actor.hpp:70] 1034050,Init]node,model]Initiaize SysMgrActor
+D1008 20:29:24.869155 1034050 timertools.cpp:74] 1034050,CreateTimerToLoop]node,model]create run timer fd success, ID:17
+D1008 20:29:24.869161 1034050 litebus.cpp:312] 1034050,InitializeImp]node,model]litebus has started.
+D1008 20:29:24.869163 1034050 litebus.cpp:220] 1034050,LiteBusExit]node,model]trace: enter LiteBusExit()---------
+Note: Google Test filter = DsGate3HoldOrder.OldDelAfterNewWrite
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from DsGate3HoldOrder
+[ RUN      ] DsGate3HoldOrder.OldDelAfterNewWrite
+E1008 20:29:33.885910 1034050 ds_cache_client_impl.cpp:88] 1034050,Del]node,model]DS return failed, error: code: [RPC deadline exceeded], msg: [DeleteAllCopy->[127.0.0.1:31592] RPC timed out [brpc errno=1008 RPC call is timed out] [E1008]Reached timeout=9000ms @127.0.0.1:31592, traceId: 2e67cf73-ff04-4467-a8c6-1a4f2a401a96. RPC Retry detail: [ RPC deadline exceeded * 1 ] with 0 times in 9000 ms.]
+DS_GATE3_ORDER old Del code=10000 ms=9000
+DS_GATE3_ORDER del final raw_rc=3 value= genuine_miss=1 new_survives=0
+[       OK ] DsGate3HoldOrder.OldDelAfterNewWrite (12026 ms)
+[----------] 1 test from DsGate3HoldOrder (12026 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (12026 ms total)
+[  PASSED  ] 1 test.
+I1008 20:29:36.895760 1034050 main.cpp:81] 1034050,main]node,model]Run all gtest cases finished with code 0 in 12026ms
+D1008 20:29:36.897000 1034050 litebus.cpp:225] 1034050,~LiteBusExit]node,model]trace: enter ~LiteBusExit()---------
+D1008 20:29:36.897008 1034050 litebus.cpp:405] 1034050,Finalize]node,model]litebus starts to finalize.
+D1008 20:29:36.897064 1034050 actormgr.cpp:115] 1034050,Finalize]node,model]litebus Actors finish exiting.
+D1008 20:29:36.897067 1034050 actorthread.cpp:51] 1034050,Finalize]node,model]Actor's threads are exiting.
+D1008 20:29:36.897553 1034050 actorthread.cpp:69] 1034050,Finalize]node,model]Actor's threads finish exiting.
+D1008 20:29:36.897557 1034050 actormgr.cpp:118] 1034050,Finalize]node,model]litebus Threads finish exiting.
+D1008 20:29:36.897561 1034050 actormgr.cpp:121] 1034050,Finalize]node,model]finalize IOMgr=tcp
+D1008 20:29:36.897564 1034050 tcpmgr.cpp:989] 1034050,FinishDestruct]node,model]delete send event loop
+D1008 20:29:36.897588 1034082 evloop.cpp:82] 1034050,EventLoopRun]node,model]event epoll loop run end
+D1008 20:29:36.897639 1034050 evloop.cpp:199] 1034050,Finish]node,model]stop loop succ
+D1008 20:29:36.897644 1034050 evloop.cpp:199] 1034050,Finish]node,model]stop loop succ
+D1008 20:29:36.897647 1034050 tcpmgr.cpp:996] 1034050,FinishDestruct]node,model]delete recv event loop
+D1008 20:29:36.897668 1034081 evloop.cpp:82] 1034050,EventLoopRun]node,model]event epoll loop run end
+D1008 20:29:36.897714 1034050 evloop.cpp:199] 1034050,Finish]node,model]stop loop succ
+E1008 20:29:36.897724 1034050 evloop.cpp:348] 1034050,DelFdEvent]node,model]epoll ctl delete fail, fd:16,epollfd:-1,errno:9
+E1008 20:29:36.897726 1034050 tcpmgr.cpp:999] 1034050,FinishDestruct]node,model]failed to delete server fd event
+D1008 20:29:36.897729 1034050 evloop.cpp:199] 1034050,Finish]node,model]stop loop succ
+D1008 20:29:36.897738 1034050 actormgr.cpp:121] 1034050,Finalize]node,model]finalize IOMgr=udp
+D1008 20:29:36.897760 1034080 evloop.cpp:82] 1034050,EventLoopRun]node,model]event epoll loop run end
+D1008 20:29:36.897806 1034050 evloop.cpp:199] 1034050,Finish]node,model]stop loop succ
+E1008 20:29:36.897810 1034050 evloop.cpp:348] 1034050,DelFdEvent]node,model]epoll ctl delete fail, fd:11,epollfd:-1,errno:9
+E1008 20:29:36.897822 1034050 udpmgr.cpp:608] 1034050,FinishDestruct]node,model]failed to delete server fd event
+D1008 20:29:36.897825 1034050 evloop.cpp:199] 1034050,Finish]node,model]stop loop succ
+D1008 20:29:36.897831 1034050 actormgr.cpp:125] 1034050,Finalize]node,model]litebus IOMGRS finish exiting.
+D1008 20:29:36.897834 1034050 timertools.cpp:274] 1034050,Finalize]node,model]Timer Finalize.
+D1008 20:29:36.897864 1034058 evloop.cpp:82] 1034050,EventLoopRun]node,model]event epoll loop run end
+D1008 20:29:36.897909 1034050 evloop.cpp:199] 1034050,Finish]node,model]stop loop succ
+D1008 20:29:36.897912 1034050 evloop.cpp:199] 1034050,Finish]node,model]stop loop succ
+D1008 20:29:36.897918 1034050 timertools.cpp:284] 1034050,Finalize]node,model]run timer close ID=17
+D1008 20:29:36.897921 1034050 timertools.cpp:289] 1034050,Finalize]node,model]watch timer close ID=6
+D1008 20:29:36.897923 1034050 litebus.cpp:409] 1034050,Finalize]node,model]litebus has been finalized.
+D1008 20:29:36.897953 1034079 evloop.cpp:82] 1034050,EventLoopRun]node,model]event epoll loop run end
+D1008 20:29:36.898003 1034050 evloop.cpp:199] 1034050,Finish]node,model]stop loop succ
+D1008 20:29:36.898006 1034050 evloop.cpp:199] 1034050,Finish]node,model]stop loop succ
+fs: async thread end
+0
+{
+ "cmd": [
+  "/root/akernel-bm1/src/fs-work/functionsystem/build-test/bin/instance_ctrl_intent_gate_test",
+  "--gtest_filter=DsGate3HoldOrder.OldDelAfterNewWrite",
+  "--gtest_output=xml:/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/order.xml"
+ ],
+ "env_gates": {
+  "DS_GATE3_CASE_FILTER": "DsGate3HoldOrder.OldDelAfterNewWrite",
+  "DS_GATE3_ORDER": "1",
+  "DS_GATE3_RUNID": "20261008T202920Z",
+  "DS_GATE3_ARM": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/ARM",
+  "DS_GATE3_RELEASE": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE",
+  "DS_GATE3_OUT": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/order.jsonl"
+ },
+ "bin_sha256": "00ebd030093951d40ba6ea80394ab5208411f303dd858ba90078cd5919e40d98",
+ "proxy_pid": 1034018,
+ "proxy_sha256": "5cc1cec00178945d02be698c371715865ab817254508ba2fe01020b3adbbae52",
+ "gate_paths": {
+  "ARM": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/ARM",
+  "RELEASE": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE"
+ },
+ "t": 1791491364.5970411
+}{"e": "listening", "mode": "hold:/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE", "listen": ["127.0.0.1", 31592], "target": ["127.0.0.1", 31594], "arm": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/ARM", "hold_max_s": 120.0, "t": 1791491360.1640768}
+{"e": "conn", "t": 1791491364.8772552}
+{"e": "req_packet", "bytes": 123, "act": "forwarded", "t": 1791491364.879099}
+{"e": "req_packet", "bytes": 175, "act": "forwarded", "t": 1791491364.8801727}
+{"e": "req_packet", "bytes": 158, "act": "forwarded", "t": 1791491364.8815227}
+{"e": "req_packet", "bytes": 123, "act": "forwarded", "t": 1791491364.8830857}
+{"e": "req_packet", "bytes": 175, "act": "forwarded", "t": 1791491364.8833055}
+{"e": "req_packet", "bytes": 158, "act": "forwarded", "t": 1791491364.883863}
+{"e": "req_packet", "bytes": 216, "act": "forwarded", "t": 1791491364.884593}
+{"e": "req_packet", "bytes": 194, "act": "forwarded", "t": 1791491364.8850577}
+{"e": "hold_begin", "key": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE", "t": 1791491364.8854053}
+{"e": "stats", "conns": 1, "total_conns": 1, "req_bytes": 1521, "rsp_bytes": 1131, "drops": 0, "holds": 0, "hold_timeouts": 0, "threads_alive": 2, "t": 1791491365.1644857}
+{"e": "conn", "t": 1791491366.882258}
+{"e": "hold_begin", "key": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE", "t": 1791491366.8826976}
+{"e": "conn", "t": 1791491366.8843844}
+{"e": "hold_begin", "key": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE", "t": 1791491366.8848748}
+{"e": "conn", "t": 1791491369.8824804}
+{"e": "hold_begin", "key": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE", "t": 1791491369.8829355}
+{"e": "conn", "t": 1791491369.8845236}
+{"e": "hold_begin", "key": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE", "t": 1791491369.8848991}
+{"e": "stats", "conns": 5, "total_conns": 5, "req_bytes": 2172, "rsp_bytes": 1131, "drops": 0, "holds": 0, "hold_timeouts": 0, "threads_alive": 10, "t": 1791491370.1646776}
+{"e": "hold_released", "key": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE", "t": 1791491373.8902848}
+{"e": "req_packet", "bytes": 168, "act": "held", "t": 1791491373.8903897}
+{"e": "forward_ok_after_hold", "bytes": 168, "t": 1791491373.8904538}
+{"e": "hold_released", "key": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE", "t": 1791491373.892494}
+{"e": "req_packet", "bytes": 158, "act": "held", "t": 1791491373.8925712}
+{"e": "forward_ok_after_hold", "bytes": 158, "t": 1791491373.8926344}
+{"e": "hold_released", "key": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE", "t": 1791491373.8948922}
+{"e": "req_packet", "bytes": 158, "act": "held", "t": 1791491373.8950071}
+{"e": "forward_ok_after_hold", "bytes": 158, "t": 1791491373.8950717}
+{"e": "hold_released", "key": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE", "t": 1791491373.8978279}
+{"e": "req_packet", "bytes": 199, "act": "held", "t": 1791491373.897891}
+{"e": "forward_ok_after_hold", "bytes": 199, "t": 1791491373.89794}
+{"e": "hold_released", "key": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE", "t": 1791491373.9386258}
+{"e": "req_packet", "bytes": 167, "act": "held", "t": 1791491373.9386914}
+{"e": "forward_ok_after_hold", "bytes": 167, "t": 1791491373.9387543}
+{"e": "stats", "conns": 4, "total_conns": 5, "req_bytes": 2172, "rsp_bytes": 1614, "drops": 0, "holds": 5, "hold_timeouts": 0, "threads_alive": 8, "t": 1791491375.1648636}
+{"e": "hold_begin", "key": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE", "t": 1791491375.8929806}
+{"e": "hold_released", "key": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE", "t": 1791491375.8930995}
+{"e": "req_packet", "bytes": 158, "act": "held", "t": 1791491375.8931267}
+{"e": "forward_ok_after_hold", "bytes": 158, "t": 1791491375.8931704}
+{"e": "hold_begin", "key": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE", "t": 1791491375.895541}
+{"e": "hold_released", "key": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE", "t": 1791491375.8955672}
+{"e": "req_packet", "bytes": 158, "act": "held", "t": 1791491375.8955922}
+{"e": "forward_ok_after_hold", "bytes": 158, "t": 1791491375.8956234}
+{"e": "hold_begin", "key": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE", "t": 1791491376.8944037}
+{"e": "hold_released", "key": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE", "t": 1791491376.8945196}
+{"e": "req_packet", "bytes": 165, "act": "held", "t": 1791491376.8945456}
+{"e": "forward_ok_after_hold", "bytes": 165, "t": 1791491376.894586}
+{"e": "hold_begin", "key": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE", "t": 1791491376.8952036}
+{"e": "hold_released", "key": "/root/akernel-bm1/ds-exp/case/b2-hold-20261008T202920Z/RELEASE", "t": 1791491376.8952284}
+{"e": "req_packet", "bytes": 165, "act": "held", "t": 1791491376.8952444}
+{"e": "forward_ok_after_hold", "bytes": 165, "t": 1791491376.8952746}
