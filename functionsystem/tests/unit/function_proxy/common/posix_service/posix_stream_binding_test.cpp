@@ -222,8 +222,9 @@ TEST_F(PosixStreamBindingFixture, LateOldStreamSaveAfterFailoverZeroWrites)
     ASSERT_AWAIT_READY(rsp);
     EXPECT_NE(rsp.Get().saversp().code(), common::ERR_NONE)
         << "the late old-stream save must be refused";
-    EXPECT_THAT(rsp.Get().saversp().message(),
-                HasSubstr("stream runtime superseded or unknown"));
+    // The refusal reason comes from the MACHINE-level execution guard
+    // (ExecuteStateOpUnderLock) — the authoritative fence.
+    EXPECT_THAT(rsp.Get().saversp().message(), HasSubstr("runtime replaced"));
 }
 
 }  // namespace functionsystem::test
