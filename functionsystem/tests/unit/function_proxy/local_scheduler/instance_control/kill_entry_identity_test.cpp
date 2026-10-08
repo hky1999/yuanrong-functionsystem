@@ -1355,10 +1355,12 @@ TEST_F(KillEntryIdentityFixture, FirstRealKillFrontendSettlesRealBudgetOnce)
     // FIRST-RESPONSE CONTRACT: the physical kill and settlement SUCCEEDED
     // but the state cleanup FAILED — the frontend sees the failure (NOT
     // success, NOT a route/authorize error): the state-deletion reason.
+    // The injected store failure Status("store down") propagates VERBATIM
+    // through OnRetireStateDeleteComplete (del.Get() is returned as-is).
     EXPECT_NE(static_cast<int>(first.Get().code()), static_cast<int>(common::ERR_NONE))
         << "a failed state cleanup must surface, not report success";
-    EXPECT_THAT(first.Get().message(), testing::HasSubstr("state deletion failed"))
-        << "the failure must be the cleanup one, not an unrelated error: "
+    EXPECT_THAT(first.Get().message(), testing::HasSubstr("store down"))
+        << "the failure must be the injected cleanup one, not an unrelated error: "
         << first.Get().message();
 
     // The physical kill really happened with the trusted identity.
