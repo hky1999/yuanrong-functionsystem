@@ -505,4 +505,4 @@ TEST_F(KillEntryIdentityFixture, SameGenerationControlDeleteProceeds)
     EXPECT_TRUE(result.Get().IsOk());
 }
 
-}  // namespace functionsystem::test}  // namespace functionsystem::test
+}  // namespace functionsystem::test
