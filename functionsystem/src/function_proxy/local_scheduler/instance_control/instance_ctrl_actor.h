@@ -1257,14 +1257,25 @@ public:
         std::string killRequestID;
         std::string instanceRequestID;
         std::string state;
-        // Settled-credential fields: filled when a confirmed retirement
-        // receipt naming the expected identity arrives — the ONLY basis for
-        // an idempotent view-absent close-out retry.
-        std::string retiredSandboxID;
-        std::string retiredResourceGeneration;
-        std::string runtimeID;
     };
     std::unordered_map<std::string, FrontendKillRuntimeEvidence> frontendKillRuntimeEvidence_;
+
+    // SETTLED-RETIREMENT CREDENTIAL (separate from the 60s frontend display
+    // table above): written the moment a retirement receipt naming the FULL
+    // expected identity is CONFIRMED (physical layer), before settlement is
+    // even attempted; consulted by every kill entry on a view-absent retry
+    // to replay the same identity through the agent's durable-receipt path.
+    // An in-memory miss (e.g. after a proxy restart) is an UNKNOWN that
+    // keeps the budget — the durable receipt at sandboxd remains the
+    // restart authority and reconciliation owns recovery.
+    struct SettledRetirementCredential {
+        std::string runtimeID;
+        std::string sandboxID;
+        std::string resourceGeneration;
+        std::string confirmingRequestID;
+    };
+    std::unordered_map<std::string, SettledRetirementCredential>
+        settledRetirementCredentials_;
 
     void ResolveFrontendKillCleanupProbe(
         const std::string &requestID, const std::string &instanceID,

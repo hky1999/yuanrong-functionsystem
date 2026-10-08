@@ -1773,23 +1773,22 @@ litebus::Future<Status> InstanceCtrlActor::KillRuntimeWithIdentity(const Instanc
         // the kill with that identity so the durable-receipt path on the
         // agent re-verifies it. No recorded confirmation, or a runtimeid
         // mismatch, stays BUSY (UNKNOWN, budget retained).
-        const auto evidence = frontendKillRuntimeEvidence_.find(instanceInfo.instanceid());
-        if (evidence != frontendKillRuntimeEvidence_.end()
-            && evidence->second.state == "terminated"
-            && !evidence->second.retiredSandboxID.empty()
-            && !evidence->second.retiredResourceGeneration.empty()
-            && evidence->second.runtimeID == instanceInfo.runtimeid()) {
-            YRLOG_INFO("{}|elastic instance({}) absent from the view but a confirmed "
-                       "receipt for this incarnation was recorded; replaying the durable "
-                       "receipt for idempotent close-out",
+        const auto credential = settledRetirementCredentials_.find(instanceInfo.instanceid());
+        if (credential != settledRetirementCredentials_.end()
+            && credential->second.runtimeID == instanceInfo.runtimeid()
+            && !credential->second.sandboxID.empty()
+            && !credential->second.resourceGeneration.empty()) {
+            YRLOG_INFO("{}|elastic instance({}) absent from the view but a physically "
+                       "confirmed receipt for this incarnation was recorded; replaying "
+                       "the durable receipt for idempotent close-out",
                        instanceInfo.requestid(), instanceInfo.instanceid());
             return SendKillRequestToAgent(instanceInfo, isRecovering, false,
-                                          evidence->second.retiredSandboxID,
-                                          evidence->second.retiredResourceGeneration)
+                                          credential->second.sandboxID,
+                                          credential->second.resourceGeneration)
                 .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::RecordFrontendKillRuntimeResult,
                                       instanceInfo, _1,
-                                      evidence->second.retiredSandboxID,
-                                      evidence->second.retiredResourceGeneration));
+                                      credential->second.sandboxID,
+                                      credential->second.resourceGeneration));
         }
         YRLOG_WARN("{}|elastic instance({}) absent from the view snapshot with no recorded "
                    "confirmed receipt for this incarnation; kill held as UNKNOWN "
@@ -1873,6 +1872,15 @@ litebus::Future<Status> InstanceCtrlActor::RecordFrontendKillRuntimeResult(
         receipt.runtimeID = instanceInfo.runtimeid();
         receipt.sandboxID = expectedSandboxID;
         receipt.resourceGeneration = expectedGeneration;
+        // PHYSICAL CONFIRMATION with a full identity match: record the
+        // settled credential NOW — before settlement is attempted — so a
+        // later control-cleanup failure can retry through the durable
+        // receipt. (Settlement success/failure is a separate concern; the
+        // credential only asserts the PHYSICAL layer confirmed this exact
+        // incarnation.)
+        settledRetirementCredentials_[instanceInfo.instanceid()] =
+            {instanceInfo.runtimeid(), expectedSandboxID, expectedGeneration,
+             response.requestid()};
         ASSERT_IF_NULL(resourceViewMgr_);
         auto view = resourceViewMgr_->GetInf(resource_view::GetResourceType(instanceInfo));
         ASSERT_IF_NULL(view);
@@ -1885,17 +1893,6 @@ litebus::Future<Status> InstanceCtrlActor::RecordFrontendKillRuntimeResult(
     if (evidence != frontendKillRuntimeEvidence_.end()
         && evidence->second.instanceRequestID == instanceInfo.requestid()) {
         evidence->second.state = "terminated";
-        if (!expectedSandboxID.empty() && !expectedGeneration.empty()
-            && response.physical_retirement_confirmed()
-            && response.retired_sandbox_id() == expectedSandboxID
-            && response.retired_resource_generation() == expectedGeneration) {
-            // Settled credential: this confirmed receipt (full identity
-            // match) is the ONLY basis for a later view-absent retry to
-            // close out idempotently via the durable-receipt replay.
-            evidence->second.retiredSandboxID = expectedSandboxID;
-            evidence->second.retiredResourceGeneration = expectedGeneration;
-            evidence->second.runtimeID = instanceInfo.runtimeid();
-        }
     }
     return Status(static_cast<StatusCode>(response.code()), response.message());
 }
