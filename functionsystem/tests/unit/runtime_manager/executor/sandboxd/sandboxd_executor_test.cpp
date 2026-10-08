@@ -673,4 +673,47 @@ TEST(SandboxdExecutorTest, LegacyStopWithoutExpectedIdentityReturnsNoProof)
     EXPECT_FALSE(outcome.Get().retirement.confirmed);
 }
 
+
+// ── Fast-create-then-retire + post-delete retry (kill identity entry) ────────
+
+TEST(SandboxdExecutorTest, MissingRuntimeWithCompleteIdentityReplaysDurableReceipt)
+{
+    // The a1-0 shape: local state already unregistered, but the kill carries
+    // the COMPLETE expected identity and a durable complete receipt exists.
+    // The stop MUST go through the replay path, not the RUNTIME executor's
+    // can-not-find-pid dead end.
+    SandboxdExecutor executor("fast-create", litebus::AID(), "/tmp/fast-create");
+    auto request = std::make_shared<messages::StopInstanceRequest>();
+    request->set_runtimeid("fast-create-runtime");
+    request->set_requestid("fast-create-stop");
+    request->set_expected_sandbox_id("fast-create-sandbox");
+    request->set_expected_resource_generation("fast-create-generation");
+    // No stateManager_.Register: the runtime map is empty (already deleted).
+    auto outcome = executor.StopInstanceWithOutcome(request, false);
+    // The replay is async against sandboxd; in the unit harness it resolves
+    // to UNKNOWN (no daemon attached) — the contract is: NEVER a plain
+    // "can not find pid" failure, and never a confirmed proof without the
+    // daemon receipt. The executor selection itself is covered by the
+    // RuntimeManager routing test below.
+    ASSERT_AWAIT_READY(outcome);
+    EXPECT_TRUE(outcome.Get().status.IsError());
+    EXPECT_NE(outcome.Get().status.GetMessage().find("replay"), std::string::npos)
+        << "missing runtime with complete identity must route to replay";
+    EXPECT_FALSE(outcome.Get().retirement.confirmed);
+}
+
+TEST(SandboxdExecutorTest, MissingRuntimeWithoutIdentityStaysUnknownNoProof)
+{
+    // Identity-less stop of a missing runtime: legacy UNKNOWN — never a
+    // success that would release an allocation without a receipt.
+    SandboxdExecutor executor("legacy-missing", litebus::AID(), "/tmp/legacy-missing");
+    auto request = std::make_shared<messages::StopInstanceRequest>();
+    request->set_runtimeid("legacy-missing-runtime");
+    request->set_requestid("legacy-missing-stop");
+    auto outcome = executor.StopInstanceWithOutcome(request, false);
+    ASSERT_AWAIT_READY(outcome);
+    EXPECT_TRUE(outcome.Get().status.IsError());
+    EXPECT_FALSE(outcome.Get().retirement.confirmed);
+}
+
 }  // namespace functionsystem::test

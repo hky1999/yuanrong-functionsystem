@@ -1764,10 +1764,21 @@ litebus::Future<Status> InstanceCtrlActor::KillRuntimeWithIdentity(const Instanc
             "resource view read failed for elastic instance kill"));
     }
     const auto allocatedIt = current->instances().find(instanceInfo.instanceid());
-    const bool allocated = allocatedIt != current->instances().end();
-    if (allocated) {
-        TrustedPhysicalIdentity(allocatedIt->second, &expectedSandboxID, &expectedGeneration);
+    if (allocatedIt == current->instances().end()) {
+        // The instance is not in the CURRENT view snapshot. That is NOT
+        // verified physical absence: a settled-but-unreported retirement, a
+        // stale snapshot or a mid-reconciliation window all look the same
+        // here. An identity-less kill could delete a live runtime with no
+        // receipt — hold as a retryable UNKNOWN and let reconciliation or
+        // an explicitly verified-absence path (with its own evidence)
+        // resolve it.
+        YRLOG_WARN("{}|elastic instance({}) absent from the current view snapshot; "
+                   "kill held as UNKNOWN (budget retained, absence unverified)",
+                   instanceInfo.requestid(), instanceInfo.instanceid());
+        return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
+            "elastic instance absent from view snapshot; absence unverified"));
     }
+    TrustedPhysicalIdentity(allocatedIt->second, &expectedSandboxID, &expectedGeneration);
     // An ALLOCATED elastic instance without a trusted physical sample must
     // never degrade to an identity-less kill: that could delete the
     // physical runtime while carrying no receipt, leaving the allocation

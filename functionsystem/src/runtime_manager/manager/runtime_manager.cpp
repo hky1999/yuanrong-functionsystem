@@ -464,7 +464,7 @@ void RuntimeManager::StopInstance(const litebus::AID &from, std::string && /* na
         YRLOG_ERROR("{}|{}|stop runtime({}) refused: one-sided expected physical identity",
                     request->traceid(), request->requestid(), request->runtimeid());
         messages::StopInstanceResponse response;
-        response->set_requestid(request->requestid());
+        response.set_requestid(request->requestid());
         response.set_runtimeid(request->runtimeid());
         response->set_code(static_cast<int32_t>(RUNTIME_MANAGER_PARAMS_INVALID));
         response->set_message("stop requires both expected sandbox and generation or neither");
