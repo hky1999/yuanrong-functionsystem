@@ -506,4 +506,81 @@ TEST_F(KillEntryIdentityFixture, SameGenerationControlDeleteProceeds)
     EXPECT_TRUE(result.Get().IsOk());
 }
 
+
+// Mid-flight replacement, RUNTIME change: guard passes on the OLD machine,
+// DelInstance is HELD on a gate promise, the machine is replaced with a
+// NEW runtime, then the gate resolves — the tail guard must refuse the
+// state delete of the new incarnation.
+TEST_F(KillEntryIdentityFixture, MidFlightRuntimeReplacementKeepsNewState)
+{
+    auto controlView = std::make_shared<MockInstanceControlView>("node-test");
+    auto oldMachine = std::make_shared<MockInstanceStateMachine>("m-old");
+    const auto oldInfo = MakeElasticInfo("inst-mid", "runtime-OLD");
+    ON_CALL(*oldMachine, GetInstanceInfo()).WillByDefault(Return(oldInfo));
+    ON_CALL(*oldMachine, GetRequestID()).WillByDefault(Return(oldInfo.requestid()));
+
+    auto gate = std::make_shared<litebus::Promise<Status>>();
+    machineSlot_ = nullptr;
+    ON_CALL(*controlView, GetInstance("inst-mid"))
+        .WillByDefault(Invoke([this, oldMachine](const std::string &) {
+            return machineSlot_ ? machineSlot_ : oldMachine;
+        }));
+    ON_CALL(*controlView, DelInstance("inst-mid"))
+        .WillByDefault(Invoke([gate](const std::string &) {
+            return gate->GetFuture();
+        }));
+    EXPECT_CALL(*controlView, DelInstance("inst-mid")).Times(1);
+    actor_->BindInstanceControlView(controlView);
+
+    auto result = actor_->DeleteInstanceInControlView(Status::OK(), oldInfo);
+
+    auto newMachine = std::make_shared<MockInstanceStateMachine>("m-new");
+    const auto newInfo = MakeElasticInfo("inst-mid", "runtime-NEW");
+    ON_CALL(*newMachine, GetInstanceInfo()).WillByDefault(Return(newInfo));
+    ON_CALL(*newMachine, GetRequestID()).WillByDefault(Return(newInfo.requestid()));
+    machineSlot_ = newMachine;
+    gate->SetValue(Status::OK());
+
+    ASSERT_AWAIT_READY(result);
+    EXPECT_TRUE(result.Get().IsError())
+        << "the mid-flight replaced incarnation's state must be kept";
+}
+
+// Mid-flight replacement, REQUEST-generation change on the SAME runtime.
+TEST_F(KillEntryIdentityFixture, MidFlightRequestReplacementKeepsNewState)
+{
+    auto controlView = std::make_shared<MockInstanceControlView>("node-test");
+    auto oldMachine = std::make_shared<MockInstanceStateMachine>("m-req-old");
+    const auto oldInfo = MakeElasticInfo("inst-req", "runtime-SAME");
+    ON_CALL(*oldMachine, GetInstanceInfo()).WillByDefault(Return(oldInfo));
+    ON_CALL(*oldMachine, GetRequestID()).WillByDefault(Return(oldInfo.requestid()));
+
+    auto gate = std::make_shared<litebus::Promise<Status>>();
+    machineSlot_ = nullptr;
+    ON_CALL(*controlView, GetInstance("inst-req"))
+        .WillByDefault(Invoke([this, oldMachine](const std::string &) {
+            return machineSlot_ ? machineSlot_ : oldMachine;
+        }));
+    ON_CALL(*controlView, DelInstance("inst-req"))
+        .WillByDefault(Invoke([gate](const std::string &) {
+            return gate->GetFuture();
+        }));
+    EXPECT_CALL(*controlView, DelInstance("inst-req")).Times(1);
+    actor_->BindInstanceControlView(controlView);
+
+    auto result = actor_->DeleteInstanceInControlView(Status::OK(), oldInfo);
+
+    auto newMachine = std::make_shared<MockInstanceStateMachine>("m-req-new");
+    const auto newInfo = MakeElasticInfo("inst-req", "runtime-SAME");
+    ON_CALL(*newMachine, GetInstanceInfo()).WillByDefault(Return(newInfo));
+    // Same runtime, NEW request generation.
+    ON_CALL(*newMachine, GetRequestID()).WillByDefault(Return(newInfo.requestid()));
+    machineSlot_ = newMachine;
+    gate->SetValue(Status::OK());
+
+    ASSERT_AWAIT_READY(result);
+    EXPECT_TRUE(result.Get().IsError())
+        << "the same-runtime new request generation's state must be kept";
+}
+
 }  // namespace functionsystem::test

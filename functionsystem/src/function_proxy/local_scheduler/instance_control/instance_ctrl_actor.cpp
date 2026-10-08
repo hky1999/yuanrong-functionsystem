@@ -613,7 +613,7 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
             insCtrlView->OnDelInstance(instanceID, requestID, status.IsOk());
             return status;
         })
-        .Then([this, instanceInfo](const Status &status) {
+        .Then([this, instanceInfo](const Status &status) -> litebus::Future<Status> {
             if (status.IsOk()) {
                 // Re-verify the guard BEFORE the state delete: OnDelInstance
                 // refusing an old request generation does NOT stop this
@@ -647,21 +647,21 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
                             "state delete refused: request generation replaced");
                     }
                 }
-                // The async state deletion RESULT is propagated: a bound
-                // actor's failure fails the chain (retry contract); the
-                // unbound case is a stateless instance and stays OK.
+                // The async state deletion RESULT is propagated verbatim:
+                // any failure (including an unbound actor — production
+                // binds it in CommonDriver::BindStateActor, so unbound is
+                // an error, NOT a stateless license) fails the chain so
+                // the caller retries; stateless compatibility is the
+                // store-level idempotent Del of absent state.
                 auto delState = function_proxy::StateHandler::DeleteState(
                     instanceInfo.instanceid());
                 auto promise = std::make_shared<litebus::Promise<Status>>();
                 delState.OnComplete([promise](const litebus::Future<Status> &f) {
-                    promise->SetValue(f.IsError()
-                        ? Status(StatusCode::ERR_INNER_SYSTEM_ERROR,
-                                 "state deletion failed")
-                        : f.Get());
+                    promise->SetValue(f.IsError() ? f.GetError() : f.Get());
                 });
                 return promise->GetFuture();
             }
-            return status;
+            return litebus::Future<Status>(status);
         });
 }
 
