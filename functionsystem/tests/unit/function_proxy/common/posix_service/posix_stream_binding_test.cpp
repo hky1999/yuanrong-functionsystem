@@ -98,6 +98,9 @@ protected:
     void TearDown() override
     {
         client_ = nullptr;
+        // The service keeps a STATIC ready-client registry: clear this
+        // instance so later fixtures/other suites start clean.
+        PosixService::DeleteClient("inst-stream");
         if (server_) { server_->Shutdown(); }
         if (stateActor_ != nullptr) {
             litebus::Terminate(stateActor_->GetAID());
