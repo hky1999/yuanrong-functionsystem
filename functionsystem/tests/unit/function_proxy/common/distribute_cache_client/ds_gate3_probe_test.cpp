@@ -184,7 +184,7 @@ TEST(DsGate3Probe, PhaseARealSetGetDelPositiveControl)
         std::string after;
         const auto rawMiss = rawVerifier.Get(key, after);
         const auto rawRc = static_cast<int>(rawMiss.GetCode());
-        const bool genuineMiss = (rawRc == static_cast<int>(datasystem::Status::K_NOT_FOUND));
+        const bool genuineMiss = (rawRc == static_cast<int>(datasystem::StatusCode::K_NOT_FOUND));
         jsonl << "{\"op\":\"miss_check\",\"i\":" << i
               << ",\"control_ok\":true,\"raw_rc\":" << rawRc
               << ",\"raw_msg\":\"" << rawMiss.GetMsg() << "\""
