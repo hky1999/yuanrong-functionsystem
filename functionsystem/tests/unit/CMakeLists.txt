@@ -211,6 +211,7 @@ add_executable(instance_ctrl_intent_gate_test
         function_proxy/local_scheduler/instance_control/instance_ctrl_intent_gate_test.cpp
         function_proxy/common/state_handler/state_handler_test.cpp
         function_proxy/common/distribute_cache_client/ds_gate3_probe_test.cpp
+        function_proxy/common/distribute_cache_client/ds_gate3_hold_order_test.cpp
         function_proxy/common/posix_service/posix_stream_binding_test.cpp
         function_proxy/local_scheduler/instance_control/kill_entry_identity_test.cpp
         function_proxy/local_scheduler/instance_control/restore_ceiling_behavior_test.cpp

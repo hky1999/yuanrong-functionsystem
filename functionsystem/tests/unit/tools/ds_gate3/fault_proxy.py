@@ -80,6 +80,7 @@ def hold_if_armed(direction):
     if direction != "req" or mode.split(":")[0] != "hold" or not armed():
         return "forwarded"
     dfile = mode.split(":")[1] if len(mode.split(":")) > 1 else ""
+    ev(e="hold_begin", key=dfile)
     deadline = time.time() + HOLD_MAX_S
     while not os.path.exists(dfile):
         if time.time() >= deadline:
@@ -151,9 +152,9 @@ def handle(c):
                     bump("req_bytes", len(data))
                     verdict = hold_if_armed("req")
                     ev(e="req_packet", bytes=len(data), act=verdict)
-                    if verdict in ("held", "held_timeout"):
-                        ev(e="forwarded_after_hold", bytes=len(data))
                     u.sendall(data)
+                    if verdict in ("held", "held_timeout"):
+                        ev(e="forward_ok_after_hold", bytes=len(data))
             except OSError:
                 pass
             finally:
