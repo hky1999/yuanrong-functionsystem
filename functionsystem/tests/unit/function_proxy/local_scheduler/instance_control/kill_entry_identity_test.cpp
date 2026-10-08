@@ -50,6 +50,7 @@
 #include "mocks/mock_instance_state_machine.h"
 #include "mocks/mock_internal_iam.h"
 #include "function_proxy/common/state_handler/state_handler.h"
+#include "common/state_machine/instance_control_view.h"
 #include "function_proxy/common/state_handler/state_handler_helper.h"
 #include "mocks/mock_distributed_cache_client.h"
 #include "mocks/mock_resource_view.h"
@@ -751,6 +752,47 @@ TEST_F(KillEntryIdentityFixture, FullChainMidFlightRequestZeroCacheDel)
     ASSERT_AWAIT_READY(result);
     ASSERT_TRUE(result.Get().IsError());
     EXPECT_EQ(result.Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY);
+}
+
+
+// ── Real-view convergence: state-delete failure AFTER machine removal ────────
+// The production shape the root asked for: OnDelInstance already erased the
+// machine/request index (DeleteInstanceInControlView .Then chain), then the
+// state delete fails. The RETRY from the real entry must converge: the real
+// view's DelInstance is idempotent for a missing machine (OK), GetInstance
+// answers nullptr so the guard skips to the state delete, which succeeds on
+// attempt two.
+TEST_F(KillEntryIdentityFixture, StateDeleteFailureAfterMachineRemovalRetryConverges)
+{
+    // REAL control view (not the mock): GenerateStateMachine inserts a real
+    // machine; DelInstance on it runs the real path (PublishDeleteToLocalObserver
+    // + OnDelInstance erase). -fno-access-control lets us drive insertion
+    // directly without a full ScheduleRequest handshake.
+    auto realView = std::make_shared<InstanceControlView>("node-test", false);
+    const auto info = MakeElasticInfo("inst-conv", "runtime-conv");
+    realView->GenerateStateMachine(info.instanceid(), info);
+    ASSERT_NE(realView->GetInstance("inst-conv"), nullptr);
+    actor_->BindInstanceControlView(realView);
+
+    // First attempt: machine delete succeeds (real path erases the machine
+    // + request index via OnDelInstance), state delete FAILS once.
+    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>("inst-conv")))
+        .WillOnce(Return(Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "store down")))
+        .WillOnce(Return(Status::OK()));
+
+    auto first = actor_->DeleteInstanceInControlView(Status::OK(), info);
+    ASSERT_AWAIT_READY(first);
+    ASSERT_TRUE(first.Get().IsError());
+    EXPECT_EQ(first.Get().StatusCode(), StatusCode::ERR_INNER_SYSTEM_ERROR);
+    // The machine is ALREADY gone (OnDelInstance ran before the failure).
+    EXPECT_EQ(realView->GetInstance("inst-conv"), nullptr);
+
+    // Retry from the SAME real entry converges: missing machine => DelInstance
+    // OK (idempotent), guard's GetInstance nullptr => straight to state delete.
+    auto retry = actor_->DeleteInstanceInControlView(Status::OK(), info);
+    ASSERT_AWAIT_READY(retry);
+    EXPECT_TRUE(retry.Get().IsOk()) << retry.Get().ToString();
+    EXPECT_EQ(realView->GetInstance("inst-conv"), nullptr);
 }
 
 }  // namespace functionsystem::test
