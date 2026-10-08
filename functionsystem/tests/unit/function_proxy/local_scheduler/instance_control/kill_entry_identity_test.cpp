@@ -1411,7 +1411,16 @@ TEST_F(KillEntryIdentityFixture, RegisterTraefikRouteRealEntryFourStates)
     info.set_function("default/0-test-helloWorld/$latest");
     (*info.mutable_extensions())[PORT_FORWARD_KEY] = ext;
     harness.view->GenerateStateMachine("inst-rt4", info);
-    harness.view->GetInstance("inst-rt4")->SetModRevision(10);
+    // Seed the DURABLE instance record (same identity) into the fake store
+    // and stamp the machine with its revision — the register's commit-time
+    // record-mod-revision condition reads exactly this.
+    const std::string recordKey = InstanceStateMachine::GetInstanceRecordKey(info, false);
+    ASSERT_FALSE(recordKey.empty());
+    auto bumpRecord = [&](const std::string &runtime) {
+        store->Put(recordKey, "instance-record|" + runtime + "|req-inst-rt4");
+        harness.view->GetInstance("inst-rt4")->SetModRevision(store->modRevision[recordKey]);
+    };
+    bumpRecord("runtime-R1");
 
     // 1) Normal create: route + marker land under the SNAPSHOT identity.
     auto created = actor_->RegisterTraefikRoute(info);
@@ -1430,7 +1439,7 @@ TEST_F(KillEntryIdentityFixture, RegisterTraefikRouteRealEntryFourStates)
     swapped.set_function("default/0-test-helloWorld/$latest");
     (*swapped.mutable_extensions())[PORT_FORWARD_KEY] = ext;
     harness.view->Update("inst-rt4", swapped, true);
-    harness.view->GetInstance("inst-rt4")->SetModRevision(11);
+    bumpRecord("runtime-R2");
     auto staleRegister = actor_->RegisterTraefikRoute(info);  // OLD payload
     ASSERT_AWAIT_READY(staleRegister);
     EXPECT_TRUE(staleRegister.Get().IsOk()) << staleRegister.Get().GetMessage();
@@ -1443,19 +1452,19 @@ TEST_F(KillEntryIdentityFixture, RegisterTraefikRouteRealEntryFourStates)
     auto migrated = swapped;
     migrated.set_functionproxyid("other-proxy");
     harness.view->Update("inst-rt4", migrated, true);
-    harness.view->GetInstance("inst-rt4")->SetModRevision(12);
+    bumpRecord("runtime-R2");
     auto foreignOwner = actor_->RegisterTraefikRoute(swapped);
     ASSERT_AWAIT_READY(foreignOwner);
     EXPECT_TRUE(foreignOwner.Get().IsError());
     EXPECT_EQ(store->kv.count("yr/tk/http/routers/inst-rt4-p8080/rule"), 1u);
     harness.view->Update("inst-rt4", swapped, true);  // restore ownership
-    harness.view->GetInstance("inst-rt4")->SetModRevision(13);
+    bumpRecord("runtime-R2");
 
     // 4) Valid empty refresh: the old key list is atomically cleaned.
     auto zeroed = swapped;
     (*zeroed.mutable_extensions())[PORT_FORWARD_KEY] = "[]";
     harness.view->Update("inst-rt4", zeroed, true);
-    harness.view->GetInstance("inst-rt4")->SetModRevision(14);
+    bumpRecord("runtime-R2");
     auto emptied = actor_->RegisterTraefikRoute(zeroed);
     ASSERT_AWAIT_READY(emptied);
     EXPECT_TRUE(emptied.Get().IsOk()) << emptied.Get().GetMessage();
@@ -1466,7 +1475,7 @@ TEST_F(KillEntryIdentityFixture, RegisterTraefikRouteRealEntryFourStates)
     // 5) Corrupt payload (mixed valid + invalid entries): nothing changes.
     (*swapped.mutable_extensions())[PORT_FORWARD_KEY] = R"(["http:40002:8081","garbage"])";
     harness.view->Update("inst-rt4", swapped, true);
-    harness.view->GetInstance("inst-rt4")->SetModRevision(15);
+    bumpRecord("runtime-R2");
     const auto before = store->kv;
     auto corrupt = actor_->RegisterTraefikRoute(swapped);
     ASSERT_AWAIT_READY(corrupt);
