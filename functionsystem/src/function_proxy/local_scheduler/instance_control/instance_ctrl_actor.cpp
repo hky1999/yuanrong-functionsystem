@@ -666,6 +666,7 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
                             // THIS incarnation so a later real kill retry
                             // can finish it.
                             settledCleanupPending_[instanceInfo.instanceid()] = {
+                                instanceInfo.tenantid(),
                                 instanceInfo.runtimeid(),
                                 instanceInfo.requestid(),
                                 del.IsError() ? "future-error" : del.Get().RawMessage()};
@@ -1058,33 +1059,49 @@ litebus::Future<KillResponse> InstanceCtrlActor::KillFrontend(const std::string 
     // prove deletion. Do not relay through master here: the legacy relay folds
     // ERR_INSTANCE_NOT_FOUND into success for shutdown signals, which would turn
     // a stale route into a false idempotent-delete acknowledgement.
+    if (tenantID.empty()) {
+        return GenKillResponse(common::ERR_AUTHORIZE_FAILED,
+                               "frontend proxy kill tenant does not match instance tenant");
+    }
     if (stateMachine == nullptr) {
-        // A settled-cleanup-pending record for THIS incarnation means the
-        // machine was already deleted and only the state cleanup failed:
-        // the retry completes it (bounded to the recorded runtime+request;
-        // never applies to a same-name replacement). No record = the
-        // genuine NOT_FOUND unchanged.
+        // A settled-cleanup-pending record means the machine was already
+        // deleted and only the state cleanup failed. The retry path is
+        // STILL tenant-gated and identity-bound: the recorded tenant must
+        // match, and if a NEW machine has reappeared under the name the
+        // old cleanup refuses (the record's creation identity is not this
+        // machine's). No record = the genuine NOT_FOUND unchanged.
         const auto pending = settledCleanupPending_.find(killReq->instanceid());
-        if (pending != settledCleanupPending_.end()) {
+        if (pending != settledCleanupPending_.end() && tenantID == pending->second.tenantID) {
+            // A same-name replacement during the wait: refuse the OLD
+            // cleanup — the state key may now belong to the new machine.
+            if (instanceControlView_->GetInstance(killReq->instanceid()) != nullptr) {
+                return GenKillResponse(common::ERR_INSTANCE_BUSY,
+                    "instance name reused; stale cleanup refused");
+            }
+            const auto recorded = pending->second;
             auto promise = std::make_shared<litebus::Promise<KillResponse>>();
             function_proxy::StateHandler::DeleteState(killReq->instanceid())
-                .OnComplete([this, promise, killReq, pending](const litebus::Future<Status> &del) {
+                .OnComplete([this, promise, killReq, recorded](const litebus::Future<Status> &del) {
                     if (del.IsError() || del.Get().IsError()) {
                         promise->SetValue(GenKillResponse(
                             common::ERR_INNER_SYSTEM_ERROR, "state deletion failed"));
                         return;
                     }
-                    settledCleanupPending_.erase(killReq->instanceid());
+                    // Erase ONLY if the entry is STILL the one we captured:
+                    // a record rewritten during the wait survives.
+                    const auto now = settledCleanupPending_.find(killReq->instanceid());
+                    if (now != settledCleanupPending_.end()
+                        && now->second.runtimeID == recorded.runtimeID
+                        && now->second.requestID == recorded.requestID
+                        && now->second.tenantID == recorded.tenantID) {
+                        settledCleanupPending_.erase(now);
+                    }
                     promise->SetValue(GenKillResponse(common::ERR_NONE, ""));
                 });
             return promise->GetFuture();
         }
         return GenKillResponse(common::ERR_INSTANCE_NOT_FOUND,
                                "frontend proxy is not the owning proxy for this instance");
-    }
-    if (tenantID.empty()) {
-        return GenKillResponse(common::ERR_AUTHORIZE_FAILED,
-                               "frontend proxy kill tenant does not match instance tenant");
     }
     const auto instanceInfo = stateMachine->GetInstanceInfo();
     if (tenantID != instanceInfo.tenantid()) {

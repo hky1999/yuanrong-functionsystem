@@ -1286,8 +1286,9 @@ public:
     // the record is bound to runtime+request and NEVER applies to a
     // same-name replacement.
     struct SettledCleanupPending {
-        std::string runtimeID;
-        std::string requestID;
+        std::string tenantID;      // authorized at record time; retried kills re-verify
+        std::string runtimeID;     // creation-time incarnation identity
+        std::string requestID;     // the CREATION request generation (not the kill requestID)
         std::string reason;
     };
     std::unordered_map<std::string, SettledCleanupPending>
