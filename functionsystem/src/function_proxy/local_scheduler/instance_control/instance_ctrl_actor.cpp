@@ -9355,6 +9355,11 @@ litebus::Future<Status> InstanceCtrlActor::RegisterTraefikRouteAttempt(const Ins
                             invalidEntries++;
                             YRLOG_WARN("Failed to parse port mapping from '{}': {}", mapping, e.what());
                         }
+                    } else if (parts.size() != legacyFormatParts && parts.size() != newFormatParts) {
+                        // Neither "proto:host:sandbox" nor legacy "host:sandbox".
+                        invalidEntries++;
+                        YRLOG_WARN("Port mapping entry '{}' has {} parts (expected 2 or 3)",
+                                   mapping, parts.size());
                     } else if (parts.size() == legacyFormatParts) {
                         // Legacy format: "hostPort:containerPort" (2 parts, no protocol)
                         // Default to "http" for backward compatibility (HTTP backend)
