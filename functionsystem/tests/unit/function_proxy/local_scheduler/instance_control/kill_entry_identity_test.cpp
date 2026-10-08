@@ -1296,6 +1296,15 @@ TEST_F(KillEntryIdentityFixture, FirstRealKillFrontendSettlesRealBudgetOnce)
     // answer a READY false or the chain parks on an unresolved future.
     ON_CALL(*functionAgentMgr_, IsFuncAgentRecovering(_))
         .WillByDefault(Return(litebus::Future<bool>(false)));
+    // The graceful-shutdown probe: a READY null client (no client → skip)
+    // — an unresolved default would park the exit handler.
+    ON_CALL(*clientManager_, GetControlInterfacePosixClient(_))
+        .WillByDefault(Invoke([](const std::string &) {
+            auto promise = std::make_shared<
+                litebus::Promise<std::shared_ptr<ControlInterfacePosixClient>>>();
+            promise->SetValue(std::shared_ptr<ControlInterfacePosixClient>{});
+            return promise->GetFuture();
+        }));
     auto observer = std::make_shared<MockObserver>();
     actor_->BindObserver(observer);
 
