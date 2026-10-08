@@ -158,6 +158,12 @@ protected:
 
     void TearDown() override
     {
+        // Finalize iterates executorMap_ and calls the non-virtual
+        // ExecutorProxy::Stop, which dereferences the wrapped executor —
+        // the probes hold none. Remove them BEFORE terminating the manager
+        // so teardown only walks proxies with real lifecycles.
+        manager_->executorMap_.erase(EXECUTOR_TYPE::SANDBOXD);
+        manager_->executorMap_.erase(EXECUTOR_TYPE::RUNTIME);
         litebus::Terminate(testActor_->GetAID());
         litebus::Await(testActor_->GetAID());
         litebus::Terminate(manager_->GetAID());
