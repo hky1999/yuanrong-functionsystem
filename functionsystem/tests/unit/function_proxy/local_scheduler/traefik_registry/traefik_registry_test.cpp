@@ -233,7 +233,7 @@ protected:
             { local_scheduler::TraefikRegistry::PortMapping{ sandboxPort, 40000 + sandboxPort, "http" } },
             tenant, runtime, req, revision, recordKey);
         // The fake commits synchronously; WaitFor bounds the check.
-        EXPECT_EQ(future.WaitFor(5000), Status::OK());
+        EXPECT_TRUE(future.WaitFor(5000).IsOK());
         return std::make_shared<Status>(future.Get());
     }
 
