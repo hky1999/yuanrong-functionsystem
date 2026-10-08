@@ -32,6 +32,7 @@
 
 #include "common/posix_service/posix_service.h"
 #include "common/rpc/stream/posix/control_client.h"
+#include "function_proxy/common/iam/internal_iam.h"
 #include "function_proxy/common/state_handler/state_handler.h"
 #include "function_proxy/common/state_handler/state_handler_helper.h"
 #include "function_proxy/common/state_machine/instance_control_view.h"
@@ -69,6 +70,10 @@ protected:
         // Real gRPC server hosting the production PosixService with the
         // production resolver shape (view snapshot; runtime must match).
         posixService_ = std::make_shared<PosixService>();
+        InternalIAM::Param iamParam;
+        iamParam.isEnableIAM = false;
+        internalIAM_ = std::make_shared<InternalIAM>(iamParam);
+        posixService_->BindInternalIAM(internalIAM_);
         posixService_->SetStreamIdentityResolver(
             [view = view_](const std::string &instanceID, const std::string &runtimeID) {
                 const auto snapshot = view->GetIncarnationSnapshot(instanceID);
@@ -125,6 +130,7 @@ protected:
     std::shared_ptr<StateActor> stateActor_;
     std::shared_ptr<InstanceControlView> view_;
     std::shared_ptr<PosixService> posixService_;
+    std::shared_ptr<InternalIAM> internalIAM_;
     ::grpc::ServerBuilder builder_;
     std::unique_ptr<::grpc::Server> server_;
     std::shared_ptr<functionsystem::grpc::ControlClient> client_;
