@@ -1765,18 +1765,33 @@ litebus::Future<Status> InstanceCtrlActor::KillRuntimeWithIdentity(const Instanc
     }
     const auto allocatedIt = current->instances().find(instanceInfo.instanceid());
     if (allocatedIt == current->instances().end()) {
-        // The instance is not in the CURRENT view snapshot. That is NOT
-        // verified physical absence: a settled-but-unreported retirement, a
-        // stale snapshot or a mid-reconciliation window all look the same
-        // here. An identity-less kill could delete a live runtime with no
-        // receipt — hold as a retryable UNKNOWN and let reconciliation or
-        // an explicitly verified-absence path (with its own evidence)
-        // resolve it.
-        YRLOG_WARN("{}|elastic instance({}) absent from the current view snapshot; "
-                   "kill held as UNKNOWN (budget retained, absence unverified)",
-                   instanceInfo.requestid(), instanceInfo.instanceid());
-        return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
-            "elastic instance absent from view snapshot; absence unverified"));
+        // Not in THIS snapshot. A stale snapshot and a settled retirement
+        // look identical, so settle the question with a FRESH authoritative
+        // read — the same verification DeleteInstanceInResourceView uses
+        // ("verify absence instead of issuing a generic delete"). Absence
+        // confirmed on the fresh read = the physical settlement question is
+        // closed for this incarnation (ApplyPhysicalRetirement already
+        // removed the allocation, or it never reached the physical layer
+        // and the view's own guardrail refused any ledger entry): proceed
+        // to the logical cleanup idempotently. Still present = the first
+        // snapshot was stale; hold UNKNOWN so the retry rebinds below (an
+        // old runtime must never touch a same-name new incarnation).
+        return view->GetResourceView().Then(
+            [instanceInfo, view](const std::shared_ptr<resource_view::ResourceUnit> &fresh)
+                -> litebus::Future<Status> {
+                if (fresh != nullptr
+                    && fresh->instances().find(instanceInfo.instanceid()) != fresh->instances().end()) {
+                    YRLOG_WARN("{}|elastic instance({}) reappeared on the fresh read; "
+                               "kill held as UNKNOWN (snapshot was stale; retry rebinds)",
+                               instanceInfo.requestid(), instanceInfo.instanceid());
+                    return Status(StatusCode::ERR_INSTANCE_BUSY,
+                        "elastic instance present on fresh view read; retry with rebinding");
+                }
+                YRLOG_INFO("{}|elastic instance({}) absent from the fresh authoritative "
+                           "read; physical settlement closed, logical cleanup proceeds",
+                           instanceInfo.requestid(), instanceInfo.instanceid());
+                return Status::OK();
+            });
     }
     TrustedPhysicalIdentity(allocatedIt->second, &expectedSandboxID, &expectedGeneration);
     // 2) generation binding: the view entry must still belong to THIS
