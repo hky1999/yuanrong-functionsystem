@@ -564,35 +564,47 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
     // A failed physical/control step is not successful retirement. Keep identity
     // and state available for reconciliation instead of publishing deletion.
     if (status.IsError()) { return status; }
-    if (traefikRegistry_) {
-        (void)litebus::Async(GetAID(), &InstanceCtrlActor::UnregisterTraefikRoute, instanceInfo.instanceid());
-    }
-    // Delete the reserved resource information corresponding to the group instance bound to the local node.
-    if (!instanceInfo.groupid().empty() && groupInstanceClear_ != nullptr) {
-        groupInstanceClear_(instanceInfo);
-    }
-    // LATE-RECEIPT IDENTITY GUARD (before ANY control-delete side effect):
-    // the control-view machine under this instanceID may now belong to a
+    // LATE-RECEIPT IDENTITY GUARD — FIRST, before route unregistration,
+    // group cleanup, DelInstance or StateHandler::DeleteState: the
+    // control-view machine under this instanceID may now belong to a
     // SAME-NAME NEW incarnation (old kill dispatched, instance replaced,
     // old receipt arriving late). DelInstance deletes the CURRENT machine's
     // metadata by its latest version and OnDelInstance's requestID check
-    // only runs AFTER that — too late. Compare the machine's incarnation
-    // identity HERE: a runtimeid/request mismatch means this delete belongs
-    // to the old incarnation and must not touch the new one's state.
+    // only runs AFTER that — too late. Both the incarnation runtime AND
+    // the request generation must match; any mismatch refuses every
+    // side effect below.
     {
         const auto machine = instanceControlView_->GetInstance(instanceInfo.instanceid());
         if (machine != nullptr) {
             const auto &current = machine->GetInstanceInfo();
             if (current.runtimeid() != instanceInfo.runtimeid()) {
                 YRLOG_WARN("{}|control-view instance({}) now belongs to runtime({}) but the "
-                           "retiring incarnation was runtime({}); refusing to delete the new "
-                           "incarnation's state (late-receipt guard)",
+                           "retiring incarnation was runtime({}); refusing ALL control-delete "
+                           "side effects (late-receipt guard)",
                            instanceInfo.requestid(), instanceInfo.instanceid(),
                            current.runtimeid(), instanceInfo.runtimeid());
                 return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
                     "control view bound to another incarnation; late delete refused"));
             }
+            const auto currentRequest = machine->GetRequestID();
+            if (!currentRequest.empty() && !instanceInfo.requestid().empty()
+                && currentRequest != instanceInfo.requestid()) {
+                YRLOG_WARN("{}|control-view instance({}) request generation is ({}) but the "
+                           "retiring chain carried ({}); refusing ALL control-delete side "
+                           "effects (late-receipt guard)",
+                           instanceInfo.requestid(), instanceInfo.instanceid(),
+                           currentRequest, instanceInfo.requestid());
+                return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
+                    "control view request generation mismatch; late delete refused"));
+            }
         }
+    }
+    if (traefikRegistry_) {
+        (void)litebus::Async(GetAID(), &InstanceCtrlActor::UnregisterTraefikRoute, instanceInfo.instanceid());
+    }
+    // Delete the reserved resource information corresponding to the group instance bound to the local node.
+    if (!instanceInfo.groupid().empty() && groupInstanceClear_ != nullptr) {
+        groupInstanceClear_(instanceInfo);
     }
     YRLOG_INFO("{}|delete instance({}) in control view", instanceInfo.requestid(), instanceInfo.instanceid());
     return instanceControlView_->DelInstance(instanceInfo.instanceid())
