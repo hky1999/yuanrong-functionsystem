@@ -42,6 +42,16 @@ public:
     virtual litebus::Future<GeneratedInstanceStates> NewInstance(
         const std::shared_ptr<messages::ScheduleRequest> &scheduleReq);
     virtual litebus::Future<Status> DelInstance(const std::string &instanceID);
+    // Ownership-fenced delete: the machine is selected AND its incarnation
+    // identity (runtimeid + requestID) verified inside the SAME lock; a
+    // same-name replacement (old chain arriving late) is refused with
+    // ERR_INSTANCE_BUSY and untouched. Empty expected fields = unchecked
+    // legacy behavior (the two-arg overload).
+    litebus::Future<Status> DelInstance(const std::string &instanceID,
+                                        const std::string &expectedRuntimeID,
+                                        const std::string &expectedRequestID);
+    // Lock-held identity snapshot for post-delete re-verification (#2).
+    std::pair<std::string, std::string> GetIncarnationSnapshot(const std::string &instanceID);
     void OnDelInstance(const std::string &instanceID, const std::string &requestID, bool needErase);
 
     void Update(const std::string &instanceID, const resources::InstanceInfo &instanceInfo,

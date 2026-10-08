@@ -288,6 +288,60 @@ litebus::Future<Status> InstanceControlView::DelInstance(const std::string &inst
     });
 }
 
+litebus::Future<Status> InstanceControlView::DelInstance(const std::string &instanceID,
+    const std::string &expectedRuntimeID, const std::string &expectedRequestID)
+{
+    if (expectedRuntimeID.empty() && expectedRequestID.empty()) {
+        return DelInstance(instanceID);  // legacy unchecked path
+    }
+    std::shared_ptr<InstanceStateMachine> machine;
+    {
+        // Machine selection AND incarnation verification under the SAME lock:
+        // a same-name replacement cannot slip between the check and the
+        // dispatch (ObserverActor::NotifyUpdateInstance updates listeners
+        // directly, so the actor's own serialization cannot exclude this).
+        std::lock_guard<std::mutex> guard(lock_);
+        auto it = machines_.find(instanceID);
+        if (it == machines_.end()) {
+            YRLOG_WARN("instance control view failed to find instance({})", instanceID);
+            return litebus::Future<Status>(Status::OK());
+        }
+        machine = it->second;
+        const auto &current = machine->GetInstanceInfo();
+        if (!expectedRuntimeID.empty() && current.runtimeid() != expectedRuntimeID) {
+            YRLOG_WARN("ownership-fenced delete refused: instance({}) now runtime({}), "
+                       "retiring chain runtime({})", instanceID, current.runtimeid(), expectedRuntimeID);
+            return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
+                "control view bound to another incarnation"));
+        }
+        const auto currentRequest = machine->GetRequestID();
+        if (!expectedRequestID.empty() && !currentRequest.empty()
+            && currentRequest != expectedRequestID) {
+            YRLOG_WARN("ownership-fenced delete refused: instance({}) request({}), "
+                       "retiring chain request({})", instanceID, currentRequest, expectedRequestID);
+            return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
+                "control view request generation mismatch"));
+        }
+    }
+    return machine->DelInstance(instanceID).Then([machine, instanceID](const Status &status) -> Status {
+        if (status.IsOk()) {
+            machine->PublishDeleteToLocalObserver(instanceID);
+        }
+        return status;
+    });
+}
+
+std::pair<std::string, std::string> InstanceControlView::GetIncarnationSnapshot(
+    const std::string &instanceID)
+{
+    std::lock_guard<std::mutex> guard(lock_);
+    auto it = machines_.find(instanceID);
+    if (it == machines_.end()) {
+        return {"", ""};
+    }
+    return {it->second->GetInstanceInfo().runtimeid(), it->second->GetRequestID()};
+}
+
 void InstanceControlView::OnDelInstance(const std::string &instanceID, const std::string &requestID, bool needErase)
 {
     std::lock_guard<std::mutex> guard(lock_);
