@@ -339,7 +339,7 @@ TEST_F(StateHandlerTest, DeleteStateFailed)
 // forwarding): the kill chain sees the store's own verdict.
 TEST_F(StateHandlerTest, DeleteStateForwardsStoreNotFoundVerbatim)
 {
-    const Status notFound(StatusCode::ERR_DB_ERROR, "key not exist");
+    const Status notFound(StatusCode::ERR_ETCD_OPERATION_ERROR, "key not exist");
     EXPECT_CALL(*distributedCacheClient_, Del(Matcher<const std::string &>("absent-instance")))
         .WillOnce(Return(notFound));
     auto del = StateHandler::DeleteState("absent-instance");
