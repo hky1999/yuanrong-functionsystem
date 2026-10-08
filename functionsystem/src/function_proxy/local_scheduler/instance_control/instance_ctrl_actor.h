@@ -1273,6 +1273,7 @@ public:
         std::string sandboxID;
         std::string resourceGeneration;
         std::string confirmingRequestID;
+        std::string unitID;
     };
     std::unordered_map<std::string, SettledRetirementCredential>
         settledRetirementCredentials_;

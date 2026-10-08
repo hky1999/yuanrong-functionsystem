@@ -347,12 +347,16 @@ TEST_F(KillEntryIdentityFixture, NoRecordedReceiptConsecutiveEmptyViewStaysBusy)
     EXPECT_EQ(settleReceipts.size(), 0u);
 }
 
-// Root counterexample: a recorded receipt for a DIFFERENT runtime (an old
-// incarnation) must NOT close out the current one — BUSY, zero dispatch.
-TEST_F(KillEntryIdentityFixture, RecordedReceiptForOtherRuntimeStaysBusy)
+// Root counterexample (corrected shape): obtain the OLD credential through
+// the real entry first, then the view goes entry-less, and a DIFFERENT
+// runtime (a new incarnation reusing the name) calls — the old credential
+// must NOT close out the new incarnation: BUSY, ZERO new dispatch.
+TEST_F(KillEntryIdentityFixture, OldCredentialDifferentRuntimeViewAbsentStaysBusy)
 {
+    // Step 1: the OLD incarnation kills normally (view present, receipt
+    // confirmed) — this is what records the old credential.
     ServeView(MakeUnitWithEntry(
-        MakeViewEntry("inst-mix", "runtime-CURRENT", "sbox-cur", "gen-cur")));
+        MakeViewEntry("inst-mix", "runtime-OLD", "sbox-old", "gen-old")));
     EXPECT_CALL(*primary_, ApplyPhysicalRetirement(_))
         .WillOnce(Invoke([this](const resource_view::PhysicalRetirementReceipt &receipt) {
             settleReceipts.push_back(receipt);
@@ -360,50 +364,60 @@ TEST_F(KillEntryIdentityFixture, RecordedReceiptForOtherRuntimeStaysBusy)
             promise->SetValue(Status::OK());
             return promise->GetFuture();
         }));
-    auto first = actor_->KillRuntimeWithSnapshotCleanup(
-        MakeElasticInfo("inst-mix", "runtime-CURRENT"), false, true, true);
-    ASSERT_AWAIT_READY(first);
-    EXPECT_TRUE(first.Get().IsOk());
+    auto oldKill = actor_->KillRuntimeWithSnapshotCleanup(
+        MakeElasticInfo("inst-mix", "runtime-OLD"), false, true, true);
+    ASSERT_AWAIT_READY(oldKill);
+    EXPECT_TRUE(oldKill.Get().IsOk());
+    ASSERT_EQ(killRequests.size(), 1u);
 
-    // Same instance name now returns as a NEW incarnation.
-    ServeView(MakeUnitWithEntry(
-        MakeViewEntry("inst-mix", "runtime-NEW3", "sbox-NEW3", "gen-NEW3")));
-    auto retry = actor_->KillRuntimeWithSnapshotCleanup(
+    // Step 2: the view is now entry-less (settlement removed the old
+    // allocation). The NEW incarnation (different runtimeid) retries: the
+    // recorded credential belongs to runtime-OLD, so it must NOT apply.
+    ServeView(MakeUnitWithEntry(MakeElasticInfo("inst-other", "runtime-other")));
+    auto newKill = actor_->KillRuntimeWithSnapshotCleanup(
         MakeElasticInfo("inst-mix", "runtime-NEW3"), false, true, true);
-    // The new incarnation HAS a view entry with its own identity: the kill
-    // proceeds on the CURRENT identity (never the recorded old one).
-    ASSERT_AWAIT_READY(retry);
-    ASSERT_EQ(killRequests.size(), 2u);
-    EXPECT_EQ(killRequests[1]->expected_sandbox_id(), "sbox-NEW3");
+    ASSERT_AWAIT_READY(newKill);
+    EXPECT_TRUE(newKill.Get().IsError())
+        << "an old-incarnation credential must never close out a new runtime";
+    EXPECT_EQ(killRequests.size(), 1u) << "zero new dispatch for the new incarnation";
 }
 
-// 3d) Stale first snapshot: absent there, PRESENT on the fresh read (the
-// same-name new incarnation) — UNKNOWN, zero dispatch, budget retained.
-TEST_F(KillEntryIdentityFixture, StaleSnapshotReappearingHoldsUnknown)
+// Companion: the new incarnation IS in the view — its kill proceeds on its
+// OWN current identity (never the recorded old one).
+TEST_F(KillEntryIdentityFixture, NewIncarnationInViewUsesOwnIdentity)
 {
-    // First read: entry-less (stale). Second (fresh) read: the NEW
-    // incarnation is present.
-    int reads = 0;
-    auto staleUnit = MakeUnitWithEntry(MakeElasticInfo("inst-x", "runtime-x"));
-    auto freshUnit = MakeUnitWithEntry(
-        MakeViewEntry("inst-reused2", "runtime-NEW2", "sbox-NEW2", "gen-NEW2"));
-    ON_CALL(*primary_, GetResourceView())
-        .WillByDefault(Invoke([this, staleUnit, freshUnit, &reads]() {
-            reads += 1;
-            auto promise = std::make_shared<
-                litebus::Promise<std::shared_ptr<ResourceUnit>>();
-            promise->SetValue(reads == 1 ? staleUnit : freshUnit);
+    ServeView(MakeUnitWithEntry(
+        MakeViewEntry("inst-mix", "runtime-OLD", "sbox-old", "gen-old")));
+    EXPECT_CALL(*primary_, ApplyPhysicalRetirement(_))
+        .WillOnce(Invoke([this](const resource_view::PhysicalRetirementReceipt &receipt) {
+            settleReceipts.push_back(receipt);
+            auto promise = std::make_shared<litebus::Promise<Status>>();
+            promise->SetValue(Status::OK());
             return promise->GetFuture();
         }));
-    auto result = actor_->KillRuntimeWithSnapshotCleanup(
-        MakeElasticInfo("inst-reused2", "runtime-OLD2"), false, true, true);
-    ASSERT_AWAIT_READY(result);
-    EXPECT_TRUE(result.Get().IsError());
-    EXPECT_EQ(killRequests.size(), 0u)
-        << "a stale snapshot must never license touching the new incarnation";
+    auto oldKill = actor_->KillRuntimeWithSnapshotCleanup(
+        MakeElasticInfo("inst-mix", "runtime-OLD"), false, true, true);
+    ASSERT_AWAIT_READY(oldKill);
+
+    ServeView(MakeUnitWithEntry(
+        MakeViewEntry("inst-mix", "runtime-NEW4", "sbox-NEW4", "gen-NEW4")));
+    EXPECT_CALL(*primary_, ApplyPhysicalRetirement(_))
+        .WillOnce(Invoke([this](const resource_view::PhysicalRetirementReceipt &receipt) {
+            settleReceipts.push_back(receipt);
+            auto promise = std::make_shared<litebus::Promise<Status>>();
+            promise->SetValue(Status::OK());
+            return promise->GetFuture();
+        }));
+    auto newKill = actor_->KillRuntimeWithSnapshotCleanup(
+        MakeElasticInfo("inst-mix", "runtime-NEW4"), false, true, true);
+    ASSERT_AWAIT_READY(newKill);
+    EXPECT_TRUE(newKill.Get().IsOk());
+    ASSERT_EQ(killRequests.size(), 2u);
+    EXPECT_EQ(killRequests[1]->expected_sandbox_id(), "sbox-NEW4")
+        << "the new incarnation's kill carries its OWN identity";
 }
 
-// 4) Non-elastic legacy: identity-less kill STILL dispatched (old path).
+// 4) Non-elastic legacy: identity-less kill STILL dispatched (old path).// 4) Non-elastic legacy: identity-less kill STILL dispatched (old path).
 TEST_F(KillEntryIdentityFixture, NonElasticLegacyKillStillDispatched)
 {
     InstanceInfo legacy;

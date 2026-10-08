@@ -1797,8 +1797,11 @@ litebus::Future<Status> InstanceCtrlActor::KillRuntimeWithIdentity(const Instanc
         // agent re-verifies it. No recorded confirmation, or a runtimeid
         // mismatch, stays BUSY (UNKNOWN, budget retained).
         const auto credential = settledRetirementCredentials_.find(instanceInfo.instanceid());
+        const std::string callerUnit = instanceInfo.unitid().empty()
+            ? instanceInfo.functionagentid() : instanceInfo.unitid();
         if (credential != settledRetirementCredentials_.end()
             && credential->second.runtimeID == instanceInfo.runtimeid()
+            && credential->second.unitID == callerUnit
             && !credential->second.sandboxID.empty()
             && !credential->second.resourceGeneration.empty()) {
             YRLOG_INFO("{}|elastic instance({}) absent from the view but a physically "
@@ -1903,7 +1906,7 @@ litebus::Future<Status> InstanceCtrlActor::RecordFrontendKillRuntimeResult(
         // incarnation.)
         settledRetirementCredentials_[instanceInfo.instanceid()] =
             {instanceInfo.runtimeid(), expectedSandboxID, expectedGeneration,
-             response.requestid()};
+             response.requestid(), receipt.unitID};
         ASSERT_IF_NULL(resourceViewMgr_);
         auto view = resourceViewMgr_->GetInf(resource_view::GetResourceType(instanceInfo));
         ASSERT_IF_NULL(view);
