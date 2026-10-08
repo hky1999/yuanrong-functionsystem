@@ -286,11 +286,13 @@ TEST_F(TraefikRegistryFixture, TakeoverOrderAndSanitizeCollision)
     EXPECT_EQ(store_->kv.count("yr/traefik-ut/http/routers/inst-k-p8081/rule"), 1u);
 
     // "a_b" and "a-b" both sanitize to "a-b": the stranger is refused and
-    // the original holder is untouched.
+    // the original holder is untouched. The stranger's OWN record is seeded
+    // BEFORE the before-snapshot so the fixture's seeding is never mistaken
+    // for a modification by the code under test.
     ASSERT_TRUE(Register("a_b", "t1", "rt-orig", "req-orig", 8080)->IsOk());
-    const auto before = store_->kv;
     const std::string recordS = "rec/a-b";
     store_->Put(recordS, "instance-record|rt-stranger|req-stranger");
+    const auto before = store_->kv;
     auto stranger = registry_->RegisterInstance(
         "a-b", "10.0.0.1",
         { local_scheduler::TraefikRegistry::PortMapping{ 8082, 49082, "http" } },
@@ -298,7 +300,7 @@ TEST_F(TraefikRegistryFixture, TakeoverOrderAndSanitizeCollision)
         static_cast<uint64_t>(store_->modRevision[recordS]), recordS);
     ASSERT_AWAIT_READY(stranger);
     EXPECT_TRUE(stranger.Get().IsError());
-    EXPECT_EQ(store_->kv, before);
+    EXPECT_EQ(store_->kv, before) << "the whole store must be byte-identical after the refusal";
 }
 
 // Legacy (marker-less) cleanup: exact-key enumeration only, neighbor

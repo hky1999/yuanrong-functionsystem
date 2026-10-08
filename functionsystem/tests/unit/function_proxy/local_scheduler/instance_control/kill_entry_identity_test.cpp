@@ -1243,21 +1243,24 @@ TEST_F(KillEntryIdentityFixture, SameRequestBarrierBlocksInPlaceRuntimeSwapSave)
         published->store(true);
     });
     ThreadJoiner joiner{ publisher };
-    ASSERT_EQ(publisherStarted->get_future().wait_for(std::chrono::seconds(5)),
-              std::future_status::ready)
+    // Retrieve the started-future ONCE and reuse it (a second get_future()
+    // on the same promise throws "Future already retrieved").
+    auto startedFuture = publisherStarted->get_future();
+    ASSERT_EQ(startedFuture.wait_for(std::chrono::seconds(5)), std::future_status::ready)
         << "publisher thread must confirm start";
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     EXPECT_FALSE(published->load()) << "the in-place runtime swap must be blocked by the guarded op";
 
     // NORMAL PATH: release, then WAIT for BOTH the old op's completion and
-    // the publisher's completion BEFORE asserting any state.
+    // the publisher's completion (bounded) BEFORE asserting any state.
     releaser.Release();
     ASSERT_AWAIT_READY(*oldSave);
-    ASSERT_EQ(publisherStarted->get_future().wait_for(std::chrono::seconds(5)),
-              std::future_status::ready);
-    while (!published->load()) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+    bool publishedInTime = false;
+    for (int i = 0; i < 500 && !(publishedInTime = published->load()); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(publishedInTime) << "publisher must complete after release (bounded 5s)";
     EXPECT_TRUE(barrierWaitOk->load()) << "the barrier wait itself must not have timed out";
-    EXPECT_TRUE(published->load());
     EXPECT_EQ(machine->GetInstanceInfo().runtimeid(), "runtime-R2");
     EXPECT_EQ(*stored, "OLD-STATE");  // old save happened-before the publish
     (void)joiner;
@@ -1330,18 +1333,21 @@ TEST_F(KillEntryIdentityFixture, SameRequestBarrierBlocksInPlaceRuntimeSwapDelet
         published->store(true);
     });
     ThreadJoiner joiner{ publisher };
-    ASSERT_EQ(publisherStarted->get_future().wait_for(std::chrono::seconds(5)),
-              std::future_status::ready)
+    auto startedFuture = publisherStarted->get_future();
+    ASSERT_EQ(startedFuture.wait_for(std::chrono::seconds(5)), std::future_status::ready)
         << "publisher thread must confirm start";
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     EXPECT_FALSE(published->load()) << "the in-place runtime swap must be blocked by the guarded Del";
 
-    // NORMAL PATH: release, wait for BOTH completions, THEN assert.
+    // NORMAL PATH: release, wait for BOTH completions (bounded), THEN assert.
     releaser.Release();
     ASSERT_AWAIT_READY(*oldDel);
-    while (!published->load()) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+    bool publishedInTime = false;
+    for (int i = 0; i < 500 && !(publishedInTime = published->load()); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(publishedInTime) << "publisher must complete after release (bounded 5s)";
     EXPECT_TRUE(barrierWaitOk->load()) << "the barrier wait itself must not have timed out";
-    EXPECT_TRUE(published->load());
     (void)joiner;
     ASSERT_AWAIT_READY(*oldDel);
     EXPECT_TRUE(oldDel->Get().IsOk());
