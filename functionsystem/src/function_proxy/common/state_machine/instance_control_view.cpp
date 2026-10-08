@@ -342,18 +342,21 @@ Status InstanceControlView::SaveStateGuarded(const std::string &instanceID,
                                              const std::string &expectedRuntimeID,
                                              const std::function<Status()> &op)
 {
+    // VIEW lock serializes against map swaps/inserts (Update / Generate-
+    // StateMachine / OnDelInstance); the machine's OWN lock — taken inside
+    // ExecuteStateOpUnderLock and held across the re-check and the
+    // synchronous op — serializes against the DIRECT in-place update paths
+    // that never take the view lock (InstanceCtrlActor::UpdateInstanceInfo,
+    // transition callbacks, recovery handling). Both locks, one order
+    // (view → machine, the same order Update itself uses).
     std::lock_guard<std::mutex> guard(lock_);
     auto it = machines_.find(instanceID);
-    if (it == machines_.end()
-        || it->second->GetInstanceInfo().runtimeid() != expectedRuntimeID) {
-        const std::string current = (it == machines_.end()) ? std::string("<none>")
-                                                            : it->second->GetInstanceInfo().runtimeid();
-        YRLOG_WARN("state save refused for instance({}): stream bound to runtime({}) but the "
-                   "machine currently runs runtime({})", instanceID, expectedRuntimeID, current);
+    if (it == machines_.end()) {
+        YRLOG_WARN("state save refused for instance({}): no machine (unknown)", instanceID);
         return Status(StatusCode::ERR_INSTANCE_BUSY,
             "state save refused: stream runtime superseded or unknown");
     }
-    return op();
+    return it->second->ExecuteStateOpUnderLock(expectedRuntimeID, op);
 }
 
 Status InstanceControlView::DeleteStateGuarded(const std::string &instanceID,
@@ -362,15 +365,12 @@ Status InstanceControlView::DeleteStateGuarded(const std::string &instanceID,
 {
     std::lock_guard<std::mutex> guard(lock_);
     auto it = machines_.find(instanceID);
-    if (it != machines_.end()
-        && it->second->GetInstanceInfo().runtimeid() != expectedRuntimeID) {
-        YRLOG_WARN("state delete refused for instance({}): retiring chain runtime({}) but the "
-                   "machine currently runs runtime({})",
-                   instanceID, expectedRuntimeID, it->second->GetInstanceInfo().runtimeid());
-        return Status(StatusCode::ERR_INSTANCE_BUSY,
-            "state delete refused: machine bound to another runtime");
+    if (it == machines_.end()) {
+        // Retire completion: no machine — serialized against same-name
+        // inserts by the view lock.
+        return op();
     }
-    return op();
+    return it->second->ExecuteStateOpUnderLock(expectedRuntimeID, op);
 }
 
 std::pair<std::string, std::string> InstanceControlView::GetIncarnationSnapshot(

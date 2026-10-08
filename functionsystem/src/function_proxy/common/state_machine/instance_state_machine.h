@@ -96,6 +96,16 @@ public:
     virtual litebus::Future<Status> DelInstance(const std::string &instanceID,
                                                 const std::string &expectedRuntimeID,
                                                 const std::string &expectedRequestID);
+    // EXECUTION-POINT state op under THIS machine's lock (root 16:5x
+    // follow-up): callers already hold the control view's lock; this adds
+    // the machine's own recursive_mutex across the identity re-check and
+    // the SYNCHRONOUS store operation, so the DIRECT in-place update paths
+    // (InstanceCtrlActor::UpdateInstanceInfo, transition callbacks,
+    // recovery handling — all of which take only this lock) cannot
+    // interleave before or during the op.
+    virtual Status ExecuteStateOpUnderLock(const std::string &expectedRuntimeID,
+                                           const std::function<Status()> &op);
+
     // The durable instance-record etcd key for this identity ("" on
     // derivation failure) — PUBLIC: external callers (e.g. the traefik
     // registration) need a commit-time still-current condition on the

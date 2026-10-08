@@ -408,6 +408,20 @@ litebus::Future<Status> InstanceStateMachine::DelInstance(const std::string &ins
     return DelInstance(instanceID, "", "");
 }
 
+Status InstanceStateMachine::ExecuteStateOpUnderLock(const std::string &expectedRuntimeID,
+                                                     const std::function<Status()> &op)
+{
+    std::lock_guard<std::recursive_mutex> guard(lock_);
+    RETURN_STATUS_IF_NULL(instanceContext_, StatusCode::FAILED, "no context for guarded state op");
+    const auto current = instanceContext_->GetInstanceInfo().runtimeid();
+    if (current != expectedRuntimeID) {
+        YRLOG_WARN("guarded state op refused: machine runtime({}) != expected({})",
+                   current, expectedRuntimeID);
+        return Status(StatusCode::ERR_INSTANCE_BUSY, "guarded state op refused: runtime replaced");
+    }
+    return op();
+}
+
 std::string InstanceStateMachine::GetInstanceRecordKey(const resources::InstanceInfo &instanceInfo,
                                                        bool isMetaStoreEnable)
 {

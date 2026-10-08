@@ -1163,17 +1163,24 @@ TEST_F(KillEntryIdentityFixture, LateFailureCallbackDoesNotOverwriteRewrittenRec
 }
 
 
-// ── SAME-REQUEST DIFFERENT-RUNTIME WINDOW (root 16:48/16:5x) ─────────────────
+// ── SAME-REQUEST DIFFERENT-RUNTIME WINDOW (root 16:48/16:5x follow-up) ───────
+// Scope guard: guarantees barrier release on EVERY exit path (ASSERT
+// included) so no thread is left dangling on a failed assertion.
+struct BarrierReleaser {
+    std::shared_ptr<std::promise<void>> release;
+    ~BarrierReleaser() { release->set_value(); }
+};
 
 // Failover keeps the CREATION REQUEST but replaces the RUNTIME — both
-// compose the SAME state key. The BARRIER sits at the backend Set INSIDE
-// the view-guarded execution: the old stream's save passes its ownership
-// check (R1 current) and blocks at the store; the NEW runtime's publish
-// (GenerateStateMachine, same view lock) must be BLOCKED meanwhile; the
-// release lets the old save finish, then the publish lands, then the new
-// save writes — and the FINAL value is the successor's. A later old-stream
-// save is refused with zero writes.
-TEST_F(KillEntryIdentityFixture, SameRequestBarrierProvesLockSerialization)
+// compose the SAME state key. The barrier sits at the backend Set INSIDE
+// the two-lock guarded execution. The publish under test is the REAL
+// in-place rewrite `machine->UpdateInstanceInfo(R2)` — the path that takes
+// ONLY the machine lock and previously bypassed the view-lock guard. It
+// must be MUTEX-blocked while the old save's store op is in flight; the
+// release completes the old save, then the in-place publish lands, then
+// the new save writes — the FINAL value is the successor's, and a later
+// old-stream save refuses with zero writes.
+TEST_F(KillEntryIdentityFixture, SameRequestBarrierBlocksInPlaceRuntimeSwapSave)
 {
     auto harness = MakeRealView();
     actor_->BindInstanceControlView(harness.view);
@@ -1181,16 +1188,20 @@ TEST_F(KillEntryIdentityFixture, SameRequestBarrierProvesLockSerialization)
     auto infoOld = MakeElasticInfo("inst-bar", "runtime-R1");
     infoOld.set_functionproxyid("node-test");
     infoOld.set_function("default/0-test-helloWorld/$latest");
-    harness.view->GenerateStateMachine("inst-bar", infoOld);  // machine = R1/q
+    harness.view->GenerateStateMachine("inst-bar", infoOld);
+    const auto machine = harness.view->GetInstance("inst-bar");
+    ASSERT_NE(machine, nullptr);
 
     const std::string key = StateClient::ComposeStateKey("inst-bar", "req-inst-bar");
     auto stored = std::make_shared<std::string>();
     auto reached = std::make_shared<std::promise<void>>();
     auto release = std::make_shared<std::promise<void>>();
+    BarrierReleaser releaser{ release };
     EXPECT_CALL(*cacheClient_, Set(Matcher<const std::string &>(key), _))
         .WillOnce(Invoke([stored, reached, release](const std::string &, const std::string &val) {
             reached->set_value();
-            release->get_future().wait();  // backend barrier, under the view lock
+            // BOUNDED barrier: an abandoned wait still frees the locks.
+            (void)release->get_future().wait_for(std::chrono::seconds(10));
             *stored = val;
             return Status::OK();
         }))
@@ -1206,23 +1217,24 @@ TEST_F(KillEntryIdentityFixture, SameRequestBarrierProvesLockSerialization)
             grpc::PosixStreamIdentity{ "inst-bar", "runtime-R1", "req-inst-bar" }, oldMsg));
     ASSERT_EQ(reached->get_future().wait_for(std::chrono::seconds(5)), std::future_status::ready);
 
-    // The NEW generation's publish takes the SAME view lock: it must be
-    // BLOCKED while the old save's store operation is in flight.
+    // The REAL in-place runtime publish (machine lock only — the bypass
+    // path root identified) must be BLOCKED by the guarded store op.
     auto published = std::make_shared<std::atomic<bool>>(false);
     auto infoNew = MakeElasticInfo("inst-bar", "runtime-R2");
     infoNew.set_functionproxyid("node-test");
     infoNew.set_function("default/0-test-helloWorld/$latest");
-    std::thread publisher([harness, infoNew, published]() {
-        harness.view->GenerateStateMachine("inst-bar", infoNew);
+    std::thread publisher([machine, infoNew, published]() {
+        machine->UpdateInstanceInfo(infoNew);  // direct in-place rewrite
         published->store(true);
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    EXPECT_FALSE(published->load()) << "the publish must be blocked by the in-flight guarded store op";
+    EXPECT_FALSE(published->load()) << "the in-place runtime swap must be blocked by the guarded op";
 
-    release->set_value();  // old save completes under the lock
+    release->set_value();
     publisher.join();
     EXPECT_TRUE(published->load());
-    EXPECT_EQ(*stored, "OLD-STATE");  // ordering: old save happened-before publish
+    EXPECT_EQ(machine->GetInstanceInfo().runtimeid(), "runtime-R2");
+    EXPECT_EQ(*stored, "OLD-STATE");  // old save happened-before the publish
 
     // The successor's save lands AFTER the publish — final value is NEW.
     auto newMsg = std::make_shared<runtime_rpc::StreamingMessage>();
@@ -1233,8 +1245,7 @@ TEST_F(KillEntryIdentityFixture, SameRequestBarrierProvesLockSerialization)
     EXPECT_EQ(newSave.Get()->saversp().code(), common::ERR_NONE);
     EXPECT_EQ(*stored, "NEW-STATE");
 
-    // Any LATER old-stream save is refused at the execution point: zero
-    // writes, the successor's value survives.
+    // Any LATER old-stream save refuses at the execution point: zero writes.
     auto staleMsg = std::make_shared<runtime_rpc::StreamingMessage>();
     staleMsg->mutable_savereq()->set_state("STALE-STATE");
     auto staleSave = function_proxy::StateHandler::SaveState(
@@ -1244,35 +1255,70 @@ TEST_F(KillEntryIdentityFixture, SameRequestBarrierProvesLockSerialization)
     EXPECT_EQ(*stored, "NEW-STATE");
 }
 
-// DELETE leg of the same window: with a machine running R2 under the SAME
-// request, the OLD chain's state delete is refused at the execution point
-// (zero Del on the shared key); with NO machine (retire completion) the
-// delete proceeds.
-TEST_F(KillEntryIdentityFixture, SameRequestOldRuntimeDeleteGuarded)
+// DELETE leg, same barrier: the retiring chain's guarded Del of the shared
+// key blocks the in-place runtime swap while in flight; after the swap the
+// OLD chain's Del refuses (zero Del) and the NEW chain's Del proceeds.
+TEST_F(KillEntryIdentityFixture, SameRequestBarrierBlocksInPlaceRuntimeSwapDelete)
 {
     auto harness = MakeRealView();
     actor_->BindInstanceControlView(harness.view);
 
-    auto info = MakeElasticInfo("inst-gd", "runtime-R2");
-    info.set_functionproxyid("node-test");
-    info.set_function("default/0-test-helloWorld/$latest");
-    harness.view->GenerateStateMachine("inst-gd", info);
+    auto infoOld = MakeElasticInfo("inst-bd", "runtime-R1");
+    infoOld.set_functionproxyid("node-test");
+    infoOld.set_function("default/0-test-helloWorld/$latest");
+    harness.view->GenerateStateMachine("inst-bd", infoOld);
+    const auto machine = harness.view->GetInstance("inst-bd");
+    ASSERT_NE(machine, nullptr);
 
-    const std::string key = StateClient::ComposeStateKey("inst-gd", "req-inst-gd");
-    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>(key))).Times(0);
-    auto refused = function_proxy::StateHandler::DeleteState("inst-gd", "req-inst-gd", "runtime-R1");
-    ASSERT_AWAIT_READY(refused);
-    EXPECT_TRUE(refused.Get().IsError());
-    EXPECT_EQ(refused.Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY);
+    const std::string key = StateClient::ComposeStateKey("inst-bd", "req-inst-bd");
+    auto delCount = std::make_shared<std::atomic<int>>(0);
+    auto reached = std::make_shared<std::promise<void>>();
+    auto release = std::make_shared<std::promise<void>>();
+    BarrierReleaser releaser{ release };
+    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>(key)))
+        .WillOnce(Invoke([delCount, reached, release](const std::string &) {
+            reached->set_value();
+            (void)release->get_future().wait_for(std::chrono::seconds(10));
+            delCount->fetch_add(1);
+            return Status::OK();
+        }))
+        .WillRepeatedly(Invoke([delCount](const std::string &) {
+            delCount->fetch_add(1);
+            return Status::OK();
+        }));
 
-    // Retire completion (machine absent): the delete of the retiring
-    // chain's OWN key executes.
-    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>(key))).WillOnce(Return(Status::OK()));
-    harness.view->OnDelInstance("inst-gd", "req-inst-gd", true);
-    ASSERT_EQ(harness.view->GetInstance("inst-gd"), nullptr);
-    auto done = function_proxy::StateHandler::DeleteState("inst-gd", "req-inst-gd", "runtime-R1");
-    ASSERT_AWAIT_READY(done);
-    EXPECT_TRUE(done.Get().IsOk());
+    auto oldDel = std::make_shared<litebus::Future<Status>>(
+        function_proxy::StateHandler::DeleteState("inst-bd", "req-inst-bd", "runtime-R1"));
+    ASSERT_EQ(reached->get_future().wait_for(std::chrono::seconds(5)), std::future_status::ready);
+
+    auto published = std::make_shared<std::atomic<bool>>(false);
+    auto infoNew = MakeElasticInfo("inst-bd", "runtime-R2");
+    infoNew.set_functionproxyid("node-test");
+    infoNew.set_function("default/0-test-helloWorld/$latest");
+    std::thread publisher([machine, infoNew, published]() {
+        machine->UpdateInstanceInfo(infoNew);
+        published->store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_FALSE(published->load()) << "the in-place runtime swap must be blocked by the guarded Del";
+
+    release->set_value();
+    publisher.join();
+    EXPECT_TRUE(published->load());
+    ASSERT_AWAIT_READY(*oldDel);
+    EXPECT_TRUE(oldDel->Get().IsOk());
+    EXPECT_EQ(delCount->load(), 1);
+
+    // After the swap, the OLD chain's Del refuses (zero new Del)…
+    auto staleDel = function_proxy::StateHandler::DeleteState("inst-bd", "req-inst-bd", "runtime-R1");
+    ASSERT_AWAIT_READY(staleDel);
+    EXPECT_EQ(staleDel.Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY);
+    EXPECT_EQ(delCount->load(), 1);
+    // …and the NEW chain's Del proceeds.
+    auto newDel = function_proxy::StateHandler::DeleteState("inst-bd", "req-inst-bd", "runtime-R2");
+    ASSERT_AWAIT_READY(newDel);
+    EXPECT_TRUE(newDel.Get().IsOk());
+    EXPECT_EQ(delCount->load(), 2);
 }
 
 // ── MACHINE-LEVEL FENCE (#1, root 15:12): identity at the metadata read ─────
