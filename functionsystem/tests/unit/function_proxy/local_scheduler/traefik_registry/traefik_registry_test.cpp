@@ -347,9 +347,13 @@ TEST_F(TraefikRegistryFixture, RedCaseOldRetireBarrierThenNewRegister)
     ASSERT_NE(newRoute, store_->kv.end());
 
     releaser.Release();
+    // JOIN the old-call thread BEFORE touching the Future it wrote (the
+    // join is the happens-before edge; reading a Future another thread is
+    // still assigning is a data race).
+    if (oldCall.joinable()) { oldCall.join(); }
     EXPECT_TRUE(barrierOk->load()) << "the barrier wait itself must not have timed out";
     ASSERT_AWAIT_READY(*oldRetire);
-    EXPECT_EQ(oldRetire.Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY);
+    EXPECT_EQ(oldRetire->Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY);
     // New routes + marker fully intact.
     EXPECT_EQ(store_->kv.count("yr/traefik-ut/http/routers/inst-r-p8080/rule"), 1u);
     EXPECT_EQ(store_->kv.count("yr/traefik-ut/http/services/inst-r-p8080/loadbalancer/servers/0/url"), 1u);
@@ -398,9 +402,10 @@ TEST_F(TraefikRegistryFixture, RedCaseLateOldRegisterCannotOverwriteNewHolder)
     const auto snapshot = store_->kv;
 
     releaser.Release();
+    if (oldCall.joinable()) { oldCall.join(); }
     EXPECT_TRUE(barrierOk->load()) << "the barrier wait itself must not have timed out";
     ASSERT_AWAIT_READY(*refreshFuture);
-    EXPECT_TRUE(refreshFuture.Get().IsError())
+    EXPECT_TRUE(refreshFuture->Get().IsError())
         << "the late old refresh must fail, not overwrite the newer holder";
     EXPECT_EQ(store_->kv, snapshot) << "the new holder's keys must be byte-identical";
 }
@@ -469,9 +474,10 @@ TEST_F(TraefikRegistryFixture, LegacyCleanupNeighborsAndConditionalCommit)
     ASSERT_EQ(reached->get_future().wait_for(std::chrono::seconds(5)), std::future_status::ready);
     ASSERT_TRUE(Register("inst-c", "t1", "rt-NEW", "req-NEW", 8080)->IsOk());
     releaser.Release();
+    if (oldCall.joinable()) { oldCall.join(); }
     EXPECT_TRUE(barrierOk->load()) << "the barrier wait itself must not have timed out";
     ASSERT_AWAIT_READY(*cleanup);
-    EXPECT_EQ(cleanup.Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY)
+    EXPECT_EQ(cleanup->Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY)
         << "the compare failure must propagate, not silently succeed";
     EXPECT_EQ(store_->kv.count("yr/traefik-ut/http/routers/inst-c-p8080/rule"), 1u)
         << "the registered generation's route survives the stale cleanup";

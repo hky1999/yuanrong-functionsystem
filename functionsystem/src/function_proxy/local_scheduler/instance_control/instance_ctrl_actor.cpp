@@ -9383,13 +9383,16 @@ litebus::Future<Status> InstanceCtrlActor::RegisterTraefikRouteAttempt(const Ins
         return Status(StatusCode::ERR_INSTANCE_INFO_INVALID,
                       "traefik registration: port payload unparseable");
     }
-    if (portMappings.empty() && invalidEntries > 0) {
-        // Entries existed but NONE parsed: corrupt payload, not an empty
-        // refresh — existing routes stay.
-        YRLOG_ERROR("traefik registration for instance({}): all {} port entries invalid",
-                    instanceInfo.instanceid(), invalidEntries);
+    if (invalidEntries > 0) {
+        // ANY invalid entry makes the payload corrupt: a mixed batch must
+        // be rejected WHOLE — registering only the valid subset would
+        // delete the existing routes of the invalid entries' ports (root
+        // follow-up). Existing routes stay untouched.
+        YRLOG_ERROR("traefik registration for instance({}): {} of {} port entries invalid — "
+                    "rejecting the payload whole, existing routes kept",
+                    instanceInfo.instanceid(), invalidEntries, portMappings.size() + invalidEntries);
         return Status(StatusCode::ERR_INSTANCE_INFO_INVALID,
-                      "traefik registration: port payload entries all invalid");
+                      "traefik registration: port payload has invalid entries");
     }
     // NOTE: a VALID empty array is NOT an early-OK — a record at zero
     // ports still runs the marker transaction so the previous own-key list
