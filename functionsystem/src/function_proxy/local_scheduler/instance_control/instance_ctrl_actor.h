@@ -1141,8 +1141,11 @@ private:
 
     void ClearLocalDriver();
     litebus::Future<Status> RegisterTraefikRoute(const InstanceInfo &instanceInfo);
-    // Bounded-retry driver (the call sites are fire-and-forget Asyncs).
+    // Bounded-retry driver (the call sites are fire-and-forget Asyncs) and
+    // its AsyncAfter hop (AsyncAfter has no Future-returning member form).
     litebus::Future<Status> RegisterTraefikRouteAttempt(const InstanceInfo &instanceInfo, uint32_t attempt);
+    void ScheduleTraefikRegisterRetry(const InstanceInfo &instanceInfo, uint32_t attempt);
+    void RunScheduledTraefikRegisterRetry(const InstanceInfo &instanceInfo, uint32_t attempt);
     litebus::Future<Status> UnregisterTraefikRoute(const std::string &instanceID);
     // Identity-bearing unregister (#3): the registry fences against its
     // recorded incarnation; a late old chain cannot strip a same-name new

@@ -460,7 +460,12 @@ void RequestDispatcher::SendNotify(const std::basic_string<char> &req,
     callResult->set_message(fatalMsg_);
     callResult->set_instanceid(context->from);
     callResult->set_requestid(req);
-    (void)InvocationHandler::CallResultAdapter(instanceID_, response);
+    // Proxy-internal dispatch: synthesized identity carrying the stream's
+    // bound instance (this dispatcher IS the instance-side stream owner;
+    // no generation binding here — the state actor only consumes the
+    // identity on save/load paths).
+    (void)InvocationHandler::CallResultAdapter(
+        grpc::PosixStreamIdentity{ instanceID_, runtimeID_, "" }, response);
 }
 
 std::list<litebus::Future<SharedStreamMsg>> RequestDispatcher::GetOnRespFuture()

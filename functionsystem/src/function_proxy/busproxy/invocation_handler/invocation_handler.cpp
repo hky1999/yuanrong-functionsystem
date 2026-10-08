@@ -167,7 +167,7 @@ litebus::Future<std::shared_ptr<StreamingMessage>> InvocationHandler::CallResult
                 });
         }
     }
-    return CallResult(from, request);
+    return CallResult(identity, request);
 }
 
 litebus::Future<std::shared_ptr<StreamingMessage>> InvocationHandler::EventAdapter(

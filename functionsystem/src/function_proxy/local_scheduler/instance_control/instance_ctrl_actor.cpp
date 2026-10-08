@@ -5481,7 +5481,7 @@ litebus::Future<Status> InstanceCtrlActor::Checkpoint(const std::string &instanc
             // state can never be saved under the OLD generation's key.
             return instanceClient->CheckpointForRuntime(std::move(req), runtimeID);
         })
-        .Then([instanceID](const litebus::Future<runtime::CheckpointResponse> &rsp)
+        .Then([instanceID, runtimeID, checkpointGeneration](const litebus::Future<runtime::CheckpointResponse> &rsp)
                   -> litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> {
             auto checkpointRsp = rsp.Get();
             if (checkpointRsp.code() != common::ErrorCode::ERR_NONE) {
@@ -5534,7 +5534,8 @@ litebus::Future<Status> InstanceCtrlActor::Recover(const resource_view::Instance
             req.set_checkpointid(StateClient::ComposeStateKey(instance.instanceid(), instance.requestid()));
             auto msg = std::make_shared<runtime_rpc::StreamingMessage>();
             *msg->mutable_loadreq() = std::move(req);
-            return function_proxy::StateHandler::LoadState(instance.instanceid(), msg)
+            return function_proxy::StateHandler::LoadState(
+                grpc::PosixStreamIdentity{ instance.instanceid(), instance.runtimeid(), "" }, msg)
                 .Then([instance, aid,
                        instanceClient](const litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> &rsp)
                           -> litebus::Future<runtime::RecoverResponse> {
@@ -9216,6 +9217,20 @@ litebus::Future<Status> InstanceCtrlActor::RegisterTraefikRoute(const InstanceIn
     return RegisterTraefikRouteAttempt(instanceInfo, 0);
 }
 
+// AsyncAfter has no Future-returning member overload: the delayed retry
+// hops through this void scheduler.
+void InstanceCtrlActor::ScheduleTraefikRegisterRetry(const InstanceInfo &instanceInfo, uint32_t attempt)
+{
+    constexpr uint64_t TRAEFIK_REGISTER_RETRY_MS = 1000;
+    litebus::AsyncAfter(TRAEFIK_REGISTER_RETRY_MS, GetAID(),
+        &InstanceCtrlActor::RunScheduledTraefikRegisterRetry, instanceInfo, attempt);
+}
+
+void InstanceCtrlActor::RunScheduledTraefikRegisterRetry(const InstanceInfo &instanceInfo, uint32_t attempt)
+{
+    (void)RegisterTraefikRouteAttempt(instanceInfo, attempt);
+}
+
 // BOUNDED internal retry: the call sites dispatch this chain fire-and-forget,
 // so "retry by the caller" does not exist — a transiently-unestablished
 // record (revision not yet persisted) is retried HERE until the route is
@@ -9326,13 +9341,12 @@ litebus::Future<Status> InstanceCtrlActor::RegisterTraefikRouteAttempt(const Ins
     if (!authority.valid) {
         constexpr uint32_t MAX_TRAEFIK_REGISTER_ATTEMPTS = 5;
         if (attempt + 1 < MAX_TRAEFIK_REGISTER_ATTEMPTS) {
-            constexpr uint64_t TRAEFIK_REGISTER_RETRY_MS = 1000;
             YRLOG_INFO("traefik registration for instance({}) deferred (attempt {}): authority not "
                        "established yet (machine missing={}, revision={}, record key empty={}); retrying",
                        instanceInfo.instanceid(), attempt, machineMissing, authority.modRevision,
                        authority.recordKey.empty());
-            return litebus::AsyncAfter(TRAEFIK_REGISTER_RETRY_MS, GetAID(),
-                &InstanceCtrlActor::RegisterTraefikRouteAttempt, instanceInfo, attempt + 1);
+            ScheduleTraefikRegisterRetry(instanceInfo, attempt + 1);
+            return Status::OK();
         }
         YRLOG_ERROR("failed to register traefik route for instance({}): authority never established "
                     "after {} attempts — the instance will run WITHOUT a route",
