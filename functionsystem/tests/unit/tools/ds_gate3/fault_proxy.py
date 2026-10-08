@@ -103,11 +103,16 @@ def handle(c):
     try:
         with lock:
             if counts["conns"] >= MAX_CONN:
-                ev(e="conn_refused_over_ceiling")
+                # NOTE: no bump()/ev() under the lock — both re-acquire it.
                 c.close()
-                return
-            counts["conns"] += 1
-            counts["total_conns"] += 1
+                locked_refuse = True
+            else:
+                counts["conns"] += 1
+                counts["total_conns"] += 1
+                locked_refuse = False
+        if locked_refuse:
+            ev(e="conn_refused_over_ceiling")
+            return
         ev(e="conn")
         try:
             # 10s applies to the CONNECT only (proxy self-protection); the
@@ -127,11 +132,15 @@ def handle(c):
 
         with lock:
             if threads_alive + 2 > MAX_THREADS:
-                ev(e="thread_ceiling")
-                c.close(); u.close()
-                bump("conns", -1)
-                return
-        thread_enter(); thread_enter()
+                over = True
+            else:
+                globals()["threads_alive"] += 2
+                over = False
+        if over:
+            ev(e="thread_ceiling")
+            c.close(); u.close()
+            bump("conns", -1)
+            return
 
         def c2u():
             try:
