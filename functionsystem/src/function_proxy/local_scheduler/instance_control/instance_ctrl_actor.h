@@ -1152,6 +1152,7 @@ private:
     // generation's route. Distinct name (not an overload) so member-pointer
     // dispatch through litebus::Async stays unambiguous.
     litebus::Future<Status> UnregisterTraefikRouteFenced(const std::string &instanceID,
+                                                         const std::string &expectedTenantID,
                                                          const std::string &expectedRuntimeID,
                                                          const std::string &expectedRequestID);
 

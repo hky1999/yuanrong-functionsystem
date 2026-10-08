@@ -3048,8 +3048,9 @@ void InstanceCtrlActor::CleanupFailedSnapStart(const std::shared_ptr<messages::S
     // machine->DelInstance fails with an empty key (304) and the generic
     // DeleteInstanceInControlView would skip the erase -- exactly the stale
     // CREATING leftover this cleanup exists to remove.
+    const std::string requestID = scheduleReq->requestid();
     (void)instanceControlView_->DelInstance(instanceID)
-        .Then([insCtrlView(instanceControlView_), instanceID, requestID(scheduleReq->requestid())](
+        .Then([insCtrlView(instanceControlView_), instanceID, requestID](
                   const Status &delStatus) {
             if (delStatus.IsError()) {
                 YRLOG_WARN("metastore delete of failed snapstart instance({}) failed (low-reliability has no key), "
@@ -9396,6 +9397,7 @@ litebus::Future<Status> InstanceCtrlActor::UnregisterTraefikRoute(const std::str
 }
 
 litebus::Future<Status> InstanceCtrlActor::UnregisterTraefikRouteFenced(const std::string &instanceID,
+                                                                         const std::string &expectedTenantID,
                                                                          const std::string &expectedRuntimeID,
                                                                          const std::string &expectedRequestID)
 {
@@ -9405,7 +9407,8 @@ litebus::Future<Status> InstanceCtrlActor::UnregisterTraefikRouteFenced(const st
     if (expectedRuntimeID.empty() && expectedRequestID.empty()) {
         return UnregisterTraefikRoute(instanceID);
     }
-    return traefikRegistry_->UnregisterInstance(instanceID, expectedRuntimeID, expectedRequestID)
+    return traefikRegistry_->UnregisterInstance(instanceID, expectedTenantID, expectedRuntimeID,
+                                                expectedRequestID)
         .Then([instanceID, expectedRuntimeID](const Status& status) -> Status {
             if (!status.IsOk()) {
                 if (status.StatusCode() == StatusCode::ERR_INSTANCE_BUSY) {
