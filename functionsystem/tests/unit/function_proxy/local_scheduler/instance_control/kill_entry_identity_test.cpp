@@ -1168,14 +1168,17 @@ TEST_F(KillEntryIdentityFixture, LateFailureCallbackDoesNotOverwriteRewrittenRec
 
 
 // ── FIRST REAL FRONTEND KILL + REAL BUDGET (root gate 2) ─────────────────────
-// KillFrontend → Kill → authorize/param/state chain → TryExitInstance (REAL
-// EXITING transition through FakeEvalTxn etcd) → exitHandler → KillRuntime
-// (identity gate on a REAL ResourceView) → agent kill (confirmed receipt) →
-// REAL ApplyPhysicalRetirement settlement → resource-view verify-absence →
+// KillFrontend → Kill → authorize/param/state chain → Exit: the RUNNING
+// local path currently calls ForceDeleteInstance (TryExitInstance is
+// commented out in Exit) → ForceDeleteInstance drives the production exit
+// handler → ShutDown (null client → skip) → KillRuntime (identity gate on a
+// REAL ResourceView) → agent kill (confirmed receipt) → REAL
+// ApplyPhysicalRetirement settlement → resource-view verify-absence →
 // control delete → state delete FAILS once → pending record; the SECOND
 // KillFrontend (real entry, tenant-checked) completes the cleanup; the third
 // is the genuine NOT_FOUND. Budget: non-zero credit settles EXACTLY once for
-// this identity; the neighbour's credit is untouched.
+// this identity; the neighbour's credit is untouched. (No claim of a real
+// EXITING state-machine transition — the actual path is ForceDeleteInstance.)
 TEST_F(KillEntryIdentityFixture, FirstRealKillFrontendSettlesRealBudgetOnce)
 {
     using schedule_plugin::filter::UsageAwareFilter;
@@ -1357,11 +1360,13 @@ TEST_F(KillEntryIdentityFixture, FirstRealKillFrontendSettlesRealBudgetOnce)
     // success, NOT a route/authorize error): the state-deletion reason.
     // The injected store failure Status("store down") propagates VERBATIM
     // through OnRetireStateDeleteComplete (del.Get() is returned as-is).
-    EXPECT_NE(static_cast<int>(first.Get().code()), static_cast<int>(common::ERR_NONE))
-        << "a failed state cleanup must surface, not report success";
-    EXPECT_THAT(first.Get().message(), testing::HasSubstr("store down"))
-        << "the failure must be the injected cleanup one, not an unrelated error: "
-        << first.Get().message();
+    // EXACT contract: the injected Status(StatusCode::ERR_INNER_SYSTEM_ERROR,
+    // "store down") propagates verbatim — precise code AND precise formatted
+    // message, compared against the SAME Status object's own rendering.
+    EXPECT_EQ(static_cast<int>(first.Get().code()),
+              static_cast<int>(common::ERR_INNER_SYSTEM_ERROR));
+    EXPECT_EQ(first.Get().message(),
+              Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "store down").GetMessage());
 
     // The physical kill really happened with the trusted identity.
     ASSERT_EQ(killRequests.size(), 1u);

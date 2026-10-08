@@ -29,7 +29,6 @@ using namespace runtime_rpc;
 namespace functionsystem::grpc {
 
 const std::string INSTANCE_ID_META = "instance_id";
-const std::string RUNTIME_ID_META = "runtime_id";
 const int32_t SIZE_MEGA_BYTES = 1024 * 1024;
 const int32_t DEFAULT_GRPC_MAX_SIZE = 4;
 const int32_t GRPC_MAX_SIZE_LIMIT = 500;
@@ -77,9 +76,6 @@ ControlClient::ControlClient(const std::string &instanceID, const std::string &r
         reactor_->SetID(runtimeID_);
         stub_ = runtime_rpc::RuntimeRPC::NewStub(channel);
         context_.AddMetadata(INSTANCE_ID_META, instanceID);
-    // The server's accept path requires BOTH identities; the runtime side
-    // of the stream always advertises its runtime id alongside.
-    context_.AddMetadata(RUNTIME_ID_META, runtimeID);
         stub_->async()->MessageStream(&context_, reactor_.get());
     } catch (std::exception &e) {
         YRLOG_ERROR(
