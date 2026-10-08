@@ -186,8 +186,10 @@ protected:
     {
         ON_CALL(*primary_, GetResourceView())
             .WillByDefault(Invoke([]() {
-                return litebus::Future<std::shared_ptr<ResourceUnit>>(
-                    std::shared_ptr<ResourceUnit>{});
+                auto promise = std::make_shared<
+                    litebus::Promise<std::shared_ptr<ResourceUnit>>>();
+                promise->SetValue(std::shared_ptr<ResourceUnit>{});
+                return promise->GetFuture();
             }));
     }
 
