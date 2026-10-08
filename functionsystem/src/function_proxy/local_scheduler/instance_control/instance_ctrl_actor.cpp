@@ -1538,7 +1538,23 @@ litebus::Future<Status> InstanceCtrlActor::KillRuntimeWithSnapshotCleanup(
     }
     // Scheduler-line retirement: the physical receipt travels in the kill's
     // expected identity; Record settles the ledger on a matching confirmation.
-    return SendKillRequestToAgent(instanceInfo, isRecovering, false, std::string{}, std::string{})
+    // 2026-10-08 fix (a1-0 forensics): this entry point MUST resolve the
+    // trusted identity from the resource view exactly like KillRuntime —
+    // the previous unconditional empty-identity kill sent elastic
+    // instances down the RUNTIME executor's can-not-find-pid path, so a
+    // fast-create-then-retire incarnation could never replay its durable
+    // receipt (delete_attempt 38bb7cdd…: complete=true receipt + paired
+    // before/after resource records existed) and the view deletion stayed
+    // fail-closed forever. Identity fence and receipt contract unchanged.
+    if (resource_view::UsesElasticAdmission(instanceInfo)) {
+        auto view = resourceViewMgr_ ? resourceViewMgr_->GetInf(resource_view::GetResourceType(instanceInfo)) : nullptr;
+        if (view != nullptr) {
+            return view->GetResourceView().Then(litebus::Defer(GetAID(),
+                &InstanceCtrlActor::KillRuntimeWithIdentity, instanceInfo, isRecovering,
+                std::placeholders::_1));
+        }
+    }
+    return SendKillRequestToAgent(instanceInfo, isRecovering)
         .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::RecordFrontendKillRuntimeResult, instanceInfo, _1,
                              std::string{}, std::string{}));
 }
