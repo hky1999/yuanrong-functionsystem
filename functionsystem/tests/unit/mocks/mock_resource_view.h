@@ -91,6 +91,11 @@ public:
                 (const std::string &unitID, resource_view::UnitStatus status), (override));
 
     MOCK_METHOD(litebus::Future<resource_view::PullResourceRequest>, GetUnitSnapshotInfo, (const std::string &id), (override));
+
+    // Settlement seam: the production interface is virtual; tests capture
+    // the receipt here instead of touching a real actor.
+    MOCK_METHOD(litebus::Future<Status>, ApplyPhysicalRetirement,
+                (const resource_view::PhysicalRetirementReceipt &receipt), (override));
 };
 }  // namespace functionsystem::test
 
