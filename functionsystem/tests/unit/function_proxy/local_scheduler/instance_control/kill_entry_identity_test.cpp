@@ -1286,6 +1286,10 @@ TEST_F(KillEntryIdentityFixture, FirstRealKillFrontendSettlesRealBudgetOnce)
     harnessView->BindMetaStoreClient(metaClient);
     actor_->BindInstanceControlView(harnessView);
     auto entry = MakeViewEntry(instA, "rt-budget", "sbox-budget", "gen-budget");
+    // The machine MUST carry the SAME unit the real view allocated under —
+    // the identity gate compares runtime AND unit (a mismatch reads as
+    // "bound to another incarnation" and refuses the kill).
+    entry.set_unitid(agentID);
     entry.set_functionproxyid("node-test");
     entry.set_function("default/0-test-helloWorld/$latest");
     entry.set_tenantid("tenant-budget");
