@@ -75,6 +75,11 @@
 #include "function_proxy/common/state_handler/state_handler_helper.h"
 #include "mocks/mock_distributed_cache_client.h"
 #include "mocks/mock_resource_view.h"
+#include "common/resource_view/view_utils.h"
+#include "common/resource_view/memory_elasticity_fence.h"
+#include "common/constants/signal.h"
+#include "mocks/mock_observer.h"
+#include "schedule_plugin/filter/usage_aware_filter.h"
 #include "utils/future_test_helper.h"
 
 namespace functionsystem::test {
@@ -1160,6 +1165,196 @@ TEST_F(KillEntryIdentityFixture, LateFailureCallbackDoesNotOverwriteRewrittenRec
     EXPECT_EQ(after->second.reason, "rewritten-failure");
 }
 
+
+// ── FIRST REAL FRONTEND KILL + REAL BUDGET (root gate 2) ─────────────────────
+// KillFrontend → Kill → authorize/param/state chain → TryExitInstance (REAL
+// EXITING transition through FakeEvalTxn etcd) → exitHandler → KillRuntime
+// (identity gate on a REAL ResourceView) → agent kill (confirmed receipt) →
+// REAL ApplyPhysicalRetirement settlement → resource-view verify-absence →
+// control delete → state delete FAILS once → pending record; the SECOND
+// KillFrontend (real entry, tenant-checked) completes the cleanup; the third
+// is the genuine NOT_FOUND. Budget: non-zero credit settles EXACTLY once for
+// this identity; the neighbour's credit is untouched.
+TEST_F(KillEntryIdentityFixture, FirstRealKillFrontendSettlesRealBudgetOnce)
+{
+    using schedule_plugin::filter::UsageAwareFilter;
+    struct ConfigGuard {
+        double safety = UsageAwareFilter::GetSafety();
+        double floor = UsageAwareFilter::GetFloorMb();
+        int32_t cap = UsageAwareFilter::GetMaxInstances();
+        ~ConfigGuard() { UsageAwareFilter::SetConfig(safety, floor, cap); }
+    } guard;
+    UsageAwareFilter::SetConfig(0.9, 2048, 0);
+    resource_view::SetMemoryElasticityFenceForTest(true);
+
+    // REAL resource view with a real 1-D unit (the PhysicalRetirementTest
+    // recipe), wired as the actor's primary view.
+    const std::string agentID = "unit-budget";
+    resource_view::ResourceViewActor::Param budgetParam {
+        .isLocal = true,
+        .enableTenantAffinity = true,
+        .tenantPodReuseTimeWindow = 1
+    };
+    auto realView = resource_view::ResourceView::CreateResourceView("kill-budget", budgetParam);
+    auto unit = view_utils::Get1DResourceUnit(agentID);
+    for (auto *resources : {unit.mutable_capacity(), unit.mutable_allocatable()}) {
+        (*resources->mutable_resources())[resource_view::RESOURCE_CPU_NAME].mutable_scalar()->set_value(32000);
+        (*resources->mutable_resources())[resource_view::RESOURCE_MEM_NAME].mutable_scalar()->set_value(32768);
+    }
+    {
+        auto added = realView->AddResourceUnit(unit);
+        ASSERT_AWAIT_READY(added);
+        ASSERT_TRUE(added.Get().IsOk()) << added.Get().ToString();
+    }
+    resourceViewMgr_->primary_ = realView;
+
+    // Elastic owners: the victim (A) and a neighbour (B).
+    const std::string instA = "inst-budget";
+    auto mkOwner = [&](const std::string &id, const std::string &runtime, const std::string &sbox,
+                       const std::string &gen, uint64_t maxBytes, uint64_t curBytes) {
+        auto info = view_utils::Get1DInstance();
+        info.set_instanceid(id);
+        info.set_requestid("req-" + id);
+        info.set_unitid(agentID);
+        info.set_runtimeid(runtime);
+        info.mutable_schedulerchain()->Clear();
+        *info.mutable_schedulerchain()->Add() = agentID;
+        (*info.mutable_createoptions())[SCHEDULER_ELASTIC_RESOURCES] = "true";
+        auto *cpu = (*info.mutable_resources()->mutable_resources())[resource_view::RESOURCE_CPU_NAME].mutable_scalar();
+        cpu->set_value(500);
+        cpu->set_limit(8000);
+        auto addFuture = realView->AddInstances({ { id, { info, nullptr } } });
+        ASSERT_AWAIT_READY(addFuture);
+        // Revision-known sample creates the credit (max - current).
+        auto report = std::make_shared<ResourceUnit>(unit);
+        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        report->set_memory_sample_unix_ms(nowMs);
+        report->set_cpu_sample_unix_ms(nowMs);
+        auto &observed = (*report->mutable_instances())[id];
+        observed.set_runtimeid(runtime);
+        auto *sample = observed.mutable_sandbox_resource_sample();
+        sample->set_runtime_id(runtime);
+        sample->set_sandbox_id(sbox);
+        sample->set_resource_generation(gen);
+        sample->set_sampled_at_unix_ms(nowMs);
+        sample->set_resource_revision(5);
+        sample->set_resource_revision_known(true);
+        sample->set_memory_limit_bytes(maxBytes);
+        sample->set_memory_limit_known(true);
+        sample->set_memory_usage_known(true);
+        sample->set_memory_current_bytes(curBytes);
+        sample->set_memory_high_bytes(resource_view::ExpectedHighBytes(maxBytes));
+        sample->set_memory_high_known(true);
+        sample->set_memory_high_unlimited(false);
+        sample->set_frozen(false);
+        sample->set_frozen_known(true);
+        sample->set_cpu_usage_known(true);
+        sample->set_cpu_usage_cores(0.05);
+        sample->set_cpu_limits_known(true);
+        auto upd = realView->UpdateResourceUnit(report, resource_view::UpdateType::UPDATE_ACTUAL);
+        ASSERT_AWAIT_READY(upd);
+    };
+    constexpr uint64_t MiB = 1024ULL * 1024ULL;
+    ASSERT_NO_FATAL_FAILURE(mkOwner(instA, "rt-budget", "sbox-budget", "gen-budget", MiB * 512, MiB * 269));
+    ASSERT_NO_FATAL_FAILURE(mkOwner("inst-nbr", "rt-nbr", "sbox-nbr", "gen-nbr", MiB * 384, MiB * 269));
+
+    const auto beforeOutstanding = realView->GetOutstandingResizeForTest(agentID);
+    EXPECT_NEAR(beforeOutstanding.memoryMb, (512 - 269) + (384 - 269), 0.01);
+
+    // Control view machine (RUNNING) + etcd-shaped FakeEvalTxn store so the
+    // REAL EXITING transition persists and the control delete really runs.
+    auto store = std::make_shared<FakeStore>();
+    auto metaClient = std::make_shared<MockMetaStoreClient>("127.0.0.1:1");
+    ON_CALL(*metaClient, BeginTransaction).WillByDefault(Invoke([store]() {
+        return std::shared_ptr<functionsystem::meta_store::TxnTransaction>(
+            std::make_shared<FakeEvalTxn>(store));
+    }));
+    auto harnessView = std::make_shared<InstanceControlView>("node-test", false);
+    harnessView->BindMetaStoreClient(metaClient);
+    actor_->BindInstanceControlView(harnessView);
+    auto entry = MakeViewEntry(instA, "rt-budget", "sbox-budget", "gen-budget");
+    entry.set_functionproxyid("node-test");
+    entry.set_function("default/0-test-helloWorld/$latest");
+    entry.set_tenantid("tenant-budget");
+    entry.mutable_instancestatus()->set_code(static_cast<int32_t>(InstanceState::RUNNING));
+    harnessView->GenerateStateMachine(instA, entry);
+
+    auto observer = std::make_shared<MockObserver>();
+    actor_->BindObserver(observer);
+
+    // The physical layer confirms EXACTLY the expected identity (the
+    // legitimate receipt); settlement then runs against the REAL view —
+    // the mock primary is replaced above, so every read/settle is real.
+
+    // State delete fails ONCE (pending-record trigger), succeeds after.
+    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>(
+        StateClient::ComposeStateKey(instA, "req-" + instA))))
+        .WillOnce(Return(Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "store down")))
+        .WillOnce(Return(Status::OK()));
+
+    // FIRST KILL — through the REAL frontend entry.
+    auto killReq = std::make_shared<KillRequest>();
+    killReq->set_instanceid(instA);
+    killReq->set_requestid("req-kill-real-1");
+    killReq->set_signal(SHUT_DOWN_SIGNAL);
+    auto first = actor_->KillFrontend("tenant-budget", killReq);
+    ASSERT_AWAIT_READY(first);
+
+    // The physical kill really happened with the trusted identity.
+    ASSERT_EQ(killRequests.size(), 1u);
+    EXPECT_EQ(killRequests[0]->expected_sandbox_id(), "sbox-budget");
+    EXPECT_EQ(killRequests[0]->expected_resource_generation(), "gen-budget");
+
+    // REAL budget settled EXACTLY once for A: A's credit released, the
+    // neighbour's untouched.
+    const auto afterOutstanding = realView->GetOutstandingResizeForTest(agentID);
+    EXPECT_NEAR(afterOutstanding.memoryMb, 384.0 - 269.0, 0.01);
+    EXPECT_EQ(realView->GetResizeBudgetEntryCountForTest(), size_t{1});
+    {
+        auto current = realView->GetResourceView();
+        ASSERT_AWAIT_READY(current);
+        EXPECT_EQ(current.Get()->instances().count(instA), 0u);
+        EXPECT_EQ(current.Get()->instances().count("inst-nbr"), 1u);
+    }
+
+    // The machine is gone; the pending record holds the full identity.
+    EXPECT_EQ(harnessView->GetInstance(instA), nullptr);
+    {
+        const auto pending = actor_->settledCleanupPending_.find(instA);
+        ASSERT_NE(pending, actor_->settledCleanupPending_.end());
+        EXPECT_EQ(pending->second.runtimeID, "rt-budget");
+        EXPECT_EQ(pending->second.requestID, "req-" + instA);
+        EXPECT_EQ(pending->second.tenantID, "tenant-budget");
+    }
+
+    // SECOND KILL — real frontend entry completes the cleanup via the record.
+    auto retryReq = std::make_shared<KillRequest>();
+    retryReq->set_instanceid(instA);
+    retryReq->set_requestid("req-kill-real-2");
+    retryReq->set_signal(SHUT_DOWN_SIGNAL);
+    auto second = actor_->KillFrontend("tenant-budget", retryReq);
+    ASSERT_AWAIT_READY(second);
+    EXPECT_EQ(static_cast<int>(second.Get().code()), static_cast<int>(common::ERR_NONE))
+        << second.Get().message();
+    EXPECT_EQ(actor_->settledCleanupPending_.count(instA), 0u);
+
+    // THIRD: no record, no machine — the genuine NOT_FOUND.
+    auto thirdReq = std::make_shared<KillRequest>();
+    thirdReq->set_instanceid(instA);
+    thirdReq->set_requestid("req-kill-real-3");
+    thirdReq->set_signal(SHUT_DOWN_SIGNAL);
+    auto third = actor_->KillFrontend("tenant-budget", thirdReq);
+    ASSERT_AWAIT_READY(third);
+    EXPECT_EQ(static_cast<int>(third.Get().code()),
+              static_cast<int>(common::ERR_INSTANCE_NOT_FOUND));
+
+    // The budget is UNCHANGED by the retries (idempotent settlement).
+    const auto finalOutstanding = realView->GetOutstandingResizeForTest(agentID);
+    EXPECT_NEAR(finalOutstanding.memoryMb, 384.0 - 269.0, 0.01);
+    EXPECT_EQ(realView->GetResizeBudgetEntryCountForTest(), size_t{1});
+    resource_view::ResetMemoryElasticityFenceOverride();
+}
 
 // ── SAME-REQUEST DIFFERENT-RUNTIME WINDOW (root 16:48/16:5x follow-up) ───────
 // Idempotent, noexcept barrier release: the test body and the destructor
