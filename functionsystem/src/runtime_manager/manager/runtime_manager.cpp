@@ -457,7 +457,14 @@ void RuntimeManager::StopInstance(const litebus::AID &from, std::string && /* na
         return;
     }
     const auto executorType = ResolveStopExecutorType(request);
-    auto executor = FindExecutor(executorType);
+    // A stop carrying the complete expected physical identity belongs to the
+    // sandboxd executor even when the local runtime map was already cleared:
+    // the executor replays the durable retirement receipt by sandbox/
+    // generation, which the plain RUNTIME executor cannot do.
+    const auto effectiveType = (request->expected_sandbox_id().empty()
+        || request->expected_resource_generation().empty())
+        ? executorType : ContainerExecutorType();
+    auto executor = FindExecutor(effectiveType);
     if (executor == nullptr) {
         YRLOG_ERROR("{}|{}|the type({}) is not supported to stop runtime({})", request->traceid(), request->requestid(),
                     static_cast<int32_t>(executorType), request->runtimeid());

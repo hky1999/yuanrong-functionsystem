@@ -1715,7 +1715,11 @@ litebus::Future<Status> InstanceCtrlActor::KillRuntime(const InstanceInfo &insta
     // Elastic incarnations retire against the resource view's authoritative
     // physical sample: the control-view copy never carries sandbox samples, so
     // deriving the expected identity from it would silently downgrade the kill
-    // to a receipt-less legacy stop.
+    // to a receipt-less legacy stop. A MISSING sample is not proof the
+    // incarnation was never created — an allocated elastic instance without
+    // a trusted sample stays UNKNOWN and retryable (see the identity-hold in
+    // KillRuntimeWithIdentity); only verified absence may take the
+    // identity-less path.
     if (resource_view::UsesElasticAdmission(instanceInfo)) {
         auto view = resourceViewMgr_ ? resourceViewMgr_->GetInf(resource_view::GetResourceType(instanceInfo)) : nullptr;
         if (view != nullptr) {
@@ -1733,11 +1737,27 @@ litebus::Future<Status> InstanceCtrlActor::KillRuntimeWithIdentity(const Instanc
 {
     std::string expectedSandboxID;
     std::string expectedGeneration;
+    bool allocated = false;
     if (current != nullptr) {
-        const auto allocated = current->instances().find(instanceInfo.instanceid());
-        if (allocated != current->instances().end()) {
-            TrustedPhysicalIdentity(allocated->second, &expectedSandboxID, &expectedGeneration);
+        const auto allocatedIt = current->instances().find(instanceInfo.instanceid());
+        if (allocatedIt != current->instances().end()) {
+            allocated = true;
+            TrustedPhysicalIdentity(allocatedIt->second, &expectedSandboxID, &expectedGeneration);
         }
+    }
+    // An ALLOCATED elastic instance without a trusted physical sample must
+    // never degrade to an identity-less kill: that could delete the
+    // physical runtime while carrying no receipt, leaving the allocation
+    // unreleasable. A missing sample is not proof of never-created — it is
+    // an UNKNOWN that keeps the budget and stays retryable. Only a
+    // provably-absent instance falls through to the legacy identity-less
+    // path (nothing left to fence).
+    if (allocated && expectedSandboxID.empty()) {
+        YRLOG_WARN("{}|elastic instance({}) is allocated but carries no trusted "
+                   "physical identity; kill held as UNKNOWN (budget retained)",
+                   instanceInfo.requestid(), instanceInfo.instanceid());
+        return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
+            "elastic instance allocated without a trusted physical identity"));
     }
     return SendKillRequestToAgent(instanceInfo, isRecovering, false, expectedSandboxID, expectedGeneration)
         .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::RecordFrontendKillRuntimeResult, instanceInfo, _1,
