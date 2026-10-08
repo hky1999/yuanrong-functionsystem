@@ -37,8 +37,10 @@
 //      machine-level fence (identity checked under the machine lock at the
 //      metadata-read point) is exercised on REAL views with real in-place
 //      ObserverActor-shaped updates;
-//   7. the REAL first kill entry (production exit handler installed by
-//      Init) drives the whole kill -> settlement -> control-delete chain;
+//   7. the REAL internal exit chain (production exit handler installed by
+//      Init) drives kill -> settlement -> control-delete — NOT a verified
+//      frontend kill (final combination case must go through KillFrontend
+//      with a real receipt + real settlement);
 //   8. Traefik route retirement is fenced by the registry's recorded
 //      incarnation (stale chains strip nothing).
 //
@@ -1264,14 +1266,19 @@ TEST_F(KillEntryIdentityFixture, RealWindowInPlaceUpdateDuringGatedMachineDelete
 }
 
 
-// ── REAL FIRST KILL ENTRY (root 15:43 #4) ────────────────────────────────────
+// ── REAL INTERNAL EXIT-CHAIN ENTRY (root 15:43 #4, relabeled 15:5x) ──────────
 
-// The production exit handler installed by Init() is the REAL first-entry
-// chain: ShutDownInstance -> KillRuntime (elastic identity gate -> agent
-// kill -> receipt settlement) -> DeleteInstanceInResourceView ->
+// The production exit handler installed by Init() is the REAL internal
+// exit chain: ShutDownInstance -> KillRuntime (elastic identity gate ->
+// agent kill -> receipt settlement) -> DeleteInstanceInResourceView ->
 // DeleteInstanceInControlView. Driving IT (not the helper) with the state
 // delete failing once must leave the pending record; the REAL KillFrontend
 // retry then converges, and a third call is the genuine NOT_FOUND.
+// SCOPE LABEL (root): this is INTERNAL-exit-chain coverage — it does NOT
+// pass through KillFrontend -> Kill -> state transition -> request
+// receipt, so it is NOT a verified real first FRONTEND kill. The final
+// combination case must call KillFrontend first and verify the receipt
+// (with a REAL ApplyPhysicalRetirement, not the mock used here).
 TEST_F(KillEntryIdentityFixture, RealFirstKillEntryThroughExitHandlerRecordsPending)
 {
     // Install the production exit handler (static wiring) — the actor's

@@ -1301,6 +1301,16 @@ public:
     std::unordered_map<std::string, SettledCleanupPending>
         settledCleanupPending_;
 
+    // StateActor-resolved completions are marshalled back onto THIS actor
+    // via litebus::Defer before touching actor-owned tables above: the
+    // resolving thread is the StateActor/store thread, never assumed ours.
+    Status OnRetireStateDeleteComplete(const InstanceInfo &instanceInfo,
+                                       const litebus::Future<Status> &del);
+    void OnPendingCleanupStateDeleteComplete(const std::shared_ptr<KillRequest> &killReq,
+                                             const std::shared_ptr<litebus::Promise<KillResponse>> &promise,
+                                             const SettledCleanupPending &recorded,
+                                             const litebus::Future<Status> &del);
+
     void ResolveFrontendKillCleanupProbe(
         const std::string &requestID, const std::string &instanceID,
         const std::shared_ptr<litebus::Promise<FrontendKillCleanupSnapshot>> &promise);

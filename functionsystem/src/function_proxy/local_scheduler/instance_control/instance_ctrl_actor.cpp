@@ -527,9 +527,78 @@ litebus::Future<Status> InstanceCtrlActor::ReportInstanceExitLatency(const Statu
     return status;
 }
 
-litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInResourceView(const Status &status,
-                                                                        const InstanceInfo &instanceInfo)
+Status InstanceCtrlActor::OnRetireStateDeleteComplete(const InstanceInfo &instanceInfo,
+                                                       const litebus::Future<Status> &del)
 {
+    // Runs ON THIS ACTOR (litebus::Defer from the StateActor-resolved
+    // future) — settledCleanupPending_ is actor-owned.
+    if (del.IsError() || del.Get().IsError()) {
+        // Machine already removed; the state cleanup failed. Record the
+        // pending cleanup bound to THIS incarnation so a later real kill
+        // retry can finish it. The write is IDENTITY-GUARDED: a record
+        // written during the async wait by a DIFFERENT (newer) generation's
+        // failed cleanup must survive — cross-generation cleanup is
+        // reconciliation's business, not this chain's.
+        auto &slot = settledCleanupPending_[instanceInfo.instanceid()];
+        if (!slot.runtimeID.empty() || !slot.requestID.empty()) {
+            if (slot.runtimeID != instanceInfo.runtimeid()
+                || slot.requestID != instanceInfo.requestid()) {
+                YRLOG_WARN("pending-cleanup record for instance({}) kept for "
+                           "runtime({}) request({}); retiring chain runtime({}) "
+                           "request({}) does not overwrite it",
+                           instanceInfo.instanceid(), slot.runtimeID,
+                           slot.requestID, instanceInfo.runtimeid(),
+                           instanceInfo.requestid());
+                return del.IsError()
+                    ? Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "state deletion failed")
+                    : del.Get();
+            }
+        }
+        slot = {
+            instanceInfo.tenantid(),
+            instanceInfo.runtimeid(),
+            instanceInfo.requestid(),
+            del.IsError() ? "future-error" : del.Get().RawMessage()};
+        return del.IsError()
+            ? Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "state deletion failed")
+            : del.Get();
+    }
+    // Erase ONLY the record belonging to THIS chain: the wait may have seen
+    // a NEWER generation's failed-cleanup record land under the same name.
+    const auto now = settledCleanupPending_.find(instanceInfo.instanceid());
+    if (now != settledCleanupPending_.end()
+        && now->second.runtimeID == instanceInfo.runtimeid()
+        && now->second.requestID == instanceInfo.requestid()) {
+        settledCleanupPending_.erase(now);
+    }
+    return Status::OK();
+}
+
+void InstanceCtrlActor::OnPendingCleanupStateDeleteComplete(
+    const std::shared_ptr<KillRequest> &killReq,
+    const std::shared_ptr<litebus::Promise<KillResponse>> &promise,
+    const SettledCleanupPending &recorded, const litebus::Future<Status> &del)
+{
+    // Runs ON THIS ACTOR (litebus::Defer from the StateActor-resolved
+    // future) — settledCleanupPending_ is actor-owned.
+    if (del.IsError() || del.Get().IsError()) {
+        promise->SetValue(GenKillResponse(common::ERR_INNER_SYSTEM_ERROR,
+                                          "state deletion failed"));
+        return;
+    }
+    // Erase ONLY if the entry is STILL the one we captured: a record
+    // rewritten during the wait survives.
+    const auto now = settledCleanupPending_.find(killReq->instanceid());
+    if (now != settledCleanupPending_.end()
+        && now->second.runtimeID == recorded.runtimeID
+        && now->second.requestID == recorded.requestID
+        && now->second.tenantID == recorded.tenantID) {
+        settledCleanupPending_.erase(now);
+    }
+    promise->SetValue(GenKillResponse(common::ERR_NONE, ""));
+}
+
+
     if (status.IsError()) { return status; }
     ASSERT_IF_NULL(resourceViewMgr_);
     auto type = resource_view::GetResourceType(instanceInfo);
@@ -661,80 +730,16 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
                 // production binds it in CommonDriver::BindStateActor, so
                 // unbound is NOT a stateless license. Stateless compat is
                 // the store-level idempotent Del, tested at StateClient).
+                // The completion runs on the StateActor/store-resolving
+                // thread — it touches actor-owned tables, so it is
+                // marshalled back onto THIS actor via litebus::Defer (the
+                // resolving thread must never mutate settledCleanupPending_
+                // concurrently with actor-thread users).
                 return function_proxy::StateHandler::DeleteState(
                     instanceInfo.instanceid())
-                    .Then([this, instanceInfo](const litebus::Future<Status> &del) {
-                        if (del.IsError() || del.Get().IsError()) {
-                            // Machine already removed; the state cleanup
-                            // failed. Record the pending cleanup bound to
-                            // THIS incarnation so a later real kill retry
-                            // can finish it. The write is IDENTITY-GUARDED:
-                            // a record written during the async wait by a
-                            // DIFFERENT (newer) generation's failed cleanup
-                            // must survive — cross-generation cleanup is
-                            // reconciliation's business, not this chain's.
-                            auto &slot = settledCleanupPending_[instanceInfo.instanceid()];
-                            if (!slot.runtimeID.empty() || !slot.requestID.empty()) {
-                                if (slot.runtimeID != instanceInfo.runtimeid()
-                                    || slot.requestID != instanceInfo.requestid()) {
-                                    YRLOG_WARN("pending-cleanup record for instance({}) kept for "
-                                               "runtime({}) request({}); retiring chain runtime({}) "
-                                               "request({}) does not overwrite it",
-                                               instanceInfo.instanceid(), slot.runtimeID,
-                                               slot.requestID, instanceInfo.runtimeid(),
-                                               instanceInfo.requestid());
-                                    return del.IsError()
-                                        ? Status(StatusCode::ERR_INNER_SYSTEM_ERROR,
-                                                 "state deletion failed")
-                                        : del.Get();
-                                }
-                            }
-                            slot = {
-                                instanceInfo.tenantid(),
-                                instanceInfo.runtimeid(),
-                                instanceInfo.requestid(),
-                                del.IsError() ? "future-error" : del.Get().RawMessage()};
-                            return del.IsError()
-                                ? Status(StatusCode::ERR_INNER_SYSTEM_ERROR,
-                                         "state deletion failed")
-                                : del.Get();
-                        }
-                        // Post-completion narrowing of the StateActor async
-                        // window: the snapshot above was taken BEFORE the
-                        // async hop, so a replacement landing during the
-                        // flight is only detectable now. The store exposes
-                        // no conditional delete for instance state (unlike
-                        // the metadata delete, which is version-precondi-
-                        // tioned at InstanceOperator::Delete), so this layer
-                        // can narrow and report, not prevent; the successor
-                        // re-saves its state on its next save. The retiring
-                        // chain's own cleanup DID complete: OK is the honest
-                        // answer for IT, with the collision logged for
-                        // reconciliation.
-                        const auto after = instanceControlView_->GetIncarnationSnapshot(
-                            instanceInfo.instanceid());
-                        if (!after.first.empty()
-                            && (after.first != instanceInfo.runtimeid()
-                                || (!after.second.empty() && !instanceInfo.requestid().empty()
-                                    && after.second != instanceInfo.requestid()))) {
-                            YRLOG_WARN("state delete for instance({}) retired runtime({}) "
-                                       "request({}) completed while the view now shows runtime({}) "
-                                       "request({}); successor state may have been removed — "
-                                       "successor must re-save",
-                                       instanceInfo.instanceid(), instanceInfo.runtimeid(),
-                                       instanceInfo.requestid(), after.first, after.second);
-                        }
-                        // Erase ONLY the record belonging to THIS chain:
-                        // the wait may have seen a NEWER generation's
-                        // failed-cleanup record land under the same name.
-                        const auto now = settledCleanupPending_.find(instanceInfo.instanceid());
-                        if (now != settledCleanupPending_.end()
-                            && now->second.runtimeID == instanceInfo.runtimeid()
-                            && now->second.requestID == instanceInfo.requestid()) {
-                            settledCleanupPending_.erase(now);
-                        }
-                        return Status::OK();
-                    });
+                    .Then(litebus::Defer(GetAID(),
+                        &InstanceCtrlActor::OnRetireStateDeleteComplete,
+                        instanceInfo, std::placeholders::_1));
             }
             return litebus::Future<Status>(status);
         });
@@ -1144,24 +1149,13 @@ litebus::Future<KillResponse> InstanceCtrlActor::KillFrontend(const std::string 
             }
             const auto recorded = pending->second;
             auto promise = std::make_shared<litebus::Promise<KillResponse>>();
+            // Completion marshalled back onto THIS actor: the resolving
+            // thread is the StateActor/store thread, and the callback
+            // mutates actor-owned settledCleanupPending_.
             function_proxy::StateHandler::DeleteState(killReq->instanceid())
-                .OnComplete([this, promise, killReq, recorded](const litebus::Future<Status> &del) {
-                    if (del.IsError() || del.Get().IsError()) {
-                        promise->SetValue(GenKillResponse(
-                            common::ERR_INNER_SYSTEM_ERROR, "state deletion failed"));
-                        return;
-                    }
-                    // Erase ONLY if the entry is STILL the one we captured:
-                    // a record rewritten during the wait survives.
-                    const auto now = settledCleanupPending_.find(killReq->instanceid());
-                    if (now != settledCleanupPending_.end()
-                        && now->second.runtimeID == recorded.runtimeID
-                        && now->second.requestID == recorded.requestID
-                        && now->second.tenantID == recorded.tenantID) {
-                        settledCleanupPending_.erase(now);
-                    }
-                    promise->SetValue(GenKillResponse(common::ERR_NONE, ""));
-                });
+                .OnComplete(litebus::Defer(GetAID(),
+                    &InstanceCtrlActor::OnPendingCleanupStateDeleteComplete,
+                    killReq, promise, recorded, std::placeholders::_1));
             return promise->GetFuture();
         }
         return GenKillResponse(common::ERR_INSTANCE_NOT_FOUND,
