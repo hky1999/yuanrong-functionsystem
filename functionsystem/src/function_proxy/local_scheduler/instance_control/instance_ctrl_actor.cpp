@@ -9245,14 +9245,43 @@ litebus::Future<Status> InstanceCtrlActor::RegisterTraefikRouteAttempt(const Ins
         return Status::OK();
     }
 
-    // Check if instance has port mappings in extensions
-    auto it = instanceInfo.extensions().find(PORT_FORWARD_KEY);
-    if (it == instanceInfo.extensions().end() || it->second.empty()) {
-        YRLOG_DEBUG("Instance {} has no port mappings, skip Traefik registration", instanceInfo.instanceid());
-        return Status::OK();
+    // AUTHORITY FIRST (root 16:35 #1): identity AND port payload both come
+    // from the machine's CURRENT one-lock record snapshot — never from the
+    // passed request. A failover keeps the creation request while the
+    // record carries the NEW generation's truth; stale ports from an old
+    // payload must never be re-labeled onto the new identity.
+    const auto machine = instanceControlView_->GetInstance(instanceInfo.instanceid());
+    const auto authority = (machine == nullptr)
+        ? InstanceStateMachine::RegistrationAuthority{}
+        : machine->GetRegistrationAuthority(config_.isMetaStoreEnabled);
+    if (!authority.valid) {
+        constexpr uint32_t MAX_TRAEFIK_REGISTER_ATTEMPTS = 5;
+        if (attempt + 1 < MAX_TRAEFIK_REGISTER_ATTEMPTS) {
+            YRLOG_INFO("traefik registration for instance({}) deferred (attempt {}): authority not "
+                       "established yet; retrying", instanceInfo.instanceid(), attempt);
+            ScheduleTraefikRegisterRetry(instanceInfo, attempt + 1);
+            return Status::OK();
+        }
+        YRLOG_ERROR("failed to register traefik route for instance({}): authority never established "
+                    "after {} attempts — the instance will run WITHOUT a route",
+                    instanceInfo.instanceid(), attempt + 1);
+        return Status(StatusCode::ERR_INSTANCE_BUSY, "traefik registration: authority never established");
     }
-
-    const std::string& portMappingsJson = it->second;
+    if (authority.info.instanceid() != instanceInfo.instanceid()
+        || authority.info.requestid() != instanceInfo.requestid()) {
+        YRLOG_WARN("refused traefik registration for instance({}): captured request ({}|{}) does not "
+                   "match the machine's current identity ({}|{}) — stale chain",
+                   instanceInfo.instanceid(), instanceInfo.instanceid(), instanceInfo.requestid(),
+                   authority.info.instanceid(), authority.info.requestid());
+        return Status(StatusCode::ERR_INSTANCE_BUSY,
+            "traefik registration refused: captured request is not the current generation");
+    }
+    // Ports from the SAME snapshot (empty = a record legitimately at zero
+    // ports: the marker transaction still runs and atomically cleans the
+    // previous own-key list).
+    const auto portIt = authority.info.extensions().find(PORT_FORWARD_KEY);
+    const std::string portMappingsJson =
+        (portIt == authority.info.extensions().end()) ? std::string() : portIt->second;
 
     // Helper to parse IP from address (ip:port format)
     auto parseIP = [](const std::string& addr) -> std::string {
