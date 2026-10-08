@@ -107,15 +107,33 @@ public:
             }
         }
         const int64_t commitRevision = store_->globalRevision + 1;
+        auto response = std::make_shared<functionsystem::TxnResponse>();
+        response->success = true;
+        response->header.revision = commitRevision;
         for (const auto &op : thenOps) {
             ::etcdserverpb::RequestOp pb;
             op.Build(pb, "");
             Apply(*store_, pb, commitRevision);
+            // Per-op responses in the REAL etcd shape — InstanceOperator's
+            // parsers size-check responses against the key count and read
+            // DeleteResponse.deleted / PutResponse fields.
+            functionsystem::TxnOperationResponse opRsp;
+            if (pb.has_request_delete_range()) {
+                opRsp.operationType = functionsystem::TxnOperationType::OPERATION_DELETE;
+                functionsystem::DeleteResponse del;
+                del.deleted = 1;
+                opRsp.response = del;
+            } else if (pb.has_request_put()) {
+                opRsp.operationType = functionsystem::TxnOperationType::OPERATION_PUT;
+                opRsp.response = functionsystem::PutResponse{};
+            } else {
+                opRsp.operationType = functionsystem::TxnOperationType::OPERATION_GET;
+                functionsystem::GetResponse get;
+                get.count = 0;
+                opRsp.response = get;
+            }
+            response->responses.emplace_back(std::move(opRsp));
         }
-        store_->globalRevision = commitRevision;
-        auto response = std::make_shared<functionsystem::TxnResponse>();
-        response->success = true;
-        response->header.revision = commitRevision;
         return response;
     }
 
