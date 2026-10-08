@@ -203,6 +203,7 @@ protected:
     std::shared_ptr<MockInternalIAM> internalIAM_;
     std::vector<std::shared_ptr<messages::KillInstanceRequest>> killRequests;
     std::vector<resource_view::PhysicalRetirementReceipt> settleReceipts;
+    std::shared_ptr<InstanceStateMachine> machineSlot_ = nullptr;
 };
 
 // 1) Same incarnation: trusted sample identity reaches the agent request
