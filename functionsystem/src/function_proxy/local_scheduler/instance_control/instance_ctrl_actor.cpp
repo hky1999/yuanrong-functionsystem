@@ -3061,9 +3061,9 @@ void InstanceCtrlActor::CleanupFailedSnapStart(const std::shared_ptr<messages::S
             insCtrlView->OnDelInstance(instanceID, requestID, true);
             return Status::OK();
         })
-        .Then([instanceID, requestID](const Status &status) {
+        .Then([instanceID, requestID, runtimeID = instanceInfo.runtimeid()](const Status &status) {
             if (status.IsOk()) {
-                function_proxy::StateHandler::DeleteState(instanceID, requestID, instanceInfo.runtimeid());
+                function_proxy::StateHandler::DeleteState(instanceID, requestID, runtimeID);
             }
             return Status::OK();
         });
