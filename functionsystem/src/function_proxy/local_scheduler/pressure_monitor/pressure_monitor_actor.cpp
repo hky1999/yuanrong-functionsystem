@@ -402,8 +402,18 @@ void PressureMonitorActor::OnPressureResize(const std::string &instanceID, const
     if (baseline != resizeSamples_.end()) {
         resizeAfterMs_[instanceID] = pending->second.dispatchedAtMs;
     }
-    YRLOG_INFO("pressure resize instance={} request={} outcome={} code={}", instanceID, requestID,
-               static_cast<int>(result.Get().outcome()), result.Get().code());
+    // 2026-10-08 DIAGNOSTIC (A2 code-6 forensics): carry the response
+    // message and the pending request's full identity so REJECTED_BEFORE_
+    // DISPATCH + RESOURCE_NOT_ENOUGH traces name the actual cause.
+    {
+        const auto &preq = pending->second.request;
+        YRLOG_INFO("pressure resize instance={} request={} operation={} sandbox={} generation={} runtime={} outcome={} code={} message=\"{}\"",
+                   instanceID, requestID,
+                   preq.resize().operation_id(), preq.resize().sandbox_id(),
+                   preq.resize().resource_generation(), preq.runtimeid(),
+                   static_cast<int>(result.Get().outcome()),
+                   result.Get().code(), result.Get().message());
+    }
     pressureResizes_.erase(pending);
 }
 

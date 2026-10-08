@@ -185,6 +185,10 @@ Status ResourceViewActor::ReserveResize(const messages::ResizeSandboxRequest &re
         // before the unit accepts any new resource mutation.
         const auto blocker = UnitMutationBlocker(unit->second, nowMs);
         if (!blocker.empty()) {
+            YRLOG_WARN("reserve resize REJECTED instance={} runtime={} request={} sandbox={} generation={} operationId={} reason=\"unit is reconciling instance {}\" unit_mutation_blocker=\"{}\"",
+                       request.instanceid(), request.runtimeid(), request.requestid(),
+                       command.sandbox_id(), command.resource_generation(), command.operation_id(),
+                       blocker, blocker);
             return Status(RESOURCE_NOT_ENOUGH, "unit is reconciling instance " + blocker);
         }
         for (const auto &item : resizeBudget_) {
@@ -211,7 +215,13 @@ Status ResourceViewActor::ReserveResize(const messages::ResizeSandboxRequest &re
     }
     for (const auto &item : resizeBudget_) {
         if (item.second.request.instanceid() != request.instanceid()) { continue; }
-        if (!item.second.observed) { return Status(RESOURCE_NOT_ENOUGH, "prior resize outcome is unresolved"); }
+        if (!item.second.observed) {
+            YRLOG_WARN("reserve resize REJECTED instance={} runtime={} request={} sandbox={} generation={} operationId={} reason=\"prior resize outcome unresolved (op {})\"",
+                       request.instanceid(), request.runtimeid(), request.requestid(),
+                       command.sandbox_id(), command.resource_generation(), command.operation_id(),
+                       item.second.operationId);
+            return Status(RESOURCE_NOT_ENOUGH, "prior resize outcome is unresolved");
+        }
         if (item.second.request.resize().resource_generation() != command.resource_generation()) { continue; }
         if (fenced) {
             // Under the contract the sample revision, not historical landed
@@ -253,6 +263,7 @@ Status ResourceViewActor::ReserveResize(const messages::ResizeSandboxRequest &re
             case AdmissionRejectReason::CapacityExceeded:
                 reasonStr = "capacity_exceeded";
                 break;
+            case AdmissionRejectReason::Other:
             default:
                 reasonStr = "other";
                 break;
