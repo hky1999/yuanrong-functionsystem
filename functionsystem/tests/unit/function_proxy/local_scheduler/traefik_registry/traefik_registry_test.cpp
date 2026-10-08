@@ -187,6 +187,25 @@ private:
     std::function<void()> barrier_;
 };
 
+// Bounded, single-shot barrier with an exception-safe releaser and a
+// thread joiner (declaration order: releaser LAST so it runs FIRST on
+// unwind — release before join).
+struct TScopedRelease {
+    std::shared_ptr<std::promise<void>> release;
+    std::atomic<bool> done{ false };
+    void Release() noexcept
+    {
+        if (!done.exchange(true)) {
+            try { release->set_value(); } catch (...) {}
+        }
+    }
+    ~TScopedRelease() { Release(); }
+};
+struct TThreadJoiner {
+    std::thread &thread;
+    ~TThreadJoiner() { if (thread.joinable()) { thread.join(); } }
+};
+
 class TraefikRegistryFixture : public ::testing::Test {
 protected:
     void SetUp() override
@@ -194,8 +213,12 @@ protected:
         store_ = std::make_shared<FakeStore>();
         metaClient_ = std::make_shared<MockMetaStoreClient>("127.0.0.1:1");
         ON_CALL(*metaClient_, BeginTransaction).WillByDefault(Invoke([this]() {
+            // SINGLE CONSUMPTION: the barrier is moved out and cleared — a
+            // retry transaction (or any later one) never re-fulfills it.
+            auto barrier = std::move(nextBarrier_);
+            nextBarrier_ = nullptr;
             return std::shared_ptr<functionsystem::meta_store::TxnTransaction>(
-                std::make_shared<FakeEvalTxn>(store_, nextBarrier_));
+                std::make_shared<FakeEvalTxn>(store_, barrier));
         }));
         accessor_ = std::make_shared<MockMetaStorageAccessor>(metaClient_);
         ON_CALL(*accessor_, Put(_, _)).WillByDefault(Invoke([this](const std::string &k, const std::string &v) {
@@ -299,21 +322,33 @@ TEST_F(TraefikRegistryFixture, RedCaseOldRetireBarrierThenNewRegister)
 
     auto reached = std::make_shared<std::promise<void>>();
     auto release = std::make_shared<std::promise<void>>();
-    nextBarrier_ = [reached, release]() {
+    auto barrierOk = std::make_shared<std::atomic<bool>>(false);
+    nextBarrier_ = [reached, release, barrierOk]() {
         reached->set_value();
-        release->get_future().wait();
+        // BOUNDED: an abandoned wait cannot wedge the worker thread.
+        barrierOk->store(release->get_future().wait_for(std::chrono::seconds(10))
+                             == std::future_status::ready);
     };
-    auto oldRetire = registry_->UnregisterInstance("inst-r", "t1", "rt-OLD", "req-OLD");
+    // The OLD-side call runs on its OWN thread: FakeEvalTxn::Commit executes
+    // the barrier SYNCHRONOUSLY, so calling it on the test thread would
+    // deadlock before the future is even returned (root 17:2x diagnosis).
+    auto registry = registry_;
+    auto oldRetire = std::make_shared<litebus::Future<Status>>();
+    std::thread oldCall([registry, oldRetire]() {
+        *oldRetire = registry->UnregisterInstance("inst-r", "t1", "rt-OLD", "req-OLD");
+    });
+    TThreadJoiner oldJoiner{ oldCall };
+    TScopedRelease releaser{ release };
     ASSERT_EQ(reached->get_future().wait_for(std::chrono::seconds(5)), std::future_status::ready);
 
     // New generation takes the name (higher durable etcd revision).
-    nextBarrier_ = nullptr;
     ASSERT_TRUE(Register("inst-r", "t1", "rt-NEW", "req-NEW", 8080)->IsOk());
     const auto newRoute = store_->kv.find("yr/traefik-ut/http/routers/inst-r-p8080/rule");
     ASSERT_NE(newRoute, store_->kv.end());
 
-    release->set_value();
-    ASSERT_AWAIT_READY(oldRetire);
+    releaser.Release();
+    EXPECT_TRUE(barrierOk->load()) << "the barrier wait itself must not have timed out";
+    ASSERT_AWAIT_READY(*oldRetire);
     EXPECT_EQ(oldRetire.Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY);
     // New routes + marker fully intact.
     EXPECT_EQ(store_->kv.count("yr/traefik-ut/http/routers/inst-r-p8080/rule"), 1u);
@@ -335,31 +370,36 @@ TEST_F(TraefikRegistryFixture, RedCaseLateOldRegisterCannotOverwriteNewHolder)
 {
     ASSERT_TRUE(Register("inst-g", "t1", "rt-OLD", "req-OLD", 8080)->IsOk());
 
-    auto reached = std::make_shared<std::promise<void>>();
-    auto release = std::make_shared<std::promise<void>>();
-    nextBarrier_ = [reached, release]() {
-        reached->set_value();
-        release->get_future().wait();
-    };
-    // The OLD generation re-registers (its own refresh path — capture
-    // branch would authorize it against its OWN marker value). Its record
-    // still exists at the OLD revision (legitimate seeds) — the fence that
-    // stops it is the store-side value compare, not the seeding.
     const std::string recordG = "rec/inst-g";
     store_->Put(recordG, "instance-record|rt-OLD|req-OLD");
     const uint64_t revisionG = static_cast<uint64_t>(store_->modRevision[recordG]);
-    auto refreshFuture = registry_->RegisterInstance(
-        "inst-g", "10.9.9.9",
-        { local_scheduler::TraefikRegistry::PortMapping{ 8081, 49081, "http" } },
-        "t1", "rt-OLD", "req-OLD", revisionG, recordG);
+    auto reached = std::make_shared<std::promise<void>>();
+    auto release = std::make_shared<std::promise<void>>();
+    auto barrierOk = std::make_shared<std::atomic<bool>>(false);
+    nextBarrier_ = [reached, release, barrierOk]() {
+        reached->set_value();
+        barrierOk->store(release->get_future().wait_for(std::chrono::seconds(10))
+                             == std::future_status::ready);
+    };
+    // OLD-side refresh on its OWN thread (synchronous barrier — see above).
+    auto registry = registry_;
+    auto refreshFuture = std::make_shared<litebus::Future<Status>>();
+    std::thread oldCall([registry, recordG, revisionG, refreshFuture]() {
+        *refreshFuture = registry->RegisterInstance(
+            "inst-g", "10.9.9.9",
+            { local_scheduler::TraefikRegistry::PortMapping{ 8081, 49081, "http" } },
+            "t1", "rt-OLD", "req-OLD", revisionG, recordG);
+    });
+    TThreadJoiner oldJoiner{ oldCall };
+    TScopedRelease releaser{ release };
     ASSERT_EQ(reached->get_future().wait_for(std::chrono::seconds(5)), std::future_status::ready);
 
-    nextBarrier_ = nullptr;
     ASSERT_TRUE(Register("inst-g", "t1", "rt-NEW", "req-NEW", 8080)->IsOk());
     const auto snapshot = store_->kv;
 
-    release->set_value();
-    ASSERT_AWAIT_READY(refreshFuture);
+    releaser.Release();
+    EXPECT_TRUE(barrierOk->load()) << "the barrier wait itself must not have timed out";
+    ASSERT_AWAIT_READY(*refreshFuture);
     EXPECT_TRUE(refreshFuture.Get().IsError())
         << "the late old refresh must fail, not overwrite the newer holder";
     EXPECT_EQ(store_->kv, snapshot) << "the new holder's keys must be byte-identical";
@@ -413,16 +453,24 @@ TEST_F(TraefikRegistryFixture, LegacyCleanupNeighborsAndConditionalCommit)
     store_->Put("yr/traefik-ut/http/routers/inst-c-p8080/rule", "legacy-c");
     auto reached = std::make_shared<std::promise<void>>();
     auto release = std::make_shared<std::promise<void>>();
-    nextBarrier_ = [reached, release]() {
+    auto barrierOk = std::make_shared<std::atomic<bool>>(false);
+    nextBarrier_ = [reached, release, barrierOk]() {
         reached->set_value();
-        release->get_future().wait();
+        barrierOk->store(release->get_future().wait_for(std::chrono::seconds(10))
+                             == std::future_status::ready);
     };
-    auto cleanup = registry_->UnregisterInstance("inst-c");
+    auto registry = registry_;
+    auto cleanup = std::make_shared<litebus::Future<Status>>();
+    std::thread oldCall([registry, cleanup]() {
+        *cleanup = registry->UnregisterInstance("inst-c");
+    });
+    TThreadJoiner oldJoiner{ oldCall };
+    TScopedRelease releaser{ release };
     ASSERT_EQ(reached->get_future().wait_for(std::chrono::seconds(5)), std::future_status::ready);
-    nextBarrier_ = nullptr;
     ASSERT_TRUE(Register("inst-c", "t1", "rt-NEW", "req-NEW", 8080)->IsOk());
-    release->set_value();
-    ASSERT_AWAIT_READY(cleanup);
+    releaser.Release();
+    EXPECT_TRUE(barrierOk->load()) << "the barrier wait itself must not have timed out";
+    ASSERT_AWAIT_READY(*cleanup);
     EXPECT_EQ(cleanup.Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY)
         << "the compare failure must propagate, not silently succeed";
     EXPECT_EQ(store_->kv.count("yr/traefik-ut/http/routers/inst-c-p8080/rule"), 1u)
