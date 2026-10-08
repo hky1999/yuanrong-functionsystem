@@ -27,22 +27,34 @@ StateActor::StateActor(const std::shared_ptr<StateClient> &stateClient)
 }
 
 litebus::Future<StateSaveResponse> StateActor::SaveState(const std::string &instanceId,
+                                                         const std::string &boundRuntimeID,
+                                                         const std::string &boundRequestID,
                                                          const std::shared_ptr<StateSaveRequest> &request)
 {
     if (instanceId.empty() || !stateClient_) {
         YRLOG_ERROR("failed to save state: empty instance id {} or stateClient null", instanceId);
         return GenStateSaveResponse(common::ErrorCode::ERR_PARAM_INVALID, "save state failed: empty instance id");
     }
-
-    // use instance id as checkpoint id
-    auto status = stateClient_->Set(instanceId, request->state());
+    // Unbound identity (stream accepted without a resolvable creation
+    // generation) must never degrade to a bare-key write: refuse.
+    if (boundRequestID.empty()) {
+        YRLOG_ERROR("refused to save state for instance({}) runtime({}): stream carries no bound "
+                    "creation generation", instanceId, boundRuntimeID);
+        return GenStateSaveResponse(common::ErrorCode::ERR_PARAM_INVALID,
+                                    "save state failed: unbound stream identity");
+    }
+    const std::string key = StateClient::ComposeStateKey(instanceId, boundRequestID);
+    auto status = stateClient_->Set(key, request->state());
     if (status.IsError()) {
         YRLOG_ERROR("failed to save state, status: {}", status.ToString());
         return GenStateSaveResponse(common::ErrorCode::ERR_INNER_SYSTEM_ERROR,
                                     "save state failed: " + status.ToString());
     }
-    YRLOG_INFO("succeed to save instance({}) state", instanceId);
-    return GenStateSaveResponse(common::ErrorCode::ERR_NONE, "", instanceId);
+    YRLOG_INFO("succeed to save instance({}) generation({}) state under versioned checkpoint id",
+               instanceId, boundRequestID);
+    // The VERSIONED checkpoint id travels back to the runtime: subsequent
+    // loads reference it explicitly (plan v2r1 R3).
+    return GenStateSaveResponse(common::ErrorCode::ERR_NONE, "", key);
 }
 
 litebus::Future<StateLoadResponse> StateActor::LoadState(const std::shared_ptr<StateLoadRequest> &request)
@@ -50,6 +62,19 @@ litebus::Future<StateLoadResponse> StateActor::LoadState(const std::shared_ptr<S
     if (request->checkpointid().empty() || !stateClient_) {
         YRLOG_ERROR("failed to load state: empty checkpoint id");
         return GenStateLoadResponse(common::ErrorCode::ERR_PARAM_INVALID, "load state failed: empty checkpoint id");
+    }
+    // Versioned-reference well-formedness only. The EXISTING load
+    // contract — read whatever checkpoint reference the caller supplies —
+    // is preserved: no caller-identity restriction is added here (a
+    // cross-instance versioned reference loads, exactly as a cross-
+    // instance bare one did before). Bare legacy references are refused
+    // under the migration contract until backfill completes; that refusal
+    // is migration-pending, not a permanent semantic.
+    if (StateClient::ParseStateKey(request->checkpointid()).first.empty()) {
+        YRLOG_ERROR("refused to load checkpoint({}): not a versioned reference",
+                    request->checkpointid());
+        return GenStateLoadResponse(common::ErrorCode::ERR_PARAM_INVALID,
+                                    "load state failed: checkpoint reference is not versioned");
     }
 
     std::string state;
@@ -63,9 +88,14 @@ litebus::Future<StateLoadResponse> StateActor::LoadState(const std::shared_ptr<S
     return GenStateLoadResponse(common::ErrorCode::ERR_NONE, "", state);
 }
 
-litebus::Future<Status> StateActor::DeleteState(const std::string &instanceId)
+litebus::Future<Status> StateActor::DeleteState(const std::string &instanceId, const std::string &generation)
 {
-    return stateClient_->Del(instanceId);
+    if (generation.empty()) {
+        YRLOG_ERROR("refused to delete state for instance({}): no creation generation carried", instanceId);
+        return Status(StatusCode::ERR_INSTANCE_INFO_INVALID,
+                      "delete state failed: no creation generation carried");
+    }
+    return stateClient_->Del(StateClient::ComposeStateKey(instanceId, generation));
 }
 
 void StateActor::InitStateClient()

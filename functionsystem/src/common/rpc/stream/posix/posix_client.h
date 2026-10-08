@@ -25,8 +25,20 @@
 
 namespace functionsystem::grpc {
 
+// Immutable identity of the posix stream a control message arrived on,
+// bound when the stream was accepted/created — NEVER re-resolved per
+// message. `boundRequestID` is the CREATION request generation the proxy
+// bound at accept time; empty means "unbound" (mismatch or unknown), which
+// state operations must treat as an explicit refusal, never a bare-key
+// fallback.
+struct PosixStreamIdentity {
+    std::string instanceID;
+    std::string runtimeID;
+    std::string boundRequestID;
+};
+
 using PosixFunctionSysControlHandler = std::function<litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>>(
-    const std::string &, const std::shared_ptr<runtime_rpc::StreamingMessage> &)>;
+    const PosixStreamIdentity &, const std::shared_ptr<runtime_rpc::StreamingMessage> &)>;
 using PosixFunctionSysControlHandlers =
     std::unordered_map<runtime_rpc::StreamingMessage::BodyCase, PosixFunctionSysControlHandler>;
 using StreamingMessageAuthInterceptor = std::shared_ptr<AuthInterceptor<runtime_rpc::StreamingMessage>>;

@@ -67,8 +67,9 @@ Status PosixAPIHandler::IsValidCreateRequests(const CreateRequests &createReqs)
 }
 
 litebus::Future<std::shared_ptr<StreamingMessage>> PosixAPIHandler::Create(
-    const std::string &from, const std::shared_ptr<StreamingMessage> &request)
+    const grpc::PosixStreamIdentity &identity, const std::shared_ptr<StreamingMessage> &request)
 {
+    const std::string from = identity.instanceID; // stream-bound source identity
     auto &createReq = *request->mutable_createreq();
     const auto requestID = createReq.requestid();
     const auto traceID = createReq.traceid();
@@ -118,8 +119,9 @@ litebus::Future<std::shared_ptr<StreamingMessage>> PosixAPIHandler::Create(
 }
 
 litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> PosixAPIHandler::GroupCreate(
-    const std::string &from, const std::shared_ptr<runtime_rpc::StreamingMessage> &request)
+    const grpc::PosixStreamIdentity &identity, const std::shared_ptr<runtime_rpc::StreamingMessage> &request)
 {
+    const std::string from = identity.instanceID; // stream-bound source identity
     auto createReqs = std::make_shared<CreateRequests>(std::move(*request->mutable_createreqs()));
     const auto &requestID = createReqs->requestid();
     const auto &traceID = createReqs->traceid();
@@ -148,8 +150,9 @@ litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> PosixAPIHandler:
 }
 
 litebus::Future<std::shared_ptr<StreamingMessage>> PosixAPIHandler::Kill(
-    const std::string &from, const std::shared_ptr<StreamingMessage> &request)
+    const grpc::PosixStreamIdentity &identity, const std::shared_ptr<StreamingMessage> &request)
 {
+    const std::string from = identity.instanceID; // stream-bound source identity
     ASSERT_IF_NULL(request);
     auto killReq = std::make_shared<KillRequest>(std::move(*request->mutable_killreq()));
     auto response = std::make_shared<StreamingMessage>();
@@ -177,8 +180,9 @@ litebus::Future<std::shared_ptr<StreamingMessage>> PosixAPIHandler::Kill(
 }
 
 litebus::Future<std::shared_ptr<StreamingMessage>> PosixAPIHandler::Exit(
-    const std::string &from, const std::shared_ptr<StreamingMessage> &request)
+    const grpc::PosixStreamIdentity &identity, const std::shared_ptr<StreamingMessage> &request)
 {
+    const std::string from = identity.instanceID; // stream-bound source identity
     ASSERT_IF_NULL(request);
     auto instanceID = from;
     YRLOG_INFO("receive exit request from instance({})", instanceID);
@@ -199,8 +203,9 @@ litebus::Future<std::shared_ptr<StreamingMessage>> PosixAPIHandler::Exit(
 }
 
 litebus::Future<std::pair<bool, std::shared_ptr<StreamingMessage>>> PosixAPIHandler::CallResult(
-    const std::string &from, std::shared_ptr<functionsystem::CallResult> &callResult)
+    const grpc::PosixStreamIdentity &identity, std::shared_ptr<functionsystem::CallResult> &callResult)
 {
+    const std::string from = identity.instanceID; // stream-bound source identity
     auto instanceCtrl = instanceCtrl_.lock();
     if (instanceCtrl == nullptr) {
         YRLOG_ERROR("failed to call result, instance control is nullptr, instance({})", from);
@@ -221,8 +226,9 @@ litebus::Future<std::pair<bool, std::shared_ptr<StreamingMessage>>> PosixAPIHand
 }
 
 litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> PosixAPIHandler::CreateResourceGroup(
-    const std::string &from, const std::shared_ptr<runtime_rpc::StreamingMessage> &request)
+    const grpc::PosixStreamIdentity &identity, const std::shared_ptr<runtime_rpc::StreamingMessage> &request)
 {
+    const std::string from = identity.instanceID; // stream-bound source identity
     auto rgReq = std::make_shared<CreateResourceGroupRequest>(std::move(*request->mutable_rgroupreq()));
     (*rgReq->mutable_rgroupspec()->mutable_opt()->mutable_extension())["parentId"] = from;
     const auto &requestID = rgReq->requestid();

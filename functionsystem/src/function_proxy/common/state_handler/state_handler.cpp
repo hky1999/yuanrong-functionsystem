@@ -36,10 +36,11 @@ void StateHandler::BindStateActor(const std::shared_ptr<StateActor> &stateActor)
 }
 
 litebus::Future<std::shared_ptr<StreamingMessage>> StateHandler::SaveState(
-    const std::string &instanceId, const std::shared_ptr<StreamingMessage> &request)
+    const grpc::PosixStreamIdentity &identity, const std::shared_ptr<StreamingMessage> &request)
 {
-    YRLOG_INFO("state handler receive save state from instance({})", instanceId);
-    if (instanceId.empty() || !request) {
+    YRLOG_INFO("state handler receive save state from instance({}) runtime({}) bound generation({})",
+               identity.instanceID, identity.runtimeID, identity.boundRequestID);
+    if (identity.instanceID.empty() || !request) {
         YRLOG_ERROR("failed to save state: empty instance id");
         return GenStateSaveRspStreamMessage(common::ErrorCode::ERR_PARAM_INVALID,
                                             "save state failed: empty instance id");
@@ -52,7 +53,8 @@ litebus::Future<std::shared_ptr<StreamingMessage>> StateHandler::SaveState(
     }
 
     auto stateSaveRequest = std::make_shared<StateSaveRequest>(std::move(*request->mutable_savereq()));
-    return litebus::Async(stateActorAid_, &StateActor::SaveState, instanceId, stateSaveRequest)
+    return litebus::Async(stateActorAid_, &StateActor::SaveState, identity.instanceID,
+                          identity.runtimeID, identity.boundRequestID, stateSaveRequest)
         .Then([](const StateSaveResponse &rsp) -> litebus::Future<std::shared_ptr<StreamingMessage>> {
             auto response = std::make_shared<StreamingMessage>();
             response->mutable_saversp()->CopyFrom(std::move(rsp));
@@ -66,10 +68,11 @@ void StateHandler::ClearStateActor()
 }
 
 litebus::Future<std::shared_ptr<StreamingMessage>> StateHandler::LoadState(
-    const std::string &instanceId, const std::shared_ptr<StreamingMessage> &request)
+    const grpc::PosixStreamIdentity &identity, const std::shared_ptr<StreamingMessage> &request)
 {
-    YRLOG_INFO("state handler receive load state from instance({})", instanceId);
-    if (instanceId.empty() || !request) {
+    YRLOG_INFO("state handler receive load state from instance({}) runtime({})", identity.instanceID,
+               identity.runtimeID);
+    if (identity.instanceID.empty() || !request) {
         YRLOG_ERROR("failed to load state: empty instance id");
         return GenStateLoadRspStreamMessage(common::ErrorCode::ERR_PARAM_INVALID,
                                             "load state failed: empty instance id");
@@ -90,12 +93,13 @@ litebus::Future<std::shared_ptr<StreamingMessage>> StateHandler::LoadState(
         });
 }
 
-litebus::Future<Status> StateHandler::DeleteState(const std::string &instanceId)
+litebus::Future<Status> StateHandler::DeleteState(const std::string &instanceId, const std::string &generation)
 {
-    YRLOG_INFO("state handler receive delete state from instance({})", instanceId);
-    if (instanceId.empty()) {
-        YRLOG_ERROR("failed to delete state: empty instance id");
-        return Status(StatusCode::ERR_INSTANCE_INFO_INVALID, "load state failed: empty instance id");
+    YRLOG_INFO("state handler receive delete state from instance({}) generation({})", instanceId, generation);
+    if (instanceId.empty() || generation.empty()) {
+        YRLOG_ERROR("failed to delete state: empty instance id or generation");
+        return Status(StatusCode::ERR_INSTANCE_INFO_INVALID,
+                      "delete state failed: empty instance id or generation");
     }
 
     if (stateActorAid_.Name().empty()) {
@@ -103,7 +107,7 @@ litebus::Future<Status> StateHandler::DeleteState(const std::string &instanceId)
         return Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "delete state failed: don't init state actor");
     }
 
-    return litebus::Async(stateActorAid_, &StateActor::DeleteState, instanceId);
+    return litebus::Async(stateActorAid_, &StateActor::DeleteState, instanceId, generation);
 }
 
 }  // namespace functionsystem::function_proxy

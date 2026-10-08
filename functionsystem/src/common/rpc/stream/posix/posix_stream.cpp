@@ -23,10 +23,15 @@ namespace functionsystem::grpc {
 using namespace runtime_rpc;
 
 PosixStream::PosixStream(const std::shared_ptr<ServerReactor> &reactor, ::grpc::CallbackServerContext *context,
-                         const std::string &instanceID, const std::string &runtimeID)
+                         const std::string &instanceID, const std::string &runtimeID,
+                         const std::string &boundRequestID)
 {
+    // The creation-request generation is bound at CONSTRUCTION — before
+    // Start() and before the first message can be received — and is never
+    // mutated afterwards (immutable dispatch identity).
     instanceID_ = instanceID;
     runtimeID_ = runtimeID;
+    boundRequestID_ = boundRequestID;
     reactor_ = reactor;
     reactor_->RegisterClosedCallback([this]() { PosixStreamClosedCallback(); });
     reactor_->RegisterReceiver(std::bind(&PosixStream::Receiver, this, std::placeholders::_1));
@@ -166,9 +171,9 @@ void PosixStream::Receiver(const std::shared_ptr<StreamingMessage> &recv)
             });
     };
 
-    auto doReceive = [instanceID(instanceID_), bodyType, recv, recvMsgID, doSend, notHeartbeat,
-                      self(shared_from_this())]() {
-        PosixClient::handlers_[bodyType](instanceID, recv)
+    auto doReceive = [identity(PosixStreamIdentity{ instanceID_, runtimeID_, boundRequestID_ }), bodyType, recv,
+                      recvMsgID, doSend, notHeartbeat, self(shared_from_this())]() {
+        PosixClient::handlers_[bodyType](identity, recv)
             .OnComplete([self, notHeartbeat, recvMsgID,
                          doSend](const litebus::Future<std::shared_ptr<StreamingMessage>> &future) {
                 if (future.IsError()) {

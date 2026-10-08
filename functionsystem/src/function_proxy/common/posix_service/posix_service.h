@@ -56,6 +56,18 @@ public:
         updatePosixClientCallback_ = cb;
     }
 
+    // Stream-accept identity resolver: given the connecting stream's
+    // (instanceID, runtimeID), answers the CREATION request generation to
+    // bind to that stream. Invoked BEFORE the stream object is constructed
+    // (so the binding is immutable and predates Start()/first message);
+    // empty = unbound — state operations arriving on such a stream are
+    // refused by the state actor, never degraded to a bare key.
+    using StreamIdentityResolver = std::function<std::string(const std::string &, const std::string &)>;
+    void SetStreamIdentityResolver(const StreamIdentityResolver &resolver)
+    {
+        streamIdentityResolver_ = resolver;
+    }
+
     static bool CheckClientIsReady(const std::string &instanceID);
     static void DeleteClient(const std::string &instanceID);
     static void UpdateClient(const std::string &instanceID, const std::shared_ptr<grpc::PosixClient> &client);
@@ -64,6 +76,7 @@ private:
     std::shared_ptr<function_proxy::InternalIAM> internalIam_;
     // Callback should not cost much time
     UpdatePosixClientCallback updatePosixClientCallback_;
+    StreamIdentityResolver streamIdentityResolver_;
 
     inline static std::mutex mutex_;
     inline static std::unordered_map<std::string, std::shared_ptr<grpc::PosixClient>> clients_;

@@ -32,12 +32,27 @@ public:
     explicit StateActor(const std::shared_ptr<StateClient> &stateClient);
     ~StateActor() override = default;
 
+    // #S (plan v2r1 R1/R3): the physical key is generation-qualified with
+    // the CREATION request id BOUND AT THE MESSAGE SOURCE (posix stream
+    // accept for runtime saves; the proxy-internal caller's instance record
+    // otherwise). An unbound identity is an explicit refusal — never a
+    // bare-key fallback. The save response carries the full VERSIONED
+    // checkpoint id back to the runtime.
     litebus::Future<StateSaveResponse> SaveState(const std::string &instanceId,
+                                                 const std::string &boundRuntimeID,
+                                                 const std::string &boundRequestID,
                                                  const std::shared_ptr<StateSaveRequest> &request);
 
+    // Loads by EXPLICIT versioned reference (the checkpointid the saver
+    // handed out — the composed key itself). The EXISTING load contract —
+    // read whatever reference the caller supplies — is preserved (no new
+    // caller-identity restriction); only well-formedness of the versioned
+    // reference is checked, and bare legacy references are refused under
+    // the migration contract.
     litebus::Future<StateLoadResponse> LoadState(const std::shared_ptr<StateLoadRequest> &request);
 
-    litebus::Future<Status> DeleteState(const std::string &instanceId);
+    // Retire-side delete: the retiring chain's OWN creation generation.
+    litebus::Future<Status> DeleteState(const std::string &instanceId, const std::string &generation);
 
     void InitStateClient();
 

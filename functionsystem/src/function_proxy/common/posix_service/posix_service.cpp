@@ -115,8 +115,12 @@ constexpr const char *EVENT_STREAM_ROLE = "event";
                 ::grpc::Status(::grpc::StatusCode::ALREADY_EXISTS, "event connection is already existed."));
         }
         auto reactor = std::make_shared<grpc::PosixStream::ServerReactor>();
+        // Resolve the creation generation BEFORE constructing the stream —
+        // the binding is immutable and predates any message.
+        const std::string boundRequestID = streamIdentityResolver_
+            ? streamIdentityResolver_(metaData.instanceID, metaData.runtimeID) : "";
         auto eventClient = std::make_shared<grpc::PosixStream>(
-            reactor, context, metaData.instanceID, metaData.runtimeID);
+            reactor, context, metaData.instanceID, metaData.runtimeID, boundRequestID);
         eventClients_[metaData.instanceID] = eventClient;
         YRLOG_INFO("accepted event MessageStream from instance({}), runtime({})",
                    metaData.instanceID, metaData.runtimeID);
@@ -131,8 +135,17 @@ constexpr const char *EVENT_STREAM_ROLE = "event";
     }
 
     auto reactor = std::make_shared<grpc::PosixStream::ServerReactor>();
+    // Resolve the creation generation BEFORE constructing the stream: an
+    // accepted (instanceID, runtimeID) that does NOT match the view's
+    // current machine binds EMPTY (unbound) — state operations on such a
+    // stream are refused; a stream accepted while its generation owns the
+    // name keeps that binding for its whole lifetime, so a LATE save from
+    // it still lands on its OWN generation's key.
+    const std::string boundRequestID = streamIdentityResolver_
+        ? streamIdentityResolver_(metaData.instanceID, metaData.runtimeID) : "";
     std::shared_ptr<grpc::PosixClient> posixClient =
-        std::make_shared<grpc::PosixStream>(reactor, context, metaData.instanceID, metaData.runtimeID);
+        std::make_shared<grpc::PosixStream>(reactor, context, metaData.instanceID, metaData.runtimeID,
+                                            boundRequestID);
     if (internalIam_->IsIAMEnabled() && internalIam_->GetCredType() == function_proxy::IAMCredType::AK_SK) {
         auto authInterceptor =
             std::make_shared<PosixAuthInterceptor>(metaData.runtimeID, metaData.instanceID, metaData.accessKey);

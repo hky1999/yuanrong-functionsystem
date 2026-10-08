@@ -59,8 +59,9 @@ std::shared_ptr<StreamingMessage> CallResponseToInvokeResponse(const std::shared
 }
 
 litebus::Future<std::shared_ptr<StreamingMessage>> InvocationHandler::Invoke(
-    const std::string &from, const std::shared_ptr<StreamingMessage> &request)
+    const grpc::PosixStreamIdentity &identity, const std::shared_ptr<StreamingMessage> &request)
 {
+    const std::string from = identity.instanceID; // stream-bound source identity
     // Get AID of instance actor from instance view according to instance ID.
     ASSERT_IF_NULL(request);
     ASSERT_FS(request->has_invokereq());
@@ -125,8 +126,9 @@ litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> InvocationHandle
 }
 
 litebus::Future<std::shared_ptr<StreamingMessage>> InvocationHandler::CallResultAdapter(
-    const std::string &from, const std::shared_ptr<StreamingMessage> &request)
+    const grpc::PosixStreamIdentity &identity, const std::shared_ptr<StreamingMessage> &request)
 {
+    const std::string from = identity.instanceID; // stream-bound source identity
     ASSERT_IF_NULL(request);
     ASSERT_FS(request->has_callresultreq());
     YRLOG_INFO("{}|received CallResult request from {} via POSIX.", request->callresultreq().requestid(), from);
@@ -169,8 +171,9 @@ litebus::Future<std::shared_ptr<StreamingMessage>> InvocationHandler::CallResult
 }
 
 litebus::Future<std::shared_ptr<StreamingMessage>> InvocationHandler::EventAdapter(
-    const std::string &from, const std::shared_ptr<StreamingMessage> &request)
+    const grpc::PosixStreamIdentity &identity, const std::shared_ptr<StreamingMessage> &request)
 {
+    const std::string from = identity.instanceID; // stream-bound source identity
     ASSERT_IF_NULL(request);
     ASSERT_FS(request->has_eventreq());
     if (frontendEventReceiver_ && frontendEventReceiver_(from, request)) {
@@ -188,8 +191,9 @@ litebus::Future<std::shared_ptr<StreamingMessage>> InvocationHandler::EventAdapt
 }
 
 litebus::Future<std::shared_ptr<StreamingMessage>> InvocationHandler::CallResult(
-    const std::string &from, const std::shared_ptr<StreamingMessage> &request)
+    const grpc::PosixStreamIdentity &identity, const std::shared_ptr<StreamingMessage> &request)
 {
+    const std::string from = identity.instanceID; // stream-bound source identity
     auto recevied =
         isPerf_ ? std::make_shared<busproxy::TimePoint>(std::chrono::high_resolution_clock::now()) : nullptr;
     ASSERT_IF_NULL(request);

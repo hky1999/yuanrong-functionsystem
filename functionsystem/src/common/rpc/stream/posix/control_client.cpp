@@ -42,7 +42,8 @@ std::shared_ptr<ControlClient> PosixControlWrapper::InitPosixStream(const std::s
 
 ControlClient::ControlClient(const std::string &instanceID, const std::string &runtimeID,
                              const ControlClientConfig &config)
-    : instanceID_(instanceID), runtimeID_(runtimeID), isStopped_(false)
+    : instanceID_(instanceID), runtimeID_(runtimeID), boundRequestID_(config.boundRequestID),
+      isStopped_(false)
 {
     int maxGrpcSize = config.maxGrpcSize;
     if (maxGrpcSize <= 0) {
@@ -138,7 +139,8 @@ void ControlClient::Receiver(const std::shared_ptr<StreamingMessage> &recv)
         YRLOG_WARN("{} invalid control stream msg type, recvMsgID {}", fmt::underlying(bodyType), recvMsgID);
         return;
     }
-    auto future = PosixClient::handlers_[bodyType](instanceID_, recv);
+    auto future = PosixClient::handlers_[bodyType](
+        PosixStreamIdentity{ instanceID_, runtimeID_, boundRequestID_ }, recv);
     (void)future.OnComplete(
         [debug, recvMsgID, reactor(this->reactor_), instanceID(this->instanceID_),
          runtimeID(this->runtimeID_)](const litebus::Future<std::shared_ptr<StreamingMessage>> &future) {

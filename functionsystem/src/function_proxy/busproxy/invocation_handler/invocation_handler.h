@@ -21,6 +21,7 @@
 #include <functional>
 
 #include "common/proto/pb/posix_pb.h"
+#include "common/rpc/stream/posix/posix_client.h"
 #include "function_proxy/common/iam/internal_iam.h"
 #include "function_proxy/common/observer/data_plane_observer/data_plane_observer.h"
 #include "function_proxy/busproxy/instance_proxy/instance_proxy.h"
@@ -31,13 +32,13 @@ namespace functionsystem {
 class InvocationHandler {
 public:
     static litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> Invoke(
-        const std::string &from, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
+        const grpc::PosixStreamIdentity &identity, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
     static litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> CallResultAdapter(
-        const std::string &from, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
+        const grpc::PosixStreamIdentity &identity, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
     static litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> CallResult(
-        const std::string &from, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
+        const grpc::PosixStreamIdentity &identity, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
     static litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> EventAdapter(
-        const std::string &from, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
+        const grpc::PosixStreamIdentity &identity, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
 
     using CreateCallResultReciver =
         std::function<litebus::Future<std::pair<bool, std::shared_ptr<runtime_rpc::StreamingMessage>>>(

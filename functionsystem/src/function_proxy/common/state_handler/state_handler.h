@@ -17,6 +17,7 @@
 #ifndef BUSPROXY_BUSINESS_STATE_ACTOR_STATE_HANDLER_H
 #define BUSPROXY_BUSINESS_STATE_ACTOR_STATE_HANDLER_H
 
+#include "common/rpc/stream/posix/posix_client.h"
 #include "state_actor.h"
 
 namespace functionsystem::function_proxy {
@@ -26,13 +27,18 @@ public:
     virtual ~StateHandler();
 
     static void BindStateActor(const std::shared_ptr<StateActor> &stateActor);
+    // The posix handler signature: the STREAM-BOUND identity (creation
+    // generation fixed at accept) travels with the message; an unbound
+    // stream is refused by the actor, never silently degraded.
     static litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> SaveState(
-        const std::string &instanceId, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
+        const grpc::PosixStreamIdentity &identity, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
 
     static litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> LoadState(
-        const std::string &instanceId, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
+        const grpc::PosixStreamIdentity &identity, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
 
-    static litebus::Future<Status> DeleteState(const std::string &instanceId);
+    // Proxy-internal retire-side delete carrying the retiring chain's OWN
+    // creation generation.
+    static litebus::Future<Status> DeleteState(const std::string &instanceId, const std::string &generation);
 
 protected:
     [[maybe_unused]] static void ClearStateActor();

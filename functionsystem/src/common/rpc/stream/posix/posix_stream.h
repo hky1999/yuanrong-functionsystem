@@ -28,7 +28,8 @@ public:
         PosixReactor<ReactorType::SERVER, runtime_rpc::StreamingMessage, runtime_rpc::StreamingMessage>;
 
     PosixStream(const std::shared_ptr<ServerReactor> &reactor, ::grpc::CallbackServerContext *context,
-                const std::string &instanceID, const std::string &runtimeID);
+                const std::string &instanceID, const std::string &runtimeID,
+                const std::string &boundRequestID = "");
     ~PosixStream() override;
 
     void Start() override;
@@ -50,6 +51,7 @@ private:
     std::shared_ptr<litebus::Promise<bool>> isConnected_;
     std::string runtimeID_;
     std::string instanceID_;
+    std::string boundRequestID_;
     std::mutex mut_;
     std::atomic<bool> isStarted_;
     bool isStopped_{ false };

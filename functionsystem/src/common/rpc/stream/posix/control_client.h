@@ -37,6 +37,9 @@ struct ControlClientConfig {
     std::shared_ptr<::grpc::ChannelCredentials> creds;
     int64_t timeoutSec = DEFAULT_TIMEOUT_SEC;
     int32_t maxGrpcSize = DEFAULT_MAX_GRPC_SIZE;
+    // Creation request generation for this proxy-initiated stream, set
+    // BEFORE construction (immutable afterwards).
+    std::string boundRequestID;
 };
 
 class ControlClient : public PosixClient {
@@ -65,6 +68,7 @@ private:
         PosixReactor<ReactorType::CLIENT, runtime_rpc::StreamingMessage, runtime_rpc::StreamingMessage>;
     std::string instanceID_;
     std::string runtimeID_;
+    std::string boundRequestID_;
     std::unique_ptr<runtime_rpc::RuntimeRPC::Stub> stub_ = nullptr;
     ::grpc::ClientContext context_;
     std::shared_ptr<ClientReactor> reactor_ = nullptr;

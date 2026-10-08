@@ -22,6 +22,7 @@
 #include "actor/actor.hpp"
 #include "async/future.hpp"
 #include "common/proto/pb/posix_pb.h"
+#include "common/rpc/stream/posix/posix_client.h"
 #include "local_scheduler/instance_control/instance_ctrl.h"
 #include "local_scheduler/local_scheduler_service/local_sched_srv.h"
 #include "local_scheduler/local_group_ctrl/local_group_ctrl.h"
@@ -37,7 +38,7 @@ public:
      * @return create instance result
      */
     static litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> Create(
-        const std::string &from, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
+        const grpc::PosixStreamIdentity &identity, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
 
     /**
      * kill instance from runtime
@@ -46,7 +47,7 @@ public:
      * @return kill instance result
      */
     static litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> Kill(
-        const std::string &from, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
+        const grpc::PosixStreamIdentity &identity, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
 
     /**
      * exit instance
@@ -55,7 +56,7 @@ public:
      * @return kill instance result
      */
     static litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> Exit(
-        const std::string &from, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
+        const grpc::PosixStreamIdentity &identity, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
 
     /**
      * receive the create call result
@@ -65,7 +66,7 @@ public:
      * @return true if the result is an instance creation result.
      */
     static litebus::Future<std::pair<bool, std::shared_ptr<runtime_rpc::StreamingMessage>>> CallResult(
-        const std::string &from, std::shared_ptr<functionsystem::CallResult> &callResult);
+        const grpc::PosixStreamIdentity &identity, std::shared_ptr<functionsystem::CallResult> &callResult);
 
     /**
      * create group instance from runtime
@@ -74,7 +75,7 @@ public:
      * @return create group instance response
      */
     static litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> GroupCreate(
-        const std::string &from, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
+        const grpc::PosixStreamIdentity &identity, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
 
     /**
      * create resource group from runtime
@@ -83,7 +84,7 @@ public:
      * @return resource group request response
      */
     static litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> CreateResourceGroup(
-        const std::string &from, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
+        const grpc::PosixStreamIdentity &identity, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
 
     /**
      * bind instance control

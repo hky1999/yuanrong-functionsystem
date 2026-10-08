@@ -598,7 +598,9 @@ void InstanceCtrlActor::OnPendingCleanupStateDeleteComplete(
     promise->SetValue(GenKillResponse(common::ERR_NONE, ""));
 }
 
-
+litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInResourceView(const Status &status,
+                                                                        const InstanceInfo &instanceInfo)
+{
     if (status.IsError()) { return status; }
     ASSERT_IF_NULL(resourceViewMgr_);
     auto type = resource_view::GetResourceType(instanceInfo);
@@ -736,7 +738,7 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
                 // resolving thread must never mutate settledCleanupPending_
                 // concurrently with actor-thread users).
                 return function_proxy::StateHandler::DeleteState(
-                    instanceInfo.instanceid())
+                    instanceInfo.instanceid(), instanceInfo.requestid())
                     .Then(litebus::Defer(GetAID(),
                         &InstanceCtrlActor::OnRetireStateDeleteComplete,
                         instanceInfo, std::placeholders::_1));
@@ -1152,7 +1154,7 @@ litebus::Future<KillResponse> InstanceCtrlActor::KillFrontend(const std::string 
             // Completion marshalled back onto THIS actor: the resolving
             // thread is the StateActor/store thread, and the callback
             // mutates actor-owned settledCleanupPending_.
-            function_proxy::StateHandler::DeleteState(killReq->instanceid())
+            function_proxy::StateHandler::DeleteState(killReq->instanceid(), recorded.requestID)
                 .OnComplete(litebus::Defer(GetAID(),
                     &InstanceCtrlActor::OnPendingCleanupStateDeleteComplete,
                     killReq, promise, recorded, std::placeholders::_1));
@@ -3056,9 +3058,9 @@ void InstanceCtrlActor::CleanupFailedSnapStart(const std::shared_ptr<messages::S
             insCtrlView->OnDelInstance(instanceID, requestID, true);
             return Status::OK();
         })
-        .Then([instanceID](const Status &status) {
+        .Then([instanceID, requestID](const Status &status) {
             if (status.IsOk()) {
-                function_proxy::StateHandler::DeleteState(instanceID);
+                function_proxy::StateHandler::DeleteState(instanceID, requestID);
             }
             return Status::OK();
         });
@@ -5441,6 +5443,26 @@ litebus::Future<Status> InstanceCtrlActor::Checkpoint(const std::string &instanc
 {
     auto promise = std::make_shared<litebus::Promise<Status>>();
     ASSERT_IF_NULL(clientManager_);
+    // Proxy-internal save: the generation is resolved from the AUTHORITATIVE
+    // local view once, at call time (this is the instance's owner proxy
+    // checking out a LIVE machine; a miss is an explicit error — never a
+    // bare-key write).
+    const auto machine = instanceControlView_->GetInstance(instanceID);
+    if (machine == nullptr) {
+        YRLOG_ERROR("failed to checkpoint instance({}): no local machine to bind the creation "
+                    "generation", instanceID);
+        return Status(StatusCode::ERR_INSTANCE_NOT_FOUND,
+                      "checkpoint failed: no local machine for generation binding");
+    }
+    const auto snapshot = instanceControlView_->GetIncarnationSnapshot(instanceID);
+    const std::string runtimeID = snapshot.first;
+    const std::string checkpointGeneration = snapshot.second;
+    if (runtimeID.empty() || checkpointGeneration.empty()) {
+        YRLOG_ERROR("failed to checkpoint instance({}): machine carries no complete identity "
+                    "(runtime({}) generation({}))", instanceID, runtimeID, checkpointGeneration);
+        return Status(StatusCode::ERR_INSTANCE_INFO_INVALID,
+                      "checkpoint failed: incomplete machine identity");
+    }
     clientManager_->GetControlInterfacePosixClient(instanceID)
         .Then([instanceID](const litebus::Future<std::shared_ptr<ControlInterfacePosixClient>> &future)
                   -> litebus::Future<runtime::CheckpointResponse> {
@@ -5471,7 +5493,8 @@ litebus::Future<Status> InstanceCtrlActor::Checkpoint(const std::string &instanc
             req.set_state(checkpointRsp.state());
             auto msg = std::make_shared<runtime_rpc::StreamingMessage>();
             *msg->mutable_savereq() = std::move(req);
-            return function_proxy::StateHandler::SaveState(instanceID, msg);
+            return function_proxy::StateHandler::SaveState(
+                grpc::PosixStreamIdentity{ instanceID, runtimeID, checkpointGeneration }, msg);
         })
         .OnComplete([promise](const litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> &rsp) {
             StateSaveResponse saveRsp = std::move(rsp.Get()->saversp());
@@ -5501,7 +5524,10 @@ litebus::Future<Status> InstanceCtrlActor::Recover(const resource_view::Instance
                     common::ErrorCode::ERR_LOCAL_SCHEDULER_OPERATION_ERROR, "failed to get instance client");
             }
             StateLoadRequest req{};
-            req.set_checkpointid(instance.instanceid());
+            // The recover reference is the VERSIONED key of the persisted
+            // creation generation this recovery carries (etcd instance
+            // record's request id — R2 evidence).
+            req.set_checkpointid(StateClient::ComposeStateKey(instance.instanceid(), instance.requestid()));
             auto msg = std::make_shared<runtime_rpc::StreamingMessage>();
             *msg->mutable_loadreq() = std::move(req);
             return function_proxy::StateHandler::LoadState(instance.instanceid(), msg)
@@ -6734,9 +6760,20 @@ void InstanceCtrlActor::DeleteDriverClient(const std::string &instanceID, const 
     ASSERT_IF_NULL(clientManager_);
     connectedDriver_.erase(instanceID);
     RemoveInternalTokenReference(instanceID);
-    // Unregister from Traefik (async, non-blocking)
+    // Unregister from Traefik (async, non-blocking). When the machine is
+    // still known, retire FENCED with its identity; a vanished machine
+    // falls back to the legacy path, which REFUSES marker-bearing routes
+    // (unknown identity may not delete them) and only cleans marker-less
+    // legacy keys.
     if (traefikRegistry_) {
-        (void)litebus::Async(GetAID(), &InstanceCtrlActor::UnregisterTraefikRoute, instanceID);
+        const auto machine = instanceControlView_->GetInstance(instanceID);
+        if (machine != nullptr) {
+            const auto info = machine->GetInstanceInfo();
+            (void)litebus::Async(GetAID(), &InstanceCtrlActor::UnregisterTraefikRouteFenced,
+                instanceID, info.tenantid(), info.runtimeid(), info.requestid());
+        } else {
+            (void)litebus::Async(GetAID(), &InstanceCtrlActor::UnregisterTraefikRoute, instanceID);
+        }
     }
     (void)observer_->DelInstance(instanceID)
         .After(OBSERVER_TIMEOUT_MS,
@@ -7703,9 +7740,14 @@ litebus::Future<Status> InstanceCtrlActor::DeleteSchedulingInstance(const std::s
         ASSERT_IF_NULL(observer_);
         observer_->DelInstanceEvent(instanceID, stateMachine->GetModRevision());
     }
-    // Unregister from Traefik (async, non-blocking)
+    // Unregister from Traefik (async, non-blocking) — FENCED with this
+    // machine's identity: a stale marker from a same-name predecessor must
+    // not be strippable by this cleanup (root: legacy callers must carry
+    // the original generation's identity; unknown identity may not delete
+    // marker-bearing data).
     if (traefikRegistry_) {
-        (void)litebus::Async(GetAID(), &InstanceCtrlActor::UnregisterTraefikRoute, instanceID);
+        (void)litebus::Async(GetAID(), &InstanceCtrlActor::UnregisterTraefikRouteFenced,
+            instanceID, instanceInfo.tenantid(), instanceInfo.runtimeid(), instanceInfo.requestid());
     }
     return Status::OK();
 }
@@ -9254,10 +9296,25 @@ litebus::Future<Status> InstanceCtrlActor::RegisterTraefikRoute(const InstanceIn
     YRLOG_INFO("Registering instance to Traefik: instanceID={}, hostIP={}, ports={}",
                instanceInfo.instanceid(), ip, portMappings.size());
 
-    // Identity-bearing registration (#3): the registry records this
-    // incarnation so a stale unregister from an older chain is fenced.
+    // Identity-bearing registration (#T): route keys and the ownership
+    // marker land in ONE store transaction. The durable authority order is
+    // the machine's ETCD MOD REVISION (extensions[INSTANCE_MOD_REVISION],
+    // written when the instance record is persisted) — NOT the state-
+    // machine version, which restarts low for a NEW generation and would
+    // invert the old/new order. A revision of 0 means the record is not
+    // durably established: no routes are issued for it (a late OLD
+    // registration cannot resurrect an unregistered name either — it
+    // carries a stale/absent revision or a foreign one).
+    const int64_t modRevision = GetModRevisionFromInstanceInfo(instanceInfo);
+    if (modRevision <= 0) {
+        YRLOG_WARN("skip traefik registration for instance({}): no persisted etcd mod revision to "
+                   "prove this generation's authority", instanceInfo.instanceid());
+        return Status::OK();
+    }
     return traefikRegistry_->RegisterInstance(instanceInfo.instanceid(), ip, portMappings,
-                                              instanceInfo.runtimeid(), instanceInfo.requestid())
+                                              instanceInfo.tenantid(), instanceInfo.runtimeid(),
+                                              instanceInfo.requestid(),
+                                              static_cast<uint64_t>(modRevision))
         .Then([instanceID = instanceInfo.instanceid()](const Status& status) -> Status {
             if (!status.IsOk()) {
                 YRLOG_ERROR("failed to register traefik route for instance({}): {}",
