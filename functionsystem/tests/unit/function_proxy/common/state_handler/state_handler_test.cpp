@@ -449,13 +449,16 @@ TEST_F(StateHandlerTest, DeleteStateForwardsStoreNotFoundVerbatim)
 // A genuine store failure propagates (the kill chain must retry).
 TEST_F(StateHandlerTest, DeleteStateStoreFailurePropagates)
 {
+    const Status storeFailure(StatusCode::ERR_INNER_SYSTEM_ERROR, "store down");
     EXPECT_CALL(*distributedCacheClient_, Del(Matcher<const std::string &>(
         StateClient::ComposeStateKey("failing-instance", "req-gen"))))
-        .WillOnce(Return(Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "store down")));
+        .WillOnce(Return(storeFailure));
     auto del = StateHandler::DeleteState("failing-instance", "req-gen", "rt-1");
     ASSERT_AWAIT_READY(del);
     EXPECT_TRUE(del.Get().IsError());
-    EXPECT_THAT(del.Get().GetMessage(), testing::HasSubstr("store down"));
+    // EXACT propagation against the input Status object's own fields.
+    EXPECT_EQ(del.Get().StatusCode(), storeFailure.StatusCode());
+    EXPECT_EQ(del.Get().GetMessage(), storeFailure.GetMessage());
 }
 
 // Positive: a successful Del propagates OK end-to-end through the bound
