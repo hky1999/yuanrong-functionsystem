@@ -184,7 +184,7 @@ Status LocalSchedDriver::Create()
     // stream object exists (immutable thereafter). A stream whose runtime
     // does not match the machine binds EMPTY and its state operations are
     // refused, never degraded to a bare key.
-    GetPosixService()->SetStreamIdentityResolver(
+    param_.posixService->SetStreamIdentityResolver(
         [view = instanceCtrl_->GetInstanceControlView()](const std::string &instanceID,
                                                          const std::string &runtimeID) -> std::string {
             const auto snapshot = view->GetIncarnationSnapshot(instanceID);
