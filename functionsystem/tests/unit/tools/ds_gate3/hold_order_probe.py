@@ -44,7 +44,8 @@ def main():
     proxy_sha = hashlib.sha256(
         open("/root/akernel-bm1/ds-exp/fault_proxy.py", "rb").read()).hexdigest()
     sha = hashlib.sha256(open(BIN, "rb").read()).hexdigest()
-    cmd = [BIN, "--gtest_filter=DsGate3HoldOrder.*",
+    filt = os.environ.get("DS_GATE3_CASE_FILTER", "DsGate3HoldOrder.*")
+    cmd = [BIN, "--gtest_filter=" + filt,
            "--gtest_output=xml:" + os.path.join(case, "order.xml")]
     env = dict(os.environ)
     env.update({

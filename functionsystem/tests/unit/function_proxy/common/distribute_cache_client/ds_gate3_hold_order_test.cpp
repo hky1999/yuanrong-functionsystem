@@ -179,4 +179,124 @@ TEST(DsGate3HoldOrder, ControlledDetentionOrderObservation)
     SUCCEED();
 }
 
+// ── B red case (root work-block B): OLD DEL after NEW WRITE ──────────────────
+// Same shape as the Set case, but the detained operation is a Del. Current
+// bare-Del semantics EXPECT the late Del to destroy the NEW value (the
+// second counterexample); under the snapshot-reference isolation the NEW
+// value must survive. This case OBSERVES and records; the pass/fail shape
+// is decided by which semantics is live.
+TEST(DsGate3HoldOrder, OldDelAfterNewWrite)
+{
+    if (std::getenv("DS_GATE3_ORDER") == nullptr) {
+        GTEST_SKIP() << "DS_GATE3_ORDER not set — order probe skipped";
+    }
+    const std::string host = EnvOr("DS_GATE3_HOST", "127.0.0.1");
+    const std::string routerEtcd = EnvOr("DS_GATE3_ROUTER", "127.0.0.1:31591");
+    const std::string proxyPort = EnvOr("DS_GATE3_WORKER_PORT", "31592");
+    const std::string directPort = EnvOr("DS_GATE3_DIRECT_PORT", "31594");
+    const std::string armFile = EnvOr("DS_GATE3_ARM", "");
+    const std::string releaseFile = EnvOr("DS_GATE3_RELEASE", "");
+    const std::string outFile = EnvOr("DS_GATE3_OUT", "/tmp/order.jsonl");
+    const std::string runId = EnvOr("DS_GATE3_RUNID", std::to_string(NowMs()));
+    ASSERT_FALSE(armFile.empty());
+    ASSERT_FALSE(releaseFile.empty());
+    struct GateGuard {
+        std::string release;
+        ~GateGuard()
+        {
+            if (!release.empty()) {
+                std::ofstream r(release);
+                r << NowMs();
+            }
+        }
+    } gateGuard{releaseFile};
+    std::ofstream jsonl(outFile, std::ios::app);
+    auto W = [&](const std::string &op, const std::string &extra = "") {
+        jsonl << "{\"op\":\"" << op << "\",\"t_ms\":" << NowMs()
+              << ",\"runid\":\"" << runId << "\"" << extra << "}\n";
+        jsonl.flush();
+    };
+
+    datasystem::ConnectOptions viaProxy{};
+    viaProxy.host = host;
+    viaProxy.port = std::stoi(proxyPort);
+    functionsystem::RouterConnectOptions router{};
+    router.azName = "ds-exp";
+    router.etcdAddress = routerEtcd;
+    auto main = std::make_unique<functionsystem::DSCacheClientImpl>(viaProxy, router);
+    main->SetDSAuthEnable(false);
+    main->EnableDSClient(true);
+    ASSERT_TRUE(main->Init().IsOk()) << "main init failed (environment)";
+    W("del_main_init");
+
+    const std::string key = "gate3:holddel:" + runId + ":k0";
+    const std::string newValue = "NEW-" + runId;
+    ASSERT_TRUE(main->Set(key, "seed").IsOk());
+    std::string seedBack;
+    ASSERT_TRUE(main->Get(key, seedBack).IsOk() && seedBack == "seed");
+    W("del_seed_ok");
+
+    { std::ofstream a(armFile); a << NowMs(); }
+    W("del_armed");
+
+    // The ONE designated OLD DEL — synchronous, timeout captured, client
+    // alive, no ASSERT on its Status.
+    const auto delStart = NowMs();
+    const auto delStatus = main->Del(key);
+    const auto delMs = NowMs() - delStart;
+    W("old_del_returned",
+      ",\"code\":" + std::to_string(static_cast<int>(delStatus.StatusCode()))
+      + ",\"ms\":" + std::to_string(delMs)
+      + ",\"msg\":\"" + delStatus.GetMessage() + "\"");
+    std::cout << "DS_GATE3_ORDER old Del code="
+              << static_cast<int>(delStatus.StatusCode()) << " ms=" << delMs
+              << std::endl;
+
+    // NEW write on the healthy channel + exact read-back.
+    datasystem::ConnectOptions direct{};
+    direct.host = host;
+    direct.port = std::stoi(directPort);
+    functionsystem::RouterConnectOptions router2{};
+    router2.azName = "ds-exp";
+    router2.etcdAddress = routerEtcd;
+    auto healthy = std::make_unique<functionsystem::DSCacheClientImpl>(direct, router2);
+    healthy->SetDSAuthEnable(false);
+    healthy->EnableDSClient(true);
+    ASSERT_TRUE(healthy->Init().IsOk()) << "healthy-channel init failed";
+    ASSERT_TRUE(healthy->Set(key, newValue).IsOk()) << "new Set failed";
+    std::string newBack;
+    ASSERT_TRUE(healthy->Get(key, newBack).IsOk());
+    ASSERT_EQ(newBack, newValue) << "new readback must equal the new value exactly";
+    W("del_new_readback", ",\"value\":\"" + newBack + "\"");
+
+    // RELEASE the detained old Del; wait bounded for it to land.
+    { std::ofstream r(releaseFile); r << NowMs(); }
+    W("del_released");
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    W("del_post_release_settled");
+
+    // Final adjudication: independent raw SDK. deleted_new=true means the
+    // late DEL destroyed the NEW value (bare-Del counterexample shape);
+    // raw NOT_FOUND distinguishes genuine absence (unknown codes recorded).
+    datasystem::KVClient raw(direct);
+    ASSERT_TRUE(raw.Init().IsOk());
+    std::string final;
+    const auto fr = raw.Get(key, final);
+    const auto frc = static_cast<int>(fr.GetCode());
+    const bool genuineMiss = (frc == static_cast<int>(datasystem::StatusCode::K_NOT_FOUND));
+    W("del_final_read",
+      ",\"raw_rc\":" + std::to_string(frc)
+      + ",\"value\":\"" + final + "\""
+      + ",\"genuine_miss\":" + (genuineMiss ? "true" : "false")
+      + ",\"deleted_new\":" + (genuineMiss ? "true" : "false")
+      + ",\"new_survives\":" + (!genuineMiss && final == newValue ? "true" : "false"));
+    std::cout << "DS_GATE3_ORDER del final raw_rc=" << frc
+              << " value=" << final << " genuine_miss=" << genuineMiss
+              << " new_survives=" << (!genuineMiss && final == newValue)
+              << std::endl;
+    // Observation harness: no assertion on which semantics wins — the JSONL
+    // records it for the verdict.
+    SUCCEED();
+}
+
 }  // namespace functionsystem::test
