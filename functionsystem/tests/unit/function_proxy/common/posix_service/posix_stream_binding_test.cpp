@@ -39,6 +39,7 @@
 #include "function_proxy/common/state_handler/state_handler_helper.h"
 #include "function_proxy/common/state_machine/instance_control_view.h"
 #include "mocks/mock_distributed_cache_client.h"
+#include "mocks/mock_runtime_client.h"
 #include "utils/future_test_helper.h"
 
 namespace functionsystem::test {
@@ -116,18 +117,16 @@ protected:
         }
     }
 
-    std::shared_ptr<functionsystem::grpc::ControlClient> Connect(const std::string &instanceID, const std::string &runtimeID)
+    std::shared_ptr<MockRuntimeClient> Connect(const std::string &instanceID, const std::string &runtimeID)
     {
-        functionsystem::grpc::ControlClientConfig config;
-        config.target = target_;
-        config.creds = ::grpc::InsecureChannelCredentials();
-        config.timeoutSec = 5;
-        config.maxGrpcSize = 4;
-        auto client = std::make_shared<grpc::ControlClient>(instanceID, runtimeID, config);
+        RuntimeClientConfig config;
+        config.serverAddress = target_;
+        config.serverName = "daylight";
+        config.instanceID = instanceID;
+        config.runtimeID = runtimeID;
+        auto client = std::make_shared<MockRuntimeClient>(config);
         client->Start();
-        // BOUNDED accept confirmation via the service's own registry: the
-        // stream is only usable once the accept path registered the client
-        // (grpc_stream_test's settle pattern, made observable and bounded).
+        // BOUNDED accept confirmation via the service's own registry.
         bool accepted = false;
         for (int i = 0; i < 100 && !(accepted = PosixService::CheckClientIsReady(instanceID)); ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -135,6 +134,11 @@ protected:
         EXPECT_TRUE(accepted) << "server did not accept the stream within 5s";
         return client;
     }
+
+    // Bounded response hand-off keyed by message id: the mock's receive
+    // callback completes the promise for OUR sent id.
+    std::shared_ptr<litebus::Promise<runtime_rpc::StreamingMessage>> responsePromise_;
+    std::string awaitedMessageId_;
 
     std::shared_ptr<runtime_rpc::StreamingMessage> SaveMessage(const std::string &state)
     {
@@ -151,7 +155,7 @@ protected:
     std::shared_ptr<InternalIAM> internalIAM_;
     ::grpc::ServerBuilder builder_;
     std::unique_ptr<::grpc::Server> server_;
-    std::shared_ptr<functionsystem::grpc::ControlClient> client_;
+    std::shared_ptr<MockRuntimeClient> client_;
     std::string target_;
 };
 
@@ -163,10 +167,23 @@ TEST_F(PosixStreamBindingFixture, RealStreamSaveLandsOnComposedGenerationKey)
     client_ = Connect("inst-stream", "rt-1");
     ASSERT_NE(client_, nullptr);
 
+    auto msg = SaveMessage("stream-state");
+    awaitedMessageId_ = msg->messageid();
+    responsePromise_ = std::make_shared<litebus::Promise<runtime_rpc::StreamingMessage>>();
+    EXPECT_CALL(*client_, MockReceiver(_))
+        .WillRepeatedly(Invoke([this](const std::shared_ptr<runtime_rpc::StreamingMessage> &recv) {
+            if (recv->messageid() == awaitedMessageId_) {
+                responsePromise_->SetValue(*recv);
+            }
+        }));
+
     const std::string composed = StateClient::ComposeStateKey("inst-stream", "req-gen-1");
     EXPECT_CALL(*cache_, Set(Matcher<const std::string &>(composed), Matcher<const std::string &>(_)))
         .WillOnce(Return(Status::OK()));
-    auto rsp = client_->Send(SaveMessage("stream-state"));
+    auto sent = client_->Send(msg);
+    ASSERT_AWAIT_READY(sent);
+    EXPECT_TRUE(sent.Get());
+    auto rsp = responsePromise_->GetFuture();
     ASSERT_AWAIT_READY(rsp);
     EXPECT_EQ(rsp.Get().saversp().code(), common::ERR_NONE) << rsp.Get().saversp().message();
     EXPECT_EQ(rsp.Get().saversp().checkpointid(), composed);
@@ -180,6 +197,16 @@ TEST_F(PosixStreamBindingFixture, LateOldStreamSaveAfterFailoverZeroWrites)
     client_ = Connect("inst-stream", "rt-1");
     ASSERT_NE(client_, nullptr);
 
+    auto msg = SaveMessage("stale-state");
+    awaitedMessageId_ = msg->messageid();
+    responsePromise_ = std::make_shared<litebus::Promise<runtime_rpc::StreamingMessage>>();
+    EXPECT_CALL(*client_, MockReceiver(_))
+        .WillRepeatedly(Invoke([this](const std::shared_ptr<runtime_rpc::StreamingMessage> &recv) {
+            if (recv->messageid() == awaitedMessageId_) {
+                responsePromise_->SetValue(*recv);
+            }
+        }));
+
     // Failover: same request generation, NEW runtime.
     resources::InstanceInfo swapped;
     swapped.set_instanceid("inst-stream");
@@ -188,7 +215,10 @@ TEST_F(PosixStreamBindingFixture, LateOldStreamSaveAfterFailoverZeroWrites)
     view_->Update("inst-stream", swapped, true);
 
     EXPECT_CALL(*cache_, Set(Matcher<const std::string &>(_), Matcher<const std::string &>(_))).Times(0);
-    auto rsp = client_->Send(SaveMessage("stale-state"));
+    auto sent = client_->Send(msg);
+    ASSERT_AWAIT_READY(sent);
+    EXPECT_TRUE(sent.Get());
+    auto rsp = responsePromise_->GetFuture();
     ASSERT_AWAIT_READY(rsp);
     EXPECT_NE(rsp.Get().saversp().code(), common::ERR_NONE)
         << "the late old-stream save must be refused";
