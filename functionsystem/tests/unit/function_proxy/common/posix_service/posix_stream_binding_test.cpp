@@ -27,8 +27,10 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include "common/posix_service/posix_service.h"
 #include "common/rpc/stream/posix/control_client.h"
@@ -123,6 +125,14 @@ protected:
         config.maxGrpcSize = 4;
         auto client = std::make_shared<grpc::ControlClient>(instanceID, runtimeID, config);
         client->Start();
+        // BOUNDED accept confirmation via the service's own registry: the
+        // stream is only usable once the accept path registered the client
+        // (grpc_stream_test's settle pattern, made observable and bounded).
+        bool accepted = false;
+        for (int i = 0; i < 100 && !(accepted = PosixService::CheckClientIsReady(instanceID)); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        EXPECT_TRUE(accepted) << "server did not accept the stream within 5s";
         return client;
     }
 
