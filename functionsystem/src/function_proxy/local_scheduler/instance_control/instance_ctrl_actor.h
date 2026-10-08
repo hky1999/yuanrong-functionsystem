@@ -1278,6 +1278,21 @@ public:
     std::unordered_map<std::string, SettledRetirementCredential>
         settledRetirementCredentials_;
 
+    // SETTLED-CLEANUP-PENDING: the machine was removed (DelInstance +
+    // OnDelInstance ran) but the state/budget cleanup FAILED. A later real
+    // frontend kill retry for this exact incarnation finds the record and
+    // completes the cleanup instead of bouncing on ERR_INSTANCE_NOT_FOUND.
+    // No record + no machine = genuine NOT_FOUND (unchanged semantics);
+    // the record is bound to runtime+request and NEVER applies to a
+    // same-name replacement.
+    struct SettledCleanupPending {
+        std::string runtimeID;
+        std::string requestID;
+        std::string reason;
+    };
+    std::unordered_map<std::string, SettledCleanupPending>
+        settledCleanupPending_;
+
     void ResolveFrontendKillCleanupProbe(
         const std::string &requestID, const std::string &instanceID,
         const std::shared_ptr<litebus::Promise<FrontendKillCleanupSnapshot>> &promise);

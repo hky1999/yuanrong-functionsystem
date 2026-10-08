@@ -658,7 +658,25 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
                 // unbound is NOT a stateless license. Stateless compat is
                 // the store-level idempotent Del, tested at StateClient).
                 return function_proxy::StateHandler::DeleteState(
-                    instanceInfo.instanceid());
+                    instanceInfo.instanceid())
+                    .Then([this, instanceInfo](const litebus::Future<Status> &del) {
+                        if (del.IsError() || del.Get().IsError()) {
+                            // Machine already removed; the state cleanup
+                            // failed. Record the pending cleanup bound to
+                            // THIS incarnation so a later real kill retry
+                            // can finish it.
+                            settledCleanupPending_[instanceInfo.instanceid()] = {
+                                instanceInfo.runtimeid(),
+                                instanceInfo.requestid(),
+                                del.IsError() ? "future-error" : del.Get().RawMessage()};
+                            return del.IsError()
+                                ? Status(StatusCode::ERR_INNER_SYSTEM_ERROR,
+                                         "state deletion failed")
+                                : del.Get();
+                        }
+                        settledCleanupPending_.erase(instanceInfo.instanceid());
+                        return Status::OK();
+                    });
             }
             return litebus::Future<Status>(status);
         });
@@ -1041,6 +1059,26 @@ litebus::Future<KillResponse> InstanceCtrlActor::KillFrontend(const std::string 
     // ERR_INSTANCE_NOT_FOUND into success for shutdown signals, which would turn
     // a stale route into a false idempotent-delete acknowledgement.
     if (stateMachine == nullptr) {
+        // A settled-cleanup-pending record for THIS incarnation means the
+        // machine was already deleted and only the state cleanup failed:
+        // the retry completes it (bounded to the recorded runtime+request;
+        // never applies to a same-name replacement). No record = the
+        // genuine NOT_FOUND unchanged.
+        const auto pending = settledCleanupPending_.find(killReq->instanceid());
+        if (pending != settledCleanupPending_.end()) {
+            auto promise = std::make_shared<litebus::Promise<KillResponse>>();
+            function_proxy::StateHandler::DeleteState(killReq->instanceid())
+                .OnComplete([this, promise, killReq, pending](const litebus::Future<Status> &del) {
+                    if (del.IsError() || del.Get().IsError()) {
+                        promise->SetValue(GenKillResponse(
+                            common::ERR_INNER_SYSTEM_ERROR, "state deletion failed"));
+                        return;
+                    }
+                    settledCleanupPending_.erase(killReq->instanceid());
+                    promise->SetValue(GenKillResponse(common::ERR_NONE, ""));
+                });
+            return promise->GetFuture();
+        }
         return GenKillResponse(common::ERR_INSTANCE_NOT_FOUND,
                                "frontend proxy is not the owning proxy for this instance");
     }
