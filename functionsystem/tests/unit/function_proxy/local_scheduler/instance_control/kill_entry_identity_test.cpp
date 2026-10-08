@@ -49,6 +49,8 @@
 #include "mocks/mock_instance_control_view.h"
 #include "mocks/mock_instance_state_machine.h"
 #include "mocks/mock_internal_iam.h"
+#include "function_proxy/common/state_handler/state_handler.h"
+#include "mocks/mock_distributed_cache_client.h"
 #include "mocks/mock_resource_view.h"
 #include "utils/future_test_helper.h"
 
@@ -158,6 +160,18 @@ protected:
         actor_->BindFunctionAgentMgr(functionAgentMgr_);
         actor_->BindResourceView(resourceViewMgr_);
         actor_->BindInternalIAM(internalIAM_);
+        // REAL state chain (mirrors state_handler_test.cpp SetUp):
+        // MockDistributedCacheClient -> real StateClient -> real StateActor,
+        // spawned and bound, so the control-delete chain exercises the
+        // actual async deletion and its result propagation.
+        cacheClient_ = std::make_shared<MockDistributedCacheClient>();
+        EXPECT_CALL(*cacheClient_, Init).WillOnce(Return(Status::OK()));
+        stateClient_ = std::make_shared<
+            functionsystem::function_proxy::StateClient>(cacheClient_);
+        stateActor_ = std::make_shared<
+            functionsystem::function_proxy::StateActor>(stateClient_);
+        litebus::Spawn(stateActor_);
+        functionsystem::function_proxy::StateHandler::BindStateActor(stateActor_);
         litebus::Spawn(actor_);
     }
 
@@ -166,6 +180,14 @@ protected:
         if (actor_ != nullptr) {
             litebus::Terminate(actor_->GetAID());
             litebus::Await(actor_);
+        }
+        if (stateActor_ != nullptr) {
+            litebus::Terminate(stateActor_->GetAID());
+            litebus::Await(stateActor_->GetAID());
+            stateActor_ = nullptr;
+            functionsystem::function_proxy::StateHandler::BindStateActor(nullptr);
+            stateClient_ = nullptr;
+            cacheClient_ = nullptr;
         }
     }
 
@@ -204,6 +226,9 @@ protected:
     std::vector<std::shared_ptr<messages::KillInstanceRequest>> killRequests;
     std::vector<resource_view::PhysicalRetirementReceipt> settleReceipts;
     std::shared_ptr<InstanceStateMachine> machineSlot_ = nullptr;
+    std::shared_ptr<MockDistributedCacheClient> cacheClient_;
+    std::shared_ptr<functionsystem::function_proxy::StateClient> stateClient_;
+    std::shared_ptr<functionsystem::function_proxy::StateActor> stateActor_;
 };
 
 // 1) Same incarnation: trusted sample identity reaches the agent request
@@ -589,6 +614,139 @@ TEST_F(KillEntryIdentityFixture, MidFlightRequestReplacementKeepsNewState)
     EXPECT_NE(result.Get().GetMessage().find("request generation"), std::string::npos)
         << "reason must name the request-generation guard: "
         << result.Get().GetMessage();
+}
+
+
+// ── Full control-delete chain with the REAL StateActor ──────────────────────
+
+// ① Same-generation delete: the cache Del happens EXACTLY once and the
+// chain returns OK end-to-end.
+TEST_F(KillEntryIdentityFixture, FullChainSameGenerationDeliversCacheDel)
+{
+    auto controlView = std::make_shared<MockInstanceControlView>("node-test");
+    auto machine = std::make_shared<MockInstanceStateMachine>("m-full");
+    const auto info = MakeElasticInfo("inst-full", "runtime-full");
+    ON_CALL(*machine, GetInstanceInfo()).WillByDefault(Return(info));
+    ON_CALL(*machine, GetRequestID()).WillByDefault(Return(info.requestid()));
+    ON_CALL(*controlView, GetInstance("inst-full")).WillByDefault(Return(machine));
+    ON_CALL(*controlView, DelInstance("inst-full"))
+        .WillByDefault(Invoke([](const std::string &) {
+            auto promise = std::make_shared<litebus::Promise<Status>>();
+            promise->SetValue(Status::OK());
+            return promise->GetFuture();
+        }));
+    actor_->BindInstanceControlView(controlView);
+    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>("inst-full")))
+        .WillOnce(Return(Status::OK()));
+
+    auto result = actor_->DeleteInstanceInControlView(Status::OK(), info);
+    ASSERT_AWAIT_READY(result);
+    EXPECT_TRUE(result.Get().IsOk()) << result.Get().ToString();
+}
+
+// ② Cache Del FAILURE: the control delete returns that failure (the state
+// is NOT silently considered cleaned); a retry succeeds (cleanup failure
+// is not masked by the earlier machine deletion).
+TEST_F(KillEntryIdentityFixture, FullChainCacheDelFailureSurfacesAndRetries)
+{
+    auto controlView = std::make_shared<MockInstanceControlView>("node-test");
+    auto machine = std::make_shared<MockInstanceStateMachine>("m-fail");
+    const auto info = MakeElasticInfo("inst-fail", "runtime-fail");
+    ON_CALL(*machine, GetInstanceInfo()).WillByDefault(Return(info));
+    ON_CALL(*machine, GetRequestID()).WillByDefault(Return(info.requestid()));
+    ON_CALL(*controlView, GetInstance("inst-fail")).WillByDefault(Return(machine));
+    ON_CALL(*controlView, DelInstance("inst-fail"))
+        .WillByDefault(Invoke([](const std::string &) {
+            auto promise = std::make_shared<litebus::Promise<Status>>();
+            promise->SetValue(Status::OK());
+            return promise->GetFuture();
+        }));
+    actor_->BindInstanceControlView(controlView);
+    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>("inst-fail")))
+        .WillOnce(Return(Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "store down")))
+        .WillOnce(Return(Status::OK()));
+
+    auto first = actor_->DeleteInstanceInControlView(Status::OK(), info);
+    ASSERT_AWAIT_READY(first);
+    ASSERT_TRUE(first.Get().IsError())
+        << "the store failure must surface, not be masked";
+    EXPECT_EQ(first.Get().GetMessage(), "store down");
+
+    // Retry converges: the SAME chain returns OK on the second attempt.
+    auto retry = actor_->DeleteInstanceInControlView(Status::OK(), info);
+    ASSERT_AWAIT_READY(retry);
+    EXPECT_TRUE(retry.Get().IsOk()) << retry.Get().ToString();
+}
+
+// ③ Mid-flight RUNTIME replacement: cache Del ZERO times, state kept.
+TEST_F(KillEntryIdentityFixture, FullChainMidFlightRuntimeZeroCacheDel)
+{
+    auto controlView = std::make_shared<MockInstanceControlView>("node-test");
+    auto oldMachine = std::make_shared<MockInstanceStateMachine>("m-fr-old");
+    const auto oldInfo = MakeElasticInfo("inst-fr", "runtime-OLD");
+    ON_CALL(*oldMachine, GetInstanceInfo()).WillByDefault(Return(oldInfo));
+    ON_CALL(*oldMachine, GetRequestID()).WillByDefault(Return(oldInfo.requestid()));
+
+    auto gate = std::make_shared<litebus::Promise<Status>>();
+    machineSlot_ = nullptr;
+    ON_CALL(*controlView, GetInstance("inst-fr"))
+        .WillByDefault(Invoke([this, oldMachine](const std::string &) {
+            return machineSlot_ ? machineSlot_ : oldMachine;
+        }));
+    ON_CALL(*controlView, DelInstance("inst-fr"))
+        .WillByDefault(Invoke([gate](const std::string &) {
+            return gate->GetFuture();
+        }));
+    actor_->BindInstanceControlView(controlView);
+    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>("inst-fr"))).Times(0);
+
+    auto result = actor_->DeleteInstanceInControlView(Status::OK(), oldInfo);
+    auto newMachine = std::make_shared<MockInstanceStateMachine>("m-fr-new");
+    const auto newInfo = MakeElasticInfo("inst-fr", "runtime-NEW");
+    ON_CALL(*newMachine, GetInstanceInfo()).WillByDefault(Return(newInfo));
+    ON_CALL(*newMachine, GetRequestID()).WillByDefault(Return(newInfo.requestid()));
+    machineSlot_ = newMachine;
+    gate->SetValue(Status::OK());
+
+    ASSERT_AWAIT_READY(result);
+    ASSERT_TRUE(result.Get().IsError());
+    EXPECT_EQ(result.Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY);
+}
+
+// ③' Mid-flight REQUEST replacement (same runtime): cache Del ZERO times.
+TEST_F(KillEntryIdentityFixture, FullChainMidFlightRequestZeroCacheDel)
+{
+    auto controlView = std::make_shared<MockInstanceControlView>("node-test");
+    auto oldMachine = std::make_shared<MockInstanceStateMachine>("m-fq-old");
+    const auto oldInfo = MakeElasticInfo("inst-fq", "runtime-SAME");
+    ON_CALL(*oldMachine, GetInstanceInfo()).WillByDefault(Return(oldInfo));
+    ON_CALL(*oldMachine, GetRequestID()).WillByDefault(Return(oldInfo.requestid()));
+
+    auto gate = std::make_shared<litebus::Promise<Status>>();
+    machineSlot_ = nullptr;
+    ON_CALL(*controlView, GetInstance("inst-fq"))
+        .WillByDefault(Invoke([this, oldMachine](const std::string &) {
+            return machineSlot_ ? machineSlot_ : oldMachine;
+        }));
+    ON_CALL(*controlView, DelInstance("inst-fq"))
+        .WillByDefault(Invoke([gate](const std::string &) {
+            return gate->GetFuture();
+        }));
+    actor_->BindInstanceControlView(controlView);
+    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>("inst-fq"))).Times(0);
+
+    auto result = actor_->DeleteInstanceInControlView(Status::OK(), oldInfo);
+    auto newMachine = std::make_shared<MockInstanceStateMachine>("m-fq-new");
+    auto newInfo = MakeElasticInfo("inst-fq", "runtime-SAME");
+    newInfo.set_requestid("req-inst-fq-GENERATION-2");
+    ON_CALL(*newMachine, GetInstanceInfo()).WillByDefault(Return(newInfo));
+    ON_CALL(*newMachine, GetRequestID()).WillByDefault(Return(newInfo.requestid()));
+    machineSlot_ = newMachine;
+    gate->SetValue(Status::OK());
+
+    ASSERT_AWAIT_READY(result);
+    ASSERT_TRUE(result.Get().IsError());
+    EXPECT_EQ(result.Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY);
 }
 
 }  // namespace functionsystem::test
