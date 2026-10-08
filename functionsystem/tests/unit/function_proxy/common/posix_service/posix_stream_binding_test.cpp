@@ -101,9 +101,9 @@ protected:
         }
     }
 
-    std::shared_ptr<::grpc::ControlClient> Connect(const std::string &instanceID, const std::string &runtimeID)
+    std::shared_ptr<functionsystem::grpc::ControlClient> Connect(const std::string &instanceID, const std::string &runtimeID)
     {
-        ::grpc::ControlClientConfig config;
+        functionsystem::grpc::ControlClientConfig config;
         config.target = target_;
         config.creds = ::grpc::InsecureChannelCredentials();
         config.timeoutSec = 5;
@@ -127,7 +127,7 @@ protected:
     std::shared_ptr<PosixService> posixService_;
     ::grpc::ServerBuilder builder_;
     std::unique_ptr<::grpc::Server> server_;
-    std::shared_ptr<::grpc::ControlClient> client_;
+    std::shared_ptr<functionsystem::grpc::ControlClient> client_;
     std::string target_;
 };
 
