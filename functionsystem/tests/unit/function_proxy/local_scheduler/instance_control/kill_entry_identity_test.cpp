@@ -1164,11 +1164,25 @@ TEST_F(KillEntryIdentityFixture, LateFailureCallbackDoesNotOverwriteRewrittenRec
 
 
 // ── SAME-REQUEST DIFFERENT-RUNTIME WINDOW (root 16:48/16:5x follow-up) ───────
-// Scope guard: guarantees barrier release on EVERY exit path (ASSERT
-// included) so no thread is left dangling on a failed assertion.
-struct BarrierReleaser {
+// Idempotent, noexcept barrier release: the test body and the destructor
+// share ONE Release() — double fulfillment is impossible, and EVERY exit
+// path (ASSERT included) releases the barrier so no thread dangles.
+struct ScopedBarrierRelease {
     std::shared_ptr<std::promise<void>> release;
-    ~BarrierReleaser() { release->set_value(); }
+    std::atomic<bool> done{ false };
+    void Release() noexcept
+    {
+        if (!done.exchange(true)) {
+            try { release->set_value(); } catch (...) {}  // never throw out
+        }
+    }
+    ~ScopedBarrierRelease() { Release(); }
+};
+
+// Joins the thread on every exit path (noexcept).
+struct ThreadJoiner {
+    std::thread &thread;
+    ~ThreadJoiner() { if (thread.joinable()) { thread.join(); } }
 };
 
 // Failover keeps the CREATION REQUEST but replaces the RUNTIME — both
@@ -1196,12 +1210,15 @@ TEST_F(KillEntryIdentityFixture, SameRequestBarrierBlocksInPlaceRuntimeSwapSave)
     auto stored = std::make_shared<std::string>();
     auto reached = std::make_shared<std::promise<void>>();
     auto release = std::make_shared<std::promise<void>>();
-    BarrierReleaser releaser{ release };
+    ScopedBarrierRelease releaser{ release };
+    // The barrier's wait RESULT is captured and asserted below — a timeout
+    // is an explicit failure, never silently treated as mutex proof.
+    auto barrierWaitOk = std::make_shared<std::atomic<bool>>(false);
     EXPECT_CALL(*cacheClient_, Set(Matcher<const std::string &>(key), _))
-        .WillOnce(Invoke([stored, reached, release](const std::string &, const std::string &val) {
+        .WillOnce(Invoke([stored, reached, release, barrierWaitOk](const std::string &, const std::string &val) {
             reached->set_value();
-            // BOUNDED barrier: an abandoned wait still frees the locks.
-            (void)release->get_future().wait_for(std::chrono::seconds(10));
+            barrierWaitOk->store(release->get_future().wait_for(std::chrono::seconds(10))
+                                     == std::future_status::ready);
             *stored = val;
             return Status::OK();
         }))
@@ -1218,23 +1235,32 @@ TEST_F(KillEntryIdentityFixture, SameRequestBarrierBlocksInPlaceRuntimeSwapSave)
     ASSERT_EQ(reached->get_future().wait_for(std::chrono::seconds(5)), std::future_status::ready);
 
     // The REAL in-place runtime publish (machine lock only — the bypass
-    // path root identified) must be BLOCKED by the guarded store op.
+    // path root identified) must be BLOCKED by the guarded store op. The
+    // publisher CONFIRMS it has started before the blocked-assertion; the
+    // join is guaranteed on every exit path.
     auto published = std::make_shared<std::atomic<bool>>(false);
+    auto publisherStarted = std::make_shared<std::promise<void>>();
     auto infoNew = MakeElasticInfo("inst-bar", "runtime-R2");
     infoNew.set_functionproxyid("node-test");
     infoNew.set_function("default/0-test-helloWorld/$latest");
-    std::thread publisher([machine, infoNew, published]() {
+    std::thread publisher([machine, infoNew, published, publisherStarted]() {
+        publisherStarted->set_value();
         machine->UpdateInstanceInfo(infoNew);  // direct in-place rewrite
         published->store(true);
     });
+    ThreadJoiner joiner{ publisher };
+    ASSERT_EQ(publisherStarted->get_future().wait_for(std::chrono::seconds(5)),
+              std::future_status::ready)
+        << "publisher thread must confirm start";
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     EXPECT_FALSE(published->load()) << "the in-place runtime swap must be blocked by the guarded op";
 
-    release->set_value();
-    publisher.join();
+    releaser.Release();
+    EXPECT_TRUE(barrierWaitOk->load()) << "the barrier wait itself must not have timed out";
     EXPECT_TRUE(published->load());
     EXPECT_EQ(machine->GetInstanceInfo().runtimeid(), "runtime-R2");
     EXPECT_EQ(*stored, "OLD-STATE");  // old save happened-before the publish
+    (void)joiner;
 
     // The successor's save lands AFTER the publish — final value is NEW.
     auto newMsg = std::make_shared<runtime_rpc::StreamingMessage>();
@@ -1274,11 +1300,13 @@ TEST_F(KillEntryIdentityFixture, SameRequestBarrierBlocksInPlaceRuntimeSwapDelet
     auto delCount = std::make_shared<std::atomic<int>>(0);
     auto reached = std::make_shared<std::promise<void>>();
     auto release = std::make_shared<std::promise<void>>();
-    BarrierReleaser releaser{ release };
+    ScopedBarrierRelease releaser{ release };
+    auto barrierWaitOk = std::make_shared<std::atomic<bool>>(false);
     EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>(key)))
-        .WillOnce(Invoke([delCount, reached, release](const std::string &) {
+        .WillOnce(Invoke([delCount, reached, release, barrierWaitOk](const std::string &) {
             reached->set_value();
-            (void)release->get_future().wait_for(std::chrono::seconds(10));
+            barrierWaitOk->store(release->get_future().wait_for(std::chrono::seconds(10))
+                                     == std::future_status::ready);
             delCount->fetch_add(1);
             return Status::OK();
         }))
@@ -1292,19 +1320,26 @@ TEST_F(KillEntryIdentityFixture, SameRequestBarrierBlocksInPlaceRuntimeSwapDelet
     ASSERT_EQ(reached->get_future().wait_for(std::chrono::seconds(5)), std::future_status::ready);
 
     auto published = std::make_shared<std::atomic<bool>>(false);
+    auto publisherStarted = std::make_shared<std::promise<void>>();
     auto infoNew = MakeElasticInfo("inst-bd", "runtime-R2");
     infoNew.set_functionproxyid("node-test");
     infoNew.set_function("default/0-test-helloWorld/$latest");
-    std::thread publisher([machine, infoNew, published]() {
+    std::thread publisher([machine, infoNew, published, publisherStarted]() {
+        publisherStarted->set_value();
         machine->UpdateInstanceInfo(infoNew);
         published->store(true);
     });
+    ThreadJoiner joiner{ publisher };
+    ASSERT_EQ(publisherStarted->get_future().wait_for(std::chrono::seconds(5)),
+              std::future_status::ready)
+        << "publisher thread must confirm start";
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     EXPECT_FALSE(published->load()) << "the in-place runtime swap must be blocked by the guarded Del";
 
-    release->set_value();
-    publisher.join();
+    releaser.Release();
+    EXPECT_TRUE(barrierWaitOk->load()) << "the barrier wait itself must not have timed out";
     EXPECT_TRUE(published->load());
+    (void)joiner;
     ASSERT_AWAIT_READY(*oldDel);
     EXPECT_TRUE(oldDel->Get().IsOk());
     EXPECT_EQ(delCount->load(), 1);

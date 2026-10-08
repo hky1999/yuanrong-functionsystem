@@ -20,6 +20,7 @@
 #include <cstdlib>
 
 #include "common/constants/actor_name.h"
+#include "function_proxy/common/state_handler/state_handler.h"
 #include "local_scheduler/traefik_registry/traefik_registry.h"
 #include "meta_store_monitor/meta_store_monitor_factory.h"
 #include "common/utils/param_check.h"
