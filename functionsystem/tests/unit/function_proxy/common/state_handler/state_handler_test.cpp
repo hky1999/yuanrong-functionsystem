@@ -328,23 +328,28 @@ TEST_F(StateHandlerTest, DeleteStateFailed)
     }
 
 
-// Root-directed 2026-10-08: the stateless-instance compatibility contract
-// lives HERE (store-level idempotent Del), not at the kill-chain layer.
+// Root-directed 2026-10-08: StateClient::Del forwards the STORE status
+// verbatim (ds_cache_client_impl.cpp:86 — no NOT_FOUND→OK mapping). The
+// tests below assert the REAL contract: whatever the store answers is
+// what the kill chain sees. Any not-found→OK normalization, if wanted,
+// belongs in the store layer and must be tested there with its real
+// error codes — not fabricated here.
 
-// Absent state deletes are IDEMPOTENT-OK: Del of a key with no stored
-// state succeeds (a stateless instance deletes cleanly).
-TEST_F(StateHandlerTest, DeleteStateAbsentIsIdempotentOk)
+// A not-found error from the store propagates UNCHANGED (verbatim
+// forwarding): the kill chain sees the store's own verdict.
+TEST_F(StateHandlerTest, DeleteStateForwardsStoreNotFoundVerbatim)
 {
-    EXPECT_CALL(*distributedCacheClient_, Del(Matcher<const std::string &>("stateless-instance")))
-        .WillOnce(Return(Status(StatusCode::ERR_STATE_NOT_FOUND, "no such state")));
-    auto del = StateHandler::DeleteState("stateless-instance");
-    // The store answers not-found: the delete is complete (nothing to
-    // remove), so the chain sees OK.
+    const Status notFound(StatusCode::ERR_DB_ERROR, "key not exist");
+    EXPECT_CALL(*distributedCacheClient_, Del(Matcher<const std::string &>("absent-instance")))
+        .WillOnce(Return(notFound));
+    auto del = StateHandler::DeleteState("absent-instance");
     ASSERT_AWAIT_READY(del);
-    EXPECT_TRUE(del.Get().IsOk()) << del.Get().ToString();
+    EXPECT_TRUE(del.Get().IsError());
+    EXPECT_EQ(del.Get().StatusCode(), notFound.StatusCode());
+    EXPECT_EQ(del.Get().GetMessage(), notFound.GetMessage());
 }
 
-// A genuine store FAILURE propagates (the kill chain must retry).
+// A genuine store failure propagates (the kill chain must retry).
 TEST_F(StateHandlerTest, DeleteStateStoreFailurePropagates)
 {
     EXPECT_CALL(*distributedCacheClient_, Del(Matcher<const std::string &>("failing-instance")))
@@ -352,6 +357,18 @@ TEST_F(StateHandlerTest, DeleteStateStoreFailurePropagates)
     auto del = StateHandler::DeleteState("failing-instance");
     ASSERT_AWAIT_READY(del);
     EXPECT_TRUE(del.Get().IsError());
+    EXPECT_EQ(del.Get().GetMessage(), "store down");
+}
+
+// Positive: a successful Del propagates OK end-to-end through the bound
+// actor.
+TEST_F(StateHandlerTest, DeleteStateSuccessPropagates)
+{
+    EXPECT_CALL(*distributedCacheClient_, Del(Matcher<const std::string &>("present-instance")))
+        .WillOnce(Return(Status::OK()));
+    auto del = StateHandler::DeleteState("present-instance");
+    ASSERT_AWAIT_READY(del);
+    EXPECT_TRUE(del.Get().IsOk()) << del.Get().ToString();
 }
 
 }  // namespace functionsystem::function_proxy::test
