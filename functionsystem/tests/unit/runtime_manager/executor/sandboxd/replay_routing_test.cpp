@@ -52,6 +52,13 @@ public:
             failNextDelete = false;
             return grpc::Status(grpc::StatusCode::NOT_FOUND, "no such sandbox");
         }
+        // okRetiredGeneration: when set, the RPC answers OK naming THIS
+        // generation regardless of what was expected — the OK-but-wrong
+        // receipt boundary.
+        if (!okRetiredGeneration.empty()) {
+            rsp->set_retired_generation(okRetiredGeneration);
+            return grpc::Status::OK;
+        }
         if (req->expected_generation() == retiredGeneration) {
             rsp->set_retired_generation(retiredGeneration);
             return grpc::Status::OK;
@@ -68,6 +75,7 @@ public:
 
     std::vector<std::string> deleteCalls;
     std::string retiredGeneration;
+    std::string okRetiredGeneration;  // non-empty => OK with this gen
     std::atomic<bool> failNextDelete{false};
 };
 
@@ -83,16 +91,28 @@ protected:
         server_ = builder_.BuildAndStart();
         ASSERT_NE(server_, nullptr);
         endpoint_ = "127.0.0.1:" + std::to_string(port);
-        executor_ = std::make_unique<SandboxdExecutor>(
+        executor_ = std::make_shared<SandboxdExecutor>(
             "replay-test", litebus::AID(), "/tmp/replay-test-state");
-        executor_->sandboxd_ =
+        auto client =
             functionsystem::GrpcClient<runtime::v1::SandboxService>::
-                CreateGrpcClient(endpoint_).release();
-        ASSERT_NE(executor_->sandboxd_, nullptr);
+                CreateGrpcClient(endpoint_);
+        ASSERT_NE(client, nullptr);
+        executor_->sandboxd_ = std::shared_ptr<
+            functionsystem::GrpcClient<runtime::v1::SandboxService>>(
+                client.release());
+        // The executor's continuations defer onto its OWN actor id: without
+        // a spawned actor the post-RPC callbacks never run and the futures
+        // never resolve. Spawn it and terminate in TearDown.
+        litebus::Spawn(executor_, true);
+        spawned_ = true;
     }
 
     void TearDown() override
     {
+        if (spawned_) {
+            litebus::Terminate(executor_->GetAID());
+            litebus::Await(executor_);
+        }
         if (server_) { server_->Shutdown(); }
     }
 
@@ -100,7 +120,8 @@ protected:
     grpc::ServerBuilder builder_;
     std::unique_ptr<grpc::Server> server_;
     std::string endpoint_;
-    std::unique_ptr<SandboxdExecutor> executor_;
+    std::shared_ptr<SandboxdExecutor> executor_;
+    bool spawned_ = false;
 };
 
 }  // namespace
@@ -131,11 +152,14 @@ TEST_F(ReplayRoutingTest, MissingRuntimeWithCompleteIdentityReplaysDurableReceip
     EXPECT_EQ(outcome.Get().retirement.resourceGeneration, "gen-a1-0");
 }
 
-// Durable receipt names a DIFFERENT generation: no proof, UNKNOWN, credit
-// retained — a retry may reconcile later.
-TEST_F(ReplayRoutingTest, ReplayWithMismatchedGenerationStaysUnknown)
+// RPC SUCCEEDS but retired_generation names a DIFFERENT incarnation: the
+// response boundary itself must reject the proof (OK-status response with
+// a wrong receipt is not this retirement).
+TEST_F(ReplayRoutingTest, ReplayWithOkButMismatchedGenerationStaysUnknown)
 {
-    service_->retiredGeneration = "gen-somebody-else";
+    // The controllable service answers OK only for retiredGeneration;
+    // make it answer OK with the FOREIGN generation on purpose:
+    service_->okRetiredGeneration = "gen-somebody-else";
     auto request = std::make_shared<messages::StopInstanceRequest>();
     request->set_runtimeid("runtime-mismatch");
     request->set_requestid("stop-mismatch");
