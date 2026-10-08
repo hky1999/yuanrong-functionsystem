@@ -673,7 +673,8 @@ TEST_F(KillEntryIdentityFixture, FullChainCacheDelFailureSurfacesAndRetries)
     ASSERT_AWAIT_READY(first);
     ASSERT_TRUE(first.Get().IsError())
         << "the store failure must surface, not be masked";
-    EXPECT_EQ(first.Get().GetMessage(), "store down");
+    EXPECT_EQ(first.Get().StatusCode(), StatusCode::ERR_INNER_SYSTEM_ERROR);
+    EXPECT_EQ(first.Get().RawMessage(), "store down");
 
     // Retry converges: the SAME chain returns OK on the second attempt.
     auto retry = actor_->DeleteInstanceInControlView(Status::OK(), info);
