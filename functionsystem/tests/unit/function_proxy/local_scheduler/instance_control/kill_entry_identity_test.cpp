@@ -817,4 +817,60 @@ TEST_F(KillEntryIdentityFixture, StateDeleteFailureAfterMachineRemovalRetryConve
     EXPECT_EQ(realView->GetInstance("inst-conv"), nullptr);
 }
 
-}  // namespace functionsystem::test}  // namespace functionsystem::test
+
+// Real frontend-entry retry: the first control delete removes the machine
+// (real view) but the state delete fails; the second call goes through
+// the REAL KillFrontend (tenant-checked frontend path), finds the pending
+// record, and completes the cleanup — NOT a NOT_FOUND bounce.
+TEST_F(KillEntryIdentityFixture, RealKillFrontendRetryCompletesPendingCleanup)
+{
+    auto realView = std::make_shared<InstanceControlView>("node-test", false);
+    auto mockMetaClient = std::make_shared<MockMetaStoreClient>("127.0.0.1:1");
+    realView->BindMetaStoreClient(mockMetaClient);
+    auto mockTxn = std::make_shared<MockTxnTransaction>(litebus::AID());
+    EXPECT_CALL(*mockMetaClient, BeginTransaction).WillRepeatedly(Return(mockTxn));
+    auto deleteTxnResp = TxnOperationResponse();
+    auto deleteResponse = DeleteResponse();
+    deleteResponse.deleted = true;
+    deleteTxnResp.operationType = TxnOperationType::OPERATION_DELETE;
+    deleteTxnResp.response = deleteResponse;
+    auto deleteOk = std::make_shared<TxnResponse>();
+    deleteOk->success = true;
+    deleteOk->responses.emplace_back(deleteTxnResp);
+    deleteOk->responses.emplace_back(deleteTxnResp);
+    EXPECT_CALL(*mockTxn, Commit).WillRepeatedly(
+        Return(litebus::Future<std::shared_ptr<TxnResponse>>(deleteOk)));
+
+    auto info = MakeElasticInfo("inst-fk", "runtime-fk");
+    info.set_functionproxyid("node-test");
+    info.set_function("default/0-test-helloWorld/$latest");
+    info.set_tenantid("tenant-test");
+    realView->GenerateStateMachine(info.instanceid(), info);
+    actor_->BindInstanceControlView(realView);
+
+    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>("inst-fk")))
+        .WillOnce(Return(Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "store down")))
+        .WillOnce(Return(Status::OK()));
+
+    auto first = actor_->DeleteInstanceInControlView(Status::OK(), info);
+    ASSERT_AWAIT_READY(first);
+    ASSERT_TRUE(first.Get().IsError());
+    EXPECT_EQ(realView->GetInstance("inst-fk"), nullptr);
+
+    // The REAL frontend kill entry — completes via the pending record.
+    auto killReq = std::make_shared<KillRequest>();
+    killReq->set_instanceid("inst-fk");
+    killReq->set_requestid("req-fk");
+    auto second = actor_->KillFrontend("tenant-test", killReq);
+    ASSERT_AWAIT_READY(second);
+    EXPECT_EQ(static_cast<int>(second.Get().code()), static_cast<int>(common::ERR_NONE))
+        << second.Get().message();
+
+    // A THIRD call with no pending record: genuine NOT_FOUND (unchanged).
+    auto third = actor_->KillFrontend("tenant-test", killReq);
+    ASSERT_AWAIT_READY(third);
+    EXPECT_EQ(static_cast<int>(third.Get().code()),
+              static_cast<int>(common::ERR_INSTANCE_NOT_FOUND));
+}
+
+}  // namespace functionsystem::test
