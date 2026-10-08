@@ -50,7 +50,7 @@
 #include "mocks/mock_instance_state_machine.h"
 #include "mocks/mock_internal_iam.h"
 #include "function_proxy/common/state_handler/state_handler.h"
-#include "state_handler_helper.h"
+#include "common/state_handler/state_handler_helper.h"
 #include "mocks/mock_distributed_cache_client.h"
 #include "mocks/mock_resource_view.h"
 #include "utils/future_test_helper.h"
