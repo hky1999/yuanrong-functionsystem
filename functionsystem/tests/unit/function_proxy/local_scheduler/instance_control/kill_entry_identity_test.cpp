@@ -176,6 +176,9 @@ protected:
         const auto suffix =
             litebus::uuid_generator::UUID::GetRandomUUID().ToString();
         InstanceCtrlConfig config;
+        // The traefik registration path derives the route host IP from this
+        // address; without it the entry early-OKs and never registers.
+        config.proxyGrpcAddress = "10.1.1.1:8443";
         actor_ = std::make_shared<InstanceCtrlActor>(
             "KillIdentityActor-" + suffix, "node-test", config);
 
