@@ -104,6 +104,20 @@ TEST(DsGate3Probe, PhaseARealSetGetDelPositiveControl)
     ASSERT_TRUE(verifier->Set(controlKey, controlValue).IsOk());
 
     int iterations = 20;
+    // EXPLICIT ARM POINT (root requirement): Init + verifier + control are
+    // all green BEFORE any fault can act. When DS_GATE3_ARM names a file,
+    // the proxy's fault mode activates only once this file exists — we
+    // create it HERE, after init and the control-key write, so delay/drop/
+    // hold hit ONLY the operation stage. Recorded in the jsonl.
+    const std::string armFile = EnvOr("DS_GATE3_ARM", "");
+    if (!armFile.empty()) {
+        std::ofstream arm(armFile);
+        arm << NowMs();
+        arm.close();
+        jsonl << "{\"op\":\"armed\",\"file\":\"" << armFile << "\",\"runid\":\"" << runId << "\"}\n";
+        jsonl.flush();
+        std::cout << "DS_GATE3 armed " << armFile << std::endl;
+    }
     for (int i = 0; i < iterations; ++i) {
         const std::string key = "gate3:expire:" + runId + ":k" + std::to_string(i);
         const std::string value = "v" + std::to_string(i) + "-" + std::string(64, 'x');
