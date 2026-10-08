@@ -15,6 +15,7 @@
  */
 
 #include "function_proxy/common/state_handler/state_handler.h"
+#include "common/state_machine/instance_control_view.h"
 
 #include "common/hex/hex.h"
 #include "common/utils/files.h"
@@ -39,6 +40,21 @@ public:
         stateActor_ = std::make_shared<StateActor>(stateClient_);
         litebus::Spawn(stateActor_);
         StateHandler::BindStateActor(stateActor_);
+        // NEW CONTRACT (#S): saves/deletes execute under the guarded view
+        // executors — an unbound actor refuses by design. The fixture's
+        // view starts EMPTY (deletes = retire completion allowed); tests
+        // that need a live machine generate one on it.
+        view_ = std::make_shared<functionsystem::InstanceControlView>("node-test", false);
+        stateActor_->SetSaveExecutor(
+            [view = view_](const std::string &id, const std::string &runtime,
+                           const StateActor::GuardedStoreOp &op) {
+                return view->SaveStateGuarded(id, runtime, op);
+            });
+        stateActor_->SetDeleteExecutor(
+            [view = view_](const std::string &id, const std::string &runtime,
+                           const StateActor::GuardedStoreOp &op) {
+                return view->DeleteStateGuarded(id, runtime, op);
+            });
     }
 
     void TearDown() override
@@ -54,6 +70,17 @@ protected:
     std::shared_ptr<MockDistributedCacheClient> distributedCacheClient_;
     std::shared_ptr<StateActor> stateActor_;
     std::shared_ptr<StateClient> stateClient_;
+    std::shared_ptr<functionsystem::InstanceControlView> view_;
+
+    // Registers the machine a guarded save must match.
+    void RegisterMachine(const std::string &id, const std::string &runtime, const std::string &req)
+    {
+        resources::InstanceInfo info;
+        info.set_instanceid(id);
+        info.set_runtimeid(runtime);
+        info.set_requestid(req);
+        view_->GenerateStateMachine(id, info);
+    }
 };
 
 /**
@@ -105,6 +132,7 @@ TEST_F(StateHandlerTest, SaveStateFailed)
     EXPECT_EQ(response.Get()->saversp().code(), common::ErrorCode::ERR_PARAM_INVALID);
     EXPECT_EQ(response.Get()->saversp().message(), "save state failed: empty instance id");
 
+    RegisterMachine("instance_id", "rt-1", "req-gen-1");
     EXPECT_CALL(*distributedCacheClient_, Set).WillOnce(Return(Status(StatusCode::FAILED)));
     response = StateHandler::SaveState(grpc::PosixStreamIdentity{"instance_id", "rt-1", "req-gen-1"}, request);
     EXPECT_AWAIT_READY(response);
@@ -144,12 +172,73 @@ TEST_F(StateHandlerTest, DeleteState)
  */
 TEST_F(StateHandlerTest, SaveStateSuccess)
 {
+    RegisterMachine("instance_id", "rt-1", "req-gen-1");
     auto request = std::make_shared<runtime_rpc::StreamingMessage>();
     EXPECT_CALL(*distributedCacheClient_, Set).WillOnce(Return(Status::OK()));
     auto response = StateHandler::SaveState(grpc::PosixStreamIdentity{"instance_id", "rt-1", "req-gen-1"}, request);
     EXPECT_AWAIT_READY(response);
     EXPECT_EQ(response.Get()->saversp().code(), common::ErrorCode::ERR_NONE);
-    EXPECT_EQ(response.Get()->saversp().checkpointid(), "instance_id");
+    // The save returns the VERSIONED checkpoint id (composed key).
+    EXPECT_EQ(response.Get()->saversp().checkpointid(),
+              StateClient::ComposeStateKey("instance_id", "req-gen-1"));
+}
+
+// Save → recover BY VERSIONED CHECKPOINT REFERENCE: the save returns the
+// composed checkpoint id; a later load naming exactly that reference reads
+// the saved bytes back (the cross-recovery contract).
+TEST_F(StateHandlerTest, SaveThenLoadByCheckpointReferenceRoundTrip)
+{
+    RegisterMachine("instance_id", "rt-1", "req-gen-1");
+    const std::string composed = StateClient::ComposeStateKey("instance_id", "req-gen-1");
+    std::string saved;
+    auto saveMsg = std::make_shared<runtime_rpc::StreamingMessage>();
+    saveMsg->mutable_savereq()->set_state("checkpoint-bytes");
+    EXPECT_CALL(*distributedCacheClient_, Set(Matcher<const std::string &>(composed),
+                                              Matcher<const std::string &>(_)))
+        .WillOnce(DoAll(SaveArg<1>(&saved), Return(Status::OK())));
+    auto save = StateHandler::SaveState(grpc::PosixStreamIdentity{"instance_id", "rt-1", "req-gen-1"}, saveMsg);
+    EXPECT_AWAIT_READY(save);
+    ASSERT_EQ(save.Get()->saversp().code(), common::ErrorCode::ERR_NONE);
+    ASSERT_EQ(save.Get()->saversp().checkpointid(), composed);
+
+    auto loadMsg = std::make_shared<runtime_rpc::StreamingMessage>();
+    StateLoadRequest loadReq{};
+    loadReq.set_checkpointid(save.Get()->saversp().checkpointid());
+    *loadMsg->mutable_loadreq() = std::move(loadReq);
+    EXPECT_CALL(*distributedCacheClient_,
+                Get(Matcher<const std::string &>(composed), Matcher<std::string &>(_)))
+        .WillOnce(DoAll(SetArgReferee<1>(saved), Return(Status::OK())));
+    auto load = StateHandler::LoadState(grpc::PosixStreamIdentity{"instance_id", "rt-1", "req-gen-1"}, loadMsg);
+    EXPECT_AWAIT_READY(load);
+    EXPECT_EQ(load.Get()->loadrsp().code(), common::ErrorCode::ERR_NONE);
+    EXPECT_EQ(load.Get()->loadrsp().state(), "checkpoint-bytes");
+}
+
+// OLD-CACHE MIGRATION GAP (kept honest, not silently "supported"): a load
+// by a BARE legacy reference is refused — the backfill migration owns old
+// data; this refusal is migration-pending, not a permanent semantic.
+TEST_F(StateHandlerTest, LoadBareLegacyReferenceRefusedPendingMigration)
+{
+    auto loadMsg = std::make_shared<runtime_rpc::StreamingMessage>();
+    StateLoadRequest loadReq{};
+    loadReq.set_checkpointid("instance_id");
+    *loadMsg->mutable_loadreq() = std::move(loadReq);
+    EXPECT_CALL(*distributedCacheClient_, Get(_, _)).Times(0);
+    auto load = StateHandler::LoadState(grpc::PosixStreamIdentity{"instance_id", "rt-1", "req-gen-1"}, loadMsg);
+    EXPECT_AWAIT_READY(load);
+    EXPECT_EQ(load.Get()->loadrsp().code(), common::ErrorCode::ERR_PARAM_INVALID);
+    EXPECT_THAT(load.Get()->loadrsp().message(), testing::HasSubstr("not versioned"));
+}
+
+// NEW CONTRACT negative: no machine (or a superseded runtime) refuses with
+// ZERO cache writes.
+TEST_F(StateHandlerTest, SaveStateRefusedWithoutMatchingMachine)
+{
+    auto request = std::make_shared<runtime_rpc::StreamingMessage>();
+    EXPECT_CALL(*distributedCacheClient_, Set).Times(0);
+    auto response = StateHandler::SaveState(grpc::PosixStreamIdentity{"instance_id", "rt-1", "req-gen-1"}, request);
+    EXPECT_AWAIT_READY(response);
+    EXPECT_EQ(response.Get()->saversp().code(), common::ErrorCode::ERR_INSTANCE_BUSY);
 }
 
 /**
@@ -183,10 +272,10 @@ TEST_F(StateHandlerTest, LoadStateFailed)
 
     std::string state = "";
     EXPECT_CALL(*distributedCacheClient_,
-                Get(Matcher<const std::string &>("checkpoint_id"), Matcher<std::string &>(Eq(""))))
+                Get(Matcher<const std::string &>(StateClient::ComposeStateKey("instance_id", "req-gen-1")), Matcher<std::string &>(Eq(""))))
         .WillOnce(DoAll(SetArgReferee<1>(state), Return(Status(StatusCode::FAILED))));
 
-    loadReq.set_checkpointid("checkpoint_id");
+    loadReq.set_checkpointid(StateClient::ComposeStateKey("instance_id", "req-gen-1"));
     *request->mutable_loadreq() = std::move(loadReq);
     response = StateHandler::LoadState(grpc::PosixStreamIdentity{"instance_id", "rt-1", "req-gen-1"}, request);
     EXPECT_AWAIT_READY(response);
@@ -208,11 +297,11 @@ TEST_F(StateHandlerTest, LoadStateSuccess)
     std::string state = "state";
     auto request = std::make_shared<runtime_rpc::StreamingMessage>();
     EXPECT_CALL(*distributedCacheClient_,
-                Get(Matcher<const std::string &>("checkpoint_id"), Matcher<std::string &>(Eq(""))))
+                Get(Matcher<const std::string &>(StateClient::ComposeStateKey("instance_id", "req-gen-1")), Matcher<std::string &>(Eq(""))))
         .WillOnce(DoAll(SetArgReferee<1>(state), Return(Status::OK())));
 
     StateLoadRequest loadReq{};
-    loadReq.set_checkpointid("checkpoint_id");
+    loadReq.set_checkpointid(StateClient::ComposeStateKey("instance_id", "req-gen-1"));
     *request->mutable_loadreq() = std::move(loadReq);
     auto response = StateHandler::LoadState(grpc::PosixStreamIdentity{"instance_id", "rt-1", "req-gen-1"}, request);
     EXPECT_AWAIT_READY(response);
