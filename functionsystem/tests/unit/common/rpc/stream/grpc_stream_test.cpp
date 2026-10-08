@@ -54,10 +54,10 @@ std::unique_ptr<::grpc::Server> BuildServer(ServiceT *service, std::string *serv
 }
 } // namespace
 
-litebus::Future<std::shared_ptr<StreamingMessage>> InvokeHandler(const std::string &from,
+litebus::Future<std::shared_ptr<StreamingMessage>> InvokeHandler(const grpc::PosixStreamIdentity &identity,
                                                                  const std::shared_ptr<StreamingMessage> &request)
 {
-    EXPECT_EQ(from, "tmpInstance");
+    EXPECT_EQ(identity.instanceID, "tmpInstance");
     auto msg = std::make_shared<StreamingMessage>();
     EXPECT_TRUE(request->has_invokereq());
     if (request->invokereq().requestid() == "server_call_invoke") {
@@ -68,10 +68,10 @@ litebus::Future<std::shared_ptr<StreamingMessage>> InvokeHandler(const std::stri
     return msg;
 }
 
-litebus::Future<std::shared_ptr<StreamingMessage>> CallResultHandler(const std::string &from,
+litebus::Future<std::shared_ptr<StreamingMessage>> CallResultHandler(const grpc::PosixStreamIdentity &identity,
                                                                      const std::shared_ptr<StreamingMessage> &request)
 {
-    EXPECT_EQ(from, "tmpInstance");
+    EXPECT_EQ(identity.instanceID, "tmpInstance");
     auto msg = std::make_shared<StreamingMessage>();
     EXPECT_TRUE(request->has_callresultreq());
     if (request->callresultreq().requestid() == "server_call_result") {

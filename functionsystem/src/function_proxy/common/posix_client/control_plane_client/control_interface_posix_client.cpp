@@ -223,6 +223,52 @@ litebus::Future<runtime::PrepareSnapResponse> ControlInterfacePosixClient::Prepa
     return promise->GetFuture();
 }
 
+litebus::Future<runtime::CheckpointResponse> ControlInterfacePosixClient::CheckpointForRuntime(
+    CheckpointRequest &&request, const std::string &expectedRuntimeID)
+{
+    auto promise = std::make_shared<litebus::Promise<runtime::CheckpointResponse>>();
+    auto msg = std::make_shared<StreamingMessage>();
+    *msg->mutable_checkpointreq() = std::move(request);
+    msg->set_messageid(litebus::uuid_generator::UUID::GetRandomUUID().ToString());
+    auto rejectBusy = [&promise](const std::string &reason) {
+        runtime::CheckpointResponse rsp{};
+        rsp.set_code(common::ERR_INSTANCE_BUSY);
+        rsp.set_message(reason);
+        promise->SetValue(rsp);
+    };
+    if (expectedRuntimeID.empty()) {
+        YRLOG_ERROR("{}|checkpoint for runtime rejected: expected runtime identity is empty", msg->messageid());
+        rejectBusy("checkpoint rejected: expected runtime identity is empty");
+        return promise->GetFuture();
+    }
+    runtime::CheckpointResponse rsp{};
+    rsp.set_code(common::ERR_REQUEST_BETWEEN_RUNTIME_BUS);
+    rsp.set_message("checkpoint failed! client may already closed");
+    // One shared lock covers BOTH the binding check and the send (see
+    // PrepareSnapForRuntime).
+    std::shared_lock<std::shared_mutex> lock(rwMut_);
+    if (posix_ == nullptr) {
+        promise->SetValue(rsp);
+        return promise->GetFuture();
+    }
+    if (runtimeID_.empty() || runtimeID_ != expectedRuntimeID) {
+        YRLOG_ERROR("{}|checkpoint rejected: transport bound to runtime({}) does not match expected runtime({})",
+                    msg->messageid(), runtimeID_, expectedRuntimeID);
+        lock.unlock();
+        rejectBusy("checkpoint rejected: transport no longer bound to the expected runtime");
+        return promise->GetFuture();
+    }
+    (void)posix_->Send(msg).OnComplete([promise, rsp](const litebus::Future<StreamingMessage> &resp) {
+        if (resp.IsError() || !resp.Get().has_checkpointrsp()) {
+            YRLOG_ERROR("failed to checkpoint! client may already closed");
+            promise->SetValue(rsp);
+            return;
+        }
+        promise->SetValue(resp.Get().checkpointrsp());
+    });
+    return promise->GetFuture();
+}
+
 litebus::Future<runtime::PrepareSnapResponse> ControlInterfacePosixClient::PrepareSnapForRuntime(
     PrepareSnapRequest &&request, const std::string &expectedRuntimeID)
 {

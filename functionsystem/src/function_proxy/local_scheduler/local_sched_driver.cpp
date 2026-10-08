@@ -178,6 +178,18 @@ Status LocalSchedDriver::Create()
         config.nodeProxyRouteControlUds = litebus::os::Join(activityUdsDir.Get(), "route.sock");
     }
     instanceCtrl_ = InstanceCtrl::Create(param_.nodeID, config);
+    // Stream-accept identity binding (#S): every accepted runtime stream is
+    // labeled with the CREATION request generation of the CURRENT machine
+    // whose runtimeid matches the connecting runtime — resolved BEFORE the
+    // stream object exists (immutable thereafter). A stream whose runtime
+    // does not match the machine binds EMPTY and its state operations are
+    // refused, never degraded to a bare key.
+    GetPosixService()->SetStreamIdentityResolver(
+        [view = instanceCtrl_->GetInstanceControlView()](const std::string &instanceID,
+                                                         const std::string &runtimeID) -> std::string {
+            const auto snapshot = view->GetIncarnationSnapshot(instanceID);
+            return (runtimeID.empty() || snapshot.first != runtimeID) ? std::string{} : snapshot.second;
+        });
     PosixAPIHandler::BindInstanceCtrl(instanceCtrl_);
     PosixAPIHandler::BindControlClientManager(param_.controlInterfacePosixMgr);
     PosixAPIHandler::BindLocalSchedSrv(localSchedSrv_);

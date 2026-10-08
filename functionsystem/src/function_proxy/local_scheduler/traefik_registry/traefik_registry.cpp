@@ -325,7 +325,8 @@ litebus::Future<Status> TraefikRegistry::RegisterInstance(
     const std::string& tenantID,
     const std::string& runtimeID,
     const std::string& requestID,
-    uint64_t authorityRevision)
+    uint64_t authorityRevision,
+    const std::string& instanceRecordKey)
 {
     if (!accessor_) {
         YRLOG_ERROR("TraefikRegistry: accessor is null, skip registration for instanceID={}", instanceID);
@@ -374,7 +375,8 @@ litebus::Future<Status> TraefikRegistry::RegisterInstance(
     YRLOG_INFO("Registering instance {} to Traefik HTTP (fenced): {} ports, {} keys, runtime={}, request={}",
                instanceID, portMappings.size(), kvs.size(), runtimeID, requestID);
 
-    return RegisterWithMarker(instanceID, kvs, tenantID, runtimeID, requestID, authorityRevision, 0)
+    return RegisterWithMarker(instanceID, kvs, tenantID, runtimeID, requestID, authorityRevision,
+                              instanceRecordKey, 0)
         .Then([instanceID, ports = portMappings.size()](const Status& status) -> Status {
             if (!status.IsOk()) {
                 YRLOG_ERROR("Failed to register instance {} to Traefik: {}", instanceID, status.GetMessage());
@@ -392,6 +394,7 @@ litebus::Future<Status> TraefikRegistry::RegisterWithMarker(
     const std::string& runtimeID,
     const std::string& requestID,
     uint64_t authorityRevision,
+    const std::string& instanceRecordKey,
     uint32_t attempt)
 {
     const std::string safeID = SanitizeID(instanceID);
@@ -450,6 +453,16 @@ litebus::Future<Status> TraefikRegistry::RegisterWithMarker(
 
     auto txn = accessor_->GetMetaClient()->BeginTransaction();
     txn->If(*compare);
+    // DURABLE-OWNERSHIP CONDITION (root ②): the caller's instance record
+    // must STILL carry the exact etcd modify revision the registration
+    // captured — a replay of a RETIRED generation (record deleted or since
+    // rewritten) fails this compare even when the marker is absent, so a
+    // once-valid positive revision cannot resurrect routes. Applies to
+    // EVERY branch, including marker-absence.
+    if (!instanceRecordKey.empty()) {
+        txn->If(meta_store::TxnCompare::OfModifyVersion(instanceRecordKey,
+            meta_store::CompareOperator::EQUAL, static_cast<int64_t>(authorityRevision)));
+    }
     const auto exact = ExactDeleteOption();
     for (const auto& key : oldKeys) {
         txn->Then(meta_store::TxnOperation::Create(key, exact));
@@ -460,7 +473,7 @@ litebus::Future<Status> TraefikRegistry::RegisterWithMarker(
     txn->Then(meta_store::TxnOperation::Create(markerKey, markerValue, PutOption{}));
 
     return txn->Commit().Then(
-        [this, instanceID, kvs, tenantID, runtimeID, requestID, authorityRevision, attempt]
+        [this, instanceID, kvs, tenantID, runtimeID, requestID, authorityRevision, instanceRecordKey, attempt]
         (const std::shared_ptr<TxnResponse>& response) -> litebus::Future<Status> {
             if (response->status.IsError()) {
                 YRLOG_ERROR("TraefikRegistry: register txn transport failure for instance({}): {}",
@@ -481,7 +494,7 @@ litebus::Future<Status> TraefikRegistry::RegisterWithMarker(
             // fails MayTakeOver; our own refresh retries). No state is
             // carried over from this attempt's capture.
             return RegisterWithMarker(instanceID, kvs, tenantID, runtimeID, requestID,
-                                      authorityRevision, attempt + 1);
+                                      authorityRevision, instanceRecordKey, attempt + 1);
         });
 }
 

@@ -96,7 +96,8 @@ public:
         const std::string& tenantID,
         const std::string& runtimeID,
         const std::string& requestID,
-        uint64_t authorityRevision);
+        uint64_t authorityRevision,
+        const std::string& instanceRecordKey);
 
     // Legacy retire: unconditional EXACT-key deletion (enumerated with an
     // anchored segment match — never a bare safeID prefix, which would hit
@@ -175,6 +176,7 @@ private:
                                                const std::string& runtimeID,
                                                const std::string& requestID,
                                                uint64_t authorityRevision,
+                                               const std::string& instanceRecordKey,
                                                uint32_t attempt);
 
     std::shared_ptr<MetaStorageAccessor> accessor_;

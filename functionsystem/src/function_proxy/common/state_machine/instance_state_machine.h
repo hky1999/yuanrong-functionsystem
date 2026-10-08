@@ -266,6 +266,10 @@ private:
                                     std::shared_ptr<StoreInfo> &routePutInfo,
                                     const PersistenceType persistence,
                                     std::string &key);
+    // The durable instance-record etcd key for this identity ("" on
+    // derivation failure) — for callers that need a commit-time
+    // still-current condition on the record.
+    static std::string GetInstanceRecordKey(const resources::InstanceInfo &instanceInfo, bool isMetaStoreEnable);
     static Status TransToStoredData(const resources::InstanceInfo &instanceInfo,
                                     std::shared_ptr<StoreInfo> &instancePutInfo,
                                     std::shared_ptr<StoreInfo> &routePutInfo, const PersistenceType persistence,

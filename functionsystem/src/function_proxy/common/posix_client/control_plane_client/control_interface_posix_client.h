@@ -34,6 +34,13 @@ public:
     virtual litebus::Future<runtime::ShutdownResponse> Shutdown(runtime::ShutdownRequest &&request);
     virtual litebus::Future<runtime::SignalResponse> Signal(runtime::SignalRequest &&request);
     virtual litebus::Future<runtime::CheckpointResponse> Checkpoint(runtime::CheckpointRequest &&request);
+    // Runtime-pinned Checkpoint (same fence as PrepareSnapForRuntime): the
+    // checkpoint is sent only while the transport is still labeled with the
+    // runtime the caller captured — a replacement generation's freshly
+    // re-bound transport never receives the OLD chain's checkpoint, so its
+    // state can never be saved under the old generation's key.
+    virtual litebus::Future<runtime::CheckpointResponse> CheckpointForRuntime(
+        runtime::CheckpointRequest &&request, const std::string &expectedRuntimeID);
     virtual litebus::Future<runtime::RecoverResponse> Recover(runtime::RecoverRequest &&request,
                                                               uint64_t timeoutMs = DEFAULT_RECOVER_TIMEOUT_MS);
     virtual litebus::Future<runtime::PrepareSnapResponse> PrepareSnap(runtime::PrepareSnapRequest &&request);

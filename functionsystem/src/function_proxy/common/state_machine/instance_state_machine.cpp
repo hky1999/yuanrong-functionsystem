@@ -408,6 +408,20 @@ litebus::Future<Status> InstanceStateMachine::DelInstance(const std::string &ins
     return DelInstance(instanceID, "", "");
 }
 
+std::string InstanceStateMachine::GetInstanceRecordKey(const resources::InstanceInfo &instanceInfo,
+                                                       bool isMetaStoreEnable)
+{
+    std::shared_ptr<StoreInfo> instancePutInfo;
+    std::shared_ptr<StoreInfo> routePutInfo;
+    std::string keyPath;
+    if (TransToStoredKeys(instanceInfo, instancePutInfo, routePutInfo,
+            GetPersistenceType(instanceInfo, isMetaStoreEnable), keyPath).IsError()
+        || instancePutInfo == nullptr) {
+        return "";
+    }
+    return instancePutInfo->key;
+}
+
 litebus::Future<Status> InstanceStateMachine::DelInstance(const std::string &instanceID,
                                                           const std::string &expectedRuntimeID,
                                                           const std::string &expectedRequestID)
