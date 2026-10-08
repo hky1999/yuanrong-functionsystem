@@ -186,6 +186,7 @@ protected:
     std::shared_ptr<MockResourceView> primary_;
     std::shared_ptr<MockInternalIAM> internalIAM_;
     std::vector<std::shared_ptr<messages::KillInstanceRequest>> killRequests;
+    std::vector<resource_view::PhysicalRetirementReceipt> settleReceipts;
 };
 
 // 1) Same incarnation: trusted sample identity reaches the agent request
@@ -194,6 +195,16 @@ TEST_F(KillEntryIdentityFixture, SameIncarnationIdentityPassesThrough)
 {
     ServeView(MakeUnitWithEntry(
         MakeViewEntry("inst-same", "runtime-same", "sbox-trusted", "gen-trusted")));
+    // The settlement continuation calls ApplyPhysicalRetirement with the
+    // receipt built from the CONFIRMED response: capture it and answer a
+    // ready OK so the chain completes (dispatch-shape assertions only).
+    EXPECT_CALL(*primary_, ApplyPhysicalRetirement(_))
+        .WillOnce(Invoke([this](const resource_view::PhysicalRetirementReceipt &receipt) {
+            settleReceipts.push_back(receipt);
+            auto promise = std::make_shared<litebus::Promise<Status>>();
+            promise->SetValue(Status::OK());
+            return promise->GetFuture();
+        }));
 
     auto result = actor_->KillRuntimeWithSnapshotCleanup(
         MakeElasticInfo("inst-same", "runtime-same"), false, true, true);
@@ -202,10 +213,14 @@ TEST_F(KillEntryIdentityFixture, SameIncarnationIdentityPassesThrough)
     ASSERT_EQ(killRequests.size(), 1u);
     EXPECT_EQ(killRequests[0]->expected_sandbox_id(), "sbox-trusted");
     EXPECT_EQ(killRequests[0]->expected_resource_generation(), "gen-trusted");
+    // The captured receipt must name exactly this incarnation.
+    ASSERT_EQ(settleReceipts.size(), 1u);
+    EXPECT_EQ(settleReceipts[0].sandboxID, "sbox-trusted");
+    EXPECT_EQ(settleReceipts[0].resourceGeneration, "gen-trusted");
+    EXPECT_EQ(settleReceipts[0].instanceID, "inst-same");
+    EXPECT_EQ(settleReceipts[0].runtimeID, "runtime-same");
 }
 
-// 2) OLD runtime vs SAME-NAME new incarnation: zero dispatch — the stale
-// delete cannot borrow the new incarnation's identity.
 TEST_F(KillEntryIdentityFixture, OldRuntimeSameNameNewIncarnationZeroDispatch)
 {
     ServeView(MakeUnitWithEntry(
@@ -222,6 +237,8 @@ TEST_F(KillEntryIdentityFixture, OldRuntimeSameNameNewIncarnationZeroDispatch)
 // 3a) Missing view (GetInf answers null): UNKNOWN, zero dispatch.
 TEST_F(KillEntryIdentityFixture, MissingViewHoldsUnknown)
 {
+    // SetUp binds a primary view; the MISSING-VIEW input requires it gone.
+    resourceViewMgr_->primary_ = nullptr;
     auto result = actor_->KillRuntimeWithSnapshotCleanup(
         MakeElasticInfo("inst-noview", "runtime-noview"), false, true, true);
     ASSERT_AWAIT_READY(result);
@@ -229,7 +246,18 @@ TEST_F(KillEntryIdentityFixture, MissingViewHoldsUnknown)
     EXPECT_EQ(killRequests.size(), 0u);
 }
 
-// 3b) Allocated entry WITHOUT a trusted sample: UNKNOWN, zero dispatch.
+// Distinct input: the view EXISTS but the snapshot read answers an EMPTY
+// instance map for this identity (view entry genuinely absent).
+TEST_F(KillEntryIdentityFixture, ViewSnapshotWithoutEntryHoldsUnknown)
+{
+    ServeView(MakeUnitWithEntry(MakeElasticInfo("inst-other", "runtime-other")));
+    auto result = actor_->KillRuntimeWithSnapshotCleanup(
+        MakeElasticInfo("inst-absent", "runtime-absent"), false, true, true);
+    ASSERT_AWAIT_READY(result);
+    EXPECT_TRUE(result.Get().IsError());
+    EXPECT_EQ(killRequests.size(), 0u);
+}
+
 TEST_F(KillEntryIdentityFixture, AllocatedWithoutSampleHoldsUnknown)
 {
     ServeView(MakeUnitWithEntry(
@@ -262,6 +290,7 @@ TEST_F(KillEntryIdentityFixture, NonElasticLegacyKillStillDispatched)
 // an elastic instance.
 TEST_F(KillEntryIdentityFixture, OtherEntryKillRuntimeNullViewHoldsUnknown)
 {
+    resourceViewMgr_->primary_ = nullptr;
     auto result = actor_->KillRuntime(
         MakeElasticInfo("inst-noview2", "runtime-noview2"), false);
     ASSERT_AWAIT_READY(result);
