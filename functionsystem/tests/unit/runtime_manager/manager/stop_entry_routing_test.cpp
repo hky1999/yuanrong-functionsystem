@@ -14,41 +14,53 @@
  * limitations under the License.
  */
 
-// Entry-level coverage for the 2026-10 fix chain:
-//  - RuntimeManager::StopInstance: a COMPLETE expected identity must be
-//    routed to the SANDBOXD executor even when the runtime map is empty
-//    (the durable-receipt replay path); a one-sided identity must be
-//    refused BEFORE any dispatch.
-//  - InstanceCtrlActor::SendKillRequestToAgent: the elastic kill carries
-//    expected_sandbox_id/expected_resource_generation when the trusted
-//    identity is known (and the log line names both).
+// REAL-entry coverage for the 2026-10 fix chain, driving the production
+// RuntimeManager::StopInstance message handler through the established
+// capability fixture (spawned actors + serialized messages + a
+// response-capturing test actor):
+//  - a COMPLETE expected identity with an EMPTY runtime map must be routed
+//    to the SANDBOXD executor probe (the durable-receipt replay path), and
+//    the RUNTIME executor probe must see NOTHING;
+//  - a one-sided identity must be refused before ANY dispatch.
+// The probes implement the full ExecutorProxy pure interface and override
+// the methods the entry actually calls (StopInstanceWithOutcome /
+// StopInstance).
 
-#include "domain_scheduler/instance_control/instance_ctrl_actor.h"
 #include "runtime_manager/manager/runtime_manager.h"
 #include "runtime_manager/executor/executor.h"
 #include "common/status/status.h"
+#include "utils/future_test_helper.h"
+#include "runtime_manager_test_actor.h"
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
 using namespace functionsystem;
+using namespace functionsystem::runtime_manager;
 
 namespace functionsystem::test {
 namespace {
 
-// Records executor lookups so the test can assert WHICH executor a stop
-// resolved to without a physical daemon.
-class ExecutorRoutingProbe : public runtime_manager::ExecutorProxy {
+std::string GenerateRandomEntryName(const std::string &prefix)
+{
+    static std::atomic<uint64_t> counter{0};
+    return prefix + std::to_string(::getpid()) + "-"
+        + std::to_string(counter.fetch_add(1));
+}
+
+// Full-interface probe: records every identity-bearing dispatch.
+class EntryRoutingProbe : public ExecutorProxy {
 public:
-    explicit ExecutorRoutingProbe(runtime_manager::EXECUTOR_TYPE type)
+    explicit EntryRoutingProbe(EXECUTOR_TYPE type)
         : ExecutorProxy(nullptr), type_(type) {}
 
-    // pure-virtual surface: only Stop is meaningful; the rest answers
-    // empty failures so the probe can never satisfy a dispatch
+    EXECUTOR_TYPE Type() const { return type_; }
+
     litebus::Future<::messages::StartInstanceResponse> StartInstance(
         const std::shared_ptr<messages::StartInstanceRequest> &,
         const std::vector<int> &) override
@@ -61,19 +73,18 @@ public:
         const std::shared_ptr<messages::StopInstanceRequest> &request,
         bool) override
     {
-        lastStopRuntimeID = request->runtimeid();
-        lastStopExpectedSandbox = request->expected_sandbox_id();
-        lastStopExpectedGeneration = request->expected_resource_generation();
+        RecordDispatch(request);
         return Status(StatusCode::ERR_INSTANCE_BUSY, "probe stop");
     }
 
-    litebus::Future<runtime_manager::StopInstanceOutcome> StopInstanceWithOutcome(
-        const std::shared_ptr<messages::StopInstanceRequest> &request, bool) override
+    litebus::Future<StopInstanceOutcome> StopInstanceWithOutcome(
+        const std::shared_ptr<messages::StopInstanceRequest> &request,
+        bool) override
     {
-        (void)StopInstance(request, false);
-        return runtime_manager::StopInstanceOutcome{
+        RecordDispatch(request);
+        return StopInstanceOutcome{
             Status(StatusCode::ERR_INSTANCE_BUSY, "probe stop"),
-            runtime_manager::PhysicalRetirementProof{}};
+            PhysicalRetirementProof{}};
     }
 
     litebus::Future<messages::SnapshotRuntimeResponse> SnapshotRuntime(
@@ -99,74 +110,102 @@ public:
             messages::ReconcileRuntimesResponse{});
     }
 
-    runtime_manager::EXECUTOR_TYPE type_;
-    std::string lastStopRuntimeID;
-    std::string lastStopExpectedSandbox;
-    std::string lastStopExpectedGeneration;
+    void RecordDispatch(const std::shared_ptr<messages::StopInstanceRequest> &request)
+    {
+        lastRuntimeID = request->runtimeid();
+        lastExpectedSandbox = request->expected_sandbox_id();
+        lastExpectedGeneration = request->expected_resource_generation();
+        dispatchCount++;
+    }
+
+    EXECUTOR_TYPE type_;
+    std::atomic<int> dispatchCount{0};
+    std::string lastRuntimeID;
+    std::string lastExpectedSandbox;
+    std::string lastExpectedGeneration;
+};
+
+class StopEntryRoutingFixture : public ::testing::Test {
+protected:
+    void SetUp() override
+    {
+        manager_ = std::make_shared<RuntimeManager>(GenerateRandomEntryName("StopEntryRM"));
+        manager_->isUnitTestSituation_ = true;
+        litebus::Spawn(manager_, true);
+        manager_->connected_ = true;
+        testActor_ = std::make_shared<RuntimeManagerTestActor>(
+            GenerateRandomEntryName("StopEntryActor"));
+        litebus::Spawn(testActor_, true);
+
+        sandboxdProbe_ = std::make_shared<EntryRoutingProbe>(EXECUTOR_TYPE::SANDBOXD);
+        runtimeProbe_ = std::make_shared<EntryRoutingProbe>(EXECUTOR_TYPE::RUNTIME);
+        manager_->executorMap_[EXECUTOR_TYPE::SANDBOXD] = sandboxdProbe_;
+        manager_->executorMap_[EXECUTOR_TYPE::RUNTIME] = runtimeProbe_;
+    }
+
+    void TearDown() override
+    {
+        litebus::Terminate(testActor_->GetAID());
+        litebus::Await(testActor_->GetAID());
+        litebus::Terminate(manager_->GetAID());
+        litebus::Await(manager_);
+    }
+
+    std::shared_ptr<RuntimeManager> manager_;
+    std::shared_ptr<RuntimeManagerTestActor> testActor_;
+    std::shared_ptr<EntryRoutingProbe> sandboxdProbe_;
+    std::shared_ptr<EntryRoutingProbe> runtimeProbe_;
 };
 
 }  // namespace
 
-// The a1-0 retry shape at the RuntimeManager ENTRY: the runtime map is
-// empty (GetRuntimeType would answer RUNTIME) but the stop carries the
-// COMPLETE expected identity — the dispatch must go to the SANDBOXD
-// executor (which owns the durable-receipt replay).
-TEST(StopEntryRoutingTest, CompleteIdentityRoutesToSandboxdEvenWithEmptyRuntimeMap)
+// a1-0 retry shape THROUGH THE REAL ENTRY: the runtime map is empty, the
+// serialized StopInstanceRequest carries the COMPLETE expected identity —
+// the production handler must hand it to the SANDBOXD executor (replay
+// owner), never the RUNTIME executor's can-not-find-pid path.
+TEST_F(StopEntryRoutingFixture, CompleteIdentityRoutesToSandboxdViaRealEntry)
 {
-    runtime_manager::RuntimeManager manager("routing-test", false);
-    auto sandboxdProbe = std::make_shared<ExecutorRoutingProbe>(
-        runtime_manager::EXECUTOR_TYPE::SANDBOXD);
-    auto runtimeProbe = std::make_shared<ExecutorRoutingProbe>(
-        runtime_manager::EXECUTOR_TYPE::RUNTIME);
-    manager.executorMap_[runtime_manager::EXECUTOR_TYPE::SANDBOXD] = sandboxdProbe;
-    manager.executorMap_[runtime_manager::EXECUTOR_TYPE::RUNTIME] = runtimeProbe;
+    messages::StopInstanceRequest request;
+    request.set_runtimeid("runtime-ghost");
+    request.set_requestid("stop-ghost");
+    request.set_traceid("trace-ghost");
+    request.set_expected_sandbox_id("sbox-ghost");
+    request.set_expected_resource_generation("gen-ghost");
 
-    auto request = std::make_shared<messages::StopInstanceRequest>();
-    request->set_runtimeid("runtime-ghost");
-    request->set_requestid("stop-ghost");
-    request->set_expected_sandbox_id("sbox-ghost");
-    request->set_expected_resource_generation("gen-ghost");
-    // The runtime map is empty on purpose: legacy resolution alone answers
-    // RUNTIME; the COMPLETE identity must override it to SANDBOXD so the
-    // durable-receipt replay (not can-not-find-pid) handles the stop.
-    const auto type = manager.ResolveStopExecutorType(request);
-    const auto effective = request->expected_sandbox_id().empty()
-        ? type : runtime_manager::ContainerExecutorType();
-    EXPECT_EQ(effective, runtime_manager::EXECUTOR_TYPE::SANDBOXD);
-    // The dispatched stop reaches the sandboxd executor with the identity
-    // intact (the production dispatch uses this same resolved executor).
-    auto outcome = sandboxdProbe->StopInstance(request, false);
-    EXPECT_EQ(sandboxdProbe->lastStopExpectedSandbox, "sbox-ghost");
-    EXPECT_EQ(sandboxdProbe->lastStopExpectedGeneration, "gen-ghost");
-    EXPECT_TRUE(runtimeProbe->lastStopRuntimeID.empty())
-        << "the RUNTIME executor must not see an identity-bearing stop";
+    testActor_->StopInstance(manager_->GetAID(), request);
+    ASSERT_AWAIT_TRUE([this]() {
+        return testActor_->GetIsReceiveStopInstanceResponse();
+    });
+    // The probe answers BUSY: the assertion is WHERE the dispatch went,
+    // not the synthetic status.
+    EXPECT_EQ(sandboxdProbe_->dispatchCount.load(), 1)
+        << "identity-bearing stop must reach the SANDBOXD executor";
+    EXPECT_EQ(sandboxdProbe_->lastRuntimeID, "runtime-ghost");
+    EXPECT_EQ(sandboxdProbe_->lastExpectedSandbox, "sbox-ghost");
+    EXPECT_EQ(sandboxdProbe_->lastExpectedGeneration, "gen-ghost");
+    EXPECT_EQ(runtimeProbe_->dispatchCount.load(), 0)
+        << "the RUNTIME executor must never see an identity-bearing stop";
 }
 
-// One-sided identity (sandbox without generation): the entry rejects it
-// before ANY dispatch — neither executor sees the stop. Mirrors the
-// production guard in RuntimeManager::StopInstance.
-TEST(StopEntryRoutingTest, OneSidedIdentityNeverReachesAnyExecutor)
+// One-sided identity: the production entry refuses BEFORE dispatch —
+// neither executor sees anything.
+TEST_F(StopEntryRoutingFixture, OneSidedIdentityRefusedBeforeAnyDispatch)
 {
-    runtime_manager::RuntimeManager manager("one-sided-test", false);
-    auto sandboxdProbe = std::make_shared<ExecutorRoutingProbe>(
-        runtime_manager::EXECUTOR_TYPE::SANDBOXD);
-    auto runtimeProbe = std::make_shared<ExecutorRoutingProbe>(
-        runtime_manager::EXECUTOR_TYPE::RUNTIME);
-    manager.executorMap_[runtime_manager::EXECUTOR_TYPE::SANDBOXD] = sandboxdProbe;
-    manager.executorMap_[runtime_manager::EXECUTOR_TYPE::RUNTIME] = runtimeProbe;
+    messages::StopInstanceRequest request;
+    request.set_runtimeid("runtime-one-sided");
+    request.set_requestid("stop-one-sided");
+    request.set_traceid("trace-one-sided");
+    request.set_expected_sandbox_id("sbox-one-sided");  // generation missing
 
-    auto request = std::make_shared<messages::StopInstanceRequest>();
-    request->set_runtimeid("runtime-one-sided");
-    request->set_requestid("stop-one-sided");
-    request->set_expected_sandbox_id("sbox-one-sided");  // generation missing
-    // The production entry refuses exactly this shape; the test encodes the
-    // same predicate so a regression in either place fails here.
-    const bool oneSided = request->expected_sandbox_id().empty()
-        != request->expected_resource_generation().empty();
-    ASSERT_TRUE(oneSided);
-    if (!oneSided) { return; }  // refused: nothing below dispatches
-    EXPECT_TRUE(sandboxdProbe->lastStopRuntimeID.empty());
-    EXPECT_TRUE(runtimeProbe->lastStopRuntimeID.empty());
+    testActor_->StopInstance(manager_->GetAID(), request);
+    ASSERT_AWAIT_TRUE([this]() {
+        return testActor_->GetIsReceiveStopInstanceResponse();
+    });
+    const auto response = testActor_->GetStopInstanceResponse();
+    ASSERT_NE(response, nullptr);
+    EXPECT_EQ(sandboxdProbe_->dispatchCount.load(), 0);
+    EXPECT_EQ(runtimeProbe_->dispatchCount.load(), 0);
+    EXPECT_NE(response->code(), static_cast<int32_t>(0));
 }
 
 }  // namespace functionsystem::test
