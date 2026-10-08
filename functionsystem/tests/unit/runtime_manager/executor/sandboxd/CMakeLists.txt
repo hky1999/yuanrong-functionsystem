@@ -20,6 +20,8 @@ add_executable(sandboxd_test_bin
     sandboxd_request_builder_test.cpp
     sandboxd_executor_test.cpp
     replay_routing_test.cpp
+    ../../manager/runtime_manager_test_actor.cpp
+    ../../manager/stop_entry_routing_test.cpp
     sandboxd_checkpoint_identity_test.cpp
     sandbox_stats_polls_test.cpp
     runtime_state_manager_test.cpp

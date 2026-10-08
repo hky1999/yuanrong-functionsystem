@@ -100,6 +100,16 @@ public:
         return std::map<std::string, messages::RuntimeInstanceInfo>{};
     }
 
+    // Production StopInstance calls this FIRST; the base implementation
+    // dereferences the wrapped executor (null here). A replayed retirement
+    // legitimately has no exec — answer a READY empty future, mirroring
+    // the unregistered-state contract.
+    litebus::Future<std::shared_ptr<litebus::Exec>> GetExecByRuntimeID(
+        const std::string &) override
+    {
+        return std::shared_ptr<litebus::Exec>{};
+    }
+
     void UpdatePrestartRuntimePromise(pid_t) override {}
     void ClearCapability() override {}
     litebus::Future<bool> GracefulShutdown() override { return false; }
@@ -130,6 +140,9 @@ protected:
     void SetUp() override
     {
         manager_ = std::make_shared<RuntimeManager>(GenerateRandomEntryName("StopEntryRM"));
+        // The ctor already builds healthCheckClient_ (its actor is spawned
+        // inside HealthCheck) — the existing capability fixture relies on
+        // the same member, so no extra init is required here.
         manager_->isUnitTestSituation_ = true;
         litebus::Spawn(manager_, true);
         manager_->connected_ = true;
