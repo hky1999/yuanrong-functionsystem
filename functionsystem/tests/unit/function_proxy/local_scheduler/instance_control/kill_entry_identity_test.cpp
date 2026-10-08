@@ -46,6 +46,8 @@
 #include "function_proxy/local_scheduler/instance_control/instance_ctrl_actor.h"
 #include "mocks/mock_control_interface_client_manager_proxy.h"
 #include "mocks/mock_function_agent_mgr.h"
+#include "mocks/mock_instance_control_view.h"
+#include "mocks/mock_instance_state_machine.h"
 #include "mocks/mock_internal_iam.h"
 #include "mocks/mock_resource_view.h"
 #include "utils/future_test_helper.h"
@@ -446,33 +448,59 @@ TEST_F(KillEntryIdentityFixture, OtherEntryKillRuntimeViewReadFailsHoldsUnknown)
 }
 
 
-// Root's late-receipt window: the OLD kill dispatched, the same-name
-// instance was REPLACED (new runtime in the control view), then the old
-// chain's control delete runs. The new incarnation's state must survive:
-// the guard refuses BEFORE DelInstance touches the current machine.
+// Root's late-receipt window, REAL guard coverage: the control view now
+// holds a NEW same-name incarnation; the OLD chain's control delete is
+// driven through the production DeleteInstanceInControlView. The guard must
+// refuse BEFORE any side effect: DelInstance is NEVER called and the new
+// machine's state is untouched.
 TEST_F(KillEntryIdentityFixture, LateOldReceiptDoesNotDeleteNewIncarnationState)
 {
-    ServeView(MakeUnitWithEntry(
-        MakeViewEntry("inst-late", "runtime-OLD", "sbox-old", "gen-old")));
-    EXPECT_CALL(*primary_, ApplyPhysicalRetirement(_))
-        .WillOnce(Invoke([this](const resource_view::PhysicalRetirementReceipt &receipt) {
-            settleReceipts.push_back(receipt);
+    // Bind a control view carrying the NEW incarnation's machine.
+    auto controlView = std::make_shared<MockInstanceControlView>("node-test");
+    auto newMachine = std::make_shared<MockInstanceStateMachine>("node-test");
+    const auto newInfo = MakeElasticInfo("inst-late", "runtime-NEW");
+    ON_CALL(*newMachine, GetInstanceInfo()).WillByDefault(Return(newInfo));
+    ON_CALL(*newMachine, GetRequestID()).WillByDefault(Return("req-new"));
+    ON_CALL(*controlView, GetInstance("inst-late"))
+        .WillByDefault(Return(newMachine));
+    // DelInstance must NEVER run for the new incarnation.
+    EXPECT_CALL(*controlView, DelInstance("inst-late")).Times(0);
+    actor_->BindInstanceControlView(controlView);
+
+    // The OLD chain (runtime-OLD, request-old) arrives late: the guard
+    // refuses; no delete, no route/group side effects may follow.
+    const auto oldInfo = MakeElasticInfo("inst-late", "runtime-OLD");
+    auto result = actor_->DeleteInstanceInControlView(Status::OK(), oldInfo);
+    ASSERT_AWAIT_READY(result);
+    EXPECT_TRUE(result.Get().IsError())
+        << "the late old-receipt delete must be refused, not silently applied";
+    // The new machine is untouched: still retrievable with its own identity.
+    const auto stillThere = controlView->GetInstance("inst-late");
+    ASSERT_NE(stillThere, nullptr);
+    EXPECT_EQ(stillThere->GetInstanceInfo().runtimeid(), "runtime-NEW");
+}
+
+// Same-generation delete still proceeds (the guard must not over-block).
+TEST_F(KillEntryIdentityFixture, SameGenerationControlDeleteProceeds)
+{
+    auto controlView = std::make_shared<MockInstanceControlView>("node-test");
+    auto machine = std::make_shared<MockInstanceStateMachine>("node-test");
+    const auto info = MakeElasticInfo("inst-ok", "runtime-ok");
+    ON_CALL(*machine, GetInstanceInfo()).WillByDefault(Return(info));
+    ON_CALL(*machine, GetRequestID()).WillByDefault(Return("req-ok"));
+    ON_CALL(*controlView, GetInstance("inst-ok")).WillByDefault(Return(machine));
+    ON_CALL(*controlView, DelInstance("inst-ok"))
+        .WillByDefault(Invoke([](const std::string &) {
             auto promise = std::make_shared<litebus::Promise<Status>>();
             promise->SetValue(Status::OK());
             return promise->GetFuture();
         }));
-    auto oldKill = actor_->KillRuntimeWithSnapshotCleanup(
-        MakeElasticInfo("inst-late", "runtime-OLD"), false, true, true);
-    ASSERT_AWAIT_READY(oldKill);
-    EXPECT_TRUE(oldKill.Get().IsOk());
+    EXPECT_CALL(*controlView, DelInstance("inst-ok")).Times(1);
+    actor_->BindInstanceControlView(controlView);
 
-    // Between the old kill and the control-cleanup continuation, the
-    // instance name is REUSED by a new incarnation. Drive the control
-    // delete directly with the OLD instanceInfo (the late chain's shape).
-    // NOTE: without a control view bound, the guard's GetInstance returns
-    // nullptr and the delete proceeds — this test documents that the guard
-    // keys on the CONTROL-VIEW machine identity; a full-state test needs
-    // the state-machine fixture and is the follow-up scope.
+    auto result = actor_->DeleteInstanceInControlView(Status::OK(), info);
+    ASSERT_AWAIT_READY(result);
+    EXPECT_TRUE(result.Get().IsOk());
 }
 
-}  // namespace functionsystem::test
+}  // namespace functionsystem::test}  // namespace functionsystem::test
