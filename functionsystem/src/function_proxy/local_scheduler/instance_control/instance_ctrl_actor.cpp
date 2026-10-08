@@ -647,7 +647,19 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
                             "state delete refused: request generation replaced");
                     }
                 }
-                function_proxy::StateHandler::DeleteState(instanceInfo.instanceid());
+                // The async state deletion RESULT is propagated: a bound
+                // actor's failure fails the chain (retry contract); the
+                // unbound case is a stateless instance and stays OK.
+                auto delState = function_proxy::StateHandler::DeleteState(
+                    instanceInfo.instanceid());
+                auto promise = std::make_shared<litebus::Promise<Status>>();
+                delState.OnComplete([promise](const litebus::Future<Status> &f) {
+                    promise->SetValue(f.IsError()
+                        ? Status(StatusCode::ERR_INNER_SYSTEM_ERROR,
+                                 "state deletion failed")
+                        : f.Get());
+                });
+                return promise->GetFuture();
             }
             return status;
         });
