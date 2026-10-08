@@ -284,6 +284,66 @@ TEST_F(KillEntryIdentityFixture, AllocatedWithoutSampleHoldsUnknown)
     EXPECT_EQ(killRequests.size(), 0u);
 }
 
+// 3c) SETTLED retry close-out: the first kill confirmed + settled (view
+// entry removed); the RETRY (control cleanup failed earlier) must complete
+// OK with ZERO new physical dispatches — the fresh authoritative read
+// proves absence, matching DeleteInstanceInResourceView's verify-absence
+// contract.
+TEST_F(KillEntryIdentityFixture, SettledRetryCompletesWithZeroNewDispatch)
+{
+    ServeView(MakeUnitWithEntry(
+        MakeViewEntry("inst-settled", "runtime-settled", "sbox-settled", "gen-settled")));
+    EXPECT_CALL(*primary_, ApplyPhysicalRetirement(_))
+        .WillOnce(Invoke([this](const resource_view::PhysicalRetirementReceipt &receipt) {
+            settleReceipts.push_back(receipt);
+            auto promise = std::make_shared<litebus::Promise<Status>>();
+            promise->SetValue(Status::OK());
+            return promise->GetFuture();
+        }));
+    auto first = actor_->KillRuntimeWithSnapshotCleanup(
+        MakeElasticInfo("inst-settled", "runtime-settled"), false, true, true);
+    ASSERT_AWAIT_READY(first);
+    EXPECT_TRUE(first.Get().IsOk()) << first.Get().GetMessage();
+    ASSERT_EQ(killRequests.size(), 1u);
+
+    // Settlement removed the allocation from the authoritative view: the
+    // retry now sees an entry-less snapshot and must close idempotently.
+    ServeView(MakeUnitWithEntry(MakeElasticInfo("inst-other", "runtime-other")));
+    auto retry = actor_->KillRuntimeWithSnapshotCleanup(
+        MakeElasticInfo("inst-settled", "runtime-settled"), false, true, true);
+    ASSERT_AWAIT_READY(retry);
+    EXPECT_TRUE(retry.Get().IsOk()) << retry.Get().GetMessage();
+    EXPECT_EQ(killRequests.size(), 1u)
+        << "the settled retry must not dispatch a new physical kill";
+    EXPECT_EQ(settleReceipts.size(), 1u);
+}
+
+// 3d) Stale first snapshot: absent there, PRESENT on the fresh read (the
+// same-name new incarnation) — UNKNOWN, zero dispatch, budget retained.
+TEST_F(KillEntryIdentityFixture, StaleSnapshotReappearingHoldsUnknown)
+{
+    // First read: entry-less (stale). Second (fresh) read: the NEW
+    // incarnation is present.
+    int reads = 0;
+    auto staleUnit = MakeUnitWithEntry(MakeElasticInfo("inst-x", "runtime-x"));
+    auto freshUnit = MakeUnitWithEntry(
+        MakeViewEntry("inst-reused2", "runtime-NEW2", "sbox-NEW2", "gen-NEW2"));
+    ON_CALL(*primary_, GetResourceView())
+        .WillByDefault(Invoke([this, staleUnit, freshUnit, &reads]() {
+            reads += 1;
+            auto promise = std::make_shared<
+                litebus::Promise<std::shared_ptr<ResourceUnit>>();
+            promise->SetValue(reads == 1 ? staleUnit : freshUnit);
+            return promise->GetFuture();
+        }));
+    auto result = actor_->KillRuntimeWithSnapshotCleanup(
+        MakeElasticInfo("inst-reused2", "runtime-OLD2"), false, true, true);
+    ASSERT_AWAIT_READY(result);
+    EXPECT_TRUE(result.Get().IsError());
+    EXPECT_EQ(killRequests.size(), 0u)
+        << "a stale snapshot must never license touching the new incarnation";
+}
+
 // 4) Non-elastic legacy: identity-less kill STILL dispatched (old path).
 TEST_F(KillEntryIdentityFixture, NonElasticLegacyKillStillDispatched)
 {
