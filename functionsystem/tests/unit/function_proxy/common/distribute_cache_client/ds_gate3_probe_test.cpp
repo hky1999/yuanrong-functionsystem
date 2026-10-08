@@ -34,6 +34,7 @@
 
 #include <gtest/gtest.h>
 
+#include "datasystem/kv_client.h"
 #include "function_proxy/common/distribute_cache_client/ds_cache_client_impl.h"
 #include "common/status/status.h"
 
@@ -85,23 +86,27 @@ TEST(DsGate3Probe, PhaseARealSetGetDelPositiveControl)
     ASSERT_TRUE(initStatus.IsOk()) << "init failed: " << initStatus.ToString()
         << " (environment problem — not a deadline conclusion)";
 
-    // An INDEPENDENT verification client: the wrapper maps every DS error
-    // to one code, so absence must be distinguished from disconnect/timeout
-    // by a CONTROL KEY that must exist — a healthy control read makes a
-    // target miss genuine absence.
+    // STRICT verification endpoint: the wrapper (DSCacheClientImpl) maps
+    // every DS error to one code, so absence is decided by the RAW SDK —
+    // a datasystem::KVClient whose Get must return the SDK's OWN
+    // K_NOT_FOUND for a deleted key. Any OTHER code (timeout, disconnect,
+    // internal) is UNKNOWN/failure, never absence. The control key keeps
+    // the reader's health observable through the same raw client.
     datasystem::ConnectOptions verifyConnect{};
     verifyConnect.host = host;
     verifyConnect.port = std::stoi(workerPort);
-    functionsystem::RouterConnectOptions verifyRouter{};
-    verifyRouter.azName = "ds-exp";
-    verifyRouter.etcdAddress = routerEtcd;
-    auto verifier = std::make_unique<functionsystem::DSCacheClientImpl>(verifyConnect, verifyRouter);
-    verifier->SetDSAuthEnable(false);
-    verifier->EnableDSClient(true);
-    ASSERT_TRUE(verifier->Init().IsOk()) << "verifier init failed";
+    datasystem::KVClient rawVerifier(verifyConnect);
+    const auto rawInit = rawVerifier.Init();
+    ASSERT_TRUE(rawInit.IsOk()) << "raw verifier init failed: " << rawInit.ToString()
+        << " (environment problem — not a deadline conclusion)";
     const std::string controlKey = "gate3:expire:" + runId + ":control";
     const std::string controlValue = "alive";
-    ASSERT_TRUE(verifier->Set(controlKey, controlValue).IsOk());
+    const auto rawCtlSet = rawVerifier.Set(controlKey, controlValue);
+    ASSERT_TRUE(rawCtlSet.IsOk()) << "raw control Set failed: " << rawCtlSet.ToString();
+    std::string rawCtlBack;
+    const auto rawCtlGet = rawVerifier.Get(controlKey, rawCtlBack);
+    ASSERT_TRUE(rawCtlGet.IsOk() && rawCtlBack == controlValue)
+        << "raw control Get failed: " << rawCtlGet.ToString();
 
     int iterations = 20;
     // EXPLICIT ARM POINT (root requirement): Init + verifier + control are
@@ -167,28 +172,35 @@ TEST(DsGate3Probe, PhaseARealSetGetDelPositiveControl)
         ASSERT_TRUE(delStatus.IsOk()) << "Del[" << i << "] failed (recorded above): "
                                       << delStatus.ToString();
 
-        // Miss check through the INDEPENDENT client with the control key:
-        // a control failure means the reader is unhealthy — absence is
-        // then UNDECIDABLE, never counted as a miss.
-        std::string controlBack;
-        const auto controlStatus = verifier->Get(controlKey, controlBack);
-        ASSERT_TRUE(controlStatus.IsOk()) << "verifier control read failed — reader not "
-                                         << "healthy, absence undecidable: " << controlStatus.ToString();
-        ASSERT_EQ(controlBack, controlValue);
+        // Miss check through the RAW SDK with the strict criterion: the
+        // control read proves health; the target read must return the
+        // SDK's OWN K_NOT_FOUND (rc==K_NOT_FOUND) — anything else is
+        // UNKNOWN/failure, never absence.
+        std::string controlBack2;
+        const auto rawCtl2 = rawVerifier.Get(controlKey, controlBack2);
+        ASSERT_TRUE(rawCtl2.IsOk() && controlBack2 == controlValue)
+            << "raw control re-read failed — reader unhealthy, absence UNDECIDABLE: "
+            << rawCtl2.ToString();
         std::string after;
-        const auto missStatus = verifier->Get(key, after);
-        jsonl << "{\"op\":\"miss_check\",\"i\":" << i << ",\"control_ok\":true,\"miss\":"
-              << (missStatus.IsError() ? "true" : "false") << ",\"runid\":\"" << runId << "\"}\n";
+        const auto rawMiss = rawVerifier.Get(key, after);
+        const auto rawRc = static_cast<int>(rawMiss.GetCode());
+        const bool genuineMiss = (rawRc == static_cast<int>(datasystem::Status::K_NOT_FOUND));
+        jsonl << "{\"op\":\"miss_check\",\"i\":" << i
+              << ",\"control_ok\":true,\"raw_rc\":" << rawRc
+              << ",\"raw_msg\":\"" << rawMiss.GetMsg() << "\""
+              << ",\"genuine_miss\":" << (genuineMiss ? "true" : "false")
+              << ",\"runid\":\"" << runId << "\"}\n";
         jsonl.flush();
-        ASSERT_TRUE(missStatus.IsError()) << "Get-after-Del[" << i << "] should miss "
-            << "(healthy reader via control key)";
+        ASSERT_TRUE(genuineMiss) << "Get-after-Del[" << i << "] must be the RAW SDK "
+            << "K_NOT_FOUND, got rc=" << rawRc << " msg=" << rawMiss.GetMsg()
+            << " (any other code is unknown/failure, not absence)";
 
         if (i == 0 || i == iterations - 1) {
             std::cout << "DS_GATE3 cycle[" << i << "] set=" << setMs << "ms get=" << getMs
                       << "ms del=" << delMs << "ms" << std::endl;
         }
     }
-    (void)verifier->Del(controlKey);
+    (void)rawVerifier.Del(controlKey);
     SUCCEED();
 }
 
