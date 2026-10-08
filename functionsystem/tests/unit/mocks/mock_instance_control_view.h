@@ -33,6 +33,14 @@ public:
     MOCK_METHOD(litebus::Future<GeneratedInstanceStates>, NewInstance,
                 (const std::shared_ptr<messages::ScheduleRequest> &scheduleReq), (override));
     MOCK_METHOD(litebus::Future<Status>, DelInstance, (const std::string &instanceID), (override));
+    // The ownership-fenced overload the 2026-10 retirement chain actually
+    // calls: tests MUST substitute THIS one (gate/expect it) — falling back
+    // to the base would read the real empty machines_ map and fake-green.
+    MOCK_METHOD(litebus::Future<Status>, DelInstance,
+                (const std::string &instanceID, const std::string &expectedRuntimeID,
+                 const std::string &expectedRequestID), (override));
+    MOCK_METHOD((std::pair<std::string, std::string>), GetIncarnationSnapshot,
+                (const std::string &instanceID), (override));
     MOCK_METHOD(void, Update,
                 (const std::string &instanceID, const resources::InstanceInfo &instanceInfo, bool isForceUpdate),
                 (override));

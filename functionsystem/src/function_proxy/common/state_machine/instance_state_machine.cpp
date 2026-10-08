@@ -405,12 +405,40 @@ litebus::Future<TransitionResult> InstanceStateMachine::TransitionTo(const Trans
 
 litebus::Future<Status> InstanceStateMachine::DelInstance(const std::string &instanceID)
 {
+    return DelInstance(instanceID, "", "");
+}
+
+litebus::Future<Status> InstanceStateMachine::DelInstance(const std::string &instanceID,
+                                                          const std::string &expectedRuntimeID,
+                                                          const std::string &expectedRequestID)
+{
     std::lock_guard<std::recursive_mutex> guard(lock_);
     // make sure that state machine can be deleted
     RETURN_STATUS_IF_NULL(instanceContext_, StatusCode::FAILED, "failed to delete instance, not found context.");
 
     auto oldState = instanceContext_->GetState();
     auto instanceInfo = instanceContext_->GetInstanceInfo();
+    // AUTHORITATIVE incarnation fence, under the SAME lock_ that
+    // UpdateInstanceInfo (the ObserverActor in-place update path) takes:
+    // the identity below is the identity whose keys/version the delete
+    // transaction is built from. Refuse BEFORE any callback or dispatch so
+    // a late old chain leaves a same-name new generation fully intact.
+    if (!expectedRuntimeID.empty() && instanceInfo.runtimeid() != expectedRuntimeID) {
+        YRLOG_WARN("{}|fenced delete refused: instance({}) metadata now belongs to runtime({}) "
+                   "but the retiring chain carries runtime({})",
+                   instanceInfo.requestid(), instanceID, instanceInfo.runtimeid(), expectedRuntimeID);
+        return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
+            "machine bound to another incarnation; delete refused"));
+    }
+    const auto currentRequestID = instanceContext_->GetRequestID();
+    if (!expectedRequestID.empty() && !currentRequestID.empty()
+        && currentRequestID != expectedRequestID) {
+        YRLOG_WARN("{}|fenced delete refused: instance({}) metadata now carries request "
+                   "generation ({}) but the retiring chain carries ({})",
+                   currentRequestID, instanceID, currentRequestID, expectedRequestID);
+        return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
+            "machine request generation mismatch; delete refused"));
+    }
     auto persistenceType = GetPersistenceType(instanceInfo, isMetaStoreEnable_);
     ExecuteStateChangeCallback(instanceInfo.requestid(), InstanceState::EXITED);
     if (instanceInfo.functionproxyid() == owner_) {

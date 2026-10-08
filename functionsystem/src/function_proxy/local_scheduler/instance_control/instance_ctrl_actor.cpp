@@ -600,7 +600,11 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
         }
     }
     if (traefikRegistry_) {
-        (void)litebus::Async(GetAID(), &InstanceCtrlActor::UnregisterTraefikRoute, instanceInfo.instanceid());
+        // Identity-bearing (#3): the registry fences the retire against the
+        // route's recorded incarnation, so this async unregister cannot
+        // strip a same-name new generation's route.
+        (void)litebus::Async(GetAID(), &InstanceCtrlActor::UnregisterTraefikRouteFenced,
+            instanceInfo.instanceid(), instanceInfo.runtimeid(), instanceInfo.requestid());
     }
     // Delete the reserved resource information corresponding to the group instance bound to the local node.
     if (!instanceInfo.groupid().empty() && groupInstanceClear_ != nullptr) {
@@ -664,8 +668,28 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
                             // Machine already removed; the state cleanup
                             // failed. Record the pending cleanup bound to
                             // THIS incarnation so a later real kill retry
-                            // can finish it.
-                            settledCleanupPending_[instanceInfo.instanceid()] = {
+                            // can finish it. The write is IDENTITY-GUARDED:
+                            // a record written during the async wait by a
+                            // DIFFERENT (newer) generation's failed cleanup
+                            // must survive — cross-generation cleanup is
+                            // reconciliation's business, not this chain's.
+                            auto &slot = settledCleanupPending_[instanceInfo.instanceid()];
+                            if (!slot.runtimeID.empty() || !slot.requestID.empty()) {
+                                if (slot.runtimeID != instanceInfo.runtimeid()
+                                    || slot.requestID != instanceInfo.requestid()) {
+                                    YRLOG_WARN("pending-cleanup record for instance({}) kept for "
+                                               "runtime({}) request({}); retiring chain runtime({}) "
+                                               "request({}) does not overwrite it",
+                                               instanceInfo.instanceid(), slot.runtimeID,
+                                               slot.requestID, instanceInfo.runtimeid(),
+                                               instanceInfo.requestid());
+                                    return del.IsError()
+                                        ? Status(StatusCode::ERR_INNER_SYSTEM_ERROR,
+                                                 "state deletion failed")
+                                        : del.Get();
+                                }
+                            }
+                            slot = {
                                 instanceInfo.tenantid(),
                                 instanceInfo.runtimeid(),
                                 instanceInfo.requestid(),
@@ -675,7 +699,40 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
                                          "state deletion failed")
                                 : del.Get();
                         }
-                        settledCleanupPending_.erase(instanceInfo.instanceid());
+                        // Post-completion narrowing of the StateActor async
+                        // window: the snapshot above was taken BEFORE the
+                        // async hop, so a replacement landing during the
+                        // flight is only detectable now. The store exposes
+                        // no conditional delete for instance state (unlike
+                        // the metadata delete, which is version-precondi-
+                        // tioned at InstanceOperator::Delete), so this layer
+                        // can narrow and report, not prevent; the successor
+                        // re-saves its state on its next save. The retiring
+                        // chain's own cleanup DID complete: OK is the honest
+                        // answer for IT, with the collision logged for
+                        // reconciliation.
+                        const auto after = instanceControlView_->GetIncarnationSnapshot(
+                            instanceInfo.instanceid());
+                        if (!after.first.empty()
+                            && (after.first != instanceInfo.runtimeid()
+                                || (!after.second.empty() && !instanceInfo.requestid().empty()
+                                    && after.second != instanceInfo.requestid()))) {
+                            YRLOG_WARN("state delete for instance({}) retired runtime({}) "
+                                       "request({}) completed while the view now shows runtime({}) "
+                                       "request({}); successor state may have been removed — "
+                                       "successor must re-save",
+                                       instanceInfo.instanceid(), instanceInfo.runtimeid(),
+                                       instanceInfo.requestid(), after.first, after.second);
+                        }
+                        // Erase ONLY the record belonging to THIS chain:
+                        // the wait may have seen a NEWER generation's
+                        // failed-cleanup record land under the same name.
+                        const auto now = settledCleanupPending_.find(instanceInfo.instanceid());
+                        if (now != settledCleanupPending_.end()
+                            && now->second.runtimeID == instanceInfo.runtimeid()
+                            && now->second.requestID == instanceInfo.requestid()) {
+                            settledCleanupPending_.erase(now);
+                        }
                         return Status::OK();
                     });
             }
@@ -1066,12 +1123,19 @@ litebus::Future<KillResponse> InstanceCtrlActor::KillFrontend(const std::string 
     if (stateMachine == nullptr) {
         // A settled-cleanup-pending record means the machine was already
         // deleted and only the state cleanup failed. The retry path is
-        // STILL tenant-gated and identity-bound: the recorded tenant must
-        // match, and if a NEW machine has reappeared under the name the
-        // old cleanup refuses (the record's creation identity is not this
-        // machine's). No record = the genuine NOT_FOUND unchanged.
+        // STILL tenant-gated and identity-bound: a tenant that does not
+        // match the RECORDED tenant is refused with ERR_AUTHORIZE_FAILED
+        // (uniform with the machine-present branch below) — zero state
+        // deletes, record retained. If a NEW machine has reappeared under
+        // the name the old cleanup refuses (the record's creation identity
+        // is not this machine's). No record = the genuine NOT_FOUND
+        // unchanged.
         const auto pending = settledCleanupPending_.find(killReq->instanceid());
-        if (pending != settledCleanupPending_.end() && tenantID == pending->second.tenantID) {
+        if (pending != settledCleanupPending_.end()) {
+            if (tenantID != pending->second.tenantID) {
+                return GenKillResponse(common::ERR_AUTHORIZE_FAILED,
+                                       "frontend proxy kill tenant does not match instance tenant");
+            }
             // A same-name replacement during the wait: refuse the OLD
             // cleanup — the state key may now belong to the new machine.
             if (instanceControlView_->GetInstance(killReq->instanceid()) != nullptr) {
@@ -9196,7 +9260,10 @@ litebus::Future<Status> InstanceCtrlActor::RegisterTraefikRoute(const InstanceIn
     YRLOG_INFO("Registering instance to Traefik: instanceID={}, hostIP={}, ports={}",
                instanceInfo.instanceid(), ip, portMappings.size());
 
-    return traefikRegistry_->RegisterInstance(instanceInfo.instanceid(), ip, portMappings)
+    // Identity-bearing registration (#3): the registry records this
+    // incarnation so a stale unregister from an older chain is fenced.
+    return traefikRegistry_->RegisterInstance(instanceInfo.instanceid(), ip, portMappings,
+                                              instanceInfo.runtimeid(), instanceInfo.requestid())
         .Then([instanceID = instanceInfo.instanceid()](const Status& status) -> Status {
             if (!status.IsOk()) {
                 YRLOG_ERROR("failed to register traefik route for instance({}): {}",
@@ -9219,6 +9286,36 @@ litebus::Future<Status> InstanceCtrlActor::UnregisterTraefikRoute(const std::str
                 YRLOG_WARN("failed to unregister traefik route for instance({}): {}",
                            instanceID, status.GetMessage());
                 // lease will expire automatically, so don't block main flow
+                return status;
+            }
+            return Status::OK();
+        });
+}
+
+litebus::Future<Status> InstanceCtrlActor::UnregisterTraefikRouteFenced(const std::string &instanceID,
+                                                                         const std::string &expectedRuntimeID,
+                                                                         const std::string &expectedRequestID)
+{
+    if (!traefikRegistry_) {
+        return Status::OK();
+    }
+    if (expectedRuntimeID.empty() && expectedRequestID.empty()) {
+        return UnregisterTraefikRoute(instanceID);
+    }
+    return traefikRegistry_->UnregisterInstance(instanceID, expectedRuntimeID, expectedRequestID)
+        .Then([instanceID, expectedRuntimeID](const Status& status) -> Status {
+            if (!status.IsOk()) {
+                if (status.StatusCode() == StatusCode::ERR_INSTANCE_BUSY) {
+                    // The route belongs to a SAME-NAME NEW incarnation — the
+                    // expected outcome for a late old chain; the old chain
+                    // must NOT delete it and must NOT fail its own cleanup.
+                    YRLOG_INFO("fenced traefik unregister refused for instance({}) runtime({}): "
+                               "route belongs to a newer incarnation",
+                               instanceID, expectedRuntimeID);
+                    return Status::OK();
+                }
+                YRLOG_WARN("failed to unregister traefik route for instance({}) runtime({}): {}",
+                           instanceID, expectedRuntimeID, status.GetMessage());
                 return status;
             }
             return Status::OK();

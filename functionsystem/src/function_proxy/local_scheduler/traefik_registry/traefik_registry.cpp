@@ -75,6 +75,16 @@ litebus::Future<Status> TraefikRegistry::RegisterInstance(
     const std::string& hostIP,
     const std::vector<PortMapping>& portMappings)
 {
+    return RegisterInstance(instanceID, hostIP, portMappings, "", "");
+}
+
+litebus::Future<Status> TraefikRegistry::RegisterInstance(
+    const std::string& instanceID,
+    const std::string& hostIP,
+    const std::vector<PortMapping>& portMappings,
+    const std::string& runtimeID,
+    const std::string& requestID)
+{
     if (!accessor_) {
         YRLOG_ERROR("TraefikRegistry: accessor is null, skip registration for instanceID={}", instanceID);
         return litebus::Future<Status>(Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "meta storage accessor is null"));
@@ -83,6 +93,16 @@ litebus::Future<Status> TraefikRegistry::RegisterInstance(
     if (portMappings.empty()) {
         YRLOG_INFO("No port mappings for instance {}, skip Traefik registration", instanceID);
         return Status::OK();
+    }
+
+    // Record BEFORE dispatching: the route that is about to exist belongs to
+    // THIS incarnation, so a stale unregister arriving concurrently must be
+    // fenced even before the accessor transaction commits. A failed
+    // transaction leaves a conservative stale record (it only ever refuses
+    // MISMATCHED unregisters); ForgetIncarnationIfUnchanged below removes
+    // it without touching a record a newer registration may have written.
+    if (!runtimeID.empty() || !requestID.empty()) {
+        RecordIncarnation(instanceID, runtimeID, requestID);
     }
 
     std::string safeID = SanitizeID(instanceID);
@@ -151,9 +171,13 @@ litebus::Future<Status> TraefikRegistry::RegisterInstance(
                instanceID, portMappings.size(), kvs.size());
 
     return accessor_->Txn(kvs)
-        .Then([instanceID, portMappingsCount = portMappings.size()](const Status& status) -> Status {
+        .Then([this, instanceID, runtimeID, requestID,
+               portMappingsCount = portMappings.size()](const Status& status) -> Status {
             if (!status.IsOk()) {
                 YRLOG_ERROR("Failed to register instance {} to Traefik: {}", instanceID, status.GetMessage());
+                // Drop the tentatively-recorded incarnation, but only if no
+                // newer registration replaced it while the txn was in flight.
+                ForgetIncarnationIfUnchanged(instanceID, IncarnationRecord{ runtimeID, requestID });
                 return status;
             }
             YRLOG_INFO("Successfully registered instance {} to Traefik with {} ports",
@@ -182,14 +206,109 @@ litebus::Future<Status> TraefikRegistry::UnregisterInstance(const std::string& i
             }
             return accessor_->Delete(servicePrefix, true);
         })
-        .Then([instanceID](const Status& status) -> Status {
+        .Then([this, instanceID](const Status& status) -> Status {
             if (!status.IsOk()) {
                 YRLOG_WARN("Failed to unregister instance {} from Traefik HTTP: {}", instanceID, status.GetMessage());
             } else {
                 YRLOG_INFO("Successfully unregistered instance {} from Traefik HTTP", instanceID);
+                // Legacy unchecked unregister: whatever incarnation record
+                // exists for this name has been superseded by this removal.
+                std::lock_guard<std::mutex> guard(incarnationLock_);
+                (void)incarnations_.erase(instanceID);
             }
             return Status::OK();
         });
+}
+
+litebus::Future<Status> TraefikRegistry::UnregisterInstance(const std::string& instanceID,
+                                                            const std::string& expectedRuntimeID,
+                                                            const std::string& expectedRequestID)
+{
+    if (!accessor_) {
+        YRLOG_WARN("TraefikRegistry: accessor is null, skip unregistration for instanceID={}", instanceID);
+        return litebus::Future<Status>(Status::OK());
+    }
+    if (expectedRuntimeID.empty() && expectedRequestID.empty()) {
+        return UnregisterInstance(instanceID);  // identity-less caller: legacy path
+    }
+
+    // Ownership fence: a record exists and its incarnation differs from the
+    // retiring chain's — refuse BEFORE any accessor delete so a late old
+    // chain cannot strip a same-name new generation's route.
+    IncarnationRecord matched;
+    if (!IncarnationAllows(instanceID, expectedRuntimeID, expectedRequestID, matched)) {
+        YRLOG_WARN("TraefikRegistry: unregister refused for instance({}): route belongs to "
+                   "runtime({}) request({}), retiring chain carries runtime({}) request({})",
+                   instanceID, matched.runtimeID, matched.requestID, expectedRuntimeID, expectedRequestID);
+        return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
+            "traefik route bound to another incarnation; unregister refused"));
+    }
+
+    YRLOG_INFO("Unregistering instance {} from Traefik HTTP (fenced, runtime={}, request={})",
+               instanceID, expectedRuntimeID, expectedRequestID);
+
+    std::string safeID = SanitizeID(instanceID);
+    std::string routerPrefix = keyPrefix_ + "/http/routers/" + safeID;
+    std::string servicePrefix = keyPrefix_ + "/http/services/" + safeID;
+
+    return accessor_->Delete(routerPrefix, true)
+        .Then([this, servicePrefix](const Status& status) {
+            if (!status.IsOk()) {
+                YRLOG_WARN("Failed to delete Traefik HTTP routers: {}", status.GetMessage());
+            }
+            return accessor_->Delete(servicePrefix, true);
+        })
+        .Then([this, instanceID, matched](const Status& status) -> Status {
+            if (!status.IsOk()) {
+                YRLOG_WARN("Failed to unregister instance {} from Traefik HTTP: {}", instanceID, status.GetMessage());
+            } else {
+                YRLOG_INFO("Successfully unregistered instance {} from Traefik HTTP", instanceID);
+                // Forget only the entry this unregister was fenced against:
+                // a newer registration may have rewritten it mid-flight.
+                ForgetIncarnationIfUnchanged(instanceID, matched);
+            }
+            return Status::OK();
+        });
+}
+
+bool TraefikRegistry::IncarnationAllows(const std::string& instanceID,
+                                        const std::string& expectedRuntimeID,
+                                        const std::string& expectedRequestID,
+                                        IncarnationRecord& matched)
+{
+    std::lock_guard<std::mutex> guard(incarnationLock_);
+    auto it = incarnations_.find(instanceID);
+    if (it == incarnations_.end()) {
+        // Never identity-registered (pre-tracking or legacy form): legacy
+        // semantics — proceed unchecked.
+        matched = IncarnationRecord{};
+        return true;
+    }
+    if ((!expectedRuntimeID.empty() && it->second.runtimeID != expectedRuntimeID)
+        || (!expectedRequestID.empty() && it->second.requestID != expectedRequestID)) {
+        matched = it->second;  // named for the refusal log
+        return false;
+    }
+    matched = it->second;
+    return true;
+}
+
+void TraefikRegistry::RecordIncarnation(const std::string& instanceID,
+                                        const std::string& runtimeID, const std::string& requestID)
+{
+    std::lock_guard<std::mutex> guard(incarnationLock_);
+    incarnations_[instanceID] = IncarnationRecord{ runtimeID, requestID };
+}
+
+void TraefikRegistry::ForgetIncarnationIfUnchanged(const std::string& instanceID,
+                                                   const IncarnationRecord& was)
+{
+    std::lock_guard<std::mutex> guard(incarnationLock_);
+    auto it = incarnations_.find(instanceID);
+    if (it != incarnations_.end() && it->second.runtimeID == was.runtimeID
+        && it->second.requestID == was.requestID) {
+        (void)incarnations_.erase(it);
+    }
 }
 
 std::string TraefikRegistry::SanitizeID(const std::string& id)

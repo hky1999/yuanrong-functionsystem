@@ -1142,6 +1142,13 @@ private:
     void ClearLocalDriver();
     litebus::Future<Status> RegisterTraefikRoute(const InstanceInfo &instanceInfo);
     litebus::Future<Status> UnregisterTraefikRoute(const std::string &instanceID);
+    // Identity-bearing unregister (#3): the registry fences against its
+    // recorded incarnation; a late old chain cannot strip a same-name new
+    // generation's route. Distinct name (not an overload) so member-pointer
+    // dispatch through litebus::Async stays unambiguous.
+    litebus::Future<Status> UnregisterTraefikRouteFenced(const std::string &instanceID,
+                                                         const std::string &expectedRuntimeID,
+                                                         const std::string &expectedRequestID);
 
     litebus::Future<Status> FcAccessorHeartbeatEnable(bool enable)
     {

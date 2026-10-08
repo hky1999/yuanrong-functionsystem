@@ -80,6 +80,22 @@ public:
                          bool isMetaStoreEnable);
     virtual ~InstanceStateMachine();
     virtual litebus::Future<Status> DelInstance(const std::string &instanceID);
+    // Ownership-fenced delete — the AUTHORITATIVE incarnation check lives
+    // HERE, under the machine's own lock_ at the exact point the metadata
+    // (info + version + store keys) is read for the delete transaction.
+    // The control view's pre-check cannot fence this window:
+    // ObserverActor::NotifyUpdateInstance updates the SAME machine object
+    // in place (InstanceControlView::Update -> UpdateInstanceInfo, which
+    // CopyFrom-replaces the info including runtimeid/requestid), so by the
+    // time this method reads its context the machine may already carry a
+    // SAME-NAME NEW generation's identity and version — deleting then
+    // would remove the new generation's keys with its CURRENT version.
+    // A mismatch refuses BEFORE ExecuteStateChangeCallback or any store
+    // dispatch (ERR_INSTANCE_BUSY). Empty expected fields = the legacy
+    // unchecked path above.
+    virtual litebus::Future<Status> DelInstance(const std::string &instanceID,
+                                                const std::string &expectedRuntimeID,
+                                                const std::string &expectedRequestID);
     virtual litebus::Future<TransitionResult> TransitionTo(const TransContext &context);
     virtual litebus::Future<Status> ForceDelInstance();
     void BindMetaStoreClient(const std::shared_ptr<MetaStoreClient> &client);

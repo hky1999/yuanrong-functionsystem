@@ -30,7 +30,17 @@
 //   3. missing view (GetInf null) / allocated-without-sample: UNKNOWN,
 //      zero dispatch, budget retained;
 //   4. non-elastic legacy: identity-less kill still dispatched;
-//   5. the OTHER entry (KillRuntime) rejects a null view for elastic too.
+//   5. the OTHER entry (KillRuntime) rejects a null view for elastic too;
+//   6. control-view deletes through the OWNERSHIP-FENCED DelInstance
+//      overload — mock-view tests gate THAT overload (never the legacy
+//      single-arg one, which production no longer calls here), and the
+//      machine-level fence (identity checked under the machine lock at the
+//      metadata-read point) is exercised on REAL views with real in-place
+//      ObserverActor-shaped updates;
+//   7. the REAL first kill entry (production exit handler installed by
+//      Init) drives the whole kill -> settlement -> control-delete chain;
+//   8. Traefik route retirement is fenced by the registry's recorded
+//      incarnation (stale chains strip nothing).
 //
 // NOTE: these assert DISPATCH shape only (identity carried / zero dispatch
 // / retryable-UNKNOWN). Budget-release correctness is NOT claimed here —
@@ -39,16 +49,21 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
+#include <future>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "function_proxy/local_scheduler/instance_control/instance_ctrl_actor.h"
+#include "function_proxy/local_scheduler/traefik_registry/traefik_registry.h"
 #include "mocks/mock_control_interface_client_manager_proxy.h"
 #include "mocks/mock_function_agent_mgr.h"
 #include "mocks/mock_instance_control_view.h"
 #include "mocks/mock_instance_state_machine.h"
 #include "mocks/mock_internal_iam.h"
+#include "mocks/mock_meta_storage_accessor.h"
 #include "function_proxy/common/state_handler/state_handler.h"
 #include "common/state_machine/instance_control_view.h"
 #include "mocks/mock_meta_store_client.h"
@@ -107,6 +122,45 @@ std::shared_ptr<ResourceUnit> MakeUnitWithEntry(const InstanceInfo &entry)
     unit->set_status(static_cast<uint32_t>(UnitStatus::NORMAL));
     (*unit->mutable_instances())[entry.instanceid()] = entry;
     return unit;
+}
+
+// Delete-success transaction response (the DelInstanceTest shape): the
+// real InstanceStateMachine::DelInstance runs its version-fenced compare
+// and-delete through this transport mock.
+std::shared_ptr<TxnResponse> MakeDeleteOkTxnResponse()
+{
+    auto deleteTxnResp = TxnOperationResponse();
+    auto deleteResponse = DeleteResponse();
+    deleteResponse.deleted = true;
+    deleteTxnResp.operationType = TxnOperationType::OPERATION_DELETE;
+    deleteTxnResp.response = deleteResponse;
+    auto deleteOk = std::make_shared<TxnResponse>();
+    deleteOk->success = true;
+    deleteOk->responses.emplace_back(deleteTxnResp);
+    deleteOk->responses.emplace_back(deleteTxnResp);
+    return deleteOk;
+}
+
+// A REAL view wired to a mock meta-store returning delete-success
+// transactions (the convergence-test recipe), plus the bound txn mock so
+// tests can gate Commit.
+struct RealViewHarness {
+    std::shared_ptr<InstanceControlView> view;
+    std::shared_ptr<MockMetaStoreClient> metaClient;
+    std::shared_ptr<MockTxnTransaction> txn;
+};
+
+RealViewHarness MakeRealView()
+{
+    RealViewHarness h;
+    h.view = std::make_shared<InstanceControlView>("node-test", false);
+    h.metaClient = std::make_shared<MockMetaStoreClient>("127.0.0.1:1");
+    h.view->BindMetaStoreClient(h.metaClient);
+    h.txn = std::make_shared<MockTxnTransaction>(litebus::AID());
+    EXPECT_CALL(*h.metaClient, BeginTransaction).WillRepeatedly(Return(h.txn));
+    EXPECT_CALL(*h.txn, Commit).WillRepeatedly(
+        Return(litebus::Future<std::shared_ptr<TxnResponse>>(MakeDeleteOkTxnResponse())));
+    return h;
 }
 
 }  // namespace
@@ -483,8 +537,8 @@ TEST_F(KillEntryIdentityFixture, OtherEntryKillRuntimeViewReadFailsHoldsUnknown)
 // Root's late-receipt window, REAL guard coverage: the control view now
 // holds a NEW same-name incarnation; the OLD chain's control delete is
 // driven through the production DeleteInstanceInControlView. The guard must
-// refuse BEFORE any side effect: DelInstance is NEVER called and the new
-// machine's state is untouched.
+// refuse BEFORE any side effect: the FENCED DelInstance overload is NEVER
+// called and the new machine's state is untouched.
 TEST_F(KillEntryIdentityFixture, LateOldReceiptDoesNotDeleteNewIncarnationState)
 {
     // Bind a control view carrying the NEW incarnation's machine.
@@ -495,8 +549,14 @@ TEST_F(KillEntryIdentityFixture, LateOldReceiptDoesNotDeleteNewIncarnationState)
     ON_CALL(*newMachine, GetRequestID()).WillByDefault(Return("req-new"));
     ON_CALL(*controlView, GetInstance("inst-late"))
         .WillByDefault(Return(newMachine));
-    // DelInstance must NEVER run for the new incarnation.
+    // NEITHER DelInstance form may run for the new incarnation — in
+    // particular the FENCED overload the production chain calls. The old
+    // chain carries ("inst-late", "runtime-OLD", "req-inst-late").
     EXPECT_CALL(*controlView, DelInstance("inst-late")).Times(0);
+    EXPECT_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-late"),
+                                          Matcher<const std::string &>("runtime-OLD"),
+                                          Matcher<const std::string &>("req-inst-late")))
+        .Times(0);
     actor_->BindInstanceControlView(controlView);
 
     // The OLD chain (runtime-OLD, request-old) arrives late: the guard
@@ -512,7 +572,8 @@ TEST_F(KillEntryIdentityFixture, LateOldReceiptDoesNotDeleteNewIncarnationState)
     EXPECT_EQ(stillThere->GetInstanceInfo().runtimeid(), "runtime-NEW");
 }
 
-// Same-generation delete still proceeds (the guard must not over-block).
+// Same-generation delete still proceeds through the FENCED overload with
+// the retiring chain's exact identity (the guard must not over-block).
 TEST_F(KillEntryIdentityFixture, SameGenerationControlDeleteProceeds)
 {
     auto controlView = std::make_shared<MockInstanceControlView>("node-test");
@@ -523,13 +584,24 @@ TEST_F(KillEntryIdentityFixture, SameGenerationControlDeleteProceeds)
     // MakeElasticInfo sets "req-" + instanceID; reuse info.requestid().
     ON_CALL(*machine, GetRequestID()).WillByDefault(Return(info.requestid()));
     ON_CALL(*controlView, GetInstance("inst-ok")).WillByDefault(Return(machine));
-    ON_CALL(*controlView, DelInstance("inst-ok"))
-        .WillByDefault(Invoke([](const std::string &) {
+    ON_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-ok"),
+                                      Matcher<const std::string &>("runtime-ok"),
+                                      Matcher<const std::string &>(info.requestid())))
+        .WillByDefault(Invoke([](const std::string &, const std::string &, const std::string &) {
             auto promise = std::make_shared<litebus::Promise<Status>>();
             promise->SetValue(Status::OK());
             return promise->GetFuture();
         }));
-    EXPECT_CALL(*controlView, DelInstance("inst-ok")).Times(1);
+    EXPECT_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-ok"),
+                                          Matcher<const std::string &>("runtime-ok"),
+                                          Matcher<const std::string &>(info.requestid())))
+        .Times(1);
+    // The lock-held snapshot the tail re-verification reads.
+    ON_CALL(*controlView, GetIncarnationSnapshot(Matcher<const std::string &>("inst-ok")))
+        .WillByDefault(Return(std::make_pair(info.runtimeid(), info.requestid())));
+    // State delete via the REAL StateActor: succeed once.
+    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>("inst-ok")))
+        .WillOnce(Return(Status::OK()));
     actor_->BindInstanceControlView(controlView);
 
     auto result = actor_->DeleteInstanceInControlView(Status::OK(), info);
@@ -539,9 +611,9 @@ TEST_F(KillEntryIdentityFixture, SameGenerationControlDeleteProceeds)
 
 
 // Mid-flight replacement, RUNTIME change: guard passes on the OLD machine,
-// DelInstance is HELD on a gate promise, the machine is replaced with a
-// NEW runtime, then the gate resolves — the tail guard must refuse the
-// state delete of the new incarnation.
+// the FENCED DelInstance is HELD on a gate promise, the machine is replaced
+// with a NEW runtime, then the gate resolves — the tail guard must refuse
+// the state delete of the new incarnation.
 TEST_F(KillEntryIdentityFixture, MidFlightRuntimeReplacementKeepsNewState)
 {
     auto controlView = std::make_shared<MockInstanceControlView>("node-test");
@@ -556,11 +628,26 @@ TEST_F(KillEntryIdentityFixture, MidFlightRuntimeReplacementKeepsNewState)
         .WillByDefault(Invoke([this, oldMachine](const std::string &) {
             return machineSlot_ ? machineSlot_ : oldMachine;
         }));
-    ON_CALL(*controlView, DelInstance("inst-mid"))
-        .WillByDefault(Invoke([gate](const std::string &) {
+    // GATE THE FENCED OVERLOAD — the one the production chain actually
+    // calls. The legacy single-arg form must never fire here.
+    ON_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-mid"),
+                                      Matcher<const std::string &>("runtime-OLD"),
+                                      Matcher<const std::string &>(oldInfo.requestid())))
+        .WillByDefault(Invoke([gate](const std::string &, const std::string &, const std::string &) {
             return gate->GetFuture();
         }));
-    EXPECT_CALL(*controlView, DelInstance("inst-mid")).Times(1);
+    EXPECT_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-mid"),
+                                          Matcher<const std::string &>("runtime-OLD"),
+                                          Matcher<const std::string &>(oldInfo.requestid())))
+        .Times(1);
+    EXPECT_CALL(*controlView, DelInstance("inst-mid")).Times(0);
+    // The snapshot follows the slot: OLD identity before the swap, NEW
+    // after — exactly what the real view's lock-held read would answer.
+    ON_CALL(*controlView, GetIncarnationSnapshot(Matcher<const std::string &>("inst-mid")))
+        .WillByDefault(Invoke([this, oldMachine](const std::string &) {
+            const auto machine = machineSlot_ ? machineSlot_ : oldMachine;
+            return std::make_pair(machine->GetInstanceInfo().runtimeid(), machine->GetRequestID());
+        }));
     actor_->BindInstanceControlView(controlView);
 
     auto result = actor_->DeleteInstanceInControlView(Status::OK(), oldInfo);
@@ -595,11 +682,21 @@ TEST_F(KillEntryIdentityFixture, MidFlightRequestReplacementKeepsNewState)
         .WillByDefault(Invoke([this, oldMachine](const std::string &) {
             return machineSlot_ ? machineSlot_ : oldMachine;
         }));
-    ON_CALL(*controlView, DelInstance("inst-req"))
-        .WillByDefault(Invoke([gate](const std::string &) {
+    ON_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-req"),
+                                      Matcher<const std::string &>("runtime-SAME"),
+                                      Matcher<const std::string &>(oldInfo.requestid())))
+        .WillByDefault(Invoke([gate](const std::string &, const std::string &, const std::string &) {
             return gate->GetFuture();
         }));
-    EXPECT_CALL(*controlView, DelInstance("inst-req")).Times(1);
+    EXPECT_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-req"),
+                                          Matcher<const std::string &>("runtime-SAME"),
+                                          Matcher<const std::string &>(oldInfo.requestid())))
+        .Times(1);
+    ON_CALL(*controlView, GetIncarnationSnapshot(Matcher<const std::string &>("inst-req")))
+        .WillByDefault(Invoke([this, oldMachine](const std::string &) {
+            const auto machine = machineSlot_ ? machineSlot_ : oldMachine;
+            return std::make_pair(machine->GetInstanceInfo().runtimeid(), machine->GetRequestID());
+        }));
     actor_->BindInstanceControlView(controlView);
 
     auto result = actor_->DeleteInstanceInControlView(Status::OK(), oldInfo);
@@ -635,12 +732,20 @@ TEST_F(KillEntryIdentityFixture, FullChainSameGenerationDeliversCacheDel)
     ON_CALL(*machine, GetInstanceInfo()).WillByDefault(Return(info));
     ON_CALL(*machine, GetRequestID()).WillByDefault(Return(info.requestid()));
     ON_CALL(*controlView, GetInstance("inst-full")).WillByDefault(Return(machine));
-    ON_CALL(*controlView, DelInstance("inst-full"))
-        .WillByDefault(Invoke([](const std::string &) {
+    ON_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-full"),
+                                      Matcher<const std::string &>("runtime-full"),
+                                      Matcher<const std::string &>(info.requestid())))
+        .WillByDefault(Invoke([](const std::string &, const std::string &, const std::string &) {
             auto promise = std::make_shared<litebus::Promise<Status>>();
             promise->SetValue(Status::OK());
             return promise->GetFuture();
         }));
+    EXPECT_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-full"),
+                                          Matcher<const std::string &>("runtime-full"),
+                                          Matcher<const std::string &>(info.requestid())))
+        .Times(1);
+    ON_CALL(*controlView, GetIncarnationSnapshot(Matcher<const std::string &>("inst-full")))
+        .WillByDefault(Return(std::make_pair(info.runtimeid(), info.requestid())));
     actor_->BindInstanceControlView(controlView);
     EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>("inst-full")))
         .WillOnce(Return(Status::OK()));
@@ -661,12 +766,16 @@ TEST_F(KillEntryIdentityFixture, FullChainCacheDelFailureSurfacesAndRetries)
     ON_CALL(*machine, GetInstanceInfo()).WillByDefault(Return(info));
     ON_CALL(*machine, GetRequestID()).WillByDefault(Return(info.requestid()));
     ON_CALL(*controlView, GetInstance("inst-fail")).WillByDefault(Return(machine));
-    ON_CALL(*controlView, DelInstance("inst-fail"))
-        .WillByDefault(Invoke([](const std::string &) {
+    ON_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-fail"),
+                                      Matcher<const std::string &>("runtime-fail"),
+                                      Matcher<const std::string &>(info.requestid())))
+        .WillByDefault(Invoke([](const std::string &, const std::string &, const std::string &) {
             auto promise = std::make_shared<litebus::Promise<Status>>();
             promise->SetValue(Status::OK());
             return promise->GetFuture();
         }));
+    ON_CALL(*controlView, GetIncarnationSnapshot(Matcher<const std::string &>("inst-fail")))
+        .WillByDefault(Return(std::make_pair(info.runtimeid(), info.requestid())));
     actor_->BindInstanceControlView(controlView);
     EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>("inst-fail")))
         .WillOnce(Return(Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "store down")))
@@ -700,9 +809,16 @@ TEST_F(KillEntryIdentityFixture, FullChainMidFlightRuntimeZeroCacheDel)
         .WillByDefault(Invoke([this, oldMachine](const std::string &) {
             return machineSlot_ ? machineSlot_ : oldMachine;
         }));
-    ON_CALL(*controlView, DelInstance("inst-fr"))
-        .WillByDefault(Invoke([gate](const std::string &) {
+    ON_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-fr"),
+                                      Matcher<const std::string &>("runtime-OLD"),
+                                      Matcher<const std::string &>(oldInfo.requestid())))
+        .WillByDefault(Invoke([gate](const std::string &, const std::string &, const std::string &) {
             return gate->GetFuture();
+        }));
+    ON_CALL(*controlView, GetIncarnationSnapshot(Matcher<const std::string &>("inst-fr")))
+        .WillByDefault(Invoke([this, oldMachine](const std::string &) {
+            const auto machine = machineSlot_ ? machineSlot_ : oldMachine;
+            return std::make_pair(machine->GetInstanceInfo().runtimeid(), machine->GetRequestID());
         }));
     actor_->BindInstanceControlView(controlView);
     EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>("inst-fr"))).Times(0);
@@ -735,9 +851,16 @@ TEST_F(KillEntryIdentityFixture, FullChainMidFlightRequestZeroCacheDel)
         .WillByDefault(Invoke([this, oldMachine](const std::string &) {
             return machineSlot_ ? machineSlot_ : oldMachine;
         }));
-    ON_CALL(*controlView, DelInstance("inst-fq"))
-        .WillByDefault(Invoke([gate](const std::string &) {
+    ON_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-fq"),
+                                      Matcher<const std::string &>("runtime-SAME"),
+                                      Matcher<const std::string &>(oldInfo.requestid())))
+        .WillByDefault(Invoke([gate](const std::string &, const std::string &, const std::string &) {
             return gate->GetFuture();
+        }));
+    ON_CALL(*controlView, GetIncarnationSnapshot(Matcher<const std::string &>("inst-fq")))
+        .WillByDefault(Invoke([this, oldMachine](const std::string &) {
+            const auto machine = machineSlot_ ? machineSlot_ : oldMachine;
+            return std::make_pair(machine->GetInstanceInfo().runtimeid(), machine->GetRequestID());
         }));
     actor_->BindInstanceControlView(controlView);
     EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>("inst-fq"))).Times(0);
@@ -758,11 +881,9 @@ TEST_F(KillEntryIdentityFixture, FullChainMidFlightRequestZeroCacheDel)
 
 
 // ── Real-view convergence: state-delete failure AFTER machine removal ────────
-// The production shape the root asked for: the real view's DelInstance
-// succeeds (real owner check + real meta-store transaction via
-// MockMetaStoreClient/MockTxnTransaction — the DelInstanceTest recipe),
-// OnDelInstance erases the machine/request index, THEN the state delete
-// fails. The RETRY from the real entry converges.
+// NOTE (root 15:43): the FIRST delete below drives DeleteInstanceInControlView
+// directly — that is RETRY-ENTRY coverage only. The real-first-kill-entry
+// variant is RealFirstKillEntryThroughExitHandlerRecordsPending.
 TEST_F(KillEntryIdentityFixture, StateDeleteFailureAfterMachineRemovalRetryConverges)
 {
     auto realView = std::make_shared<InstanceControlView>("node-test", false);
@@ -822,6 +943,8 @@ TEST_F(KillEntryIdentityFixture, StateDeleteFailureAfterMachineRemovalRetryConve
 // (real view) but the state delete fails; the second call goes through
 // the REAL KillFrontend (tenant-checked frontend path), finds the pending
 // record, and completes the cleanup — NOT a NOT_FOUND bounce.
+// NOTE (root 15:43): first delete is the direct helper — RETRY-ENTRY
+// coverage; the REAL first kill entry is covered separately below.
 TEST_F(KillEntryIdentityFixture, RealKillFrontendRetryCompletesPendingCleanup)
 {
     auto realView = std::make_shared<InstanceControlView>("node-test", false);
@@ -933,46 +1056,402 @@ TEST_F(KillEntryIdentityFixture, PendingCleanupTenantGateRefused)
     EXPECT_EQ(static_cast<int>(ok.Get().code()), static_cast<int>(common::ERR_NONE));
 }
 
-// Late old callback must NOT erase a record rewritten during the wait.
+// Late old callback must NOT erase (or overwrite) a record rewritten
+// during the wait. The barrier is the REAL cache Del running on the
+// StateActor thread (Del is synchronous — it returns a Status): the
+// Invoke signals arrival, then BLOCKS until the test rewrites the record,
+// so the rewrite provably happens while the deletion is in flight.
 TEST_F(KillEntryIdentityFixture, LateOldCallbackDoesNotEraseRewrittenRecord)
 {
-    // Drive DeleteInstanceInControlView with a gated state delete; rewrite
-    // the pending record mid-flight; resolve: the REWRITTEN record survives.
-    auto realView = std::make_shared<InstanceControlView>("node-test", false);
-    auto mockMetaClient = std::make_shared<MockMetaStoreClient>("127.0.0.1:1");
-    realView->BindMetaStore(mockMetaClient);
-    auto mockTxn = std::make_shared<MockTxnTransaction>(litebus::AID());
-    EXPECT_CALL(*mockMetaClient, BeginTransaction).WillRepeatedly(Return(mockTxn));
-    auto deleteOk = std::make_shared<TxnResponse>();
-    deleteOk->success = true;
-    deleteOk->responses.emplace_back(TxnOperationResponse());
-    deleteOk->responses.emplace_back(TxnOperationResponse());
-    EXPECT_CALL(*mockTxn, Commit).WillRepeatedly(
-        Return(litebus::Future<std::shared_ptr<TxnResponse>>(deleteOk)));
+    auto harness = MakeRealView();
+    actor_->BindInstanceControlView(harness.view);
 
     auto info = MakeElasticInfo("inst-late", "runtime-late");
     info.set_functionproxyid("node-test");
     info.set_function("default/0-test-helloWorld/$latest");
     info.set_tenantid("tenant-late");
-    realView->GenerateStateMachine(info.instanceid(), info);
-    actor_->BindInstanceControlView(realView);
+    harness.view->GenerateStateMachine(info.instanceid(), info);
 
-    auto gate = std::make_shared<litebus::Promise<Status>>();
+    auto reached = std::make_shared<std::promise<void>>();
+    auto release = std::make_shared<std::promise<void>>();
     EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>("inst-late")))
-        .WillOnce(Invoke([gate](const std::string &) { return gate->GetFuture(); }));
+        .WillOnce(Invoke([reached, release](const std::string &) {
+            reached->set_value();
+            // Bounded block: an early test abort must still free the actor
+            // thread for teardown.
+            (void)release->get_future().wait_for(std::chrono::seconds(10));
+            return Status::OK();
+        }));
 
     auto result = actor_->DeleteInstanceInControlView(Status::OK(), info);
 
-    // Rewrite the record mid-flight (a NEW generation's failed cleanup).
+    // Wait until the deletion has ACTUALLY reached the store layer, THEN
+    // rewrite the record mid-flight (a NEW generation's failed cleanup).
+    ASSERT_EQ(reached->get_future().wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
     actor_->settledCleanupPending_["inst-late"] = {
         "tenant-late", "runtime-NEW", "req-CREATION-NEW", "rewritten"};
-    gate->SetValue(Status::OK());
+    release->set_value();
 
     ASSERT_AWAIT_READY(result);
-    // The REWRITTEN record survives the old chain's callback.
-    const auto &after = actor_->settledCleanupPending_["inst-late"];
-    EXPECT_EQ(after.runtimeID, "runtime-NEW");
-    EXPECT_EQ(after.requestID, "req-CREATION-NEW");
+    // The REWRITTEN record survives the old chain's success callback
+    // (identity compare before erase).
+    const auto after = actor_->settledCleanupPending_.find("inst-late");
+    ASSERT_NE(after, actor_->settledCleanupPending_.end());
+    EXPECT_EQ(after->second.runtimeID, "runtime-NEW");
+    EXPECT_EQ(after->second.requestID, "req-CREATION-NEW");
+    EXPECT_EQ(after->second.reason, "rewritten");
+}
+
+// Companion (failure leg): while THIS chain's own state delete is in
+// flight, a DIFFERENT generation's failed-cleanup record lands under the
+// same name — this chain's FAILURE callback must NOT overwrite it.
+TEST_F(KillEntryIdentityFixture, LateFailureCallbackDoesNotOverwriteRewrittenRecord)
+{
+    auto harness = MakeRealView();
+    actor_->BindInstanceControlView(harness.view);
+
+    auto info = MakeElasticInfo("inst-ovw", "runtime-ovw");
+    info.set_functionproxyid("node-test");
+    info.set_function("default/0-test-helloWorld/$latest");
+    info.set_tenantid("tenant-ovw");
+    harness.view->GenerateStateMachine(info.instanceid(), info);
+
+    auto reached = std::make_shared<std::promise<void>>();
+    auto release = std::make_shared<std::promise<void>>();
+    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>("inst-ovw")))
+        .WillOnce(Invoke([reached, release](const std::string &) {
+            reached->set_value();
+            (void)release->get_future().wait_for(std::chrono::seconds(10));
+            return Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "store down");
+        }));
+
+    auto result = actor_->DeleteInstanceInControlView(Status::OK(), info);
+
+    ASSERT_EQ(reached->get_future().wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    actor_->settledCleanupPending_["inst-ovw"] = {
+        "tenant-NEW", "runtime-NEW", "req-CREATION-NEW", "rewritten-failure"};
+    release->set_value();
+
+    ASSERT_AWAIT_READY(result);
+    ASSERT_TRUE(result.Get().IsError());
+    // The newer generation's record is NOT overwritten by this chain's
+    // failure write (identity-guarded insertion).
+    const auto after = actor_->settledCleanupPending_.find("inst-ovw");
+    ASSERT_NE(after, actor_->settledCleanupPending_.end());
+    EXPECT_EQ(after->second.runtimeID, "runtime-NEW");
+    EXPECT_EQ(after->second.requestID, "req-CREATION-NEW");
+    EXPECT_EQ(after->second.reason, "rewritten-failure");
+}
+
+
+// ── MACHINE-LEVEL FENCE (#1, root 15:12): identity at the metadata read ─────
+
+// The control-view lock ends BEFORE the machine reads its own metadata, and
+// ObserverActor-shaped updates rewrite the SAME machine object in place —
+// so the authoritative check must live under the MACHINE lock where the
+// delete transaction is actually built. Here: a REAL view + REAL machine,
+// the identity swapped in place via the real Update path. The view-level
+// call is refused by the prefilter; the MACHINE's own fenced DelInstance
+// (the authoritative point) refuses independently; and the fence is
+// identity-CONDITIONAL — the NEW generation's own delete still runs.
+TEST_F(KillEntryIdentityFixture, MachineFenceRefusesInPlaceSwappedIdentity)
+{
+    auto harness = MakeRealView();
+    actor_->BindInstanceControlView(harness.view);
+
+    auto info = MakeElasticInfo("inst-fence", "runtime-OLD");
+    info.set_functionproxyid("node-test");
+    info.set_function("default/0-test-helloWorld/$latest");
+    harness.view->GenerateStateMachine(info.instanceid(), info);
+
+    // The ObserverActor shape: a forced Update lands on the SAME machine
+    // object and CopyFrom-replaces the info — new runtime AND new request
+    // generation under the same instanceID.
+    auto swapped = MakeElasticInfo("inst-fence", "runtime-NEW");
+    swapped.set_functionproxyid("node-test");
+    swapped.set_function("default/0-test-helloWorld/$latest");
+    swapped.set_requestid("req-inst-fence-GENERATION-2");
+    harness.view->Update("inst-fence", swapped, true);
+    auto machine = harness.view->GetInstance("inst-fence");
+    ASSERT_NE(machine, nullptr);
+    ASSERT_EQ(machine->GetInstanceInfo().runtimeid(), "runtime-NEW");
+
+    // 1) View-level fenced delete with the OLD identity: refused, zero
+    //    metadata transactions begun.
+    auto refused = harness.view->DelInstance("inst-fence", "runtime-OLD",
+                                             "req-inst-fence");
+    ASSERT_AWAIT_READY(refused);
+    ASSERT_TRUE(refused.Get().IsError());
+    EXPECT_EQ(refused.Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY);
+
+    // 2) MACHINE-level fence, driven directly on the machine object (the
+    //    exact point the metadata and version are read): OLD identity
+    //    refused, still zero transactions.
+    auto machineRefused = machine->DelInstance("inst-fence", "runtime-OLD",
+                                               "req-inst-fence");
+    ASSERT_AWAIT_READY(machineRefused);
+    ASSERT_TRUE(machineRefused.Get().IsError());
+    EXPECT_EQ(machineRefused.Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY);
+
+    // 3) The fence is identity-conditional: the NEW generation's OWN
+    //    delete proceeds through the real metadata transaction.
+    auto proceed = machine->DelInstance("inst-fence", "runtime-NEW",
+                                        "req-inst-fence-GENERATION-2");
+    ASSERT_AWAIT_READY(proceed);
+    EXPECT_TRUE(proceed.Get().IsOk()) << proceed.Get().ToString();
+
+    // The refused deletes never touched the view's machine entry (a direct
+    // machine delete retires METADATA; the view's own erase is
+    // OnDelInstance's business) and no instance-state delete leaked.
+    EXPECT_NE(harness.view->GetInstance("inst-fence"), nullptr);
+    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>("inst-fence"))).Times(0);
+}
+
+// The REAL WINDOW end-to-end (root's counterexample shape, real objects
+// everywhere; only the meta-store transport is a mock): the machine
+// metadata delete transaction is HELD in flight (gated Commit); during
+// the hold, a forced Update swaps the identity in place; the txn then
+// completes. OnDelInstance must refuse the erase (the request generation
+// no longer matches) and the TAIL guard must refuse the state delete —
+// the new generation keeps its machine AND its state.
+TEST_F(KillEntryIdentityFixture, RealWindowInPlaceUpdateDuringGatedMachineDelete)
+{
+    auto harness = MakeRealView();
+    // Gate the metadata transaction itself.
+    auto gate = std::make_shared<litebus::Promise<std::shared_ptr<TxnResponse>>>();
+    EXPECT_CALL(*harness.txn, Commit).WillOnce(
+        Invoke([gate]() { return gate->GetFuture(); }))
+        .WillRepeatedly(
+            Return(litebus::Future<std::shared_ptr<TxnResponse>>(MakeDeleteOkTxnResponse())));
+    actor_->BindInstanceControlView(harness.view);
+
+    auto info = MakeElasticInfo("inst-rw", "runtime-OLD");
+    info.set_functionproxyid("node-test");
+    info.set_function("default/0-test-helloWorld/$latest");
+    info.set_tenantid("tenant-rw");
+    harness.view->GenerateStateMachine(info.instanceid(), info);
+
+    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>("inst-rw"))).Times(0);
+
+    auto result = actor_->DeleteInstanceInControlView(Status::OK(), info);
+
+    // While the version-fenced delete txn is in flight, the SAME machine
+    // object is rewritten in place with a NEW generation's identity.
+    auto swapped = MakeElasticInfo("inst-rw", "runtime-NEW");
+    swapped.set_functionproxyid("node-test");
+    swapped.set_function("default/0-test-helloWorld/$latest");
+    swapped.set_requestid("req-inst-rw-GENERATION-2");
+    harness.view->Update("inst-rw", swapped, true);
+
+    // The held transaction completes (it carried the OLD version; with a
+    // real store an in-place persist of the new version would have made it
+    // fail the compare — the transport mock cannot express that, which is
+    // exactly why the tail guards below must exist).
+    gate->SetValue(MakeDeleteOkTxnResponse());
+
+    ASSERT_AWAIT_READY(result);
+    ASSERT_TRUE(result.Get().IsError());
+    EXPECT_EQ(result.Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY);
+
+    // OnDelInstance refused the erase: the machine SURVIVES with the NEW
+    // generation's identity, and its state was never deleted.
+    const auto machine = harness.view->GetInstance("inst-rw");
+    ASSERT_NE(machine, nullptr);
+    EXPECT_EQ(machine->GetInstanceInfo().runtimeid(), "runtime-NEW");
+    EXPECT_EQ(machine->GetRequestID(), "req-inst-rw-GENERATION-2");
+}
+
+
+// ── REAL FIRST KILL ENTRY (root 15:43 #4) ────────────────────────────────────
+
+// The production exit handler installed by Init() is the REAL first-entry
+// chain: ShutDownInstance -> KillRuntime (elastic identity gate -> agent
+// kill -> receipt settlement) -> DeleteInstanceInResourceView ->
+// DeleteInstanceInControlView. Driving IT (not the helper) with the state
+// delete failing once must leave the pending record; the REAL KillFrontend
+// retry then converges, and a third call is the genuine NOT_FOUND.
+TEST_F(KillEntryIdentityFixture, RealFirstKillEntryThroughExitHandlerRecordsPending)
+{
+    // Install the production exit handler (static wiring) — the actor's
+    // Init is what production runs at startup.
+    actor_->Init();
+
+    auto harness = MakeRealView();
+    actor_->BindInstanceControlView(harness.view);
+
+    auto entry = MakeViewEntry("inst-rfe", "runtime-rfe", "sbox-rfe", "gen-rfe");
+    entry.set_functionproxyid("node-test");
+    entry.set_function("default/0-test-helloWorld/$latest");
+    entry.set_tenantid("tenant-rfe");
+    harness.view->GenerateStateMachine(entry.instanceid(), entry);
+
+    // The authoritative view answers the sampled allocation; settlement
+    // (ApplyPhysicalRetirement) removes it — swap the served unit INSIDE
+    // the settlement continuation, exactly what the real atomic
+    // retirement does to the view.
+    ServeView(MakeUnitWithEntry(entry));
+    EXPECT_CALL(*primary_, ApplyPhysicalRetirement(_))
+        .WillOnce(Invoke([this, entry](const resource_view::PhysicalRetirementReceipt &receipt) {
+            settleReceipts.push_back(receipt);
+            ServeView(MakeUnitWithEntry(MakeElasticInfo("inst-other", "runtime-other")));
+            auto promise = std::make_shared<litebus::Promise<Status>>();
+            promise->SetValue(Status::OK());
+            return promise->GetFuture();
+        }));
+    // ShutDownInstance's client probe: no client -> graceful skip -> OK.
+    ON_CALL(*clientManager_, GetControlInterfacePosixClient(_))
+        .WillByDefault(Invoke([](const std::string &) {
+            auto promise = std::make_shared<
+                litebus::Promise<std::shared_ptr<ControlInterfacePosixClient>>>();
+            promise->SetValue(std::shared_ptr<ControlInterfacePosixClient>{});
+            return promise->GetFuture();
+        }));
+
+    // State delete fails once (the pending-record trigger), succeeds after.
+    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>("inst-rfe")))
+        .WillOnce(Return(Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "store down")))
+        .WillOnce(Return(Status::OK()));
+
+    // The REAL first entry: the production exit handler for a
+    // machine-tracked instance with an agent (not the helper).
+    auto first = actor_->exitHandler_(entry);
+    ASSERT_AWAIT_READY(first);
+    ASSERT_TRUE(first.Get().IsError())
+        << "the failed state cleanup must surface through the real entry: "
+        << first.Get().ToString();
+    // The physical retirement DID happen through the real chain.
+    ASSERT_EQ(killRequests.size(), 1u);
+    EXPECT_EQ(killRequests[0]->expected_sandbox_id(), "sbox-rfe");
+    EXPECT_EQ(settleReceipts.size(), 1u);
+    // Machine removed by the real DelInstance+OnDelInstance; pending record
+    // written with THIS incarnation's full identity.
+    EXPECT_EQ(harness.view->GetInstance("inst-rfe"), nullptr);
+    const auto pending = actor_->settledCleanupPending_.find("inst-rfe");
+    ASSERT_NE(pending, actor_->settledCleanupPending_.end());
+    EXPECT_EQ(pending->second.runtimeID, "runtime-rfe");
+    EXPECT_EQ(pending->second.requestID, entry.requestid());
+    EXPECT_EQ(pending->second.tenantID, "tenant-rfe");
+
+    // REAL KillFrontend retry completes via the record.
+    auto killReq = std::make_shared<KillRequest>();
+    killReq->set_instanceid("inst-rfe");
+    killReq->set_requestid("req-rfe");
+    auto second = actor_->KillFrontend("tenant-rfe", killReq);
+    ASSERT_AWAIT_READY(second);
+    EXPECT_EQ(static_cast<int>(second.Get().code()), static_cast<int>(common::ERR_NONE))
+        << second.Get().message();
+
+    // No record anymore: the genuine NOT_FOUND.
+    auto third = actor_->KillFrontend("tenant-rfe", killReq);
+    ASSERT_AWAIT_READY(third);
+    EXPECT_EQ(static_cast<int>(third.Get().code()),
+              static_cast<int>(common::ERR_INSTANCE_NOT_FOUND));
+}
+
+
+// ── TRAEFIK OWNERSHIP WIRING (#3) ────────────────────────────────────────────
+
+// A REAL TraefikRegistry over a mock accessor, bound to the actor: the
+// registry holds the NEW incarnation's route; the OLD chain's control
+// delete (entry guard passes — no view machine) must fail to strip the
+// route: zero accessor prefix-deletes.
+TEST_F(KillEntryIdentityFixture, StaleTraefikUnregisterRefusedByRegistryRecord)
+{
+    auto accessor = std::make_shared<MockMetaStorageAccessor>(
+        std::make_shared<MockMetaStoreClient>("127.0.0.1:1"));
+    ON_CALL(*accessor, Put(_, _)).WillByDefault(Return(Status::OK()));
+    ON_CALL(*accessor, Txn(_)).WillByDefault(Return(Status::OK()));
+    auto registry = std::make_shared<TraefikRegistry>(
+        accessor, "yr/traefik-test", "web", false, "");
+    actor_->SetTraefikRegistry(registry);
+
+    // The NEW generation registered a route (identity recorded).
+    auto registered = registry->RegisterInstance(
+        "inst-tk", "10.0.0.1", { TraefikRegistry::PortMapping{ 8080, 40001, "http" } },
+        "runtime-NEW", "req-new");
+    ASSERT_AWAIT_READY(registered);
+    EXPECT_TRUE(registered.Get().IsOk());
+
+    // The OLD chain's cleanup: accessor deletes must NEVER fire.
+    EXPECT_CALL(*accessor, Delete(Matcher<const std::string &>(_), Matcher<bool>(_)))
+        .Times(0);
+    auto controlView = std::make_shared<MockInstanceControlView>("node-test");
+    ON_CALL(*controlView, GetInstance("inst-tk")).WillByDefault(Return(nullptr));
+    ON_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-tk"),
+                                      Matcher<const std::string &>("runtime-OLD"),
+                                      Matcher<const std::string &>("req-inst-tk")))
+        .WillByDefault(Invoke([](const std::string &, const std::string &, const std::string &) {
+            auto promise = std::make_shared<litebus::Promise<Status>>();
+            promise->SetValue(Status::OK());
+            return promise->GetFuture();
+        }));
+    ON_CALL(*controlView, GetIncarnationSnapshot(Matcher<const std::string &>("inst-tk")))
+        .WillByDefault(Return(std::make_pair(std::string(""), std::string(""))));
+    actor_->BindInstanceControlView(controlView);
+    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>("inst-tk")))
+        .WillOnce(Return(Status::OK()));
+
+    const auto oldInfo = MakeElasticInfo("inst-tk", "runtime-OLD");
+    auto result = actor_->DeleteInstanceInControlView(Status::OK(), oldInfo);
+    ASSERT_AWAIT_READY(result);
+    EXPECT_TRUE(result.Get().IsOk()) << "the refusal must not fail the chain";
+    // The matching generation can still retire the route afterwards.
+    EXPECT_CALL(*accessor, Delete(Matcher<const std::string &>(_), Matcher<bool>(_)))
+        .WillRepeatedly(Return(Status::OK()));
+    auto matching = registry->UnregisterInstance("inst-tk", "runtime-NEW", "req-new");
+    ASSERT_AWAIT_READY(matching);
+    EXPECT_TRUE(matching.Get().IsOk());
+}
+
+// Matching identity: the control delete retires the route for real
+// (prefix deletes fire) and the chain completes.
+TEST_F(KillEntryIdentityFixture, MatchingTraefikIdentityRetiresRoute)
+{
+    auto accessor = std::make_shared<MockMetaStorageAccessor>(
+        std::make_shared<MockMetaStoreClient>("127.0.0.1:1"));
+    ON_CALL(*accessor, Put(_, _)).WillByDefault(Return(Status::OK()));
+    ON_CALL(*accessor, Txn(_)).WillByDefault(Return(Status::OK()));
+    auto prefixDeletes = std::make_shared<std::atomic<int>>(0);
+    ON_CALL(*accessor, Delete(Matcher<const std::string &>(_), Matcher<bool>(_)))
+        .WillByDefault(Invoke([prefixDeletes](const std::string &, bool) {
+            prefixDeletes->fetch_add(1);
+            return Status::OK();
+        }));
+    auto registry = std::make_shared<TraefikRegistry>(
+        accessor, "yr/traefik-test", "web", false, "");
+    actor_->SetTraefikRegistry(registry);
+
+    const auto info = MakeElasticInfo("inst-tkm", "runtime-tkm");
+    auto registered = registry->RegisterInstance(
+        "inst-tkm", "10.0.0.1", { TraefikRegistry::PortMapping{ 8080, 40002, "http" } },
+        info.runtimeid(), info.requestid());
+    ASSERT_AWAIT_READY(registered);
+    EXPECT_TRUE(registered.Get().IsOk());
+
+    auto controlView = std::make_shared<MockInstanceControlView>("node-test");
+    ON_CALL(*controlView, GetInstance("inst-tkm")).WillByDefault(Return(nullptr));
+    ON_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-tkm"),
+                                      Matcher<const std::string &>("runtime-tkm"),
+                                      Matcher<const std::string &>(info.requestid())))
+        .WillByDefault(Invoke([](const std::string &, const std::string &, const std::string &) {
+            auto promise = std::make_shared<litebus::Promise<Status>>();
+            promise->SetValue(Status::OK());
+            return promise->GetFuture();
+        }));
+    ON_CALL(*controlView, GetIncarnationSnapshot(Matcher<const std::string &>("inst-tkm")))
+        .WillByDefault(Return(std::make_pair(std::string(""), std::string(""))));
+    actor_->BindInstanceControlView(controlView);
+    EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>("inst-tkm")))
+        .WillOnce(Return(Status::OK()));
+
+    auto result = actor_->DeleteInstanceInControlView(Status::OK(), info);
+    ASSERT_AWAIT_READY(result);
+    EXPECT_TRUE(result.Get().IsOk()) << result.Get().ToString();
+    // The async unregistration is not gated on the chain's OK: wait for the
+    // router + service prefix deletes (exactly two) to fire.
+    ASSERT_AWAIT_TRUE([prefixDeletes]() { return prefixDeletes->load() >= 2; });
 }
 
 }  // namespace functionsystem::test

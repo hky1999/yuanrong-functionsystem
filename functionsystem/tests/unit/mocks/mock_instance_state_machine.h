@@ -46,6 +46,12 @@ public:
     }
 
     MOCK_METHOD(litebus::Future<Status>, DelInstance, (const std::string &instanceID));
+    // Ownership-fenced delete: the AUTHORITATIVE incarnation check under the
+    // machine lock. Mocked so tests can assert the identity the chain
+    // carried into the metadata-delete point.
+    MOCK_METHOD(litebus::Future<Status>, DelInstance,
+                (const std::string &instanceID, const std::string &expectedRuntimeID,
+                 const std::string &expectedRequestID), (override));
     MOCK_METHOD(InstanceState, GetInstanceState, (), (override));
     MOCK_METHOD(litebus::Future<Status>, TryExitInstance,
                 (const std::shared_ptr<litebus::Promise<Status>> &promise, const std::shared_ptr<KillContext> &killCtx,

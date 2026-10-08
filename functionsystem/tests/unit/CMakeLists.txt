@@ -210,7 +210,8 @@ add_executable(instance_ctrl_intent_gate_test
         common/resource_view/view_utils.cpp
         function_proxy/local_scheduler/instance_control/instance_ctrl_intent_gate_test.cpp
         function_proxy/local_scheduler/instance_control/kill_entry_identity_test.cpp
-        function_proxy/local_scheduler/instance_control/restore_ceiling_behavior_test.cpp)
+        function_proxy/local_scheduler/instance_control/restore_ceiling_behavior_test.cpp
+        function_proxy/local_scheduler/traefik_registry/traefik_registry_test.cpp)
 target_compile_options(instance_ctrl_intent_gate_test PRIVATE
         -Wno-error
         -fno-access-control

@@ -296,10 +296,13 @@ litebus::Future<Status> InstanceControlView::DelInstance(const std::string &inst
     }
     std::shared_ptr<InstanceStateMachine> machine;
     {
-        // Machine selection AND incarnation verification under the SAME lock:
-        // a same-name replacement cannot slip between the check and the
-        // dispatch (ObserverActor::NotifyUpdateInstance updates listeners
-        // directly, so the actor's own serialization cannot exclude this).
+        // Machine selection + PREFILTER under the view lock: this rejects a
+        // replacement that is already visible NOW, with view-level context
+        // in the log. It is NOT the authoritative fence — the window between
+        // releasing this lock and the machine reading its own metadata is
+        // closed by InstanceStateMachine::DelInstance's identity check under
+        // the MACHINE lock (UpdateInstanceInfo updates the same object in
+        // place, so only the machine's own lock serializes them).
         std::lock_guard<std::mutex> guard(lock_);
         auto it = machines_.find(instanceID);
         if (it == machines_.end()) {
@@ -323,12 +326,16 @@ litebus::Future<Status> InstanceControlView::DelInstance(const std::string &inst
                 "control view request generation mismatch"));
         }
     }
-    return machine->DelInstance(instanceID).Then([machine, instanceID](const Status &status) -> Status {
-        if (status.IsOk()) {
-            machine->PublishDeleteToLocalObserver(instanceID);
-        }
-        return status;
-    });
+    // The expected identity travels to the point that actually reads the
+    // metadata and builds the version-fenced delete transaction: the
+    // machine re-verifies it under its own lock_.
+    return machine->DelInstance(instanceID, expectedRuntimeID, expectedRequestID)
+        .Then([machine, instanceID](const Status &status) -> Status {
+            if (status.IsOk()) {
+                machine->PublishDeleteToLocalObserver(instanceID);
+            }
+            return status;
+        });
 }
 
 std::pair<std::string, std::string> InstanceControlView::GetIncarnationSnapshot(
