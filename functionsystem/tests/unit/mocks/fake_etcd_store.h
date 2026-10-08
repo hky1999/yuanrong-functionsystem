@@ -26,7 +26,7 @@
 // any test that must proceed while a transaction waits at the barrier has
 // to issue that transaction from a SEPARATE thread.
 
-#include <etcd/v3.grpc.pb.h>
+#include "etcd/api/etcdserverpb/rpc.grpc.pb.h"
 #include <functional>
 #include <map>
 #include <memory>
