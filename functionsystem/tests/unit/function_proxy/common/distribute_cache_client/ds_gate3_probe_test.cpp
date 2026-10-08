@@ -85,41 +85,96 @@ TEST(DsGate3Probe, PhaseARealSetGetDelPositiveControl)
     ASSERT_TRUE(initStatus.IsOk()) << "init failed: " << initStatus.ToString()
         << " (environment problem — not a deadline conclusion)";
 
+    // An INDEPENDENT verification client: the wrapper maps every DS error
+    // to one code, so absence must be distinguished from disconnect/timeout
+    // by a CONTROL KEY that must exist — a healthy control read makes a
+    // target miss genuine absence.
+    datasystem::ConnectOptions verifyConnect{};
+    verifyConnect.host = host;
+    verifyConnect.port = std::stoi(workerPort);
+    functionsystem::RouterConnectOptions verifyRouter{};
+    verifyRouter.azName = "ds-exp";
+    verifyRouter.etcdAddress = routerEtcd;
+    auto verifier = std::make_unique<functionsystem::DSCacheClientImpl>(verifyConnect, verifyRouter);
+    verifier->SetDSAuthEnable(false);
+    verifier->EnableDSClient(true);
+    ASSERT_TRUE(verifier->Init().IsOk()) << "verifier init failed";
+    const std::string controlKey = "gate3:expire:" + runId + ":control";
+    const std::string controlValue = "alive";
+    ASSERT_TRUE(verifier->Set(controlKey, controlValue).IsOk());
+
     int iterations = 20;
     for (int i = 0; i < iterations; ++i) {
         const std::string key = "gate3:expire:" + runId + ":k" + std::to_string(i);
         const std::string value = "v" + std::to_string(i) + "-" + std::string(64, 'x');
 
+        // BEGIN rows flushed BEFORE each call; outcome rows (actual
+        // code/message/elapsed) AFTER — a mid-op crash leaves the begin row
+        // as the record, never a silent gap.
+        jsonl << "{\"op\":\"begin\",\"i\":" << i << ",\"phase\":\"set\",\"runid\":\"" << runId << "\"}\n";
+        jsonl.flush();
         const auto setStart = NowMs();
         const auto setStatus = client->Set(key, value);
         const auto setMs = NowMs() - setStart;
-        ASSERT_TRUE(setStatus.IsOk()) << "Set[" << i << "] failed: " << setStatus.ToString();
+        jsonl << "{\"op\":\"result\",\"i\":" << i << ",\"phase\":\"set\",\"ok\":"
+              << (setStatus.IsOk() ? "true" : "false") << ",\"code\":"
+              << static_cast<int>(setStatus.StatusCode()) << ",\"ms\":" << setMs
+              << ",\"runid\":\"" << runId << "\"}\n";
+        jsonl.flush();
+        ASSERT_TRUE(setStatus.IsOk()) << "Set[" << i << "] failed (recorded above): "
+                                      << setStatus.ToString();
 
+        jsonl << "{\"op\":\"begin\",\"i\":" << i << ",\"phase\":\"get\",\"runid\":\"" << runId << "\"}\n";
+        jsonl.flush();
         std::string got;
         const auto getStart = NowMs();
         const auto getStatus = client->Get(key, got);
         const auto getMs = NowMs() - getStart;
-        ASSERT_TRUE(getStatus.IsOk()) << "Get[" << i << "] failed: " << getStatus.ToString();
+        jsonl << "{\"op\":\"result\",\"i\":" << i << ",\"phase\":\"get\",\"ok\":"
+              << (getStatus.IsOk() ? "true" : "false") << ",\"code\":"
+              << static_cast<int>(getStatus.StatusCode()) << ",\"ms\":" << getMs
+              << ",\"match\":" << (got == value ? "true" : "false")
+              << ",\"runid\":\"" << runId << "\"}\n";
+        jsonl.flush();
+        ASSERT_TRUE(getStatus.IsOk()) << "Get[" << i << "] failed (recorded above): "
+                                      << getStatus.ToString();
         ASSERT_EQ(got, value) << "Get[" << i << "] mismatch";
 
+        jsonl << "{\"op\":\"begin\",\"i\":" << i << ",\"phase\":\"del\",\"runid\":\"" << runId << "\"}\n";
+        jsonl.flush();
         const auto delStart = NowMs();
         const auto delStatus = client->Del(key);
         const auto delMs = NowMs() - delStart;
-        ASSERT_TRUE(delStatus.IsOk()) << "Del[" << i << "] failed: " << delStatus.ToString();
-
-        std::string after;
-        const auto missStatus = client->Get(key, after);
-        ASSERT_TRUE(missStatus.IsError()) << "Get-after-Del[" << i << "] should miss";
-
-        jsonl << "{\"op\":\"cycle\",\"i\":" << i
-              << ",\"set_ms\":" << setMs << ",\"get_ms\":" << getMs << ",\"del_ms\":" << delMs
+        jsonl << "{\"op\":\"result\",\"i\":" << i << ",\"phase\":\"del\",\"ok\":"
+              << (delStatus.IsOk() ? "true" : "false") << ",\"code\":"
+              << static_cast<int>(delStatus.StatusCode()) << ",\"ms\":" << delMs
               << ",\"runid\":\"" << runId << "\"}\n";
+        jsonl.flush();
+        ASSERT_TRUE(delStatus.IsOk()) << "Del[" << i << "] failed (recorded above): "
+                                      << delStatus.ToString();
+
+        // Miss check through the INDEPENDENT client with the control key:
+        // a control failure means the reader is unhealthy — absence is
+        // then UNDECIDABLE, never counted as a miss.
+        std::string controlBack;
+        const auto controlStatus = verifier->Get(controlKey, controlBack);
+        ASSERT_TRUE(controlStatus.IsOk()) << "verifier control read failed — reader not "
+                                         << "healthy, absence undecidable: " << controlStatus.ToString();
+        ASSERT_EQ(controlBack, controlValue);
+        std::string after;
+        const auto missStatus = verifier->Get(key, after);
+        jsonl << "{\"op\":\"miss_check\",\"i\":" << i << ",\"control_ok\":true,\"miss\":"
+              << (missStatus.IsError() ? "true" : "false") << ",\"runid\":\"" << runId << "\"}\n";
+        jsonl.flush();
+        ASSERT_TRUE(missStatus.IsError()) << "Get-after-Del[" << i << "] should miss "
+            << "(healthy reader via control key)";
+
         if (i == 0 || i == iterations - 1) {
             std::cout << "DS_GATE3 cycle[" << i << "] set=" << setMs << "ms get=" << getMs
                       << "ms del=" << delMs << "ms" << std::endl;
         }
     }
-    jsonl.flush();
+    (void)verifier->Del(controlKey);
     SUCCEED();
 }
 
