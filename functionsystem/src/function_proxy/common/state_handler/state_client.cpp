@@ -38,15 +38,11 @@ int HexDigitValue(char c)
     return -1;
 }
 
-// A segment STRICTLY as EscapeKeyPart produces it — validated by the
-// canonical round-trip EscapeKeyPart(UnescapeKeyPart(raw)) == raw at the
-// call site: it rejects malformed escapes AND non-canonical aliases
-// (e.g. lowercase %3a) in one check.
-
-// A segment STRICTLY as EscapeKeyPart produces it — validated by the
-// canonical round-trip EscapeKeyPart(UnescapeKeyPart(raw)) == raw at the
-// ParseSnapshotKey call site: it rejects malformed escapes AND
-// non-canonical aliases (e.g. lowercase %3a) in one check.
+// A snapshot-key segment is STRICTLY canonical — validated by the
+// round-trip EscapeKeyPart(UnescapeKeyPart(raw)) == raw at the
+// ParseSnapshotKey call site: one check rejects malformed escapes AND
+// non-canonical aliases (e.g. lowercase %3a where EscapeKeyPart emits
+// uppercase %3A).
 
 // Canonical textual UUID exactly as litebus::uuid_generator::UUID::
 // ToString emits (16 bytes hex, hyphens after bytes 3/5/7/9):

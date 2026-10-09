@@ -407,11 +407,13 @@ TEST_F(StateIsolation, PublishAppliedButResponseLostStaysUncertainAndCommitted)
     const auto parsedRef = StateClient::ParseSnapshotKey(appliedRef.value);
     ASSERT_FALSE(parsedRef.saveOpID.empty()) << "reference must be a strict snapshot key: "
                                              << appliedRef.value;
-    // The UNIQUE COMMITTED registration of this generation: its key names
+    // The UNIQUE COMMITTED registration of this generation — exactly ONE
+    // entry exists (count asserted, not "last one wins"): its key names
     // the SAME saveOpID, its tuple carries the SAME snapshot key, and its
     // snapshot key names THIS instance/generation.
     std::string committedRegValue;
     std::string committedRegKey;
+    size_t committedCount = 0;
     {
         const auto prefix = StateActor::RegistrationPrefix("inst-h", "req-h");
         std::lock_guard<std::mutex> guard(metaCore_->lock);
@@ -421,8 +423,10 @@ TEST_F(StateIsolation, PublishAppliedButResponseLostStaysUncertainAndCommitted)
             ASSERT_EQ(tuple.status, "COMMITTED") << "the applied registration must be COMMITTED";
             committedRegValue = entry.second.value;
             committedRegKey = entry.first;
+            committedCount += 1;
         }
     }
+    ASSERT_EQ(committedCount, 1u) << "exactly one registration for this generation";
     ASSERT_FALSE(committedRegKey.empty());
     const auto regTuple = StateActor::ParseRegistration(committedRegValue);
     const auto regKeyParts = StateActor::ParseRegistrationKey(committedRegKey);
@@ -1174,15 +1178,19 @@ TEST_F(StateIsolation, AliasCorruptedSnapshotKeyRefusedZeroDsDeletes)
     ASSERT_EQ(neighbor.Get().code(), common::ErrorCode::ERR_NONE);
     const std::string neighborKey = neighbor.Get().checkpointid();
     const std::string neighborRefKey = StateActor::StateRefKey(inst, "req:al2");
-    const std::string neighborRegValue = [&]() {
+    std::string neighborRegKey;
+    std::string neighborRegValue;
+    {
         const auto prefix = StateActor::RegistrationPrefix(inst, "req:al2");
         std::lock_guard<std::mutex> guard(metaCore_->lock);
         for (const auto &kv : metaCore_->kv) {
-            if (kv.first.rfind(prefix, 0) == 0) { return kv.second.value; }
+            if (kv.first.rfind(prefix, 0) == 0) {
+                neighborRegKey = kv.first;
+                neighborRegValue = kv.second.value;
+            }
         }
-        return std::string();
-    }();
-    ASSERT_FALSE(neighborRegValue.empty());
+    }
+    ASSERT_FALSE(neighborRegKey.empty()) << "the neighbor registration must exist";
 
     // CORRUPT the target generation's COMMITTED registration value: the
     // snapshot key's FIRST %3A becomes %3a. regKey, saveOpID, and every
@@ -1231,7 +1239,6 @@ TEST_F(StateIsolation, AliasCorruptedSnapshotKeyRefusedZeroDsDeletes)
         const auto it = ds_->data.find(realKey);
         ASSERT_NE(it, ds_->data.end());
         EXPECT_EQ(it->second, "alias-state") << "the real payload stays";
-        EXPECT_NE(ds_->data.find(neighborKey), ds_->data.end());
     }
     // The corrupted record is retained BYTE-FOR-BYTE (not normalized).
     {
@@ -1239,19 +1246,25 @@ TEST_F(StateIsolation, AliasCorruptedSnapshotKeyRefusedZeroDsDeletes)
         ASSERT_TRUE(metaCore_->Lookup(corruptedRegKey, rec));
         EXPECT_EQ(rec.value, corruptedRegValue);
     }
-    // The neighbor generation is fully unchanged.
-    EXPECT_EQ(ds_->DelCount(neighborKey), 0);
+    // The neighbor generation is fully unchanged: its registration STILL
+    // EXISTS (Lookup by the remembered key — a vanished entry cannot
+    // vacuously pass), byte-for-byte unchanged; its reference points at
+    // its own snapshot; its payload is intact and EQUAL.
+    MapRecord neighborRegAfter;
+    ASSERT_TRUE(metaCore_->Lookup(neighborRegKey, neighborRegAfter))
+        << "the neighbor registration must survive, not vanish";
+    EXPECT_EQ(neighborRegAfter.value, neighborRegValue);
     {
         MapRecord refRec;
         ASSERT_TRUE(metaCore_->Lookup(neighborRefKey, refRec));
         EXPECT_EQ(refRec.value, neighborKey);
-        const auto prefix = StateActor::RegistrationPrefix(inst, "req:al2");
-        std::lock_guard<std::mutex> guard(metaCore_->lock);
-        for (const auto &kv : metaCore_->kv) {
-            if (kv.first.rfind(prefix, 0) == 0) {
-                EXPECT_EQ(kv.second.value, neighborRegValue);
-            }
-        }
+    }
+    EXPECT_EQ(ds_->DelCount(neighborKey), 0);
+    {
+        std::lock_guard<std::mutex> guard(ds_->lock);
+        const auto it = ds_->data.find(neighborKey);
+        ASSERT_NE(it, ds_->data.end());
+        EXPECT_EQ(it->second, "neighbor-state");
     }
 }
 
