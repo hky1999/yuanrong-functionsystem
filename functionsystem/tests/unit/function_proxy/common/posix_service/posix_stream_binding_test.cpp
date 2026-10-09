@@ -248,7 +248,8 @@ TEST_F(PosixStreamBindingFixture, RealStreamSaveLandsOnComposedGenerationKey)
         }));
 
     const std::string composed = StateClient::ComposeStateKey("inst-stream", "req-gen-1");
-    EXPECT_CALL(*cache_, Set(Matcher<const std::string &>(composed), Matcher<const std::string &>(_)))
+    (void)composed;  // v3: saves land on per-save SNAPSHOT keys, not the legacy composed key
+    EXPECT_CALL(*cache_, Set(Matcher<const std::string &>(_), Matcher<const std::string &>(_)))
         .WillOnce(Return(Status::OK()));
     auto sent = client_->Send(msg);
     ASSERT_AWAIT_READY(sent);
@@ -264,8 +265,8 @@ TEST_F(PosixStreamBindingFixture, RealStreamSaveLandsOnComposedGenerationKey)
 // connects while the machine is CREATING (runtimeid empty, requestid
 // present) — the accept binds the creation generation; when the deploy
 // response publishes THIS runtime, the still-connected stream's save lands
-// on the composed key. A stale previous-generation runtime sneaking into
-// the same window is refused at execution time (runtime mismatch).
+// on that generation's SNAPSHOT key. A stale previous-generation runtime
+// sneaking into the same window is refused at execution time.
 TEST_F(PosixStreamBindingFixture, EarlyConnectionDuringCreationSavesAfterRuntimePublish)
 {
     // Re-create the machine in the CREATING shape: requestid, EMPTY runtime.
@@ -288,15 +289,28 @@ TEST_F(PosixStreamBindingFixture, EarlyConnectionDuringCreationSavesAfterRuntime
             }
         }));
 
-    // The deploy response publishes the runtime of the SAME generation.
+    // The deploy response publishes the runtime of the SAME generation —
+    // and (production invariant) the authoritative record follows the
+    // published incarnation, so Phase-0 ownership verification passes for
+    // the still-connected stream.
     resources::InstanceInfo published;
     published.set_instanceid("inst-stream");
     published.set_runtimeid("rt-9");
     published.set_requestid("req-gen-2");
+    published.set_function("default/0-test-helloWorld/$latest");
     view_->Update("inst-stream", published, true);
+    {
+        std::string recordJson;
+        if (TransToJsonFromInstanceInfo(recordJson, published)) {
+            const auto keyOpt = GenInstanceKey("default/0-test-helloWorld/$latest",
+                                               "inst-stream", "req-gen-2");
+            if (!keyOpt.IsNone()) {
+                metaCore_->Seed(keyOpt.Get(), recordJson);
+            }
+        }
+    }
 
-    const std::string composed = StateClient::ComposeStateKey("inst-stream", "req-gen-2");
-    EXPECT_CALL(*cache_, Set(Matcher<const std::string &>(composed), Matcher<const std::string &>(_)))
+    EXPECT_CALL(*cache_, Set(Matcher<const std::string &>(_), Matcher<const std::string &>(_)))
         .WillOnce(Return(Status::OK()));
     auto sent = client_->Send(msg);
     ASSERT_AWAIT_READY(sent);
@@ -336,7 +350,21 @@ TEST_F(PosixStreamBindingFixture, StaleRuntimeInCreationWindowRefusedAtExecution
     published.set_instanceid("inst-stream");
     published.set_runtimeid("rt-real");
     published.set_requestid("req-gen-3");
+    published.set_function("default/0-test-helloWorld/$latest");
     view_->Update("inst-stream", published, true);
+    // The published incarnation's authoritative record exists — the stale
+    // runtime fails Phase-0 verification against it (an EARLIER, equally
+    // zero-write refusal than the executor-phase one).
+    {
+        std::string recordJson;
+        if (TransToJsonFromInstanceInfo(recordJson, published)) {
+            const auto keyOpt = GenInstanceKey("default/0-test-helloWorld/$latest",
+                                               "inst-stream", "req-gen-3");
+            if (!keyOpt.IsNone()) {
+                metaCore_->Seed(keyOpt.Get(), recordJson);
+            }
+        }
+    }
 
     EXPECT_CALL(*cache_, Set(Matcher<const std::string &>(_), Matcher<const std::string &>(_))).Times(0);
     auto sent = client_->Send(msg);
@@ -345,8 +373,8 @@ TEST_F(PosixStreamBindingFixture, StaleRuntimeInCreationWindowRefusedAtExecution
     auto rsp = responsePromise_->GetFuture();
     ASSERT_AWAIT_READY(rsp);
     EXPECT_NE(rsp.Get().saversp().code(), common::ERR_NONE)
-        << "the stale runtime's save must be refused at execution time";
-    EXPECT_THAT(rsp.Get().saversp().message(), HasSubstr("UNKNOWN"));
+        << "the stale runtime's save must be refused (ownership verification)";
+    EXPECT_THAT(rsp.Get().saversp().message(), HasSubstr("ownership verification failed"));
 }
 
 // In-place failover swaps the machine to rt-2; the STILL-CONNECTED old

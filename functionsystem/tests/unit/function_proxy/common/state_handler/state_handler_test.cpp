@@ -399,8 +399,8 @@ TEST_F(StateHandlerTest, LoadStateFailedWithInValidAID)
     auto response = StateHandler::LoadState(grpc::PosixStreamIdentity{"instance_id", "rt-1", "req-gen-1"}, request);
 
     EXPECT_AWAIT_READY(response);
-    EXPECT_EQ(response.Get()->saversp().code(), common::ErrorCode::ERR_INNER_SYSTEM_ERROR);
-    EXPECT_EQ(response.Get()->saversp().message(), "save state failed: don't init state actor");
+    EXPECT_EQ(response.Get()->loadrsp().code(), common::ErrorCode::ERR_INNER_SYSTEM_ERROR);
+    EXPECT_EQ(response.Get()->loadrsp().message(), "load state failed: don't init state actor");
 }
 
 /**

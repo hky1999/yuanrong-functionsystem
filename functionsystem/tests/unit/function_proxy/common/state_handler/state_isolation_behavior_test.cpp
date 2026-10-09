@@ -243,6 +243,22 @@ TEST_F(StateIsolation, LateOldPublishFailsAgainstMovedReference)
     ASSERT_TRUE(WaitReady(f1));
     const auto oldRsp = f1.Get();
     EXPECT_NE(oldRsp.code(), common::ErrorCode::ERR_NONE);
+    // The old save's key is NOT in the failed response (error responses
+    // carry no checkpoint id) — derive it from the persistent records:
+    // it is the registration whose snapshot key is NOT save 2's.
+    std::string oldSnapKey;
+    {
+        const auto prefix = StateActor::RegistrationPrefix("inst-b", "req-b");
+        std::lock_guard<std::mutex> guard(metaCore_->lock);
+        for (const auto &kv : metaCore_->kv) {
+            if (kv.first.rfind(prefix, 0) != 0) { continue; }
+            const auto tuple = StateActor::ParseRegistration(kv.second.value);
+            if (!tuple.snapshotKey.empty() && tuple.snapshotKey != newKey) {
+                oldSnapKey = tuple.snapshotKey;
+            }
+        }
+    }
+    ASSERT_FALSE(oldSnapKey.empty());
 
     // The new reference survived; the old save's data is safe on its own
     // unique key (an orphan the retirement replay owns); its registration
@@ -250,7 +266,7 @@ TEST_F(StateIsolation, LateOldPublishFailsAgainstMovedReference)
     MapRecord refRec;
     ASSERT_TRUE(metaCore_->Lookup(refKey, refRec));
     EXPECT_EQ(refRec.value, newKey);
-    EXPECT_EQ(ds_->SetCount(oldRsp.checkpointid()), 1);
+    EXPECT_EQ(ds_->SetCount(oldSnapKey), 1);
     // No re-read-and-retry path exists: exactly one publish attempt each.
     EXPECT_EQ(metaCore_->GateCount(), 0);
 }
@@ -337,7 +353,18 @@ TEST(StateIsolationMachineGuard, SameRuntimeNewRequestRefusedAtExecutionPoint)
     *schedReq->mutable_instance() = info;
     auto context = std::make_shared<InstanceContext>(schedReq);
     MockInstanceStateMachine machine("node-g", context);
-
+    // GetInstanceInfo/GetRequestID are MOCKED on this machine — default
+    // returns (empty) would fail every guard. Wire them to the REAL
+    // context-backed values (what the real machine returns): the info is
+    // the ctor-time copy; the request id reads the schedule request LIVE
+    // (so the mid-test generation change is visible, as on a real machine
+    // whose schedule request is updated).
+    ON_CALL(machine, GetInstanceInfo()).WillByDefault(Invoke([context]() {
+        return context->GetInstanceInfo();
+    }));
+    ON_CALL(machine, GetRequestID()).WillByDefault(Invoke([context]() {
+        return context->GetRequestID();
+    }));
     int ran = 0;
     const auto op = [&ran]() {
         ran += 1;
@@ -363,6 +390,12 @@ TEST(StateIsolationMachineGuard, SameRuntimeNewRequestRefusedAtExecutionPoint)
     *schedReq2->mutable_instance() = info2;
     auto context2 = std::make_shared<InstanceContext>(schedReq2);
     MockInstanceStateMachine machine2("node-g2", context2);
+    ON_CALL(machine2, GetInstanceInfo()).WillByDefault(Invoke([context2]() {
+        return context2->GetInstanceInfo();
+    }));
+    ON_CALL(machine2, GetRequestID()).WillByDefault(Invoke([context2]() {
+        return context2->GetRequestID();
+    }));
     EXPECT_TRUE(machine2.ExecuteStateOpUnderLock("rt-g2", "req-bound", op).IsError());
     EXPECT_EQ(ran, 2);
 }
@@ -378,15 +411,16 @@ TEST_F(StateIsolation, PublishAppliedButResponseLostStaysUncertainAndCommitted)
     ASSERT_TRUE(WaitReady(f));
     // The operation reports UNCERTAIN — never success by default value.
     EXPECT_NE(f.Get().code(), common::ErrorCode::ERR_NONE);
-    const auto snapshotKey = f.Get().checkpointid();
+    // The applied snapshot key is not in the failed response — read the
+    // persistent reference (the transaction DID move it). A non-snapshot
+    // value here would mean the reference was never published.
+    MapRecord appliedRef;
+    ASSERT_TRUE(metaCore_->Lookup(refKey, appliedRef));
+    EXPECT_FALSE(StateClient::ParseSnapshotKey(appliedRef.value).saveOpID.empty())
+        << "reference must hold a strictly valid snapshot key: " << appliedRef.value;
 
-    // But the transaction REALLY applied: the registration is COMMITTED
-    // and the reference moved, atomically.
-    MapRecord refRec;
-    ASSERT_TRUE(metaCore_->Lookup(refKey, refRec));
-    EXPECT_EQ(refRec.value, snapshotKey);
     // The demotion attempt (conditional on the PENDING value) must NOT
-    // downgrade a COMMITTED registration.
+    // downgrade the REALLY-applied COMMITTED registration.
     bool foundCommitted = false;
     {
         std::lock_guard<std::mutex> guard(metaCore_->lock);

@@ -1939,6 +1939,14 @@ TEST_F(KillEntryIdentityFixture, SameRequestBarrierBlocksInPlaceRuntimeSwapSave)
     EXPECT_EQ(machine->GetInstanceInfo().runtimeid(), "runtime-R2");
     EXPECT_EQ(*stored, "OLD-STATE");  // old save happened-before the publish
     (void)joiner;
+    // The control plane would re-persist the authoritative record for the
+    // new incarnation; drop the stale synthesized record (it still names
+    // R1) so the successor's save re-derives it from the CURRENT machine.
+    {
+        std::lock_guard<std::mutex> guard(metaCore_->lock);
+        metaCore_->kv.erase(
+            GenInstanceKey("default/0-test-helloWorld/$latest", "inst-bar", "req-inst-bar").Get());
+    }
 
     // The successor's save lands AFTER the publish — final value is NEW.
     auto newMsg = std::make_shared<runtime_rpc::StreamingMessage>();
@@ -2228,10 +2236,17 @@ TEST_F(KillEntryIdentityFixture, MachineFenceRefusesInPlaceSwappedIdentity)
 TEST_F(KillEntryIdentityFixture, RealWindowInPlaceUpdateDuringGatedMachineDelete)
 {
     auto harness = MakeRealView();
-    // Gate the metadata transaction itself.
+    // Gate the metadata transaction itself — and flag the moment the
+    // chain actually REACHES it, so the in-place swap below lands INSIDE
+    // the delete window (deterministically AFTER the retirement fence and
+    // PostFence re-verification, which the swap must not race).
     auto gate = std::make_shared<litebus::Promise<std::shared_ptr<TxnResponse>>>();
+    auto commitReached = std::make_shared<std::atomic<bool>>(false);
     EXPECT_CALL(*harness.txn, Commit).WillOnce(
-        Invoke([gate]() { return gate->GetFuture(); }))
+        Invoke([gate, commitReached]() {
+            commitReached->store(true);
+            return gate->GetFuture();
+        }))
         .WillRepeatedly(
             Return(litebus::Future<std::shared_ptr<TxnResponse>>(MakeDeleteOkTxnResponse())));
     actor_->BindInstanceControlView(harness.view);
@@ -2245,6 +2260,15 @@ TEST_F(KillEntryIdentityFixture, RealWindowInPlaceUpdateDuringGatedMachineDelete
     EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>(StateClient::ComposeStateKey("inst-rw", "req-inst-rw")))).Times(0);
 
     auto result = actor_->DeleteInstanceInControlView(Status::OK(), info);
+
+    // The chain must be PARKED at the gated metadata delete (past the
+    // fence and PostFence) BEFORE the swap lands — otherwise the swap
+    // races the PostFence re-verification.
+    bool reachedDelete = false;
+    for (int i = 0; i < 5000 && !(reachedDelete = commitReached->load()); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(reachedDelete) << "the chain must reach the gated metadata delete";
 
     // While the version-fenced delete txn is in flight, the SAME machine
     // object is rewritten in place with a NEW generation's identity.
