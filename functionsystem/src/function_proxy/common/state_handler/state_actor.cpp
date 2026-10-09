@@ -53,7 +53,7 @@ void StateActor::MarkRegistrationUnknown(const std::string &regKey,
     auto txn = registry_->BeginTransaction();
     txn->If(meta_store::TxnCompare::OfValue(regKey, meta_store::CompareOperator::EQUAL, capturedValue));
     txn->Then(meta_store::TxnOperation::Create(regKey, SerializeRegistration(unknown),
-                                                meta_store::PutOption{}));
+                                                PutOption{}));
     (void)txn->Commit();
 }
 
@@ -106,7 +106,7 @@ litebus::Future<StateSaveResponse> StateActor::SaveState(const std::string &inst
     auto regTxn = registry_->BeginTransaction();
     regTxn->If(meta_store::TxnCompare::OfValue(guardKey, meta_store::CompareOperator::EQUAL,
                                                 boundRuntimeID));
-    regTxn->Then(meta_store::TxnOperation::Create(regKey, pendingValue, meta_store::PutOption{}));
+    regTxn->Then(meta_store::TxnOperation::Create(regKey, pendingValue, PutOption{}));
 
     return regTxn->Commit().Then(
         [this, instanceId, boundRuntimeID, boundRequestID, snapshotKey, saveOpID,
@@ -121,9 +121,9 @@ litebus::Future<StateSaveResponse> StateActor::SaveState(const std::string &inst
                 createTxn->If(meta_store::TxnCompare::OfVersion(
                     guardKey, meta_store::CompareOperator::EQUAL, 0));
                 createTxn->Then(meta_store::TxnOperation::Create(
-                    guardKey, boundRuntimeID, meta_store::PutOption{}));
+                    guardKey, boundRuntimeID, PutOption{}));
                 createTxn->Then(meta_store::TxnOperation::Create(
-                    regKey, pendingValue, meta_store::PutOption{}));
+                    regKey, pendingValue, PutOption{}));
                 return createTxn->Commit().Then(
                     [this, instanceId, boundRuntimeID, snapshotKey, saveOpID,
                      guardKey, regKey, pendingValue, request]
@@ -187,7 +187,7 @@ litebus::Future<StateSaveResponse> StateActor::ProceedAfterRegistration(
     pubTxn->If(meta_store::TxnCompare::OfValue(regKey, meta_store::CompareOperator::EQUAL,
                                                  pendingValue));
     pubTxn->Then(meta_store::TxnOperation::Create(regKey, SerializeRegistration(committed),
-                                                    meta_store::PutOption{}));
+                                                    PutOption{}));
 
     return pubTxn->Commit().Then(
         [this, instanceId, saveOpID, snapshotKey, regKey, pendingValue, guardKey, boundRuntimeID]
@@ -259,7 +259,7 @@ litebus::Future<Status> StateActor::DeleteState(const std::string &instanceId, c
         // Unconditional Put: retirement ALWAYS takes the guard (the delete
         // executor below already verified the retiring chain's authority).
         blockTxn->Then(meta_store::TxnOperation::Create(
-            guardKey, GUARD_RETIRED[0], meta_store::PutOption{}));
+            guardKey, GUARD_RETIRED[0], PutOption{}));
         (void)blockTxn->Commit();
         YRLOG_INFO("retirement for instance({}) generation({}): guard set to RETIRED "
                    "(late publishes will fail)", instanceId, generation);

@@ -325,6 +325,7 @@ protected:
     std::vector<resource_view::PhysicalRetirementReceipt> settleReceipts;
     std::shared_ptr<InstanceStateMachine> machineSlot_ = nullptr;
     std::shared_ptr<MockDistributedCacheClient> cacheClient_;
+    std::shared_ptr<MockMetaStoreClient> registryMeta_;
     std::shared_ptr<functionsystem::StateClient> stateClient_;
     std::shared_ptr<functionsystem::function_proxy::StateActor> stateActor_;
 };
