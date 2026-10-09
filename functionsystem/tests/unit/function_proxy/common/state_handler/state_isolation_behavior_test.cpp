@@ -32,7 +32,6 @@
 #include "function_proxy/common/state_handler/state_handler_helper.h"
 #include "function_proxy/common/state_machine/instance_control_view.h"
 #include "gtest/gtest.h"
-#include "mocks/mock_instance_state_machine.h"
 #include "state_isolation_support.h"
 
 namespace functionsystem::function_proxy::test {
@@ -345,26 +344,19 @@ TEST_F(StateIsolation, AuthorityAndRegistrationFailureZeroDsWrites)
     EXPECT_EQ(ds_->TotalSetCalls(), 0);
 }
 
-// ── same-runtime-new-request (execution point, real machine locks) ─────────
+// ── same-runtime-new-request (execution point, REAL machine + context) ─────
+// A REAL InstanceStateMachine over a REAL InstanceContext — no mocks. The
+// context's GetInstanceInfo() and GetRequestID() both read
+// scheduleRequest_->instance() LIVE, so the mid-test generation change is
+// exactly what a real updated schedule request produces.
 TEST(StateIsolationMachineGuard, SameRuntimeNewRequestRefusedAtExecutionPoint)
 {
     auto schedReq = std::make_shared<messages::ScheduleRequest>();
     auto info = MakeInfo("inst-g", "req-old", "rt-g");
     *schedReq->mutable_instance() = info;
     auto context = std::make_shared<InstanceContext>(schedReq);
-    MockInstanceStateMachine machine("node-g", context);
-    // GetInstanceInfo/GetRequestID are MOCKED on this machine — default
-    // returns (empty) would fail every guard. Wire them to the REAL
-    // context-backed values (what the real machine returns): the info is
-    // the ctor-time copy; the request id reads the schedule request LIVE
-    // (so the mid-test generation change is visible, as on a real machine
-    // whose schedule request is updated).
-    ON_CALL(machine, GetInstanceInfo()).WillByDefault(testing::Invoke([context]() {
-        return context->GetInstanceInfo();
-    }));
-    ON_CALL(machine, GetRequestID()).WillByDefault(testing::Invoke([context]() {
-        return context->GetRequestID();
-    }));
+    InstanceStateMachine machine("node-g", context, false);
+
     int ran = 0;
     const auto op = [&ran]() {
         ran += 1;
@@ -377,7 +369,8 @@ TEST(StateIsolationMachineGuard, SameRuntimeNewRequestRefusedAtExecutionPoint)
     auto refused = machine.ExecuteStateOpUnderLock("rt-g", "req-new", op);
     EXPECT_TRUE(refused.IsError());
     EXPECT_EQ(ran, 1);
-    // The machine's generation moves on; the OLD stream's op is refused.
+    // The machine's generation moves on (live schedule-request read); the
+    // OLD stream's op is refused, the NEW generation's op executes.
     schedReq->mutable_instance()->set_requestid("req-new");
     refused = machine.ExecuteStateOpUnderLock("rt-g", "req-old", op);
     EXPECT_TRUE(refused.IsError());
@@ -389,13 +382,7 @@ TEST(StateIsolationMachineGuard, SameRuntimeNewRequestRefusedAtExecutionPoint)
     auto info2 = MakeInfo("inst-g2", "", "rt-g2");
     *schedReq2->mutable_instance() = info2;
     auto context2 = std::make_shared<InstanceContext>(schedReq2);
-    MockInstanceStateMachine machine2("node-g2", context2);
-    ON_CALL(machine2, GetInstanceInfo()).WillByDefault(testing::Invoke([context2]() {
-        return context2->GetInstanceInfo();
-    }));
-    ON_CALL(machine2, GetRequestID()).WillByDefault(testing::Invoke([context2]() {
-        return context2->GetRequestID();
-    }));
+    InstanceStateMachine machine2("node-g2", context2, false);
     EXPECT_TRUE(machine2.ExecuteStateOpUnderLock("rt-g2", "req-bound", op).IsError());
     EXPECT_EQ(ran, 2);
 }
@@ -411,27 +398,50 @@ TEST_F(StateIsolation, PublishAppliedButResponseLostStaysUncertainAndCommitted)
     ASSERT_TRUE(WaitReady(f));
     // The operation reports UNCERTAIN — never success by default value.
     EXPECT_NE(f.Get().code(), common::ErrorCode::ERR_NONE);
-    // The applied snapshot key is not in the failed response — read the
-    // persistent reference (the transaction DID move it). A non-snapshot
-    // value here would mean the reference was never published.
+
+    // The failed response carries no checkpoint id — reconstruct EXACTLY
+    // what the applied transaction wrote from the PERSISTENT facts, then
+    // correlate all three artifacts byte-for-byte.
     MapRecord appliedRef;
     ASSERT_TRUE(metaCore_->Lookup(refKey, appliedRef));
-    EXPECT_FALSE(StateClient::ParseSnapshotKey(appliedRef.value).saveOpID.empty())
-        << "reference must hold a strictly valid snapshot key: " << appliedRef.value;
-
-    // The demotion attempt (conditional on the PENDING value) must NOT
-    // downgrade the REALLY-applied COMMITTED registration.
-    bool foundCommitted = false;
+    const auto parsedRef = StateClient::ParseSnapshotKey(appliedRef.value);
+    ASSERT_FALSE(parsedRef.saveOpID.empty()) << "reference must be a strict snapshot key: "
+                                             << appliedRef.value;
+    // The UNIQUE COMMITTED registration of this generation: its key names
+    // the SAME saveOpID, its tuple carries the SAME snapshot key, and its
+    // snapshot key names THIS instance/generation.
+    std::string committedRegValue;
+    std::string committedRegKey;
     {
+        const auto prefix = StateActor::RegistrationPrefix("inst-h", "req-h");
         std::lock_guard<std::mutex> guard(metaCore_->lock);
         for (const auto &entry : metaCore_->kv) {
-            if (entry.first.rfind("statereg:v1:", 0) != 0) { continue; }
+            if (entry.first.rfind(prefix, 0) != 0) { continue; }
             const auto tuple = StateActor::ParseRegistration(entry.second.value);
-            EXPECT_EQ(tuple.status, "COMMITTED");
-            foundCommitted = true;
+            ASSERT_EQ(tuple.status, "COMMITTED") << "the applied registration must be COMMITTED";
+            committedRegValue = entry.second.value;
+            committedRegKey = entry.first;
         }
     }
-    EXPECT_TRUE(foundCommitted);
+    ASSERT_FALSE(committedRegKey.empty());
+    const auto regTuple = StateActor::ParseRegistration(committedRegValue);
+    const auto regKeyParts = StateActor::ParseRegistrationKey(committedRegKey);
+    EXPECT_EQ(regKeyParts.saveOpID, parsedRef.saveOpID)
+        << "registration key, tuple, and reference must name ONE save op";
+    EXPECT_EQ(regTuple.saveOpID, parsedRef.saveOpID);
+    EXPECT_EQ(regTuple.snapshotKey, appliedRef.value)
+        << "tuple snapshot key must equal the published reference bytes";
+    EXPECT_EQ(parsedRef.instanceId, "inst-h");
+    EXPECT_EQ(parsedRef.creationRequest, "req-h");
+    // The DS holds the payload under EXACTLY that unique key — one Set,
+    // undamaged bytes.
+    EXPECT_EQ(ds_->SetCount(appliedRef.value), 1);
+    {
+        std::lock_guard<std::mutex> guard(ds_->lock);
+        const auto it = ds_->data.find(appliedRef.value);
+        ASSERT_NE(it, ds_->data.end());
+        EXPECT_EQ(it->second, "state-h");
+    }
 }
 
 // ── retire-before-owner-delete ──────────────────────────────────────────────
@@ -1137,6 +1147,112 @@ TEST_F(StateIsolation, EntryCapCursorLetsTailConvergePastUncertainHeads)
         EXPECT_EQ(it->second, "state-ec2");
     }
     EXPECT_EQ(ds_->DelCount(neighborSnap), 0);
+}
+
+// ── encoding-alias corruption: %3A damaged to %3a in a COMMITTED ────────────
+// registration's snapshot key. The alias DECODES to the same identity but
+// is a DIFFERENT physical DS key: the cleanup must refuse it (zero DS
+// deletes, no CLEANED, no allCleaned), keep the real payload under the
+// canonical key, retain the corrupted record byte-for-byte, and leave the
+// neighbor generation untouched.
+TEST_F(StateIsolation, AliasCorruptedSnapshotKeyRefusedZeroDsDeletes)
+{
+    const std::string inst = "inst:al";  // real ':' in the identity
+    const std::string req = "req:al";
+    SeedRecord(inst, req, "rt-al");
+    auto f = Save(inst, "rt-al", req, "alias-state");
+    ASSERT_TRUE(WaitReady(f));
+    ASSERT_EQ(f.Get().code(), common::ErrorCode::ERR_NONE);
+    const std::string realKey = f.Get().checkpointid();
+    ASSERT_NE(realKey.find("%3A"), std::string::npos)
+        << "the canonical key must carry the uppercase escape: " << realKey;
+
+    // Neighbor generation of the SAME instance (its own ':' escaped).
+    SeedRecord(inst, "req:al2", "rt-al2");
+    auto neighbor = Save(inst, "rt-al2", "req:al2", "neighbor-state");
+    ASSERT_TRUE(WaitReady(neighbor));
+    ASSERT_EQ(neighbor.Get().code(), common::ErrorCode::ERR_NONE);
+    const std::string neighborKey = neighbor.Get().checkpointid();
+    const std::string neighborRefKey = StateActor::StateRefKey(inst, "req:al2");
+    const std::string neighborRegValue = [&]() {
+        const auto prefix = StateActor::RegistrationPrefix(inst, "req:al2");
+        std::lock_guard<std::mutex> guard(metaCore_->lock);
+        for (const auto &kv : metaCore_->kv) {
+            if (kv.first.rfind(prefix, 0) == 0) { return kv.second.value; }
+        }
+        return std::string();
+    }();
+    ASSERT_FALSE(neighborRegValue.empty());
+
+    // CORRUPT the target generation's COMMITTED registration value: the
+    // snapshot key's FIRST %3A becomes %3a. regKey, saveOpID, and every
+    // other tuple field stay; the corrupted raw value is what remains
+    // stored (never normalized).
+    std::string corruptedRegValue;
+    std::string corruptedRegKey;
+    {
+        const auto prefix = StateActor::RegistrationPrefix(inst, req);
+        std::lock_guard<std::mutex> guard(metaCore_->lock);
+        for (auto &kv : metaCore_->kv) {
+            if (kv.first.rfind(prefix, 0) != 0) { continue; }
+            const auto tuple = StateActor::ParseRegistration(kv.second.value);
+            if (tuple.status != "COMMITTED") { continue; }
+            StateActor::SaveRegistration corrupted = tuple;
+            const size_t pos = corrupted.snapshotKey.find("%3A");
+            ASSERT_NE(pos, std::string::npos);
+            corrupted.snapshotKey.replace(pos, 3, "%3a");
+            corruptedRegValue = StateActor::SerializeRegistration(corrupted);
+            corruptedRegKey = kv.first;
+            kv.second.value = corruptedRegValue;
+        }
+    }
+    ASSERT_FALSE(corruptedRegValue.empty());
+
+    auto fence = StateHandler::RetireGeneration(inst, req, "rt-al");
+    ASSERT_TRUE(WaitReady(fence));
+    ASSERT_TRUE(fence.Get().fenced);
+
+    auto clean = StateHandler::CleanupRetiredSnapshots(inst, req, "rt-al");
+    ASSERT_TRUE(WaitReady(clean));
+    const auto &report = clean.Get();
+    ASSERT_TRUE(report.fenced);
+    EXPECT_FALSE(report.allCleaned);
+    // The corrupted entry is INVALID — never deleted, never CLEANED.
+    ASSERT_EQ(report.entries.size(), 1u);
+    EXPECT_TRUE(report.entries[0].invalid);
+    EXPECT_FALSE(report.entries[0].deleted);
+    EXPECT_FALSE(report.entries[0].cleanedMarker);
+    // ZERO DS deletes anywhere: the canonical key, the alias key, and the
+    // neighbor all untouched.
+    EXPECT_EQ(ds_->DelCount(realKey), 0);
+    {
+        std::lock_guard<std::mutex> guard(ds_->lock);
+        EXPECT_EQ(ds_->delCalls.size(), 0u);
+        const auto it = ds_->data.find(realKey);
+        ASSERT_NE(it, ds_->data.end());
+        EXPECT_EQ(it->second, "alias-state") << "the real payload stays";
+        EXPECT_NE(ds_->data.find(neighborKey), ds_->data.end());
+    }
+    // The corrupted record is retained BYTE-FOR-BYTE (not normalized).
+    {
+        MapRecord rec;
+        ASSERT_TRUE(metaCore_->Lookup(corruptedRegKey, rec));
+        EXPECT_EQ(rec.value, corruptedRegValue);
+    }
+    // The neighbor generation is fully unchanged.
+    EXPECT_EQ(ds_->DelCount(neighborKey), 0);
+    {
+        MapRecord refRec;
+        ASSERT_TRUE(metaCore_->Lookup(neighborRefKey, refRec));
+        EXPECT_EQ(refRec.value, neighborKey);
+        const auto prefix = StateActor::RegistrationPrefix(inst, "req:al2");
+        std::lock_guard<std::mutex> guard(metaCore_->lock);
+        for (const auto &kv : metaCore_->kv) {
+            if (kv.first.rfind(prefix, 0) == 0) {
+                EXPECT_EQ(kv.second.value, neighborRegValue);
+            }
+        }
+    }
 }
 
 }  // namespace functionsystem::function_proxy::test

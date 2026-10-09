@@ -38,27 +38,15 @@ int HexDigitValue(char c)
     return -1;
 }
 
-// A segment STRICTLY as EscapeKeyPart produces it: non-empty, no raw '@'
-// or ':', and every '%' escape well-formed decoding to '%', '@' or ':'.
-// Anything else was not composed by this scheme — reject, do not repair.
-bool IsStrictEscapedSegment(const std::string &raw)
-{
-    if (raw.empty()) { return false; }
-    for (size_t i = 0; i < raw.size(); ++i) {
-        const char c = raw[i];
-        if (c == '@' || c == ':') { return false; }
-        if (c == '%') {
-            if (i + 2 >= raw.size()) { return false; }
-            const int hi = HexDigitValue(raw[i + 1]);
-            const int lo = HexDigitValue(raw[i + 2]);
-            if (hi < 0 || lo < 0) { return false; }
-            const char decoded = static_cast<char>((hi << 4) | lo);
-            if (decoded != '%' && decoded != '@' && decoded != ':') { return false; }
-            i += 2;
-        }
-    }
-    return true;
-}
+// A segment STRICTLY as EscapeKeyPart produces it — validated by the
+// canonical round-trip EscapeKeyPart(UnescapeKeyPart(raw)) == raw at the
+// call site: it rejects malformed escapes AND non-canonical aliases
+// (e.g. lowercase %3a) in one check.
+
+// A segment STRICTLY as EscapeKeyPart produces it — validated by the
+// canonical round-trip EscapeKeyPart(UnescapeKeyPart(raw)) == raw at the
+// ParseSnapshotKey call site: it rejects malformed escapes AND
+// non-canonical aliases (e.g. lowercase %3a) in one check.
 
 // Canonical textual UUID exactly as litebus::uuid_generator::UUID::
 // ToString emits (16 bytes hex, hyphens after bytes 3/5/7/9):
@@ -168,9 +156,20 @@ StateClient::SnapshotKeyParts StateClient::ParseSnapshotKey(const std::string &k
     const std::string rawInstance = body.substr(0, sep1);
     const std::string rawRequest = body.substr(sep1 + 1, sep2 - sep1 - 1);
     const std::string rawOp = body.substr(sep2 + 1);
-    if (!IsStrictEscapedSegment(rawInstance) || !IsStrictEscapedSegment(rawRequest)) {
+    if (rawInstance.empty() || rawRequest.empty()) { return out; }
+    // CANONICAL-BYTES check (encoding-alias boundary): a key that merely
+    // DECODES to the right identity is NOT acceptable — the physical
+    // bytes must be EXACTLY what ComposeSnapshotKey produces. EscapeKeyPart
+    // emits UPPERCASE %XX, so an alias like %3a (decoding to the same ':')
+    // fails the round-trip: a corrupted registration can never delete a
+    // DIFFERENT physical DS key and report CLEANED. The round-trip also
+    // subsumes well-formedness (any malformed escape re-escapes unequal).
+    if (EscapeKeyPart(UnescapeKeyPart(rawInstance)) != rawInstance
+        || EscapeKeyPart(UnescapeKeyPart(rawRequest)) != rawRequest) {
         return out;
     }
+    // UUID: the generator (litebus ToString via std::hex) emits lowercase;
+    // both hex cases remain accepted — not over-rejected.
     if (!IsCanonicalUuid(rawOp)) { return out; }
     out.instanceId = UnescapeKeyPart(rawInstance);
     out.creationRequest = UnescapeKeyPart(rawRequest);
