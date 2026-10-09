@@ -363,6 +363,29 @@ protected:
         }
     }
 
+    // RELIABLE DEFAULT for the three-state identity snapshot on MOCK
+    // views: derive it from the mock's OWN GetInstance answer using ONE
+    // complete locked info copy (root-verified: info.requestid() ==
+    // GetRequestID()). Without this, an un-mocked GetInstanceIdentitySnapshot
+    // returns the gmock default (exists=false) and every chain passing the
+    // fence would silently bypass the PostFence unknown-identity
+    // protection. Tests needing an explicit UNKNOWN state override AFTER
+    // this call (the later, more specific ON_CALL wins).
+    void DefaultIdentityFromView(const std::shared_ptr<MockInstanceControlView> &view)
+    {
+        ON_CALL(*view, GetInstanceIdentitySnapshot(_))
+            .WillByDefault(Invoke([view](const std::string &id) {
+                InstanceControlView::InstanceIdentitySnapshot snap;
+                const auto machine = view->GetInstance(id);
+                if (machine == nullptr) { return snap; }
+                const auto info = machine->GetInstanceInfo();  // one locked copy
+                snap.exists = true;
+                snap.runtimeID = info.runtimeid();
+                snap.requestID = info.requestid();
+                return snap;
+            }));
+    }
+
     // Serve a controllable PRIMARY-view snapshot.
     void ServeView(const std::shared_ptr<ResourceUnit> &unit)
     {
@@ -675,6 +698,7 @@ TEST_F(KillEntryIdentityFixture, LateOldReceiptDoesNotDeleteNewIncarnationState)
                                           Matcher<const std::string &>("runtime-OLD"),
                                           Matcher<const std::string &>("req-inst-late")))
         .Times(0);
+    DefaultIdentityFromView(controlView);  // reliable three-state default BEFORE the bind
     actor_->BindInstanceControlView(controlView);
 
     // The OLD chain (runtime-OLD, request-old) arrives late: the guard
@@ -720,6 +744,7 @@ TEST_F(KillEntryIdentityFixture, SameGenerationControlDeleteProceeds)
     // State delete via the REAL StateActor: succeed once.
     EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>(StateClient::ComposeStateKey("inst-ok", "req-inst-ok"))))
         .WillOnce(Return(Status::OK()));
+    DefaultIdentityFromView(controlView);  // reliable three-state default BEFORE the bind
     actor_->BindInstanceControlView(controlView);
 
     auto result = actor_->DeleteInstanceInControlView(Status::OK(), info);
@@ -767,6 +792,7 @@ TEST_F(KillEntryIdentityFixture, MidFlightRuntimeReplacementKeepsNewState)
             const auto machine = machineSlot_ ? machineSlot_ : oldMachine;
             return std::make_pair(machine->GetInstanceInfo().runtimeid(), machine->GetRequestID());
         }));
+    DefaultIdentityFromView(controlView);  // reliable three-state default BEFORE the bind
     actor_->BindInstanceControlView(controlView);
 
     auto result = actor_->DeleteInstanceInControlView(Status::OK(), oldInfo);
@@ -823,6 +849,7 @@ TEST_F(KillEntryIdentityFixture, MidFlightRequestReplacementKeepsNewState)
             const auto machine = machineSlot_ ? machineSlot_ : oldMachine;
             return std::make_pair(machine->GetInstanceInfo().runtimeid(), machine->GetRequestID());
         }));
+    DefaultIdentityFromView(controlView);  // reliable three-state default BEFORE the bind
     actor_->BindInstanceControlView(controlView);
 
     auto result = actor_->DeleteInstanceInControlView(Status::OK(), oldInfo);
@@ -878,6 +905,7 @@ TEST_F(KillEntryIdentityFixture, FullChainSameGenerationDeliversCacheDel)
         .Times(1);
     ON_CALL(*controlView, GetIncarnationSnapshot(Matcher<const std::string &>("inst-full")))
         .WillByDefault(Return(std::make_pair(info.runtimeid(), info.requestid())));
+    DefaultIdentityFromView(controlView);  // reliable three-state default BEFORE the bind
     actor_->BindInstanceControlView(controlView);
     EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>(StateClient::ComposeStateKey("inst-full", "req-inst-full"))))
         .WillOnce(Return(Status::OK()));
@@ -908,6 +936,7 @@ TEST_F(KillEntryIdentityFixture, FullChainCacheDelFailureSurfacesAndRetries)
         }));
     ON_CALL(*controlView, GetIncarnationSnapshot(Matcher<const std::string &>("inst-fail")))
         .WillByDefault(Return(std::make_pair(info.runtimeid(), info.requestid())));
+    DefaultIdentityFromView(controlView);  // reliable three-state default BEFORE the bind
     actor_->BindInstanceControlView(controlView);
     EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>(StateClient::ComposeStateKey("inst-fail", "req-inst-fail"))))
         .WillOnce(Return(Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "store down")))
@@ -953,6 +982,7 @@ TEST_F(KillEntryIdentityFixture, FullChainMidFlightRuntimeZeroCacheDel)
             const auto machine = machineSlot_ ? machineSlot_ : oldMachine;
             return std::make_pair(machine->GetInstanceInfo().runtimeid(), machine->GetRequestID());
         }));
+    DefaultIdentityFromView(controlView);  // reliable three-state default BEFORE the bind
     actor_->BindInstanceControlView(controlView);
     EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>(StateClient::ComposeStateKey("inst-fr", "req-inst-fr")))).Times(0);
 
@@ -1001,6 +1031,7 @@ TEST_F(KillEntryIdentityFixture, FullChainMidFlightRequestZeroCacheDel)
             const auto machine = machineSlot_ ? machineSlot_ : oldMachine;
             return std::make_pair(machine->GetInstanceInfo().runtimeid(), machine->GetRequestID());
         }));
+    DefaultIdentityFromView(controlView);  // reliable three-state default BEFORE the bind
     actor_->BindInstanceControlView(controlView);
     EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>(StateClient::ComposeStateKey("inst-fq", "req-inst-fq")))).Times(0);
 
@@ -1034,6 +1065,7 @@ TEST_F(KillEntryIdentityFixture, FullChainMidFlightRequestZeroCacheDel)
 TEST_F(KillEntryIdentityFixture, DelayedFenceSameNameReplacementRefusesAllSideEffects)
 {
     auto controlView = std::make_shared<MockInstanceControlView>("node-test");
+    DefaultIdentityFromView(controlView);  // default FIRST — the unknown-state override below wins
     auto oldMachine = std::make_shared<MockInstanceStateMachine>("m-df-old");
     const auto oldInfo = MakeElasticInfo("inst-df", "runtime-OLD");
     oldInfo.set_groupid("grp-df");  // the group side effect must be countable
@@ -1105,6 +1137,7 @@ TEST_F(KillEntryIdentityFixture, DelayedFenceSameNameReplacementRefusesAllSideEf
 TEST_F(KillEntryIdentityFixture, PostFenceUnknownRuntimeIdentityRefusesSideEffects)
 {
     auto controlView = std::make_shared<MockInstanceControlView>("node-test");
+    DefaultIdentityFromView(controlView);  // default FIRST — the unknown-state override below wins
     auto machine = std::make_shared<MockInstanceStateMachine>("m-u1");
     const auto info = MakeElasticInfo("inst-u1", "runtime-u1");
     info.set_groupid("grp-u1");  // make the group assertion meaningful
@@ -1142,6 +1175,7 @@ TEST_F(KillEntryIdentityFixture, PostFenceUnknownRuntimeIdentityRefusesSideEffec
 TEST_F(KillEntryIdentityFixture, PostFenceUnknownRequestIdentityRefusesSideEffects)
 {
     auto controlView = std::make_shared<MockInstanceControlView>("node-test");
+    DefaultIdentityFromView(controlView);  // default FIRST — the unknown-state override below wins
     auto machine = std::make_shared<MockInstanceStateMachine>("m-u2");
     const auto info = MakeElasticInfo("inst-u2", "runtime-u2");
     info.set_groupid("grp-u2");  // make the group assertion meaningful

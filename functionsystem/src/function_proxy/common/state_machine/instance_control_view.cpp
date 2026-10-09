@@ -385,7 +385,11 @@ std::pair<std::string, std::string> InstanceControlView::GetIncarnationSnapshot(
     if (it == machines_.end()) {
         return {"", ""};
     }
-    return {it->second->GetInstanceInfo().runtimeid(), it->second->GetRequestID()};
+    // ONE locked complete copy for both fields (root-verified:
+    // InstanceContext::GetRequestID() == instanceInfo.requestid()) — no
+    // torn identity reads.
+    const auto info = it->second->GetInstanceInfo();
+    return {info.runtimeid(), info.requestid()};
 }
 
 InstanceControlView::InstanceIdentitySnapshot InstanceControlView::GetInstanceIdentitySnapshot(
@@ -398,10 +402,11 @@ InstanceControlView::InstanceIdentitySnapshot InstanceControlView::GetInstanceId
         return out;  // truly absent
     }
     out.exists = true;
-    // Locked complete copy (machine's own recursive lock) — one consistent
-    // observation, never two torn reads.
-    out.runtimeID = it->second->GetInstanceInfo().runtimeid();
-    out.requestID = it->second->GetRequestID();
+    // ONE locked complete copy (the machine's own recursive lock) — both
+    // identity fields from the same observation, never two torn reads.
+    const auto info = it->second->GetInstanceInfo();
+    out.runtimeID = info.runtimeid();
+    out.requestID = info.requestid();
     return out;
 }
 

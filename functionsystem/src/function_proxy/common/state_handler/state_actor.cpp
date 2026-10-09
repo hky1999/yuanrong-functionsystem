@@ -1088,25 +1088,44 @@ litebus::Future<StateActor::RetireReport> StateActor::PromoteNextCleanedMarker(
             allCleaned = allCleaned && entry.deleted && entry.cleanedMarker;
         }
         report.allCleaned = allCleaned;
-        // Persist the CURSOR ADVANCE (conditional on the captured
-        // tombstone value — a concurrent replayer cannot clobber a moved
-        // tombstone). Progress marker, not a proof: a failed write only
-        // means the next round re-processes some already-handled entries
-        // (CLEANED ones pass free), so fire-and-report is honest.
-        if (report.cursorAdvanced && !report.tombstoneKey.empty() && registry_ != nullptr) {
-            auto fence = ParseFence(report.tombstoneValue);
-            if (fence.status == "RETIRED") {
-                fence.cleanupCursor = report.newCursor;
-                auto txn = registry_->BeginTransaction();
-                txn->If(meta_store::TxnCompare::OfValue(
-                    report.tombstoneKey, meta_store::CompareOperator::EQUAL,
-                    report.tombstoneValue));
-                txn->Then(meta_store::TxnOperation::Create(
-                    report.tombstoneKey, SerializeFence(fence), PutOption{}));
-                (void)txn->Commit();
-            }
+        // Persist the CURSOR ADVANCE — conditionally on the captured
+        // tombstone value (a concurrent replayer cannot clobber a moved
+        // tombstone) — and AWAIT the verdict before this cleanup future
+        // completes: the report says cursorPersisted=true ONLY on a
+        // confirmed commit. A failed/lost write leaves cursorPersisted
+        // false (cursorAdvanced stays true = the round INTENDED to
+        // advance); the next round then re-processes some already-handled
+        // entries (CLEANED ones pass free) — an idempotent, bounded
+        // retry, never a false claim of persistence. The transaction is
+        // part of THIS cleanup's asynchronous tail, so the replay
+        // concurrency cap covers it.
+        if (!report.cursorAdvanced || report.tombstoneKey.empty() || registry_ == nullptr) {
+            return report;
         }
-        return report;
+        auto fence = ParseFence(report.tombstoneValue);
+        if (fence.status != "RETIRED") {
+            return report;
+        }
+        fence.cleanupCursor = report.newCursor;
+        auto txn = registry_->BeginTransaction();
+        txn->If(meta_store::TxnCompare::OfValue(
+            report.tombstoneKey, meta_store::CompareOperator::EQUAL, report.tombstoneValue));
+        txn->Then(meta_store::TxnOperation::Create(
+            report.tombstoneKey, SerializeFence(fence), PutOption{}));
+        auto promise = std::make_shared<litebus::Promise<RetireReport>>();
+        txn->Commit().OnComplete(
+            [promise, report](const litebus::Future<std::shared_ptr<TxnResponse>> &f) mutable {
+                RetireReport finalReport = report;
+                const auto &rsp = f.Get();
+                finalReport.cursorPersisted =
+                    !f.IsError() && rsp != nullptr && !rsp->status.IsError() && rsp->success;
+                if (!finalReport.cursorPersisted) {
+                    finalReport.refDetail += (finalReport.refDetail.empty() ? "" : "; ")
+                        + "cursor advance not persisted — next round re-processes idempotently";
+                }
+                promise->SetValue(std::move(finalReport));
+            });
+        return promise->GetFuture();
     }
 
     // Build the conditional marker transaction for entries[index].

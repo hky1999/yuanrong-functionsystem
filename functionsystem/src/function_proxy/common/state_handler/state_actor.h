@@ -220,11 +220,17 @@ public:
         std::vector<RegistrationCleanup> entries;
         std::string reason;        // refusal reason when !fenced
         // Internal plumbing (also observable by tests): the per-generation
-        // cursor advance persisted into the tombstone at the report's end.
+        // cursor. cursorAdvanced = this round PROCESSED past the old
+        // cursor (an intention); cursorPersisted = the conditional
+        // tombstone write CONFIRMED (awaited verdict) — false on null
+        // response, status failure, success=false, or a failed future,
+        // leaving the next round to re-process idempotently. Never report
+        // persistence without the confirmed commit.
         std::string tombstoneKey;
         std::string tombstoneValue;
         std::string newCursor;
         bool cursorAdvanced = false;
+        bool cursorPersisted = false;
     };
     // FENCE (only): commits the generation tombstone conditionally on the
     // ORIGINAL authoritative record (captured raw value + mod_revision,

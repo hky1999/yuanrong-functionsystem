@@ -966,7 +966,8 @@ TEST_F(StateIsolation, ReplayConcurrencyCapHoldsWhileEightStuck)
 // PENDING (uncertain heads). A head-truncating cap would starve the tail
 // forever; the tombstone cursor must let later rounds process past the
 // heads so the tail COMMITTED entries get Del/CLEANED, while a NEW
-// generation of the same instance stays untouched.
+// generation of the same instance (created BEFORE the cleanups, fully
+// captured) stays byte-for-byte untouched.
 TEST_F(StateIsolation, EntryCapCursorLetsTailConvergePastUncertainHeads)
 {
     const std::string inst = "inst-ec";
@@ -976,16 +977,21 @@ TEST_F(StateIsolation, EntryCapCursorLetsTailConvergePastUncertainHeads)
     ASSERT_TRUE(WaitReady(live));
     ASSERT_EQ(live.Get().code(), common::ErrorCode::ERR_NONE);
 
-    // Deterministic canonical UUIDs for the seeded registrations.
+    // Deterministic canonical UUIDs (8-4-4-4-12 hex, explicit 64-bit
+    // formats — the node counter must not overflow a 32-bit format spec).
     auto uuidOf = [](int i) {
-        char buf[37];
-        snprintf(buf, sizeof(buf), "%08x-0000-4000-8000-%012x",
-                 0xa0000000u + static_cast<unsigned>(i),
-                 0x555500000000u + static_cast<unsigned>(i));
+        char buf[40];
+        const int written = snprintf(buf, sizeof(buf),
+            "%08llx-0000-4000-8000-%012llx",
+            static_cast<unsigned long long>(0xa0000000ull + static_cast<unsigned long long>(i)),
+            static_cast<unsigned long long>(0x555500000000ull + static_cast<unsigned long long>(i)));
+        EXPECT_EQ(written, 36) << "canonical uuid length";
         return std::string(buf);
     };
     const std::string escInst = StateClient::EscapeKeyPart(inst);
     const std::string escReq = StateClient::EscapeKeyPart(req);
+    std::vector<std::string> tailRegKeys;
+    std::vector<std::string> tailSnapKeys;
     // 70 seeded registrations: #0..#63 PENDING (permanently uncertain),
     // #64..#69 COMMITTED — all strictly valid tuples for THIS generation.
     for (int i = 0; i < 70; ++i) {
@@ -1002,10 +1008,14 @@ TEST_F(StateIsolation, EntryCapCursorLetsTailConvergePastUncertainHeads)
         reg.authorityRecordKey = GenInstanceKey(kFuncKey, inst, req).Get();
         reg.authorityModRevision = 1;
         metaCore_->Seed(regKey, StateActor::SerializeRegistration(reg));
-        // The COMMITTED tail entries have real data on their unique keys.
         if (i >= 64) {
-            std::lock_guard<std::mutex> guard(ds_->lock);
-            ds_->data[snapKey] = "tail-state-" + std::to_string(i);
+            // The COMMITTED tail entries have real data on their unique keys.
+            {
+                std::lock_guard<std::mutex> guard(ds_->lock);
+                ds_->data[snapKey] = "tail-state-" + std::to_string(i);
+            }
+            tailRegKeys.push_back(regKey);
+            tailSnapKeys.push_back(snapKey);
         }
     }
     // The PENDING heads' DS writes are permanently uncertain (stuck
@@ -1019,6 +1029,26 @@ TEST_F(StateIsolation, EntryCapCursorLetsTailConvergePastUncertainHeads)
     ASSERT_TRUE(WaitReady(fence));
     ASSERT_TRUE(fence.Get().fenced);
 
+    // The NEIGHBOR (new generation, SAME instance, different request +
+    // runtime) is created NOW — fence landed, BEFORE any cleanup of the
+    // retired generation — and captured in full.
+    SeedRecord(inst, "req-ec2", "rt-ec2");
+    auto neighbor = Save(inst, "rt-ec2", "req-ec2", "state-ec2");
+    ASSERT_TRUE(WaitReady(neighbor));
+    ASSERT_EQ(neighbor.Get().code(), common::ErrorCode::ERR_NONE);
+    const std::string neighborSnap = neighbor.Get().checkpointid();
+    const std::string neighborRegValue = [&]() {
+        const auto prefix = StateActor::RegistrationPrefix(inst, "req-ec2");
+        std::lock_guard<std::mutex> guard(metaCore_->lock);
+        for (const auto &kv : metaCore_->kv) {
+            if (kv.first.rfind(prefix, 0) == 0) { return kv.second.value; }
+        }
+        return std::string();
+    }();
+    const std::string neighborRefKey = StateActor::StateRefKey(inst, "req-ec2");
+    MapRecord neighborRefBefore;
+    ASSERT_TRUE(metaCore_->Lookup(neighborRefKey, neighborRefBefore));
+
     // ROUND 1: quota (64) consumed by the uncertain heads; truncated.
     auto round1 = StateHandler::CleanupRetiredSnapshots(inst, req, "rt-ec");
     ASSERT_TRUE(WaitReady(round1));
@@ -1031,29 +1061,48 @@ TEST_F(StateIsolation, EntryCapCursorLetsTailConvergePastUncertainHeads)
     auto round2 = StateHandler::CleanupRetiredSnapshots(inst, req, "rt-ec");
     ASSERT_TRUE(WaitReady(round2));
     ASSERT_TRUE(round2.Get().fenced);
-    size_t cleaned = 0;
-    for (const auto &entry : round2.Get().entries) {
-        if (entry.cleanedMarker) { cleaned += 1; }
+    // EACH of the six tail entries: persistent CLEANED marker in the map
+    // AND its data actually gone from the DS — not just a report count.
+    for (size_t t = 0; t < tailRegKeys.size(); ++t) {
+        MapRecord rec;
+        ASSERT_TRUE(metaCore_->Lookup(tailRegKeys[t], rec)) << tailRegKeys[t];
+        EXPECT_EQ(StateActor::ParseRegistration(rec.value).status, "CLEANED") << tailRegKeys[t];
+        std::lock_guard<std::mutex> guard(ds_->lock);
+        EXPECT_EQ(ds_->data.count(tailSnapKeys[t]), 0u) << tailSnapKeys[t];
     }
-    EXPECT_GE(cleaned, 6u) << "the tail COMMITTED entries must converge";
     // The heads remain PENDING (never falsely promoted) and retained.
     {
         std::lock_guard<std::mutex> guard(metaCore_->lock);
         size_t pendingHeads = 0;
         for (const auto &kv : metaCore_->kv) {
             if (kv.first.rfind("statereg:v1:" + escInst + ":" + escReq + ":", 0) != 0) { continue; }
-            const auto tuple = StateActor::ParseRegistration(kv.second);
+            const auto tuple = StateActor::ParseRegistration(kv.second.value);
             if (tuple.status == "PENDING" || tuple.status == "UNKNOWN") { pendingHeads += 1; }
         }
         EXPECT_EQ(pendingHeads, 64u);
     }
-    // A NEW generation of the SAME instance: untouched throughout.
-    SeedRecord(inst, "req-ec2", "rt-ec2");
-    auto neighbor = Save(inst, "rt-ec2", "req-ec2", "state-ec2");
-    ASSERT_TRUE(WaitReady(neighbor));
-    ASSERT_EQ(neighbor.Get().code(), common::ErrorCode::ERR_NONE);
-    EXPECT_EQ(ds_->DelCount(neighbor.Get().checkpointid()), 0);
-    EXPECT_TRUE(metaCore_->Exists(StateActor::StateRefKey(inst, "req-ec2")));
+    // The neighbor is COMPLETELY unchanged: registration value byte-for-
+    // byte, reference still present with the same value, DS data intact,
+    // zero Del calls against its snapshot.
+    {
+        const auto prefix = StateActor::RegistrationPrefix(inst, "req-ec2");
+        std::string neighborRegAfter;
+        std::lock_guard<std::mutex> guard(metaCore_->lock);
+        for (const auto &kv : metaCore_->kv) {
+            if (kv.first.rfind(prefix, 0) == 0) { neighborRegAfter = kv.second.value; }
+        }
+        EXPECT_EQ(neighborRegAfter, neighborRegValue);
+    }
+    MapRecord neighborRefAfter;
+    ASSERT_TRUE(metaCore_->Lookup(neighborRefKey, neighborRefAfter));
+    EXPECT_EQ(neighborRefAfter.value, neighborRefBefore.value);
+    {
+        std::lock_guard<std::mutex> guard(ds_->lock);
+        auto it = ds_->data.find(neighborSnap);
+        ASSERT_NE(it, ds_->data.end());
+        EXPECT_EQ(it->second, "state-ec2");
+    }
+    EXPECT_EQ(ds_->DelCount(neighborSnap), 0);
 }
 
 }  // namespace functionsystem::function_proxy::test
