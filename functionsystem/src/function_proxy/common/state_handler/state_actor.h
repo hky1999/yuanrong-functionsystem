@@ -118,6 +118,19 @@ public:
                                        const std::string &saveOpID);
 
 private:
+    // Phase 2 (DS write) + Phase 3 (conditional publish) — shared by both
+    // registration paths (guard match and guard creation).
+    litebus::Future<StateSaveResponse> ProceedAfterRegistration(
+        const std::string &instanceId, const std::string &boundRuntimeID,
+        const std::string &snapshotKey, const std::string &saveOpID,
+        const std::string &guardKey, const std::string &regKey,
+        const std::string &pendingValue,
+        const std::shared_ptr<StateSaveRequest> &request);
+    // Fire-and-forget conditional UNKNOWN marking (only if the record
+    // still holds the captured PENDING value).
+    void MarkRegistrationUnknown(const std::string &regKey, const std::string &capturedValue,
+                                 const std::string &guardKey, const std::string &runtimeID);
+
     std::shared_ptr<StateClient> stateClient_;
     SaveExecutor saveExecutor_;
     DeleteExecutor deleteExecutor_;

@@ -22,9 +22,39 @@
 
 namespace functionsystem::function_proxy {
 
+namespace {
+// Guard key in the meta-store for the persistent generation guard.
+std::string GuardKeyFor(const std::string &instanceID, const std::string &creationRequest)
+{
+    return "stateguard:v1:" + instanceID + ":" + creationRequest;
+}
+constexpr const char *GUARD_RETIRED[] = { "RETIRED" };
+}  // namespace
+
 StateActor::StateActor(const std::shared_ptr<StateClient> &stateClient)
     : litebus::ActorBase("state_actor"), stateClient_(stateClient)
 {
+}
+
+// ── v3: fire-and-forget conditional status update ─────────────────────────
+// Marks a registration UNKNOWN only if it still holds the CAPTURED value
+// (never unconditionally overwrites a rewritten or retired record).
+void StateActor::MarkRegistrationUnknown(const std::string &regKey,
+                                         const std::string &capturedValue,
+                                         const std::string &guardKey,
+                                         const std::string &runtimeID)
+{
+    if (registry_ == nullptr) { return; }
+    SaveRegistration unknown;
+    auto parsed = ParseRegistration(capturedValue);
+    if (parsed.status.empty()) { return; }
+    unknown = parsed;
+    unknown.status = "UNKNOWN";
+    auto txn = registry_->BeginTransaction();
+    txn->If(meta_store::TxnCompare::OfValue(regKey, meta_store::CompareOperator::EQUAL, capturedValue));
+    txn->Then(meta_store::TxnOperation::Create(regKey, SerializeRegistration(unknown),
+                                                meta_store::PutOption{}));
+    (void)txn->Commit();
 }
 
 litebus::Future<StateSaveResponse> StateActor::SaveState(const std::string &instanceId,
@@ -36,176 +66,253 @@ litebus::Future<StateSaveResponse> StateActor::SaveState(const std::string &inst
         YRLOG_ERROR("failed to save state: empty instance id {} or stateClient null", instanceId);
         return GenStateSaveResponse(common::ErrorCode::ERR_PARAM_INVALID, "save state failed: empty instance id");
     }
-    // Unbound identity (stream accepted without a resolvable creation
-    // generation) must never degrade to a bare-key write: refuse.
     if (boundRequestID.empty()) {
         YRLOG_ERROR("refused to save state for instance({}) runtime({}): stream carries no bound "
                     "creation generation", instanceId, boundRuntimeID);
         return GenStateSaveResponse(common::ErrorCode::ERR_PARAM_INVALID,
                                     "save state failed: unbound stream identity");
     }
-    // EXECUTION-POINT fence: no executor bound ⇒ explicit refusal (an
-    // unbound deployment never silently writes). With one bound, the
-    // ownership check and the synchronous Set run together under the
-    // executor's lock — the same lock the control view takes for
-    // generation changes — so a replacement runtime's publish CANNOT land
-    // between the check and the write (a pre-check would allow exactly
-    // that). No relabeling of the old message onto the current runtime.
     if (!saveExecutor_) {
-        YRLOG_ERROR("refused to save state for instance({}): no save executor bound "
-                    "(unbound deployment refuses rather than silently writing)", instanceId);
+        YRLOG_ERROR("refused to save state for instance({}): no save executor bound", instanceId);
         return GenStateSaveResponse(common::ErrorCode::ERR_INNER_SYSTEM_ERROR,
                                     "save state refused: save executor not bound");
     }
-
-    // ── v3 registration-first isolation (plan 20261008T220000Z) ────────
-    // Phase 1: PERSIST REGISTRATION (etcd) BEFORE the DS write. A timeout
-    // or process death at any later point leaves a discoverable record —
-    // no undiscoverable DS object can exist. An unbound registry refuses
-    // v3 saves (never silently falls back to unregistered writes).
     if (registry_ == nullptr) {
         YRLOG_ERROR("refused to save state for instance({}): no save registry bound "
-                    "(v3 requires registration-first; unregistered writes forbidden)",
-                    instanceId);
+                    "(v3 requires registration-first)", instanceId);
         return GenStateSaveResponse(common::ErrorCode::ERR_INNER_SYSTEM_ERROR,
                                     "save state refused: save registry not bound");
     }
+
     const std::string snapshotKey = StateClient::ComposeSnapshotKey(instanceId, boundRequestID);
-    // Extract the saveOpID (the trailing UUID segment after the second ':').
     const auto lastColon = snapshotKey.rfind(':');
     const std::string saveOpID = snapshotKey.substr(lastColon + 1);
-    {
-        SaveRegistration reg;
-        reg.saveOpID = saveOpID;
-        reg.snapshotKey = snapshotKey;
-        reg.instanceID = instanceId;
-        reg.creationRequest = boundRequestID;
-        reg.runtimeID = boundRuntimeID;
-        reg.status = "PENDING";
-        // Put the registration into etcd. This is a synchronous meta-store
-        // write — if IT fails, we refuse before touching DS at all.
-        // NOTE: a full conditional transaction (If-of-value on the instance
-        // record's ownership version) is the v3 publish step; the PENDING
-        // registration itself is a plain Put (any prior record with the
-        // same saveOpID is by construction a retry of THIS operation).
-        auto txn = registry_->BeginTransaction();
-        txn->Then(meta_store::TxnOperation::Create(
-            RegistrationKey(instanceId, boundRequestID, saveOpID),
-            SerializeRegistration(reg), meta_store::PutOption{}));
-        auto committed = txn->Commit();
-        if (!committed.IsReady() || committed.Get().IsError()
-            || !committed.Get()->success) {
-            YRLOG_ERROR("refused to save state for instance({}): registration PERSIST failed "
-                        "(the DS write is NOT attempted)", instanceId);
-            return GenStateSaveResponse(common::ErrorCode::ERR_INNER_SYSTEM_ERROR,
-                                        "save state refused: registration persist failed");
-        }
-    }
+    const std::string guardKey = GuardKeyFor(instanceId, boundRequestID);
+    const std::string regKey = RegistrationKey(instanceId, boundRequestID, saveOpID);
 
-    // Phase 2: DS WRITE to the globally-unique snapshot key. A timeout
-    // here leaves the registration at PENDING (discoverable — the object
-    // may or may not arrive). The caller sees UNKNOWN (BUSY), never a
-    // false success and never a silent retry of a shared key.
-    auto writeStatus = saveExecutor_(instanceId, boundRuntimeID,
-        [this, &snapshotKey, &request]() {
-            return stateClient_->Set(snapshotKey, request->state());
-        });
-    if (writeStatus.IsError()) {
-        // Phase 3 (timeout path): mark UNKNOWN, RETAIN the registration.
-        // The object may still arrive late (B2b evidence); the UNKNOWN
-        // record is how reconciliation discovers it.
-        SaveRegistration reg;
-        reg.saveOpID = saveOpID;
-        reg.snapshotKey = snapshotKey;
-        reg.instanceID = instanceId;
-        reg.creationRequest = boundRequestID;
-        reg.runtimeID = boundRuntimeID;
-        reg.status = "UNKNOWN";
-        auto txn = registry_->BeginTransaction();
-        txn->Then(meta_store::TxnOperation::Create(
-            RegistrationKey(instanceId, boundRequestID, saveOpID),
-            SerializeRegistration(reg), meta_store::PutOption{}));
-        (void)txn->Commit();
-        YRLOG_WARN("save state for instance({}) op({}): DS write uncertain — registration "
-                   "retained as UNKNOWN (late arrival possible, never retried blindly)",
-                   instanceId, saveOpID);
-        return GenStateSaveResponse(common::ErrorCode::ERR_INSTANCE_BUSY,
-                                    "save state: DS write outcome UNKNOWN (registration retained)");
-    }
-
-    // Phase 3 (success path): CONDITIONAL PUBLISH — mark COMMITTED only
-    // when the registration still holds OUR snapshot key (a competing
-    // writer's registration would differ). This is the etcd-side fence:
-    // an old chain's late publish cannot overwrite a newer chain's.
     SaveRegistration reg;
     reg.saveOpID = saveOpID;
     reg.snapshotKey = snapshotKey;
     reg.instanceID = instanceId;
     reg.creationRequest = boundRequestID;
     reg.runtimeID = boundRuntimeID;
-    reg.status = "COMMITTED";
-    {
-        auto txn = registry_->BeginTransaction();
-        // If the registration record still names OUR snapshot key, update
-        // its status to COMMITTED; any other value ⇒ conflict (keep the
-        // other writer's record; ours is a late publish).
-        txn->If(meta_store::TxnCompare::OfValue(
-            RegistrationKey(instanceId, boundRequestID, saveOpID),
-            meta_store::CompareOperator::EQUAL,
-            SerializeRegistration([&]() {
-                SaveRegistration pending = reg;
-                pending.status = "PENDING";
-                return pending;
-            }())));
-        txn->Then(meta_store::TxnOperation::Create(
-            RegistrationKey(instanceId, boundRequestID, saveOpID),
-            SerializeRegistration(reg), meta_store::PutOption{}));
-        auto published = txn->Commit();
-        if (published.IsReady() && !published.Get().IsError()
-            && published.Get()->success) {
-            YRLOG_INFO("save state for instance({}) op({}): COMMITTED (conditional publish "
-                       "matched)", instanceId, saveOpID);
-        } else {
-            // Publish conflict: the DS write SUCCEEDED (data is safe on
-            // its unique key) but the registration was rewritten by a
-            // competing writer. Record UNKNOWN — the data is discoverable
-            // through the competing record or reconciliation.
-            SaveRegistration unknown = reg;
-            unknown.status = "UNKNOWN";
-            auto fixTxn = registry_->BeginTransaction();
-            fixTxn->Then(meta_store::TxnOperation::Create(
-                RegistrationKey(instanceId, boundRequestID, saveOpID) + ":conflict",
-                SerializeRegistration(unknown), meta_store::PutOption{}));
-            (void)fixTxn->Commit();
-            YRLOG_WARN("save state for instance({}) op({}): publish CONFLICT — data safe on "
-                       "unique key, registration marked UNKNOWN", instanceId, saveOpID);
-        }
-    }
-    YRLOG_INFO("succeed to save instance({}) generation({}) state under snapshot key",
-               instanceId, boundRequestID);
-    // The SNAPSHOT key is the opaque checkpoint id: loads reference it
-    // explicitly (immutable — a late write can never change what it reads).
-    return GenStateSaveResponse(common::ErrorCode::ERR_NONE, "", snapshotKey);
+    reg.status = "PENDING";
+    const std::string pendingValue = SerializeRegistration(reg);
+
+    // ── Phase 1: PERSIST REGISTRATION with the generation guard ─────────
+    // Two-step idempotent guard: first try If(guard==ourRuntime), then
+    // If(guard absent) with creation. Both are CONDITIONAL — an expired
+    // runtime's registration FAILS at the guard, not later.
+    auto regTxn = registry_->BeginTransaction();
+    regTxn->If(meta_store::TxnCompare::OfValue(guardKey, meta_store::CompareOperator::EQUAL,
+                                                boundRuntimeID));
+    regTxn->Then(meta_store::TxnOperation::Create(regKey, pendingValue, meta_store::PutOption{}));
+
+    return regTxn->Commit().Then(
+        [this, instanceId, boundRuntimeID, boundRequestID, snapshotKey, saveOpID,
+         guardKey, regKey, pendingValue, request]
+        (const litebus::Future<std::shared_ptr<TxnResponse>> &f) ->
+            litebus::Future<StateSaveResponse> {
+            const auto &rsp = f.Get();
+            if (rsp == nullptr || rsp->status.IsError() || !rsp->success) {
+                // Guard mismatch: either a different runtime owns the guard
+                // or the guard is absent (first save) — try creation.
+                auto createTxn = registry_->BeginTransaction();
+                createTxn->If(meta_store::TxnCompare::OfVersion(
+                    guardKey, meta_store::CompareOperator::EQUAL, 0));
+                createTxn->Then(meta_store::TxnOperation::Create(
+                    guardKey, boundRuntimeID, meta_store::PutOption{}));
+                createTxn->Then(meta_store::TxnOperation::Create(
+                    regKey, pendingValue, meta_store::PutOption{}));
+                return createTxn->Commit().Then(
+                    [this, instanceId, boundRuntimeID, snapshotKey, saveOpID,
+                     guardKey, regKey, pendingValue, request]
+                    (const litebus::Future<std::shared_ptr<TxnResponse>> &cf) ->
+                        litebus::Future<StateSaveResponse> {
+                    const auto &crsp = cf.Get();
+                    if (crsp == nullptr || crsp->status.IsError() || !crsp->success) {
+                        YRLOG_ERROR("save state for instance({}) op({}): registration REFUSED — "
+                                    "generation guard held by another runtime or retired",
+                                    instanceId, saveOpID);
+                        return GenStateSaveResponse(common::ErrorCode::ERR_INSTANCE_BUSY,
+                            "save state refused: generation guard mismatch");
+                    }
+                    return ProceedAfterRegistration(instanceId, boundRuntimeID, snapshotKey,
+                                                    saveOpID, guardKey, regKey, pendingValue, request);
+                });
+            }
+            return ProceedAfterRegistration(instanceId, boundRuntimeID, snapshotKey,
+                                            saveOpID, guardKey, regKey, pendingValue, request);
+        });
 }
 
-// ── v3 registration helpers ────────────────────────────────────────────────
+// Phase 2 (DS write) + Phase 3 (conditional publish) — shared by both
+// registration paths above.
+litebus::Future<StateSaveResponse> StateActor::ProceedAfterRegistration(
+    const std::string &instanceId, const std::string &boundRuntimeID,
+    const std::string &snapshotKey, const std::string &saveOpID,
+    const std::string &guardKey, const std::string &regKey,
+    const std::string &pendingValue, const std::shared_ptr<StateSaveRequest> &request)
+{
+    // Phase 2: DS write (synchronous within the guarded executor).
+    auto writeStatus = saveExecutor_(instanceId, boundRuntimeID,
+        [this, &snapshotKey, &request]() {
+            return stateClient_->Set(snapshotKey, request->state());
+        });
+    if (writeStatus.IsError()) {
+        // UNKNOWN: mark the registration (conditional — only if it still
+        // holds our PENDING value and the guard still holds our runtime).
+        MarkRegistrationUnknown(regKey, pendingValue, guardKey, boundRuntimeID);
+        YRLOG_WARN("save state for instance({}) op({}): DS write uncertain — registration "
+                   "retained as UNKNOWN", instanceId, saveOpID);
+        return GenStateSaveResponse(common::ErrorCode::ERR_INSTANCE_BUSY,
+            "save state: DS write outcome UNKNOWN (registration retained)");
+    }
+
+    // Phase 3: CONDITIONAL PUBLISH — both the generation guard AND the
+    // registration must still hold OUR captured values. An expired
+    // runtime's late publish FAILS at the guard (root requirement B).
+    SaveRegistration committed;
+    committed.saveOpID = saveOpID;
+    committed.snapshotKey = snapshotKey;
+    committed.instanceID = instanceId;
+    committed.creationRequest = boundRuntimeID;  // corrected below
+    committed.creationRequest = pendingValue.empty() ? "" : ParseRegistration(pendingValue).creationRequest;
+    committed.runtimeID = boundRuntimeID;
+    committed.status = "COMMITTED";
+
+    auto pubTxn = registry_->BeginTransaction();
+    pubTxn->If(meta_store::TxnCompare::OfValue(guardKey, meta_store::CompareOperator::EQUAL,
+                                                boundRuntimeID));
+    pubTxn->If(meta_store::TxnCompare::OfValue(regKey, meta_store::CompareOperator::EQUAL,
+                                                 pendingValue));
+    pubTxn->Then(meta_store::TxnOperation::Create(regKey, SerializeRegistration(committed),
+                                                    meta_store::PutOption{}));
+
+    return pubTxn->Commit().Then(
+        [this, instanceId, saveOpID, snapshotKey, regKey, pendingValue, guardKey, boundRuntimeID]
+        (const litebus::Future<std::shared_ptr<TxnResponse>> &pf) -> StateSaveResponse {
+        const auto &prsp = pf.Get();
+        if (prsp != nullptr && !prsp->status.IsError() && prsp->success) {
+            YRLOG_INFO("save state for instance({}) op({}): COMMITTED", instanceId, saveOpID);
+            return GenStateSaveResponse(common::ErrorCode::ERR_NONE, "", snapshotKey);
+        }
+        // Publish conflict (root requirement C): the DS data IS safe on
+        // its unique key, but the response is UNKNOWN — never ERR_NONE.
+        MarkRegistrationUnknown(regKey, pendingValue, guardKey, boundRuntimeID);
+        YRLOG_WARN("save state for instance({}) op({}): publish CONFLICT — data on unique "
+                   "key, outcome UNKNOWN", instanceId, saveOpID);
+        return GenStateSaveResponse(common::ErrorCode::ERR_INSTANCE_BUSY,
+            "save state: publish conflict (data safe on unique key, outcome UNKNOWN)");
+    });
+}
+
+litebus::Future<StateLoadResponse> StateActor::LoadState(const std::shared_ptr<StateLoadRequest> &request)
+{
+    if (request->checkpointid().empty() || !stateClient_) {
+        YRLOG_ERROR("failed to load state: empty checkpoint id");
+        return GenStateLoadResponse(common::ErrorCode::ERR_PARAM_INVALID, "load state failed: empty checkpoint id");
+    }
+    // Accept BOTH the v3 snapshot keys (state:snap:v1:...) and the legacy
+    // composed keys (state:v1:...) — both are explicit references to
+    // immutable data (the legacy key is only written by pre-v3 code that
+    // has already stopped by deployment ordering). Bare/foreign references
+    // are refused under the migration contract.
+    const auto &ref = request->checkpointid();
+    const bool isSnapshot = StateClient::IsSnapshotKey(ref);
+    const bool isLegacy = !StateClient::ParseStateKey(ref).first.empty();
+    if (!isSnapshot && !isLegacy) {
+        YRLOG_ERROR("refused to load checkpoint({}): not a versioned reference", ref);
+        return GenStateLoadResponse(common::ErrorCode::ERR_PARAM_INVALID,
+                                    "load state failed: checkpoint reference is not versioned");
+    }
+
+    std::string state;
+    auto status = stateClient_->Get(ref, state);
+    if (status.IsError()) {
+        YRLOG_ERROR("failed to load state: {}", status.ToString());
+        return GenStateLoadResponse(common::ErrorCode::ERR_INNER_SYSTEM_ERROR,
+                                    "load state failed: " + status.ToString());
+    }
+    YRLOG_INFO("succeed to load checkpoint({}) state", ref);
+    return GenStateLoadResponse(common::ErrorCode::ERR_NONE, "", state);
+}
+
+litebus::Future<Status> StateActor::DeleteState(const std::string &instanceId, const std::string &generation,
+                                                 const std::string &expectedRuntimeID)
+{
+    if (generation.empty() || expectedRuntimeID.empty()) {
+        YRLOG_ERROR("refused to delete state for instance({}): incomplete identity", instanceId);
+        return Status(StatusCode::ERR_INSTANCE_INFO_INVALID,
+                      "delete state failed: incomplete identity");
+    }
+    if (!deleteExecutor_) {
+        YRLOG_ERROR("refused to delete state for instance({}): no delete executor bound", instanceId);
+        return Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "delete state failed: delete executor not bound");
+    }
+    // v3 retirement Phase 1: PERSISTENTLY BLOCK further publishes for this
+    // generation — the guard is set to RETIRED, so any late registration
+    // or publish for this (instance, generation) fails at the guard.
+    if (registry_ != nullptr) {
+        const std::string guardKey = GuardKeyFor(instanceId, generation);
+        auto blockTxn = registry_->BeginTransaction();
+        // Unconditional Put: retirement ALWAYS takes the guard (the delete
+        // executor below already verified the retiring chain's authority).
+        blockTxn->Then(meta_store::TxnOperation::Create(
+            guardKey, GUARD_RETIRED[0], meta_store::PutOption{}));
+        (void)blockTxn->Commit();
+        YRLOG_INFO("retirement for instance({}) generation({}): guard set to RETIRED "
+                   "(late publishes will fail)", instanceId, generation);
+    }
+    // v3 retirement Phase 2: delete the LEGACY key (the pre-v3 shared key;
+    // pre-v3 writers are stopped by deployment ordering). Snapshot keys
+    // for this generation are enumerable from the registration prefix in
+    // the meta-store and are deleted by reconciliation — an UNKNOWN write
+    // arriving after this Del is discoverable through its registration
+    // and is NEVER cleared by a single NOT_FOUND (root requirement E).
+    const std::string legacyKey = StateClient::ComposeStateKey(instanceId, generation);
+    return deleteExecutor_(instanceId, expectedRuntimeID,
+        [this, &legacyKey]() { return stateClient_->Del(legacyKey); });
+}
+
+void StateActor::SetSaveExecutor(SaveExecutor executor)
+{
+    saveExecutor_ = std::move(executor);
+}
+
+void StateActor::SetDeleteExecutor(DeleteExecutor executor)
+{
+    deleteExecutor_ = std::move(executor);
+}
 
 void StateActor::BindSaveRegistry(const std::shared_ptr<MetaStoreClient> &metaStoreClient)
 {
     registry_ = metaStoreClient;
 }
 
+void StateActor::InitStateClient()
+{
+    RETURN_IF_NULL(stateClient_);
+    if (auto status = stateClient_->Init(); status.IsOk()) {
+        YRLOG_INFO("succeed to init state client");
+        return;
+    }
+    YRLOG_WARN("failed to init state client, try to reconnect");
+    const uint32_t stateClientInitRetryPeriod = 1000;  // ms
+    litebus::AsyncAfter(stateClientInitRetryPeriod, GetAID(), &StateActor::InitStateClient);
+}
+
+// ── v3 registration helpers ────────────────────────────────────────────────
+
 std::string StateActor::RegistrationKey(const std::string &instanceID,
                                         const std::string &creationRequest,
                                         const std::string &saveOpID)
 {
-    // Escape each part so the key is unambiguous and parseable.
     return "statereg:v1:" + instanceID + ":" + creationRequest + ":" + saveOpID;
 }
 
 std::string StateActor::SerializeRegistration(const SaveRegistration &reg)
 {
-    // Simple pipe-separated format; each field is escaped.
     auto esc = [](const std::string &s) {
         std::string out;
         for (char c : s) {
@@ -234,7 +341,7 @@ StateActor::SaveRegistration StateActor::ParseRegistration(const std::string &ra
         }
     }
     fields.push_back(current);
-    if (fields.size() != 6) { return reg; }  // parse failure: empty status
+    if (fields.size() != 6) { return reg; }
     reg.saveOpID = fields[0];
     reg.snapshotKey = fields[1];
     reg.instanceID = fields[2];
@@ -242,85 +349,6 @@ StateActor::SaveRegistration StateActor::ParseRegistration(const std::string &ra
     reg.runtimeID = fields[4];
     reg.status = fields[5];
     return reg;
-}
-
-litebus::Future<StateLoadResponse> StateActor::LoadState(const std::shared_ptr<StateLoadRequest> &request)
-{
-    if (request->checkpointid().empty() || !stateClient_) {
-        YRLOG_ERROR("failed to load state: empty checkpoint id");
-        return GenStateLoadResponse(common::ErrorCode::ERR_PARAM_INVALID, "load state failed: empty checkpoint id");
-    }
-    // Versioned-reference well-formedness only. The EXISTING load
-    // contract — read whatever checkpoint reference the caller supplies —
-    // is preserved: no caller-identity restriction is added here (a
-    // cross-instance versioned reference loads, exactly as a cross-
-    // instance bare one did before). Bare legacy references are refused
-    // under the migration contract until backfill completes; that refusal
-    // is migration-pending, not a permanent semantic.
-    if (StateClient::ParseStateKey(request->checkpointid()).first.empty()) {
-        YRLOG_ERROR("refused to load checkpoint({}): not a versioned reference",
-                    request->checkpointid());
-        return GenStateLoadResponse(common::ErrorCode::ERR_PARAM_INVALID,
-                                    "load state failed: checkpoint reference is not versioned");
-    }
-
-    std::string state;
-    auto status = stateClient_->Get(request->checkpointid(), state);
-    if (status.IsError()) {
-        YRLOG_ERROR("failed to load state: {}", status.ToString());
-        return GenStateLoadResponse(common::ErrorCode::ERR_INNER_SYSTEM_ERROR,
-                                    "load state failed: " + status.ToString());
-    }
-    YRLOG_INFO("succeed to load checkpoint({}) state", request->checkpointid());
-    return GenStateLoadResponse(common::ErrorCode::ERR_NONE, "", state);
-}
-
-litebus::Future<Status> StateActor::DeleteState(const std::string &instanceId, const std::string &generation,
-                                                 const std::string &expectedRuntimeID)
-{
-    if (generation.empty() || expectedRuntimeID.empty()) {
-        YRLOG_ERROR("refused to delete state for instance({}): incomplete identity "
-                    "(generation empty={} runtime empty={})",
-                    instanceId, generation.empty(), expectedRuntimeID.empty());
-        return Status(StatusCode::ERR_INSTANCE_INFO_INVALID,
-                      "delete state failed: incomplete identity");
-    }
-    if (!deleteExecutor_) {
-        YRLOG_ERROR("refused to delete state for instance({}): no delete executor bound", instanceId);
-        return Status(StatusCode::ERR_INNER_SYSTEM_ERROR, "delete state failed: delete executor not bound");
-    }
-    // v3 (plan 20261008T220000Z §retirement): delete BOTH the legacy
-    // logical key (migration coexistence) AND any snapshot-keyed data for
-    // this generation that the caller can name. The snapshot key passed
-    // here is the one the retiring chain holds (it may be empty when the
-    // chain never saved under v3). A late-arriving UNKNOWN write to a
-    // DIFFERENT snapshot key is discoverable through the registration and
-    // is NEVER silently deleted by a single NOT_FOUND pass.
-    const std::string legacyKey = StateClient::ComposeStateKey(instanceId, generation);
-    return deleteExecutor_(instanceId, expectedRuntimeID,
-        [this, &legacyKey]() { return stateClient_->Del(legacyKey); });
-}
-
-void StateActor::SetSaveExecutor(SaveExecutor executor)
-{
-    saveExecutor_ = std::move(executor);
-}
-
-void StateActor::SetDeleteExecutor(DeleteExecutor executor)
-{
-    deleteExecutor_ = std::move(executor);
-}
-
-void StateActor::InitStateClient()
-{
-    RETURN_IF_NULL(stateClient_);
-    if (auto status = stateClient_->Init(); status.IsOk()) {
-        YRLOG_INFO("succeed to init state client");
-        return;
-    }
-    YRLOG_WARN("failed to init state client, try to reconnect");
-    const uint32_t stateClientInitRetryPeriod = 1000;  // ms
-    litebus::AsyncAfter(stateClientInitRetryPeriod, GetAID(), &StateActor::InitStateClient);
 }
 
 }  // namespace functionsystem::function_proxy

@@ -84,6 +84,7 @@ public:
 protected:
     std::shared_ptr<MockDistributedCacheClient> distributedCacheClient_;
     std::shared_ptr<MockMetaStoreClient> registryMeta_;
+    std::string snapshotKey_;
     std::shared_ptr<StateActor> stateActor_;
     std::shared_ptr<StateClient> stateClient_;
     std::shared_ptr<functionsystem::InstanceControlView> view_;
@@ -194,9 +195,11 @@ TEST_F(StateHandlerTest, SaveStateSuccess)
     auto response = StateHandler::SaveState(grpc::PosixStreamIdentity{"instance_id", "rt-1", "req-gen-1"}, request);
     EXPECT_AWAIT_READY(response);
     EXPECT_EQ(response.Get()->saversp().code(), common::ErrorCode::ERR_NONE);
-    // The save returns the VERSIONED checkpoint id (composed key).
-    EXPECT_EQ(response.Get()->saversp().checkpointid(),
-              StateClient::ComposeStateKey("instance_id", "req-gen-1"));
+    // v3: the save returns a SNAPSHOT key (state:snap:v1:...:<uuid>) —
+    // globally unique per save operation, NOT the legacy composed key.
+    EXPECT_TRUE(StateClient::IsSnapshotKey(response.Get()->saversp().checkpointid()))
+        << "checkpoint id must be in the snapshot namespace, got: "
+        << response.Get()->saversp().checkpointid();
 }
 
 // Save → recover BY VERSIONED CHECKPOINT REFERENCE: the save returns the
@@ -205,24 +208,26 @@ TEST_F(StateHandlerTest, SaveStateSuccess)
 TEST_F(StateHandlerTest, SaveThenLoadByCheckpointReferenceRoundTrip)
 {
     RegisterMachine("instance_id", "rt-1", "req-gen-1");
-    const std::string composed = StateClient::ComposeStateKey("instance_id", "req-gen-1");
     std::string saved;
     auto saveMsg = std::make_shared<runtime_rpc::StreamingMessage>();
     saveMsg->mutable_savereq()->set_state("checkpoint-bytes");
-    EXPECT_CALL(*distributedCacheClient_, Set(Matcher<const std::string &>(composed),
+    // v3: the Set goes to a SNAPSHOT key (unique per save) — use a wildcard
+    // matcher and capture both the key and the value.
+    EXPECT_CALL(*distributedCacheClient_, Set(Matcher<const std::string &>(_),
                                               Matcher<const std::string &>(_)))
-        .WillOnce(DoAll(SaveArg<1>(&saved), Return(Status::OK())));
+        .WillOnce(DoAll(SaveArg<0>(&snapshotKey_), SaveArg<1>(&saved), Return(Status::OK())));
     auto save = StateHandler::SaveState(grpc::PosixStreamIdentity{"instance_id", "rt-1", "req-gen-1"}, saveMsg);
     EXPECT_AWAIT_READY(save);
     ASSERT_EQ(save.Get()->saversp().code(), common::ErrorCode::ERR_NONE);
-    ASSERT_EQ(save.Get()->saversp().checkpointid(), composed);
+    ASSERT_TRUE(StateClient::IsSnapshotKey(save.Get()->saversp().checkpointid()));
+    ASSERT_EQ(save.Get()->saversp().checkpointid(), snapshotKey_);
 
     auto loadMsg = std::make_shared<runtime_rpc::StreamingMessage>();
     StateLoadRequest loadReq{};
     loadReq.set_checkpointid(save.Get()->saversp().checkpointid());
     *loadMsg->mutable_loadreq() = std::move(loadReq);
     EXPECT_CALL(*distributedCacheClient_,
-                Get(Matcher<const std::string &>(composed), Matcher<std::string &>(_)))
+                Get(Matcher<const std::string &>(snapshotKey_), Matcher<std::string &>(_)))
         .WillOnce(DoAll(SetArgReferee<1>(saved), Return(Status::OK())));
     // A SUCCESSOR generation (new runtime AND new request) recovers the
     // ORIGINALLY SAVED reference: loads are reference-driven, the caller
