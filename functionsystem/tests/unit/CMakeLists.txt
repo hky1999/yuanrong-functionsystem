@@ -212,6 +212,7 @@ add_executable(instance_ctrl_intent_gate_test
         function_proxy/common/state_handler/state_handler_test.cpp
         function_proxy/common/state_handler/state_isolation_support.cpp
         function_proxy/common/state_handler/state_isolation_behavior_test.cpp
+        function_proxy/busproxy/invocation_handler/invocation_handler_test.cpp
         function_proxy/common/distribute_cache_client/ds_gate3_probe_test.cpp
         function_proxy/common/distribute_cache_client/ds_gate3_hold_order_test.cpp
         function_proxy/common/posix_service/posix_stream_binding_test.cpp

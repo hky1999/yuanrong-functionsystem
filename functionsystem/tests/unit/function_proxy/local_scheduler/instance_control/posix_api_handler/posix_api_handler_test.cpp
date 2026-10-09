@@ -136,7 +136,7 @@ public:
     void CallResultCheckTest()
     {
         auto callResult = std::make_shared<functionsystem::CallResult>();
-        auto res = PosixAPIHandler::CallResult("", callResult);
+        auto res = PosixAPIHandler::CallResult({"", "", ""}, callResult);
         EXPECT_EQ(res.Get().first, false);
         PosixAPIHandler::BindInstanceCtrl(mockInstanceCtrl_);
         callResult->set_requestid("rq1");
@@ -144,7 +144,7 @@ public:
         CallResultAck ack;
         ack.set_code(static_cast<common::ErrorCode>(StatusCode::LS_REQUEST_NOT_FOUND));
         EXPECT_CALL(*mockInstanceCtrl_, CallResult).WillOnce(testing::Return(ack));
-        auto res1 = PosixAPIHandler::CallResult("", callResult);
+        auto res1 = PosixAPIHandler::CallResult({"", "", ""}, callResult);
         EXPECT_EQ(res1.Get().first, false);
     }
 

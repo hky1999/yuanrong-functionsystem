@@ -148,7 +148,9 @@ litebus::Future<std::shared_ptr<StreamingMessage>> InvocationHandler::CallResult
             auto callResult =
                 std::make_shared<functionsystem::CallResult>(std::move(*request->mutable_callresultreq()));
             callResult->set_requestid(requestIDs[0]);
-            return createCallResultReceiver_(from, callResult)
+            // The receiver gets the ORIGINAL stream-bound identity (full
+            // triple) — never a collapsed instance-id string.
+            return createCallResultReceiver_(identity, callResult)
                 .Then([from, callResult,
                        request](const std::pair<bool, std::shared_ptr<runtime_rpc::StreamingMessage>> &result)
                           -> litebus::Future<std::shared_ptr<StreamingMessage>> {

@@ -42,7 +42,7 @@ public:
 
     using CreateCallResultReciver =
         std::function<litebus::Future<std::pair<bool, std::shared_ptr<runtime_rpc::StreamingMessage>>>(
-            const std::string &, std::shared_ptr<functionsystem::CallResult> &)>;
+            const grpc::PosixStreamIdentity &, std::shared_ptr<functionsystem::CallResult> &)>;
     static void RegisterCreateCallResultReceiver(const CreateCallResultReciver createCallResult)
     {
         createCallResultReceiver_ = createCallResult;

@@ -104,16 +104,23 @@ TEST_F(InvocationHandlerTest, Invoke)
     EXPECT_EQ(responseFuture.Get()->invokersp().code(), common::ErrorCode::ERR_NONE);
 }
 
+// Captured identity of the LAST AdapterTrue invocation — the test asserts
+// the receiver saw the SAME FULL TRIPLE that entered CallResultAdapter
+// (not a collapsed instance-id string, and not self-verified from the
+// typedef).
+grpc::PosixStreamIdentity g_receivedIdentity;
+
 litebus::Future<std::pair<bool, std::shared_ptr<runtime_rpc::StreamingMessage>>> AdapterTrue(
-    const std::string &, std::shared_ptr<functionsystem::CallResult> &)
+    const grpc::PosixStreamIdentity &identity, std::shared_ptr<functionsystem::CallResult> &)
 {
+    g_receivedIdentity = identity;
     std::shared_ptr<runtime_rpc::StreamingMessage> response = std::make_shared<runtime_rpc::StreamingMessage>();
     response->mutable_callresultack()->set_code(common::ErrorCode::ERR_NONE);
     return std::make_pair<bool, std::shared_ptr<runtime_rpc::StreamingMessage>>(true, std::move(response));
 }
 
 litebus::Future<std::pair<bool, std::shared_ptr<runtime_rpc::StreamingMessage>>> AdapterFalse(
-    const std::string &, std::shared_ptr<functionsystem::CallResult> &)
+    const grpc::PosixStreamIdentity &, std::shared_ptr<functionsystem::CallResult> &)
 {
     std::shared_ptr<runtime_rpc::StreamingMessage> response = std::make_shared<runtime_rpc::StreamingMessage>();
     response->mutable_callresultack()->set_code(static_cast<common::ErrorCode>(StatusCode::LS_REQUEST_NOT_FOUND));
@@ -132,14 +139,21 @@ TEST_F(InvocationHandlerTest, CallResultAdapter)
 {
     std::shared_ptr<runtime_rpc::StreamingMessage> response = std::make_shared<runtime_rpc::StreamingMessage>();
     response->mutable_callresultack()->set_code(common::ErrorCode::ERR_NONE);
+    // A stream identity carrying the FULL triple (non-empty runtime and
+    // bound request) enters the adapter — the create receiver must see
+    // exactly this triple, never a collapsed string.
+    const grpc::PosixStreamIdentity entry{ "from", "rt-from", "req-from" };
     // with @initcall return true
     InvocationHandler::RegisterCreateCallResultReceiver(AdapterTrue);
     std::unique_ptr<runtime_rpc::StreamingMessage> request = std::make_unique<runtime_rpc::StreamingMessage>();
     request->mutable_callresultreq()->set_instanceid("LocalInstanceActor");
     request->mutable_callresultreq()->set_requestid("request@initcall");
-    auto responseFuture = InvocationHandler::CallResultAdapter("from", std::move(request));
+    auto responseFuture = InvocationHandler::CallResultAdapter(entry, std::move(request));
     ASSERT_AWAIT_READY(responseFuture);
     EXPECT_EQ(responseFuture.Get()->callresultack().code(), common::ERR_NONE);
+    EXPECT_EQ(g_receivedIdentity.instanceID, entry.instanceID);
+    EXPECT_EQ(g_receivedIdentity.runtimeID, entry.runtimeID);
+    EXPECT_EQ(g_receivedIdentity.boundRequestID, entry.boundRequestID);
 
     // without @initcall
     expectedAid_.SetName("from");
@@ -147,16 +161,17 @@ TEST_F(InvocationHandlerTest, CallResultAdapter)
     request1->mutable_callresultreq()->set_instanceid("LocalInstanceActor");
     request1->mutable_callresultreq()->set_requestid("request");
     EXPECT_CALL(*instanceProxy_, CallResult(expectedAid_, "from", "LocalInstanceActor", _, _)).WillOnce(Return(response));
-    responseFuture = InvocationHandler::CallResultAdapter("from", std::move(request1));
+    responseFuture = InvocationHandler::CallResultAdapter(entry, std::move(request1));
     ASSERT_AWAIT_READY(responseFuture);
     EXPECT_EQ(responseFuture.Get()->callresultack().code(), common::ERR_NONE);
 
-    // with @initcall return false
+    // with @initcall return false — the failure branch still produces an
+    // explicit error response.
     InvocationHandler::RegisterCreateCallResultReceiver(AdapterFalse);
     std::unique_ptr<runtime_rpc::StreamingMessage> request2 = std::make_unique<runtime_rpc::StreamingMessage>();
     request2->mutable_callresultreq()->set_instanceid("LocalInstanceActor");
     request2->mutable_callresultreq()->set_requestid("request@initcall");
-    responseFuture = InvocationHandler::CallResultAdapter("from", std::move(request2));
+    responseFuture = InvocationHandler::CallResultAdapter(entry, std::move(request2));
     ASSERT_AWAIT_READY(responseFuture);
     EXPECT_EQ(responseFuture.Get()->callresultack().code(), common::ERR_INNER_COMMUNICATION);
 }
