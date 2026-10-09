@@ -153,8 +153,11 @@ TEST_F(StateHandlerTest, SaveStateFailed)
     EXPECT_CALL(*distributedCacheClient_, Set).WillOnce(Return(Status(StatusCode::FAILED)));
     response = StateHandler::SaveState(grpc::PosixStreamIdentity{"instance_id", "rt-1", "req-gen-1"}, request);
     EXPECT_AWAIT_READY(response);
-    EXPECT_EQ(response.Get()->saversp().code(), common::ErrorCode::ERR_INNER_SYSTEM_ERROR);
-    EXPECT_THAT(response.Get()->saversp().message(), testing::HasSubstr("save state failed: [code: -1"));
+    // v3: a failed DS write is an UNKNOWN outcome (the registration is
+    // retained for reconciliation) — not INNER_SYSTEM_ERROR.
+    EXPECT_EQ(response.Get()->saversp().code(), common::ErrorCode::ERR_INSTANCE_BUSY);
+    EXPECT_THAT(response.Get()->saversp().message(),
+                testing::HasSubstr("UNKNOWN"));
 }
 
 /**
@@ -262,9 +265,11 @@ TEST_F(StateHandlerTest, SaveStateRefusedWithoutMatchingMachine)
     EXPECT_CALL(*distributedCacheClient_, Set).Times(0);
     auto response = StateHandler::SaveState(grpc::PosixStreamIdentity{"instance_id", "rt-1", "req-gen-1"}, request);
     EXPECT_AWAIT_READY(response);
-    EXPECT_NE(response.Get()->saversp().code(), common::ErrorCode::ERR_NONE);
-    EXPECT_THAT(response.Get()->saversp().message(),
-                testing::HasSubstr("stream runtime superseded or unknown"));
+    EXPECT_NE(response.Get()->saversp().code(), common::ERR_NONE);
+    // v3: the guarded executor's refusal propagates through the DS-write
+    // phase as an UNKNOWN outcome (registration retained).
+    EXPECT_EQ(response.Get()->saversp().code(), common::ERR_INSTANCE_BUSY);
+    EXPECT_THAT(response.Get()->saversp().message(), testing::HasSubstr("UNKNOWN"));
 }
 
 /**

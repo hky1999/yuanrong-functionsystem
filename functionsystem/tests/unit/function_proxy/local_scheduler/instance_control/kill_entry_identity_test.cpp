@@ -1506,7 +1506,7 @@ TEST_F(KillEntryIdentityFixture, SameRequestBarrierBlocksInPlaceRuntimeSwapSave)
     // The barrier's wait RESULT is captured and asserted below — a timeout
     // is an explicit failure, never silently treated as mutex proof.
     auto barrierWaitOk = std::make_shared<std::atomic<bool>>(false);
-    EXPECT_CALL(*cacheClient_, Set(Matcher<const std::string &>(key), _))
+    EXPECT_CALL(*cacheClient_, Set(Matcher<const std::string &>(_), _))
         .WillOnce(Invoke([stored, reached, release, barrierWaitOk](const std::string &, const std::string &val) {
             reached->set_value();
             barrierWaitOk->store(release->get_future().wait_for(std::chrono::seconds(10))

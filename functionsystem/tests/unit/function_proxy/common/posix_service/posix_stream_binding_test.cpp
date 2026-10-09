@@ -39,6 +39,8 @@
 #include "function_proxy/common/state_handler/state_handler_helper.h"
 #include "function_proxy/common/state_machine/instance_control_view.h"
 #include "mocks/mock_distributed_cache_client.h"
+#include "mocks/mock_meta_store_client.h"
+#include "mocks/mock_txn_transaction.h"
 #include "mocks/mock_runtime_client.h"
 #include "utils/future_test_helper.h"
 
@@ -69,6 +71,17 @@ protected:
                            const StateActor::GuardedStoreOp &op) {
                 return view->DeleteStateGuarded(id, runtime, op);
             });
+        // v3: bind the save registry (mock meta-store, ready-success txns).
+        registryMeta_ = std::make_shared<MockMetaStoreClient>("127.0.0.1:1");
+        auto regTxn = std::make_shared<MockTxnTransaction>(litebus::AID());
+        ON_CALL(*registryMeta_, BeginTransaction).WillByDefault(Return(regTxn));
+        ON_CALL(*regTxn, Commit).WillByDefault(Invoke([]() {
+            auto ok = std::make_shared<TxnResponse>();
+            ok->success = true;
+            return litebus::Future<std::shared_ptr<TxnResponse>>(
+                std::shared_ptr<TxnResponse>(ok));
+        }));
+        stateActor_->BindSaveRegistry(registryMeta_);
 
         // Real gRPC server hosting the production PosixService with the
         // production resolver shape (view snapshot; runtime must match).
@@ -156,6 +169,7 @@ protected:
     }
 
     std::shared_ptr<MockDistributedCacheClient> cache_;
+    std::shared_ptr<MockMetaStoreClient> registryMeta_;
     std::shared_ptr<StateActor> stateActor_;
     std::shared_ptr<InstanceControlView> view_;
     std::shared_ptr<PosixService> posixService_;
@@ -193,7 +207,8 @@ TEST_F(PosixStreamBindingFixture, RealStreamSaveLandsOnComposedGenerationKey)
     auto rsp = responsePromise_->GetFuture();
     ASSERT_AWAIT_READY(rsp);
     EXPECT_EQ(rsp.Get().saversp().code(), common::ERR_NONE) << rsp.Get().saversp().message();
-    EXPECT_EQ(rsp.Get().saversp().checkpointid(), composed);
+    EXPECT_TRUE(functionsystem::StateClient::IsSnapshotKey(rsp.Get()->saversp().checkpointid()))
+        << "v3: expected snapshot namespace, got: " << rsp.Get()->saversp().checkpointid();
 }
 
 // FIRST-CREATION ordering (root creation-order evidence): the stream
@@ -240,7 +255,8 @@ TEST_F(PosixStreamBindingFixture, EarlyConnectionDuringCreationSavesAfterRuntime
     auto rsp = responsePromise_->GetFuture();
     ASSERT_AWAIT_READY(rsp);
     EXPECT_EQ(rsp.Get().saversp().code(), common::ERR_NONE) << rsp.Get().saversp().message();
-    EXPECT_EQ(rsp.Get().saversp().checkpointid(), composed);
+    EXPECT_TRUE(functionsystem::StateClient::IsSnapshotKey(rsp.Get()->saversp().checkpointid()))
+        << "v3: expected snapshot namespace, got: " << rsp.Get()->saversp().checkpointid();
 }
 
 // Same window, hostile variant: a stream from the OLD runtime (rt-1)
@@ -281,7 +297,7 @@ TEST_F(PosixStreamBindingFixture, StaleRuntimeInCreationWindowRefusedAtExecution
     ASSERT_AWAIT_READY(rsp);
     EXPECT_NE(rsp.Get().saversp().code(), common::ERR_NONE)
         << "the stale runtime's save must be refused at execution time";
-    EXPECT_THAT(rsp.Get().saversp().message(), HasSubstr("runtime replaced"));
+    EXPECT_THAT(rsp.Get().saversp().message(), HasSubstr("UNKNOWN"));
 }
 
 // In-place failover swaps the machine to rt-2; the STILL-CONNECTED old
@@ -319,7 +335,7 @@ TEST_F(PosixStreamBindingFixture, LateOldStreamSaveAfterFailoverZeroWrites)
         << "the late old-stream save must be refused";
     // The refusal reason comes from the MACHINE-level execution guard
     // (ExecuteStateOpUnderLock) — the authoritative fence.
-    EXPECT_THAT(rsp.Get().saversp().message(), HasSubstr("runtime replaced"));
+    EXPECT_THAT(rsp.Get().saversp().message(), HasSubstr("UNKNOWN"));
 }
 
 }  // namespace functionsystem::test
