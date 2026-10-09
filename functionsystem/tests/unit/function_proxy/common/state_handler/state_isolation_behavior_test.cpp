@@ -359,10 +359,10 @@ TEST(StateIsolationMachineGuard, SameRuntimeNewRequestRefusedAtExecutionPoint)
     // the ctor-time copy; the request id reads the schedule request LIVE
     // (so the mid-test generation change is visible, as on a real machine
     // whose schedule request is updated).
-    ON_CALL(machine, GetInstanceInfo()).WillByDefault(Invoke([context]() {
+    ON_CALL(machine, GetInstanceInfo()).WillByDefault(testing::Invoke([context]() {
         return context->GetInstanceInfo();
     }));
-    ON_CALL(machine, GetRequestID()).WillByDefault(Invoke([context]() {
+    ON_CALL(machine, GetRequestID()).WillByDefault(testing::Invoke([context]() {
         return context->GetRequestID();
     }));
     int ran = 0;
@@ -390,10 +390,10 @@ TEST(StateIsolationMachineGuard, SameRuntimeNewRequestRefusedAtExecutionPoint)
     *schedReq2->mutable_instance() = info2;
     auto context2 = std::make_shared<InstanceContext>(schedReq2);
     MockInstanceStateMachine machine2("node-g2", context2);
-    ON_CALL(machine2, GetInstanceInfo()).WillByDefault(Invoke([context2]() {
+    ON_CALL(machine2, GetInstanceInfo()).WillByDefault(testing::Invoke([context2]() {
         return context2->GetInstanceInfo();
     }));
-    ON_CALL(machine2, GetRequestID()).WillByDefault(Invoke([context2]() {
+    ON_CALL(machine2, GetRequestID()).WillByDefault(testing::Invoke([context2]() {
         return context2->GetRequestID();
     }));
     EXPECT_TRUE(machine2.ExecuteStateOpUnderLock("rt-g2", "req-bound", op).IsError());
