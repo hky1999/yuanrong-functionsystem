@@ -373,10 +373,16 @@ protected:
     // this call (the later, more specific ON_CALL wins).
     void DefaultIdentityFromView(const std::shared_ptr<MockInstanceControlView> &view)
     {
-        ON_CALL(*view, GetInstanceIdentitySnapshot(_))
-            .WillByDefault(Invoke([view](const std::string &id) {
+        // RAW pointer, deliberately: the default action is stored INSIDE
+        // the mock, so capturing the shared_ptr would create a self-cycle
+        // (mock → expectation → action → mock) that leaks at exit and
+        // fails gmock's leak check with rc=1. The action's lifetime is
+        // bounded by the mock itself, so the raw pointer is always valid.
+        MockInstanceControlView *raw = view.get();
+        ON_CALL(*raw, GetInstanceIdentitySnapshot(_))
+            .WillByDefault(Invoke([raw](const std::string &id) {
                 InstanceControlView::InstanceIdentitySnapshot snap;
-                const auto machine = view->GetInstance(id);
+                const auto machine = raw->GetInstance(id);
                 if (machine == nullptr) { return snap; }
                 const auto info = machine->GetInstanceInfo();  // one locked copy
                 snap.exists = true;
