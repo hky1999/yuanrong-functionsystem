@@ -27,7 +27,57 @@ StateClient::StateClient(const std::shared_ptr<DistributedCacheClient> &distribu
 }
 
 namespace {
-std::string EscapeKeyPart(const std::string &in)
+constexpr const char *STATE_KEY_SCHEME = "state:v1:";
+constexpr const char *SNAPSHOT_KEY_SCHEME = "state:snap:v1:";
+
+int HexDigitValue(char c)
+{
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    return -1;
+}
+
+// A segment STRICTLY as EscapeKeyPart produces it: non-empty, no raw '@'
+// or ':', and every '%' escape well-formed decoding to '%', '@' or ':'.
+// Anything else was not composed by this scheme — reject, do not repair.
+bool IsStrictEscapedSegment(const std::string &raw)
+{
+    if (raw.empty()) { return false; }
+    for (size_t i = 0; i < raw.size(); ++i) {
+        const char c = raw[i];
+        if (c == '@' || c == ':') { return false; }
+        if (c == '%') {
+            if (i + 2 >= raw.size()) { return false; }
+            const int hi = HexDigitValue(raw[i + 1]);
+            const int lo = HexDigitValue(raw[i + 2]);
+            if (hi < 0 || lo < 0) { return false; }
+            const char decoded = static_cast<char>((hi << 4) | lo);
+            if (decoded != '%' && decoded != '@' && decoded != ':') { return false; }
+            i += 2;
+        }
+    }
+    return true;
+}
+
+// Canonical textual UUID exactly as litebus::uuid_generator::UUID::
+// ToString emits (16 bytes hex, hyphens after bytes 3/5/7/9):
+// 36 chars, hyphens at 8/13/18/23, hex digits elsewhere.
+bool IsCanonicalUuid(const std::string &s)
+{
+    if (s.size() != 36) { return false; }
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (s[i] != '-') { return false; }
+            continue;
+        }
+        if (HexDigitValue(s[i]) < 0) { return false; }
+    }
+    return true;
+}
+}  // namespace
+
+std::string StateClient::EscapeKeyPart(const std::string &in)
 {
     std::string out;
     out.reserve(in.size());
@@ -44,20 +94,14 @@ std::string EscapeKeyPart(const std::string &in)
     return out;
 }
 
-std::string UnescapeKeyPart(const std::string &in)
+std::string StateClient::UnescapeKeyPart(const std::string &in)
 {
     std::string out;
     out.reserve(in.size());
     for (size_t i = 0; i < in.size(); ++i) {
         if (in[i] == '%' && i + 2 < in.size()) {
-            const auto hexVal = [](char c) -> int {
-                if (c >= '0' && c <= '9') { return c - '0'; }
-                if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
-                if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
-                return -1;
-            };
-            const int hi = hexVal(in[i + 1]);
-            const int lo = hexVal(in[i + 2]);
+            const int hi = HexDigitValue(in[i + 1]);
+            const int lo = HexDigitValue(in[i + 2]);
             if (hi >= 0 && lo >= 0) {
                 out.push_back(static_cast<char>((hi << 4) | lo));
                 i += 2;
@@ -68,10 +112,6 @@ std::string UnescapeKeyPart(const std::string &in)
     }
     return out;
 }
-
-constexpr const char *STATE_KEY_SCHEME = "state:v1:";
-constexpr const char *SNAPSHOT_KEY_SCHEME = "state:snap:v1:";
-}  // namespace
 
 std::string StateClient::ComposeStateKey(const std::string &instanceId, const std::string &generation)
 {
@@ -109,9 +149,38 @@ std::string StateClient::ComposeSnapshotKey(const std::string &instanceId,
         + EscapeKeyPart(creationRequest) + ":" + uuid;
 }
 
+StateClient::SnapshotKeyParts StateClient::ParseSnapshotKey(const std::string &key)
+{
+    SnapshotKeyParts out;
+    if (key.rfind(SNAPSHOT_KEY_SCHEME, 0) != 0) {
+        return out;
+    }
+    const size_t schemeLen = std::char_traits<char>::length(SNAPSHOT_KEY_SCHEME);
+    const std::string body = key.substr(schemeLen);
+    // Escaped segments can never contain a literal ':' — a valid key has
+    // EXACTLY two separators (three segments), no more, no fewer.
+    const size_t sep1 = body.find(':');
+    if (sep1 == std::string::npos) { return out; }
+    const size_t sep2 = body.find(':', sep1 + 1);
+    if (sep2 == std::string::npos) { return out; }
+    if (body.find(':', sep2 + 1) != std::string::npos) { return out; }
+
+    const std::string rawInstance = body.substr(0, sep1);
+    const std::string rawRequest = body.substr(sep1 + 1, sep2 - sep1 - 1);
+    const std::string rawOp = body.substr(sep2 + 1);
+    if (!IsStrictEscapedSegment(rawInstance) || !IsStrictEscapedSegment(rawRequest)) {
+        return out;
+    }
+    if (!IsCanonicalUuid(rawOp)) { return out; }
+    out.instanceId = UnescapeKeyPart(rawInstance);
+    out.creationRequest = UnescapeKeyPart(rawRequest);
+    out.saveOpID = rawOp;
+    return out;
+}
+
 bool StateClient::IsSnapshotKey(const std::string &key)
 {
-    return key.rfind(SNAPSHOT_KEY_SCHEME, 0) == 0;
+    return !ParseSnapshotKey(key).saveOpID.empty();
 }
 
 Status StateClient::Init()

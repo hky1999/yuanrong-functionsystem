@@ -409,6 +409,7 @@ litebus::Future<Status> InstanceStateMachine::DelInstance(const std::string &ins
 }
 
 Status InstanceStateMachine::ExecuteStateOpUnderLock(const std::string &expectedRuntimeID,
+                                                     const std::string &expectedRequestID,
                                                      const std::function<Status()> &op)
 {
     std::lock_guard<std::recursive_mutex> guard(lock_);
@@ -418,6 +419,21 @@ Status InstanceStateMachine::ExecuteStateOpUnderLock(const std::string &expected
         YRLOG_WARN("guarded state op refused: machine runtime({}) != expected({})",
                    current, expectedRuntimeID);
         return Status(StatusCode::ERR_INSTANCE_BUSY, "guarded state op refused: runtime replaced");
+    }
+    // SAME-runtime new-generation guard: when the caller carries a bound
+    // request, the machine's request must EQUAL it — an UNKNOWN (empty)
+    // current request refuses too, not just a known mismatch. An old
+    // stream's store op never executes merely because the runtime
+    // survived a generation change.
+    if (!expectedRequestID.empty()) {
+        const auto currentRequest = GetRequestID();
+        if (currentRequest != expectedRequestID) {
+            YRLOG_WARN("guarded state op refused: machine request({}) != expected({})",
+                       currentRequest.empty() ? "<unknown>" : currentRequest.c_str(),
+                       expectedRequestID);
+            return Status(StatusCode::ERR_INSTANCE_BUSY,
+                "guarded state op refused: request generation mismatch or unknown");
+        }
     }
     return op();
 }

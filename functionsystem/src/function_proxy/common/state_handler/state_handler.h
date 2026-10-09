@@ -32,8 +32,10 @@ public:
     // view's lock — the same lock generation changes take.
     static void BindSaveExecutor(const StateActor::SaveExecutor &executor);
     static void BindDeleteExecutor(const StateActor::DeleteExecutor &executor);
-    // v3: bind the meta-store registry used for registration-first saves.
-    static void BindSaveRegistry(const std::shared_ptr<MetaStoreClient> &metaStoreClient);
+    // v3: bind the meta-store registry AND a function-key resolver (reads
+    // each instance's function from the control view) onto the live actor.
+    static void BindSaveRegistry(const std::shared_ptr<MetaStoreClient> &metaStoreClient,
+                                 const StateActor::FunctionKeyResolver &functionKeyResolver);
     // The posix handler signature: the STREAM-BOUND identity (creation
     // generation fixed at accept) travels with the message; an unbound
     // stream is refused by the actor, never silently degraded.
@@ -42,6 +44,32 @@ public:
 
     static litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> LoadState(
         const grpc::PosixStreamIdentity &identity, const std::shared_ptr<runtime_rpc::StreamingMessage> &request);
+
+    // Recover-side: ASYNC resolution of the generation's published
+    // checkpoint reference (stateref) through the state actor. The caller
+    // feeds the resolved reference into LoadState — it never composes a
+    // key itself. Refusal (read error / corrupt / identity mismatch) is
+    // surfaced, never degraded; only explicit absence yields the legacy
+    // migration key.
+    static litebus::Future<StateActor::CheckpointRef> ResolveCheckpointRef(
+        const std::string &instanceId, const std::string &creationRequest);
+
+    // Retirement-side: commits the PERSISTENT retirement fence for the
+    // generation (conditionally on the ORIGINAL authoritative record —
+    // identity verified; replays verify the existing tombstone). Must run
+    // BEFORE the control view deletes the authoritative metadata.
+    static litebus::Future<StateActor::RetireReport> RetireGeneration(
+        const std::string &instanceId, const std::string &creationRequest,
+        const std::string &runtimeID);
+    // Retirement-side: idempotent, replayable snapshot cleanup gated on
+    // the tombstone (the only admissible identity proof once the
+    // authoritative record is gone). Enumerates the generation's statereg
+    // prefix in the meta-store, exact-Dels each validated snapshot key,
+    // conditionally deletes the stateref. Reports per-entry outcomes;
+    // tombstone + registrations retained for replay.
+    static litebus::Future<StateActor::RetireReport> CleanupRetiredSnapshots(
+        const std::string &instanceId, const std::string &creationRequest,
+        const std::string &runtimeID);
 
     // Proxy-internal retire-side delete carrying the retiring chain's OWN
     // identity (creation generation + runtime).

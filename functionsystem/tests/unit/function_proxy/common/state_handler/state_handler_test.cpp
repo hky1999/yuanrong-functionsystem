@@ -16,6 +16,8 @@
 
 #include "function_proxy/common/state_handler/state_handler.h"
 #include "function_proxy/common/state_machine/instance_control_view.h"
+#include "common/utils/meta_store_kv_operation.h"
+#include "function_proxy/common/state_handler/state_isolation_support.h"
 
 #include "common/hex/hex.h"
 #include "common/utils/files.h"
@@ -48,28 +50,24 @@ public:
         // that need a live machine generate one on it.
         view_ = std::make_shared<functionsystem::InstanceControlView>("node-test", false);
         stateActor_->SetSaveExecutor(
-            [view = view_](const std::string &id, const std::string &runtime,
+            [view = view_](const std::string &id, const std::string &runtime, const std::string &req,
                            const StateActor::GuardedStoreOp &op) {
-                return view->SaveStateGuarded(id, runtime, op);
+                return view->SaveStateGuarded(id, runtime, req, op);
             });
         stateActor_->SetDeleteExecutor(
-            [view = view_](const std::string &id, const std::string &runtime,
+            [view = view_](const std::string &id, const std::string &runtime, const std::string &req,
                            const StateActor::GuardedStoreOp &op) {
-                return view->DeleteStateGuarded(id, runtime, op);
+                return view->DeleteStateGuarded(id, runtime, req, op);
             });
-        // v3: bind the save registry (a mock meta-store returning ready
-        // success transactions — the DelInstanceTest recipe).
-        registryMeta_ = std::make_shared<MockMetaStoreClient>("127.0.0.1:1");
-        auto mockTxn = std::make_shared<MockTxnTransaction>(litebus::AID());
-        EXPECT_CALL(*registryMeta_, BeginTransaction).WillRepeatedly(Return(mockTxn));
-        EXPECT_CALL(*mockTxn, Commit).WillRepeatedly(
-            Return(litebus::Future<std::shared_ptr<TxnResponse>>(
-                []() {
-                    auto ok = std::make_shared<TxnResponse>();
-                    ok->success = true;
-                    return ok;
-                }())));
-        stateActor_->BindSaveRegistry(registryMeta_);
+        // v3: bind the save registry to the REAL map transaction model
+        // (no wildcard-success transactions): Phase 0's record/fence/ref
+        // reads resolve against the map, and registration/publish/fence
+        // transactions are genuinely evaluated.
+        metaCore_ = std::make_shared<
+            functionsystem::function_proxy::test::MapMetaStoreCore>();
+        registryMeta_ = std::make_shared<
+            functionsystem::function_proxy::test::MapMetaStore>(metaCore_);
+        stateActor_->BindSaveRegistry(registryMeta_, [](const std::string &, const std::string &, const std::string &) { return "default/0-test-helloWorld/$latest"; });
     }
 
     void TearDown() override
@@ -83,13 +81,31 @@ public:
 
 protected:
     std::shared_ptr<MockDistributedCacheClient> distributedCacheClient_;
-    std::shared_ptr<MockMetaStoreClient> registryMeta_;
+    std::shared_ptr<functionsystem::function_proxy::test::MapMetaStoreCore> metaCore_;
+    std::shared_ptr<functionsystem::function_proxy::test::MapMetaStore> registryMeta_;
     std::string snapshotKey_;
     std::shared_ptr<StateActor> stateActor_;
     std::shared_ptr<StateClient> stateClient_;
     std::shared_ptr<functionsystem::InstanceControlView> view_;
 
-    // Registers the machine a guarded save must match.
+    // Seeds the AUTHORITATIVE record for an identity (the production
+    // invariant: a registered view machine has its record persisted).
+    void SeedRegistryRecord(const std::string &id, const std::string &req, const std::string &runtime)
+    {
+        resources::InstanceInfo info;
+        info.set_instanceid(id);
+        info.set_runtimeid(runtime);
+        info.set_requestid(req);
+        info.set_function("default/0-test-helloWorld/$latest");
+        std::string json;
+        ASSERT_TRUE(TransToJsonFromInstanceInfo(json, info));
+        const auto keyOpt = GenInstanceKey("default/0-test-helloWorld/$latest", id, req);
+        ASSERT_TRUE(!keyOpt.IsNone());
+        metaCore_->Seed(keyOpt.Get(), json);
+    }
+
+    // Registers the machine a guarded save must match — and seeds its
+    // authoritative record (the ownership Phase verifies against it).
     void RegisterMachine(const std::string &id, const std::string &runtime, const std::string &req)
     {
         resources::InstanceInfo info;
@@ -97,6 +113,7 @@ protected:
         info.set_runtimeid(runtime);
         info.set_requestid(req);
         view_->GenerateStateMachine(id, info);
+        SeedRegistryRecord(id, req, runtime);
     }
 };
 
@@ -262,6 +279,10 @@ TEST_F(StateHandlerTest, LoadBareLegacyReferenceRefusedPendingMigration)
 TEST_F(StateHandlerTest, SaveStateRefusedWithoutMatchingMachine)
 {
     auto request = std::make_shared<runtime_rpc::StreamingMessage>();
+    // The AUTHORITATIVE record exists (ownership Phase passes); the VIEW
+    // machine does not — the guarded executor must refuse at the DS-write
+    // phase with an UNKNOWN outcome.
+    SeedRegistryRecord("instance_id", "req-gen-1", "rt-1");
     EXPECT_CALL(*distributedCacheClient_, Set).Times(0);
     auto response = StateHandler::SaveState(grpc::PosixStreamIdentity{"instance_id", "rt-1", "req-gen-1"}, request);
     EXPECT_AWAIT_READY(response);

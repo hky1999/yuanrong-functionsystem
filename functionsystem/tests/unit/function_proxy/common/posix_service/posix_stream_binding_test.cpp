@@ -34,9 +34,11 @@
 
 #include "common/posix_service/posix_service.h"
 #include "common/rpc/stream/posix/control_client.h"
+#include "common/utils/meta_store_kv_operation.h"
 #include "function_proxy/common/iam/internal_iam.h"
 #include "function_proxy/common/state_handler/state_handler.h"
 #include "function_proxy/common/state_handler/state_handler_helper.h"
+#include "function_proxy/common/state_handler/state_isolation_support.h"
 #include "function_proxy/common/state_machine/instance_control_view.h"
 #include "mocks/mock_distributed_cache_client.h"
 #include "mocks/mock_meta_store_client.h"
@@ -62,26 +64,23 @@ protected:
         StateHandler::BindStateActor(stateActor_);
         view_ = std::make_shared<InstanceControlView>("node-test", false);
         stateActor_->SetSaveExecutor(
-            [view = view_](const std::string &id, const std::string &runtime,
+            [view = view_](const std::string &id, const std::string &runtime, const std::string &req,
                            const StateActor::GuardedStoreOp &op) {
-                return view->SaveStateGuarded(id, runtime, op);
+                return view->SaveStateGuarded(id, runtime, req, op);
             });
         stateActor_->SetDeleteExecutor(
-            [view = view_](const std::string &id, const std::string &runtime,
+            [view = view_](const std::string &id, const std::string &runtime, const std::string &req,
                            const StateActor::GuardedStoreOp &op) {
-                return view->DeleteStateGuarded(id, runtime, op);
+                return view->DeleteStateGuarded(id, runtime, req, op);
             });
-        // v3: bind the save registry (mock meta-store, ready-success txns).
-        registryMeta_ = std::make_shared<MockMetaStoreClient>("127.0.0.1:1");
-        auto regTxn = std::make_shared<MockTxnTransaction>(litebus::AID());
-        ON_CALL(*registryMeta_, BeginTransaction).WillByDefault(Return(regTxn));
-        ON_CALL(*regTxn, Commit).WillByDefault(Invoke([]() {
-            auto ok = std::make_shared<TxnResponse>();
-            ok->success = true;
-            return litebus::Future<std::shared_ptr<TxnResponse>>(
-                std::shared_ptr<TxnResponse>(ok));
-        }));
-        stateActor_->BindSaveRegistry(registryMeta_);
+        // v3: bind the save registry to the REAL map transaction model
+        // (no wildcard-success transactions) and seed the authoritative
+        // record for the machine created below.
+        metaCore_ = std::make_shared<
+            functionsystem::function_proxy::test::MapMetaStoreCore>();
+        registryMeta_ = std::make_shared<
+            functionsystem::function_proxy::test::MapMetaStore>(metaCore_);
+        stateActor_->BindSaveRegistry(registryMeta_, [](const std::string &, const std::string &, const std::string &) { return "default/0-test-helloWorld/$latest"; });
 
         // Real gRPC server hosting the production PosixService with the
         // production resolver shape (view snapshot; runtime must match).
@@ -115,12 +114,22 @@ protected:
         // enforces this. Mirror it for the machine under test.
         internalIAM_->Insert("inst-stream");
 
-        // The machine the stream must bind to.
+        // The machine the stream must bind to — and its authoritative
+        // record (Phase 0 verifies against it).
         resources::InstanceInfo info;
         info.set_instanceid("inst-stream");
         info.set_runtimeid("rt-1");
         info.set_requestid("req-gen-1");
+        info.set_function("default/0-test-helloWorld/$latest");
         view_->GenerateStateMachine("inst-stream", info);
+        std::string recordJson;
+        if (TransToJsonFromInstanceInfo(recordJson, info)) {
+            const auto keyOpt = GenInstanceKey("default/0-test-helloWorld/$latest",
+                                               "inst-stream", "req-gen-1");
+            if (!keyOpt.IsNone()) {
+                metaCore_->Seed(keyOpt.Get(), recordJson);
+            }
+        }
     }
 
     void TearDown() override
@@ -169,7 +178,8 @@ protected:
     }
 
     std::shared_ptr<MockDistributedCacheClient> cache_;
-    std::shared_ptr<MockMetaStoreClient> registryMeta_;
+    std::shared_ptr<functionsystem::function_proxy::test::MapMetaStoreCore> metaCore_;
+    std::shared_ptr<functionsystem::function_proxy::test::MapMetaStore> registryMeta_;
     std::shared_ptr<StateActor> stateActor_;
     std::shared_ptr<InstanceControlView> view_;
     std::shared_ptr<PosixService> posixService_;

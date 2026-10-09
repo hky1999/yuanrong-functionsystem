@@ -670,6 +670,56 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
             }
         }
     }
+    // PERSISTENT RETIREMENT FENCE — the FIRST persistent side effect,
+    // BEFORE the route unregister, group cleanup, and DelInstance (which
+    // deletes the AUTHORITATIVE metadata): the fence commits conditionally
+    // on the ORIGINAL authoritative record (captured raw value +
+    // mod_revision, bound instance/request/runtime verified first), or —
+    // on a retry/restart — verifies the EXISTING tombstone as the only
+    // admissible identity proof. Once fenced, every late
+    // registration/publish/reference-resolution of this generation
+    // fails. A refused fence refuses the whole chain; no unconditional
+    // RETIRED Put ever happens after the owner disappeared.
+    return function_proxy::StateHandler::RetireGeneration(
+               instanceInfo.instanceid(), instanceInfo.requestid(), instanceInfo.runtimeid())
+        .Then(litebus::Defer(GetAID(), &InstanceCtrlActor::ContinueAfterRetireFence,
+                             instanceInfo, std::placeholders::_1));
+}
+
+// The post-fence chain (gate: ContinueAfterRetireFence): the tombstone is
+// committed/verified, so the control-view deletion and state cleanup may
+// proceed for THIS identity.
+litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlViewPostFence(
+    const Status &status, const InstanceInfo &instanceInfo)
+{
+    // A failed physical/control step is not successful retirement (kept
+    // from the original entry — the fence gate passes Status::OK()).
+    if (status.IsError()) { return status; }
+    // RE-VERIFY THE CURRENT GENERATION — the entry's identity check ran
+    // BEFORE the async fence wait, and a same-name replacement may have
+    // landed in between. Every side effect below (route unregister, group
+    // cleanup, DelInstance, state deletes) is refused if the name now
+    // belongs to a different incarnation; only an ABSENT machine (nothing
+    // to contradict the fence-proven identity) proceeds. The per-effect
+    // fences (traefik route fencing, view-locked DelInstance re-check)
+    // remain in force — this closes the entry window, it does not replace
+    // them.
+    {
+        const auto snapshot = instanceControlView_->GetIncarnationSnapshot(
+            instanceInfo.instanceid());
+        if (!snapshot.first.empty()
+            && (snapshot.first != instanceInfo.runtimeid()
+                || (!snapshot.second.empty() && !instanceInfo.requestid().empty()
+                    && snapshot.second != instanceInfo.requestid()))) {
+            YRLOG_WARN("{}|post-fence re-verification refused: instance({}) now belongs to "
+                       "runtime({}) request({}); retiring chain was runtime({}) request({}) "
+                       "— no route/group/meta side effects",
+                       instanceInfo.requestid(), instanceInfo.instanceid(), snapshot.first,
+                       snapshot.second, instanceInfo.runtimeid(), instanceInfo.requestid());
+            return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
+                "post-fence re-verification: instance name rebound to a new generation"));
+        }
+    }
     if (traefikRegistry_) {
         // Identity-bearing (#3): the registry fences the retire against the
         // route's recorded incarnation, so this async unregister cannot
@@ -742,10 +792,102 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlView(const Sta
                     instanceInfo.instanceid(), instanceInfo.requestid(), instanceInfo.runtimeid())
                     .Then(litebus::Defer(GetAID(),
                         &InstanceCtrlActor::OnRetireStateDeleteComplete,
-                        instanceInfo, std::placeholders::_1));
+                        instanceInfo, std::placeholders::_1))
+                    // Snapshot cleanup runs AFTER the legacy delete, gated on
+                    // the tombstone. Its outcome is REPORTED (logged in full
+                    // via OnRetireSnapshotCleanupComplete) but never folded
+                    // into the retirement status: storage cleanup is
+                    // retryable via replay (tombstone + registrations are
+                    // retained) and must not block the exactly-once
+                    // settlement of an already-proven physical generation —
+                    // nor be hidden by it.
+                    .Then([aid(GetAID()), instanceInfo](const Status &delStatus) -> Status {
+                        (void)function_proxy::StateHandler::CleanupRetiredSnapshots(
+                            instanceInfo.instanceid(), instanceInfo.requestid(),
+                            instanceInfo.runtimeid())
+                            .OnComplete(litebus::Defer(aid,
+                                &InstanceCtrlActor::OnRetireSnapshotCleanupComplete,
+                                instanceInfo.instanceid(), instanceInfo.requestid(),
+                                instanceInfo.runtimeid(), std::placeholders::_1));
+                        return delStatus;
+                    });
             }
             return litebus::Future<Status>(status);
         });
+}
+
+// The persistent-fence gate for DeleteInstanceInControlView: runs BEFORE
+// any persistent side effect (route unregister, group cleanup, DelInstance
+// — which deletes the AUTHORITATIVE metadata). A refused fence refuses the
+// whole retirement chain; an accepted one (fresh or verified-existing)
+// proceeds. The tombstone carries the persistent token across retries and
+// restarts: once the authoritative record is gone, IT is the only
+// admissible identity proof.
+litebus::Future<Status> InstanceCtrlActor::ContinueAfterRetireFence(
+    const InstanceInfo &instanceInfo,
+    const litebus::Future<function_proxy::StateActor::RetireReport> &fence)
+{
+    // Failed future = the fence outcome itself is UNKNOWN (transport).
+    // Never unconditionally Get(): an explicit refusal beats a default
+    // report.
+    if (fence.IsError()) {
+        YRLOG_ERROR("{}|retirement fence future FAILED for instance({}) runtime({})",
+                    instanceInfo.requestid(), instanceInfo.instanceid(), instanceInfo.runtimeid());
+        return litebus::Future<Status>(Status(StatusCode::ERR_INNER_SYSTEM_ERROR,
+            "retirement fence future failed (outcome unknown)"));
+    }
+    const auto &report = fence.Get();
+    if (!report.fenced) {
+        YRLOG_ERROR("{}|retirement fence REFUSED for instance({}) runtime({}): {}",
+                    instanceInfo.requestid(), instanceInfo.instanceid(),
+                    instanceInfo.runtimeid(), report.reason);
+        return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
+            "retirement fence refused: " + report.reason));
+    }
+    YRLOG_INFO("{}|retirement fence {} for instance({}) runtime({})",
+               instanceInfo.requestid(),
+               report.fenceFresh ? "COMMITTED (fresh)" : "VERIFIED (existing tombstone)",
+               instanceInfo.instanceid(), instanceInfo.runtimeid());
+    return DeleteInstanceInControlViewPostFence(Status::OK(), instanceInfo);
+}
+
+void InstanceCtrlActor::OnRetireSnapshotCleanupComplete(
+    const std::string &instanceID, const std::string &requestID, const std::string &runtimeID,
+    const litebus::Future<function_proxy::StateActor::RetireReport> &cleanup)
+{
+    if (cleanup.IsError()) {
+        YRLOG_WARN("snapshot cleanup future for instance({}) request({}) runtime({}) FAILED — "
+                   "outcome unknown, replay required (tombstone + registrations retained)",
+                   instanceID, requestID, runtimeID);
+        return;
+    }
+    const auto &report = cleanup.Get();
+    if (!report.fenced) {
+        YRLOG_WARN("snapshot cleanup for instance({}) request({}) runtime({}) refused: {}",
+                   instanceID, requestID, runtimeID, report.reason);
+        return;
+    }
+    size_t deleted = 0;
+    size_t absent = 0;
+    size_t uncertain = 0;
+    size_t invalid = 0;
+    for (const auto &entry : report.entries) {
+        deleted += entry.deleted ? 1 : 0;
+        absent += entry.absent ? 1 : 0;
+        uncertain += entry.uncertain ? 1 : 0;
+        invalid += entry.invalid ? 1 : 0;
+        if (entry.uncertain || entry.invalid) {
+            YRLOG_WARN("snapshot cleanup entry({}) snapshot({}): committed({}) absent({}) "
+                       "uncertain({}) invalid({}) detail({})",
+                       entry.regKey, entry.snapshotKey, entry.wasCommitted, entry.absent,
+                       entry.uncertain, entry.invalid, entry.detail);
+        }
+    }
+    YRLOG_INFO("snapshot cleanup for instance({}) request({}) runtime({}): entries({}) "
+               "deleted({}) absent({}) uncertain({}) invalid({}) refDeleted({}) refDetail({}) "
+               "allCleaned({}) — tombstone and registrations RETAINED for replay",
+               instanceID, requestID, runtimeID, report.entries.size(), deleted, absent,
+               uncertain, invalid, report.refDeleted, report.refDetail, report.allCleaned);
 }
 
 litebus::Future<KillResponse> InstanceCtrlActor::KillResourceGroup(const std::string &srcInstanceID,
@@ -1160,6 +1302,17 @@ litebus::Future<KillResponse> InstanceCtrlActor::KillFrontend(const std::string 
                 .OnComplete(litebus::Defer(GetAID(),
                     &InstanceCtrlActor::OnPendingCleanupStateDeleteComplete,
                     killReq, promise, recorded, std::placeholders::_1));
+            // The replay also re-runs the snapshot cleanup, gated on the
+            // persistent tombstone (the ONLY identity proof left for this
+            // deleted machine): reported, never folded into the kill
+            // result. Identity comes from the RECORDED creation identity —
+            // never self-derived.
+            (void)function_proxy::StateHandler::CleanupRetiredSnapshots(
+                killReq->instanceid(), recorded.requestID, recorded.runtimeID)
+                .OnComplete(litebus::Defer(GetAID(),
+                    &InstanceCtrlActor::OnRetireSnapshotCleanupComplete,
+                    killReq->instanceid(), recorded.requestID, recorded.runtimeID,
+                    std::placeholders::_1));
             return promise->GetFuture();
         }
         return GenKillResponse(common::ERR_INSTANCE_NOT_FOUND,
@@ -5504,6 +5657,15 @@ litebus::Future<Status> InstanceCtrlActor::Checkpoint(const std::string &instanc
                 grpc::PosixStreamIdentity{ instanceID, runtimeID, checkpointGeneration }, msg);
         })
         .OnComplete([promise](const litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> &rsp) {
+            // FAILED-FUTURE GUARD: a failed chain future Gets() a null
+            // message pointer — dereferencing it would crash; fail
+            // explicitly instead.
+            if (rsp.IsError() || rsp.Get() == nullptr) {
+                YRLOG_ERROR("checkpoint save chain future FAILED — explicit error");
+                promise->SetValue(Status(StatusCode::ERR_INNER_SYSTEM_ERROR,
+                    "checkpoint failed: save chain future failed"));
+                return;
+            }
             StateSaveResponse saveRsp = std::move(rsp.Get()->saversp());
             if (saveRsp.code() != common::ErrorCode::ERR_NONE) {
                 YRLOG_ERROR("failed to save checkpoint state, error code: {}, msg: {}", fmt::underlying(saveRsp.code()),
@@ -5530,34 +5692,74 @@ litebus::Future<Status> InstanceCtrlActor::Recover(const resource_view::Instance
                 return GenRecoverResponse(
                     common::ErrorCode::ERR_LOCAL_SCHEDULER_OPERATION_ERROR, "failed to get instance client");
             }
-            StateLoadRequest req{};
-            // The recover reference is the VERSIONED key of the persisted
-            // creation generation this recovery carries (etcd instance
-            // record's request id — R2 evidence).
-            req.set_checkpointid(StateClient::ComposeStateKey(instance.instanceid(), instance.requestid()));
-            auto msg = std::make_shared<runtime_rpc::StreamingMessage>();
-            *msg->mutable_loadreq() = std::move(req);
-            return function_proxy::StateHandler::LoadState(
-                grpc::PosixStreamIdentity{ instance.instanceid(), instance.runtimeid(), "" }, msg)
-                .Then([instance, aid,
-                       instanceClient](const litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> &rsp)
+            // v3: the recover reference is the PERSISTENT checkpoint
+            // reference (stateref:v1:...) — the latest COMMITTED snapshot
+            // key for this generation, written atomically with the
+            // registration publish. It is resolved ASYNC by the state
+            // actor from the generation's ORIGINAL identity
+            // (instance + creation request); a successor runtime's ID
+            // never substitutes for that reference. Resolution failures
+            // (read error/timeout, corrupt value, generation mismatch)
+            // REFUSE the recover — never degrade to a freshly composed
+            // key; ONLY explicit absence yields the legacy migration key.
+            return function_proxy::StateHandler::ResolveCheckpointRef(
+                       instance.instanceid(), instance.requestid())
+                .Then([instance, aid, instanceClient](
+                          const litebus::Future<function_proxy::StateActor::CheckpointRef> &refFuture)
                           -> litebus::Future<runtime::RecoverResponse> {
-                    StateLoadResponse loadRsp = std::move(rsp.Get()->loadrsp());
-                    if (loadRsp.code() != common::ErrorCode::ERR_NONE) {
-                        return GenRecoverResponse(loadRsp.code(), loadRsp.message());
+                    if (refFuture.IsError()) {
+                        YRLOG_ERROR("recover for instance({}): reference-resolution future "
+                                    "FAILED — refusing (no legacy fallback)",
+                                    instance.instanceid());
+                        return GenRecoverResponse(
+                            common::ErrorCode::ERR_LOCAL_SCHEDULER_OPERATION_ERROR,
+                            "checkpoint reference resolution future failed");
                     }
+                    const auto ref = refFuture.Get();
+                    if (!ref.ok) {
+                        YRLOG_ERROR("recover for instance({}) failed to resolve checkpoint "
+                                    "reference: {}",
+                                    instance.instanceid(), ref.reason);
+                        return GenRecoverResponse(
+                            common::ErrorCode::ERR_LOCAL_SCHEDULER_OPERATION_ERROR,
+                            "unresolved checkpoint reference: " + ref.reason);
+                    }
+                    StateLoadRequest req{};
+                    req.set_checkpointid(ref.checkpointRef);
+                    auto msg = std::make_shared<runtime_rpc::StreamingMessage>();
+                    *msg->mutable_loadreq() = std::move(req);
+                    return function_proxy::StateHandler::LoadState(
+                        grpc::PosixStreamIdentity{ instance.instanceid(), instance.runtimeid(), "" }, msg)
+                        .Then([instance, aid,
+                               instanceClient](
+                                  const litebus::Future<std::shared_ptr<runtime_rpc::StreamingMessage>> &rsp)
+                                  -> litebus::Future<runtime::RecoverResponse> {
+                            StateLoadResponse loadRsp = std::move(rsp.Get()->loadrsp());
+                            if (loadRsp.code() != common::ErrorCode::ERR_NONE) {
+                                return GenRecoverResponse(loadRsp.code(), loadRsp.message());
+                            }
 
-                    runtime::RecoverRequest req{};
-                    req.set_state(loadRsp.state());
-                    auto createOptions = instance.createoptions();
-                    *req.mutable_createoptions() = createOptions;
+                            runtime::RecoverRequest req{};
+                            req.set_state(loadRsp.state());
+                            auto createOptions = instance.createoptions();
+                            *req.mutable_createoptions() = createOptions;
 
-                    YRLOG_INFO("send recover to instance({})", instance.instanceid());
-                    litebus::Async(aid, &InstanceCtrlActor::SetInstanceBillingContext, instance);
-                    return instanceClient->Recover(std::move(req), GetRuntimeRecoverTimeout(instance));
+                            YRLOG_INFO("send recover to instance({})", instance.instanceid());
+                            litebus::Async(aid, &InstanceCtrlActor::SetInstanceBillingContext, instance);
+                            return instanceClient->Recover(std::move(req), GetRuntimeRecoverTimeout(instance));
+                        });
                 });
         })
         .OnComplete([promise](const litebus::Future<runtime::RecoverResponse> &rsp) {
+            // FAILED-FUTURE GUARD: a failed chain future would Get() a
+            // default-constructed response whose code() == 0 reads as
+            // ERR_NONE — a FALSE success. Fail explicitly instead.
+            if (rsp.IsError()) {
+                YRLOG_ERROR("recover chain future FAILED — explicit error, no default read");
+                promise->SetValue(Status(StatusCode::ERR_INNER_SYSTEM_ERROR,
+                    "recover failed: chain future failed"));
+                return;
+            }
             auto recoverRsp = rsp.Get();
             if (recoverRsp.code() != common::ErrorCode::ERR_NONE) {
                 YRLOG_ERROR("failed to recover, error code: {}, msg: {}", fmt::underlying(recoverRsp.code()),

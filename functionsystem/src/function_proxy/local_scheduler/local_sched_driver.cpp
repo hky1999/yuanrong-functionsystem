@@ -221,13 +221,38 @@ Status LocalSchedDriver::Create()
         const auto view = instanceCtrl_->GetInstanceControlView();
         function_proxy::StateHandler::BindSaveExecutor(
             [view](const std::string &instanceID, const std::string &expectedRuntimeID,
+                   const std::string &expectedRequestID,
                    const function_proxy::StateActor::GuardedStoreOp &op) -> Status {
-                return view->SaveStateGuarded(instanceID, expectedRuntimeID, op);
+                return view->SaveStateGuarded(instanceID, expectedRuntimeID, expectedRequestID, op);
             });
         function_proxy::StateHandler::BindDeleteExecutor(
             [view](const std::string &instanceID, const std::string &expectedRuntimeID,
+                   const std::string &expectedRequestID,
                    const function_proxy::StateActor::GuardedStoreOp &op) -> Status {
-                return view->DeleteStateGuarded(instanceID, expectedRuntimeID, op);
+                return view->DeleteStateGuarded(instanceID, expectedRuntimeID, expectedRequestID, op);
+            });
+        // v3 PRODUCTION REGISTRY BINDING: the REAL MetaStoreClient (the
+        // same client the state machine uses for authoritative persistence)
+        // + a function-key resolver that reads each instance's function
+        // from the CONTROL VIEW at save time (the function varies per
+        // instance — no single startup key). The resolver takes the FULL
+        // bound identity and answers ONLY when the live machine still
+        // matches it: a newer incarnation's machine must never supply the
+        // function key that authorizes an old stream's save over a stale
+        // generation's records — the captured owner conditions stay on
+        // the ORIGINAL owner, never re-tokened to whoever now holds the
+        // instance slot.
+        function_proxy::StateHandler::BindSaveRegistry(
+            metaStoreClient_,
+            [view](const std::string &instanceID, const std::string &runtimeID,
+                   const std::string &requestID) -> std::string {
+                const auto machine = view->GetInstance(instanceID);
+                if (machine == nullptr) { return ""; }
+                const auto &info = machine->GetInstanceInfo();
+                if (info.runtimeid() != runtimeID || info.requestid() != requestID) {
+                    return "";  // view identity no longer matches the bound identity
+                }
+                return info.function();
             });
     }
     PosixAPIHandler::BindInstanceCtrl(instanceCtrl_);

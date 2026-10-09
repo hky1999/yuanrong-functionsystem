@@ -340,6 +340,7 @@ litebus::Future<Status> InstanceControlView::DelInstance(const std::string &inst
 
 Status InstanceControlView::SaveStateGuarded(const std::string &instanceID,
                                              const std::string &expectedRuntimeID,
+                                             const std::string &expectedRequestID,
                                              const std::function<Status()> &op)
 {
     // VIEW lock serializes against map swaps/inserts (Update / Generate-
@@ -356,11 +357,12 @@ Status InstanceControlView::SaveStateGuarded(const std::string &instanceID,
         return Status(StatusCode::ERR_INSTANCE_BUSY,
             "state save refused: stream runtime superseded or unknown");
     }
-    return it->second->ExecuteStateOpUnderLock(expectedRuntimeID, op);
+    return it->second->ExecuteStateOpUnderLock(expectedRuntimeID, expectedRequestID, op);
 }
 
 Status InstanceControlView::DeleteStateGuarded(const std::string &instanceID,
                                                const std::string &expectedRuntimeID,
+                                               const std::string &expectedRequestID,
                                                const std::function<Status()> &op)
 {
     std::lock_guard<std::mutex> guard(lock_);
@@ -370,7 +372,7 @@ Status InstanceControlView::DeleteStateGuarded(const std::string &instanceID,
         // inserts by the view lock.
         return op();
     }
-    return it->second->ExecuteStateOpUnderLock(expectedRuntimeID, op);
+    return it->second->ExecuteStateOpUnderLock(expectedRuntimeID, expectedRequestID, op);
 }
 
 std::pair<std::string, std::string> InstanceControlView::GetIncarnationSnapshot(

@@ -104,6 +104,7 @@ public:
     // recovery handling — all of which take only this lock) cannot
     // interleave before or during the op.
     virtual Status ExecuteStateOpUnderLock(const std::string &expectedRuntimeID,
+                                           const std::string &expectedRequestID,
                                            const std::function<Status()> &op);
 
     // The durable instance-record etcd key for this identity ("" on

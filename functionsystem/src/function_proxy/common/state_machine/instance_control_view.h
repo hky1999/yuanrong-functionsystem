@@ -66,10 +66,12 @@ public:
     // runtime (absent machine = unknown = refuse); delete requires it to
     // equal the retiring chain's runtime when a machine exists (absent
     // allows the retire completion, serialized against same-name inserts).
+    // Both ALSO verify the bound creation REQUEST when known — a same-
+    // runtime new-generation machine never authorizes an old stream's op.
     Status SaveStateGuarded(const std::string &instanceID, const std::string &expectedRuntimeID,
-                            const std::function<Status()> &op);
+                            const std::string &expectedRequestID, const std::function<Status()> &op);
     Status DeleteStateGuarded(const std::string &instanceID, const std::string &expectedRuntimeID,
-                              const std::function<Status()> &op);
+                              const std::string &expectedRequestID, const std::function<Status()> &op);
     void OnDelInstance(const std::string &instanceID, const std::string &requestID, bool needErase);
 
     void Update(const std::string &instanceID, const resources::InstanceInfo &instanceInfo,

@@ -70,6 +70,8 @@
 #include "mocks/mock_meta_storage_accessor.h"
 #include "function_proxy/common/state_handler/state_handler.h"
 #include "common/state_machine/instance_control_view.h"
+#include "common/utils/meta_store_kv_operation.h"
+#include "function_proxy/common/state_handler/state_isolation_support.h"
 #include "mocks/mock_meta_store_client.h"
 #include "mocks/mock_txn_transaction.h"
 #include "function_proxy/common/state_handler/state_handler_helper.h"
@@ -175,6 +177,59 @@ RealViewHarness MakeRealView()
 
 }  // namespace
 
+// View-backed map meta store: the REAL transaction model from
+// state_isolation_support, plus authoritative-record synthesis — the
+// first read of a production instance-record key that has no stored value
+// synthesizes the record from the CURRENT control-view machine (a locked
+// complete copy) and PERSISTS it, mirroring "view machine exists ⇒ its
+// authoritative record exists". Tombstones/fence transactions persist
+// through the real engine, so retry chains after machine removal find
+// them.
+class ViewBackedMetaStore : public functionsystem::function_proxy::test::MapMetaStore {
+public:
+    using MachineProvider =
+        std::function<std::shared_ptr<InstanceStateMachine>(const std::string &)>;
+
+    ViewBackedMetaStore(const std::shared_ptr<functionsystem::function_proxy::test::MapMetaStoreCore> &core,
+                        MachineProvider provider)
+        : MapMetaStore(core), provider_(std::move(provider)), coreHolder_(core)
+    {
+    }
+
+    litebus::Future<std::shared_ptr<GetResponse>> Get(const std::string &key,
+                                                      const GetOption &option) override
+    {
+        if (!option.prefix && key.rfind(INSTANCE_PATH_PREFIX, 0) == 0
+            && !coreHolder_->Exists(key)) {
+            const auto parts = litebus::strings::Split(key, "/");
+            if (parts.size() >= 2) {
+                const std::string &instance = parts[parts.size() - 1];
+                const std::string &request = parts[parts.size() - 2];
+                const auto machine = provider_(instance);
+                if (machine != nullptr) {
+                    const auto info = machine->GetInstanceInfo();  // locked copy
+                    if (!info.runtimeid().empty()) {
+                        resources::InstanceInfo record;
+                        record.set_instanceid(instance);
+                        record.set_requestid(request);
+                        record.set_runtimeid(info.runtimeid());
+                        record.set_function("default/0-test-helloWorld/$latest");
+                        std::string json;
+                        if (TransToJsonFromInstanceInfo(record, json)) {
+                            coreHolder_->Seed(key, json);
+                        }
+                    }
+                }
+            }
+        }
+        return MapMetaStore::Get(key, option);
+    }
+
+private:
+    MachineProvider provider_;
+    std::shared_ptr<functionsystem::function_proxy::test::MapMetaStoreCore> coreHolder_;
+};
+
 class KillEntryIdentityFixture : public testing::Test {
 protected:
     void SetUp() override
@@ -248,26 +303,32 @@ protected:
         // operation runs under the view lock — same lock as generation
         // changes.
         stateActor_->SetSaveExecutor([this](const std::string &instanceID,
-                                            const std::string &expectedRuntimeID,
-                                            const functionsystem::function_proxy::StateActor::GuardedStoreOp &op) {
-            return actor_->GetInstanceControlView()->SaveStateGuarded(instanceID, expectedRuntimeID, op);
+                                             const std::string &expectedRuntimeID,
+                                             const std::string &expectedRequestID,
+                                             const functionsystem::function_proxy::StateActor::GuardedStoreOp &op) {
+            return actor_->GetInstanceControlView()->SaveStateGuarded(instanceID, expectedRuntimeID, expectedRequestID, op);
         });
         stateActor_->SetDeleteExecutor([this](const std::string &instanceID,
-                                              const std::string &expectedRuntimeID,
-                                              const functionsystem::function_proxy::StateActor::GuardedStoreOp &op) {
-            return actor_->GetInstanceControlView()->DeleteStateGuarded(instanceID, expectedRuntimeID, op);
+                                               const std::string &expectedRuntimeID,
+                                               const std::string &expectedRequestID,
+                                               const functionsystem::function_proxy::StateActor::GuardedStoreOp &op) {
+            return actor_->GetInstanceControlView()->DeleteStateGuarded(instanceID, expectedRuntimeID, expectedRequestID, op);
         });
-        // v3: bind the save registry (mock meta-store, ready-success txns).
-        registryMeta_ = std::make_shared<MockMetaStoreClient>("127.0.0.1:1");
-        auto regTxn = std::make_shared<MockTxnTransaction>(litebus::AID());
-        ON_CALL(*registryMeta_, BeginTransaction).WillByDefault(Return(regTxn));
-        ON_CALL(*regTxn, Commit).WillByDefault(Invoke([]() {
-            auto ok = std::make_shared<TxnResponse>();
-            ok->success = true;
-            return litebus::Future<std::shared_ptr<TxnResponse>>(
-                std::shared_ptr<TxnResponse>(ok));
-        }));
-        stateActor_->BindSaveRegistry(registryMeta_);
+        // v3: bind the save registry to the REAL map transaction model —
+        // no wildcard-success transactions. Authoritative records are
+        // synthesized from the CURRENT control-view machine on first read
+        // (and then persist), so the retirement fence has a genuine record
+        // to verify against for every guard-passing chain, and tombstones
+        // genuinely persist across machine removal for retry paths.
+        metaCore_ = std::make_shared<
+            functionsystem::function_proxy::test::MapMetaStoreCore>();
+        registryMeta_ = std::make_shared<ViewBackedMetaStore>(
+            metaCore_, [this](const std::string &instance) {
+                const auto view = actor_ != nullptr ? actor_->GetInstanceControlView() : nullptr;
+                return view != nullptr ? view->GetInstance(instance)
+                                       : std::shared_ptr<InstanceStateMachine>();
+            });
+        stateActor_->BindSaveRegistry(registryMeta_, [](const std::string &, const std::string &, const std::string &) { return "default/0-test-helloWorld/$latest"; });
         litebus::Spawn(actor_);
     }
 
@@ -325,7 +386,12 @@ protected:
     std::vector<resource_view::PhysicalRetirementReceipt> settleReceipts;
     std::shared_ptr<InstanceStateMachine> machineSlot_ = nullptr;
     std::shared_ptr<MockDistributedCacheClient> cacheClient_;
-    std::shared_ptr<MockMetaStoreClient> registryMeta_;
+    std::shared_ptr<functionsystem::function_proxy::test::MapMetaStoreCore> metaCore_;
+    std::shared_ptr<ViewBackedMetaStore> registryMeta_;
+    // Set by tests that gate the fenced DelInstance: flipped when the
+    // production chain actually REACHES the gate, so mid-flight swaps
+    // happen deterministically after PostFence re-verification.
+    std::atomic<bool> delGateReached_{ false };
     std::shared_ptr<functionsystem::StateClient> stateClient_;
     std::shared_ptr<functionsystem::function_proxy::StateActor> stateActor_;
 };
@@ -672,7 +738,8 @@ TEST_F(KillEntryIdentityFixture, MidFlightRuntimeReplacementKeepsNewState)
     ON_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-mid"),
                                       Matcher<const std::string &>("runtime-OLD"),
                                       Matcher<const std::string &>(oldInfo.requestid())))
-        .WillByDefault(Invoke([gate](const std::string &, const std::string &, const std::string &) {
+        .WillByDefault(Invoke([this, gate](const std::string &, const std::string &, const std::string &) {
+            delGateReached_.store(true);
             return gate->GetFuture();
         }));
     EXPECT_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-mid"),
@@ -690,6 +757,12 @@ TEST_F(KillEntryIdentityFixture, MidFlightRuntimeReplacementKeepsNewState)
     actor_->BindInstanceControlView(controlView);
 
     auto result = actor_->DeleteInstanceInControlView(Status::OK(), oldInfo);
+    // Wait until the chain is PARKED at the gated DelInstance (after the
+    // fence and the PostFence re-verification) before swapping.
+    for (int i = 0; i < 5000 && !delGateReached_.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(delGateReached_.load());
 
     auto newMachine = std::make_shared<MockInstanceStateMachine>("m-new");
     const auto newInfo = MakeElasticInfo("inst-mid", "runtime-NEW");
@@ -724,7 +797,8 @@ TEST_F(KillEntryIdentityFixture, MidFlightRequestReplacementKeepsNewState)
     ON_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-req"),
                                       Matcher<const std::string &>("runtime-SAME"),
                                       Matcher<const std::string &>(oldInfo.requestid())))
-        .WillByDefault(Invoke([gate](const std::string &, const std::string &, const std::string &) {
+        .WillByDefault(Invoke([this, gate](const std::string &, const std::string &, const std::string &) {
+            delGateReached_.store(true);
             return gate->GetFuture();
         }));
     EXPECT_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-req"),
@@ -739,6 +813,12 @@ TEST_F(KillEntryIdentityFixture, MidFlightRequestReplacementKeepsNewState)
     actor_->BindInstanceControlView(controlView);
 
     auto result = actor_->DeleteInstanceInControlView(Status::OK(), oldInfo);
+    // Wait until the chain is PARKED at the gated DelInstance (after the
+    // fence and the PostFence re-verification) before swapping.
+    for (int i = 0; i < 5000 && !delGateReached_.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(delGateReached_.load());
 
     auto newMachine = std::make_shared<MockInstanceStateMachine>("m-req-new");
     auto newInfo = MakeElasticInfo("inst-req", "runtime-SAME");
@@ -851,7 +931,8 @@ TEST_F(KillEntryIdentityFixture, FullChainMidFlightRuntimeZeroCacheDel)
     ON_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-fr"),
                                       Matcher<const std::string &>("runtime-OLD"),
                                       Matcher<const std::string &>(oldInfo.requestid())))
-        .WillByDefault(Invoke([gate](const std::string &, const std::string &, const std::string &) {
+        .WillByDefault(Invoke([this, gate](const std::string &, const std::string &, const std::string &) {
+            delGateReached_.store(true);
             return gate->GetFuture();
         }));
     ON_CALL(*controlView, GetIncarnationSnapshot(Matcher<const std::string &>("inst-fr")))
@@ -863,6 +944,11 @@ TEST_F(KillEntryIdentityFixture, FullChainMidFlightRuntimeZeroCacheDel)
     EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>(StateClient::ComposeStateKey("inst-fr", "req-inst-fr")))).Times(0);
 
     auto result = actor_->DeleteInstanceInControlView(Status::OK(), oldInfo);
+    for (int i = 0; i < 5000 && !delGateReached_.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(delGateReached_.load());
+
     auto newMachine = std::make_shared<MockInstanceStateMachine>("m-fr-new");
     const auto newInfo = MakeElasticInfo("inst-fr", "runtime-NEW");
     ON_CALL(*newMachine, GetInstanceInfo()).WillByDefault(Return(newInfo));
@@ -893,7 +979,8 @@ TEST_F(KillEntryIdentityFixture, FullChainMidFlightRequestZeroCacheDel)
     ON_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-fq"),
                                       Matcher<const std::string &>("runtime-SAME"),
                                       Matcher<const std::string &>(oldInfo.requestid())))
-        .WillByDefault(Invoke([gate](const std::string &, const std::string &, const std::string &) {
+        .WillByDefault(Invoke([this, gate](const std::string &, const std::string &, const std::string &) {
+            delGateReached_.store(true);
             return gate->GetFuture();
         }));
     ON_CALL(*controlView, GetIncarnationSnapshot(Matcher<const std::string &>("inst-fq")))
@@ -905,6 +992,11 @@ TEST_F(KillEntryIdentityFixture, FullChainMidFlightRequestZeroCacheDel)
     EXPECT_CALL(*cacheClient_, Del(Matcher<const std::string &>(StateClient::ComposeStateKey("inst-fq", "req-inst-fq")))).Times(0);
 
     auto result = actor_->DeleteInstanceInControlView(Status::OK(), oldInfo);
+    for (int i = 0; i < 5000 && !delGateReached_.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(delGateReached_.load());
+
     auto newMachine = std::make_shared<MockInstanceStateMachine>("m-fq-new");
     auto newInfo = MakeElasticInfo("inst-fq", "runtime-SAME");
     newInfo.set_requestid("req-inst-fq-GENERATION-2");
@@ -916,6 +1008,66 @@ TEST_F(KillEntryIdentityFixture, FullChainMidFlightRequestZeroCacheDel)
     ASSERT_AWAIT_READY(result);
     ASSERT_TRUE(result.Get().IsError());
     EXPECT_EQ(result.Get().StatusCode(), StatusCode::ERR_INSTANCE_BUSY);
+}
+
+
+// PostFence re-verification (root entry test): a same-name replacement
+// landing DURING the retirement-fence wait. The fence commits for the OLD
+// generation's identity, yet the PostFence entry re-check must refuse
+// EVERY control side effect — the NEW generation's route/group/metadata
+// are untouchable by the old chain.
+TEST_F(KillEntryIdentityFixture, DelayedFenceSameNameReplacementRefusesAllSideEffects)
+{
+    auto controlView = std::make_shared<MockInstanceControlView>("node-test");
+    auto oldMachine = std::make_shared<MockInstanceStateMachine>("m-df-old");
+    const auto oldInfo = MakeElasticInfo("inst-df", "runtime-OLD");
+    ON_CALL(*oldMachine, GetInstanceInfo()).WillByDefault(Return(oldInfo));
+    ON_CALL(*oldMachine, GetRequestID()).WillByDefault(Return(oldInfo.requestid()));
+    machineSlot_ = nullptr;
+    ON_CALL(*controlView, GetInstance("inst-df"))
+        .WillByDefault(Invoke([this, oldMachine](const std::string &) {
+            return machineSlot_ ? machineSlot_ : oldMachine;
+        }));
+    ON_CALL(*controlView, GetIncarnationSnapshot(Matcher<const std::string &>("inst-df")))
+        .WillByDefault(Invoke([this, oldMachine](const std::string &) {
+            const auto machine = machineSlot_ ? machineSlot_ : oldMachine;
+            return std::make_pair(machine->GetInstanceInfo().runtimeid(), machine->GetRequestID());
+        }));
+    // NEITHER metadata-delete form may fire for the new generation.
+    EXPECT_CALL(*controlView, DelInstance("inst-df")).Times(0);
+    EXPECT_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-df"), _, _)).Times(0);
+    actor_->BindInstanceControlView(controlView);
+
+    // Gate the FENCE COMMIT itself (the tombstone Put for the OLD
+    // generation) so the replacement lands inside the fence wait.
+    const std::string fenceKey = functionsystem::function_proxy::StateActor::RetirementKey(
+        "inst-df", oldInfo.requestid());
+    metaCore_->AddGate(functionsystem::function_proxy::test::OnThenKey(fenceKey));
+
+    auto result = actor_->DeleteInstanceInControlView(Status::OK(), oldInfo);
+
+    // The chain is parked at the fence commit.
+    for (int i = 0; i < 5000 && metaCore_->GateCount() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_EQ(metaCore_->GateCount(), 1u);
+    // The same name is REBOUND to a new generation while the fence waits.
+    auto newMachine = std::make_shared<MockInstanceStateMachine>("m-df-new");
+    auto newInfo = MakeElasticInfo("inst-df", "runtime-NEW");
+    newInfo.set_requestid("req-inst-df-GENERATION-2");
+    ON_CALL(*newMachine, GetInstanceInfo()).WillByDefault(Return(newInfo));
+    ON_CALL(*newMachine, GetRequestID()).WillByDefault(Return(newInfo.requestid()));
+    machineSlot_ = newMachine;
+    // The OLD generation's fence still commits (it is generation-scoped).
+    metaCore_->ReleaseGate(functionsystem::function_proxy::test::OnThenKey(fenceKey));
+
+    ASSERT_AWAIT_READY(result);
+    ASSERT_TRUE(result.Get().IsError());
+    EXPECT_NE(result.Get().GetMessage().find("rebound"), std::string::npos)
+        << "the refusal must name the post-fence re-verification: "
+        << result.Get().GetMessage();
+    // The old generation's tombstone DID commit (its own isolation holds).
+    EXPECT_TRUE(metaCore_->Exists(fenceKey));
 }
 
 

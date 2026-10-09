@@ -43,6 +43,7 @@
 #include "function_proxy/common/observer/control_plane_observer/control_plane_observer.h"
 #include "function_proxy/common/posix_client/control_plane_client/control_interface_client_manager_proxy.h"
 #include "function_proxy/common/rate_limiter/token_bucket_rate_limiter.h"
+#include "function_proxy/common/state_handler/state_handler.h"
 #include "local_scheduler/instance_control/frontend_kill_cleanup_snapshot.h"
 #include "local_scheduler/instance_control/instance_generation_conflict_resolver.h"
 // for remove rgroup, easy for facilitates authentication, which should be extracted in the future
@@ -881,6 +882,22 @@ private:
                                                const std::shared_ptr<KillRequest> &killReq);
     litebus::Future<Status> DeleteInstanceInResourceView(const Status &status, const InstanceInfo &instanceInfo);
     litebus::Future<Status> DeleteInstanceInControlView(const Status &status, const InstanceInfo &instanceInfo);
+    // The persistent-fence gate for DeleteInstanceInControlView: verifies
+    // the RetireGeneration report on THIS actor and dispatches the
+    // post-fence chain; a refused fence fails the retirement.
+    litebus::Future<Status> ContinueAfterRetireFence(
+        const InstanceInfo &instanceInfo,
+        const litebus::Future<function_proxy::StateActor::RetireReport> &fence);
+    // Post-fence control-view deletion chain (route unregister → group
+    // cleanup → DelInstance → legacy state delete → snapshot cleanup).
+    litebus::Future<Status> DeleteInstanceInControlViewPostFence(const Status &status,
+                                                                 const InstanceInfo &instanceInfo);
+    // Logs the full snapshot-cleanup report (per-entry outcomes; tombstone
+    // and registrations retained for replay). Reporting only — never folds
+    // into the retirement status.
+    void OnRetireSnapshotCleanupComplete(const std::string &instanceID, const std::string &requestID,
+                                         const std::string &runtimeID,
+                                         const litebus::Future<function_proxy::StateActor::RetireReport> &cleanup);
 
     litebus::Future<Status> DoLocalRedeploy(const Status &status,
                                             const std::shared_ptr<::messages::ScheduleRequest> &request,
