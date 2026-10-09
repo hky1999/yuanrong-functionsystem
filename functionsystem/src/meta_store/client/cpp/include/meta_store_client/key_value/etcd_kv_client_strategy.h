@@ -17,7 +17,12 @@
 #ifndef COMMON_META_STORE_CLIENT_KEY_VALUE_ETCD_KV_CLIENT_STRATEGY_H
 #define COMMON_META_STORE_CLIENT_KEY_VALUE_ETCD_KV_CLIENT_STRATEGY_H
 
+#include <chrono>
+#include <mutex>
+#include <unordered_set>
+
 #include "meta_store_client/key_value/kv_client_strategy.h"
+#include "meta_store_client/key_value/prefix_range_cursor.h"
 #include "common/rpc/client/grpc_client.h"
 
 namespace functionsystem::meta_store {
@@ -77,12 +82,32 @@ public:
     };
 
 private:
+    struct PrefixRead {
+        PrefixRead(const etcdserverpb::RangeRequest &initial, uint32_t pageSize, uint32_t timeoutSeconds)
+            : request(initial), cursor(initial.key(), initial.range_end(), pageSize),
+              deadline(std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSeconds))
+        {
+            request.set_limit(pageSize);
+        }
+        etcdserverpb::RangeRequest request;
+        PrefixRangeCursor cursor;
+        std::chrono::steady_clock::time_point deadline;
+        std::shared_ptr<GetResponse> output = std::make_shared<GetResponse>();
+        litebus::Promise<std::shared_ptr<GetResponse>> promise;
+    };
+
+    bool ReadPrefixPage(const std::shared_ptr<PrefixRead> &read);
+    bool OnPrefixPage(const std::shared_ptr<PrefixRead> &read,
+                      const std::shared_ptr<etcdserverpb::RangeResponse> &page, const Status &status);
+    void FailPrefixRead(const std::shared_ptr<PrefixRead> &read, const Status &status);
+
     void DoPut(const std::shared_ptr<litebus::Promise<functionsystem::Status>> &promise,
                const etcdserverpb::PutRequest &request, const std::shared_ptr<etcdserverpb::PutResponse> &response,
                int retryTimes);
     void DoGet(const std::shared_ptr<litebus::Promise<functionsystem::Status>> &promise,
                const etcdserverpb::RangeRequest &request, const std::shared_ptr<etcdserverpb::RangeResponse> &response,
-               int retryTimes);
+               int retryTimes,
+               std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max());
     void DoCommit(const std::shared_ptr<litebus::Promise<functionsystem::Status>> &promise,
                   const etcdserverpb::TxnRequest &request, const std::shared_ptr<etcdserverpb::TxnResponse> &response,
                   int retryTimes);
@@ -102,6 +127,8 @@ private:
 
 private:
     std::unique_ptr<GrpcClient<etcdserverpb::KV>> kvClient_;
+    std::mutex prefixReadsMutex_;
+    std::unordered_set<std::shared_ptr<PrefixRead>> prefixReads_;
 
 private:
     std::atomic<bool> running_ = true;

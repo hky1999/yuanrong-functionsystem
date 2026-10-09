@@ -28,6 +28,12 @@
 #include "common/utils/time_trigger.h"
 
 namespace functionsystem {
+struct SnapshotSyncResponse {
+    Status status = Status::OK();
+    std::vector<WatchEvent> events;
+    int64_t revision = 0;
+};
+
 class MetaStorageAccessor {
 public:
     explicit MetaStorageAccessor(const std::shared_ptr<MetaStoreClient> &metaClient);
@@ -142,6 +148,7 @@ public:
     virtual litebus::Future<Status> Delete(const std::string &key, bool isPrefix);
 
     std::pair<std::vector<WatchEvent>, int64_t> Sync(const std::string &key, bool isPrefix);
+    SnapshotSyncResponse SyncWithStatus(const std::string &key, bool isPrefix);
     std::shared_ptr<MetaStoreClient> GetMetaClient()
     {
         return metaClient_;

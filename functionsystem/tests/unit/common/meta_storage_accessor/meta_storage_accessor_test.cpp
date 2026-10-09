@@ -48,6 +48,58 @@ public:
     }
 };
 
+TEST_F(MetaStorageAccessorTest, FailedSnapshotIsNotAnEmptySuccess)
+{
+    auto client = std::make_shared<MockMetaStoreClient>("127.0.0.1:1");
+    auto response = std::make_shared<GetResponse>();
+    response->status = Status(GRPC_UNAVAILABLE, "unavailable");
+    response->header.revision = 10;
+    response->kvs.emplace_back();
+    EXPECT_CALL(*client, Get).WillOnce(Return(response));
+    MetaStorageAccessor accessor(client);
+    auto result = accessor.SyncWithStatus("/instances/", true);
+    EXPECT_EQ(result.status.StatusCode(), GRPC_UNAVAILABLE);
+    EXPECT_TRUE(result.events.empty());
+    EXPECT_EQ(result.revision, 0);
+}
+
+TEST_F(MetaStorageAccessorTest, CompleteEmptySnapshotPreservesRevision)
+{
+    auto client = std::make_shared<MockMetaStoreClient>("127.0.0.1:1");
+    auto response = std::make_shared<GetResponse>();
+    response->header.revision = 10;
+    EXPECT_CALL(*client, Get).WillOnce(Return(response));
+    MetaStorageAccessor accessor(client);
+    auto result = accessor.SyncWithStatus("/instances/", true);
+    EXPECT_TRUE(result.status.IsOk());
+    EXPECT_TRUE(result.events.empty());
+    EXPECT_EQ(result.revision, 10);
+}
+
+TEST_F(MetaStorageAccessorTest, MissingSnapshotPreservesFailure)
+{
+    auto client = std::make_shared<MockMetaStoreClient>("127.0.0.1:1");
+    EXPECT_CALL(*client, Get).WillOnce(Return(std::shared_ptr<GetResponse>{}));
+    MetaStorageAccessor accessor(client);
+    auto result = accessor.SyncWithStatus("/instances/", true);
+    EXPECT_TRUE(result.status.IsError());
+    EXPECT_TRUE(result.events.empty());
+    EXPECT_EQ(result.revision, 0);
+}
+
+TEST_F(MetaStorageAccessorTest, FailedSnapshotFuturePreservesFailure)
+{
+    auto client = std::make_shared<MockMetaStoreClient>("127.0.0.1:1");
+    litebus::Future<std::shared_ptr<GetResponse>> future;
+    future.SetFailed(FAILED);
+    EXPECT_CALL(*client, Get).WillOnce(Return(future));
+    MetaStorageAccessor accessor(client);
+    auto result = accessor.SyncWithStatus("/instances/", true);
+    EXPECT_TRUE(result.status.IsError());
+    EXPECT_TRUE(result.events.empty());
+    EXPECT_EQ(result.revision, 0);
+}
+
 static void MockMetaStoreClientPutWithLease(std::unique_ptr<MockMetaStoreClient> &mockMetaStoreClient,
                                             const std::string &key, const std::string &value, const int64_t leaseID,
                                             const int ttl)

@@ -118,7 +118,7 @@ struct GetResponse {
 
     ResponseHeader header;
 
-    int64_t count;  // for count only
+    int64_t count = 0;  // for count only
 
     std::vector<KeyValue> kvs;
 };
@@ -265,6 +265,10 @@ struct MetaStoreTimeoutOption {
     int64_t operationRetryIntervalUpperBound = KV_OPERATE_RETRY_INTERVAL_UPPER_BOUND;
     int64_t operationRetryTimes = KV_OPERATE_RETRY_TIMES;
     int64_t grpcTimeout = GRPC_TIMEOUT_SECONDS;
+
+    // Sequential pages for unlimited, default-order etcd prefix reads.
+    uint32_t prefixReadPageSize = 256;
+    uint32_t prefixReadTimeoutSeconds = 60;
 };
 
 struct MetaStoreBackupOption {

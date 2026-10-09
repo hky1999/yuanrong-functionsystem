@@ -77,8 +77,13 @@ Status ObserverActor::Register()
             busProxySyncer)
         .After(WATCH_TIMEOUT_MS, after);
 
-    auto synced = metaStorageAccessor_->Sync(INSTANCE_PATH_PREFIX, true);
-    UpdateInstanceEvent(synced.first, true);
+    auto synced = metaStorageAccessor_->SyncWithStatus(INSTANCE_PATH_PREFIX, true);
+    if (synced.status.IsError()) {
+        YRLOG_ERROR("failed to sync initial instance snapshot: {}", synced.status.ToString());
+        instanceSyncDone_.SetFailed(synced.status.StatusCode());
+        return synced.status;
+    }
+    UpdateInstanceEvent(synced.events, true);
     YRLOG_DEBUG("sync key({}) finished", INSTANCE_PATH_PREFIX);
     instanceSyncDone_.SetValue(true);
 
@@ -104,7 +109,7 @@ Status ObserverActor::Register()
 
     if (!isPartialWatchInstances_ && !DirectRoutingConfig::IsEnabled()) {
         YRLOG_INFO("Register watch with prefix: {}", INSTANCE_ROUTE_PATH_PREFIX);
-        watchOpt = WatchOption{ true, false, synced.second + 1, true };
+        watchOpt = WatchOption{ true, false, synced.revision + 1, true };
         (void)metaStorageAccessor_
             ->RegisterObserver(
                 INSTANCE_ROUTE_PATH_PREFIX, watchOpt,
@@ -1271,7 +1276,8 @@ SyncResult ObserverActor::OnSyncer(const std::shared_ptr<GetResponse> &getRespon
 {
     if (getResponse == nullptr || getResponse->status.IsError()) {
         YRLOG_INFO("failed to get key({}) from meta storage", prefixKey);
-        return SyncResult{ getResponse->status};
+        return SyncResult{ getResponse == nullptr ? Status(POINTER_IS_NULL, "missing meta store snapshot")
+                                                  : getResponse->status };
     }
 
     if (getResponse->kvs.empty()) {

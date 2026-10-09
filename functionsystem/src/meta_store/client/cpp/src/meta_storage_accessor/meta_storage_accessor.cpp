@@ -43,23 +43,38 @@ litebus::Future<std::shared_ptr<Watcher>> MetaStorageAccessor::RegisterObserver(
 
 std::pair<std::vector<WatchEvent>, int64_t> MetaStorageAccessor::Sync(const std::string &key, bool isPrefix)
 {
+    auto result = SyncWithStatus(key, isPrefix);
+    return { std::move(result.events), result.revision };
+}
+
+SnapshotSyncResponse MetaStorageAccessor::SyncWithStatus(const std::string &key, bool isPrefix)
+{
     YRLOG_DEBUG("sync from meta store, key: {}", key);
     GetOption opts{
         .prefix = isPrefix,
     };
 
-    std::vector<WatchEvent> events;
+    SnapshotSyncResponse result;
     ASSERT_IF_NULL(metaClient_);
-    auto getResponse = metaClient_->Get(key, opts).Get();
-    if (getResponse->kvs.empty()) {
-        YRLOG_INFO("get no result with key({}) from meta storage, revision is {}", key, getResponse->header.revision);
-        return { events, getResponse->header.revision };
+    auto future = metaClient_->Get(key, opts);
+    future.Wait();
+    if (future.IsError()) {
+        result.status = Status(FAILED, "failed meta store snapshot future");
+        return result;
     }
+    auto getResponse = future.Get();
+    if (getResponse == nullptr || getResponse->status.IsError()) {
+        result.status = getResponse == nullptr ? Status(POINTER_IS_NULL, "missing meta store snapshot")
+                                               : getResponse->status;
+        return result;
+    }
+    result.revision = getResponse->header.revision;
+    result.events.reserve(getResponse->kvs.size());
     for (auto &kv : getResponse->kvs) {
-        WatchEvent event{ .eventType = EVENT_TYPE_PUT, .kv = kv, .prevKv = {} };
-        (void)events.emplace_back(event);
+        WatchEvent event{ .eventType = EVENT_TYPE_PUT, .kv = std::move(kv), .prevKv = {} };
+        result.events.emplace_back(std::move(event));
     }
-    return { events, getResponse->header.revision };
+    return result;
 }
 
 litebus::Future<Status> MetaStorageAccessor::Put(const std::string &key, const std::string &value)

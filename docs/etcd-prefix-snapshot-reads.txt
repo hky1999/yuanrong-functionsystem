@@ -1,0 +1,108 @@
+Bounded etcd prefix snapshots: first implementation stage
+
+Unlimited, default-order prefix Get calls previously issued a single etcd
+Range RPC containing the entire prefix. Worker initialization and reconnect
+syncers use this path, so concurrent workers can each request a very large
+response. This change limits each physical Range to a sequential page while
+preserving the existing complete GetResponse contract.
+
+Implementation
+
+* EtcdKvClientStrategy pages prefix=true, limit=0, countOnly=false reads with
+  sortOrder=NONE and sortTarget=KEY. Other option combinations retain their
+  current behavior. Each logical read has at most one active page RPC.
+* The first page supplies the snapshot revision and total count. Subsequent
+  pages use that revision, the original range_end, and last_key + NUL as the
+  inclusive next cursor. A later header revision never replaces the snapshot
+  revision. Keys, ordering, cluster identity and final count are validated.
+* Only a successful complete snapshot reaches the caller. Failed, compacted,
+  malformed or expired reads return an error with no partial KV collection.
+  Compaction and permission/configuration errors are not retried as transient
+  RPC errors. Client shutdown resolves pending reads with a cancellation error.
+* Initial GetAndWatch callbacks receive the complete snapshot once. Failed
+  reads and rejected callbacks do not establish a watch. Successful watches
+  still start at the original snapshot revision plus one.
+* MetaStorageAccessor exposes SyncWithStatus. Worker ObserverActor checks it
+  before publishing initial instance synchronization or registering its route
+  watch; failed reads also fail its InstanceSyncDone future. The legacy Sync
+  interface remains source compatible for other users and still cannot express
+  failure in its return type.
+
+Client options
+
+MetaStoreTimeoutOption.prefixReadPageSize defaults to 256 and accepts 1..4096.
+prefixReadTimeoutSeconds defaults to 60 and accepts 1..3600. Invalid values
+fail explicitly; they never disable pagination. These are constructor options,
+not new operator-facing CLI or Helm settings. A configurable deployment source
+is a separate integration task. RPC deadlines have second granularity; late
+results are rejected and retry delays are capped by the remaining read budget.
+One RPC may finish up to one second after the nominal overall budget.
+
+Compatibility and remaining scope
+
+Consumers continue to receive one full collection. Do not call an existing
+full-snapshot deletion/reconciliation callback separately for every page.
+No owner index, metadata schema, worker rollout or deployment configuration is
+changed. Native Metastore reads retain their current implementation.
+
+This is a first-stage memory amplification fix, not completion of the broader
+read/recovery plan. Page size limits KV count, not bytes; historical large
+values still require a value-size audit and byte budget. The full client cache
+and complete result still grow with the prefix, although page protobuf values
+are moved into the result instead of copied. Etcd may scan the remaining index
+to calculate count, so paging does not bound backend CPU by the page size.
+
+Global bulk-read admission, initial startup staggering, per-owner reads,
+consumer staging/parse failure semantics, runtime watch acknowledgement and
+checkpoint repair, Go watcher lifecycle fixes, subscription sharing and old
+worker recovery coverage require subsequent changes and validation.
+The default snapshot budget must also be tested against the worker's existing
+30-second watch startup timeout and process supervision. This change does not
+alter those timers or establish a complete worker readiness policy.
+
+Validation
+
+The focused CMake target is etcd_prefix_read_test_bin (BUILD_LLT=ON). It uses
+the normal project dependencies and includes cursor, RPC and accessor tests.
+The cursor tests can also be compiled independently with C++17 and GoogleTest:
+
+  g++ -std=c++17 -Wall -Wextra -Werror \
+    -Ifunctionsystem/src/meta_store/client/cpp/include \
+    functionsystem/tests/unit/common/meta_store_client/prefix_range_cursor_test.cpp \
+    -lgtest_main -lgtest -pthread -o /tmp/prefix_cursor_tests
+  /tmp/prefix_cursor_tests
+
+Two optional integration tests require ETCD_PREFIX_READ_TEST_ENDPOINT pointing
+to a dedicated etcd on 127.0.0.1. They write only a unique test prefix and clean
+it afterward. They verify a fixed snapshot while writes occur between pages
+and historical replay of a write between snapshot completion and watch start.
+Without the environment variable, these tests are skipped.
+
+Local validation on 2026-10-09 passed 25 tests: 10 cursor tests, 13 mocked
+RPC tests including the existing transaction test, and both real-etcd tests
+against the official etcd 3.6.8 binary. The changed accessor and observer
+translation units and accessor regression tests also passed compile checks;
+the four new accessor regression tests have not been executed.
+
+The local RPC harness compiled the actual client and Litebus sources using
+Ubuntu 22.04, GCC 11.4, gRPC 1.30.2, Protobuf 3.12.4, and generated protocol
+headers. It required test-only Litebus header includes for this dependency
+combination. This is not a full build with the project's pinned dependencies
+or a validated core wheel. Run the focused CMake target and worker regressions
+with the official dependency set before publishing a release artifact.
+
+Before production acceptance, test a real supported etcd version with
+concurrent writes, compaction, worker reconnects and the intended data scale.
+Measure etcd RSS/heap, CPU, RPC latency, client memory and recovery duration.
+Do not infer fleet-wide safety from a small RPC or mocked Range responses.
+
+AKernel image integration
+
+AKernel currently consumes a checksum-pinned openYuanRong core wheel. Editing
+this source checkout or changing its gitlink does not update the shipped core.
+Build and validate a core wheel from the reviewed source, then use AKernel's
+OPEN_YR_CORE_WHEEL_URL and OPEN_YR_CORE_WHEEL_SHA256 pair for an isolated image
+candidate. A release pin update requires the actual published artifact and
+verified checksum. Do not guess a digest or silently replace the build path.
+Worker deployment must preserve running workloads and avoid a full existing
+node-pool rollout; this source change performs no deployment.

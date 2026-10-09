@@ -114,3 +114,22 @@ target_link_libraries(port_forward_mapping_test_bin PRIVATE
   ${gmock_LIB_A}
   pthread)
 add_test(NAME port_forward_mapping_test_bin COMMAND port_forward_mapping_test_bin)
+
+# Run etcd snapshot regressions without linking every scheduler and runtime test.
+add_executable(etcd_prefix_read_test_bin
+  ${PROJECT_SOURCE_DIR}/tests/unit/main.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/meta_store_client/kv_client_test.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/meta_store_client/prefix_range_cursor_test.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/meta_storage_accessor/meta_storage_accessor_test.cpp)
+add_dependencies(etcd_prefix_read_test_bin gtest_1_10_0)
+target_compile_options(etcd_prefix_read_test_bin PRIVATE
+  -Wno-error -fno-access-control -Wno-missing-field-initializers)
+target_include_directories(etcd_prefix_read_test_bin PRIVATE
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/src/meta_store/client/cpp/include
+  ${gtest_INCLUDE_DIR})
+target_link_libraries(etcd_prefix_read_test_bin PRIVATE
+  meta_store_client utils
+  ${grpcpp_LIB} ${gpr_LIB} ${crypto_LIB} ${ssl_LIB} ${zlib_LIB}
+  ${litebus_ALL_LIB} ${gtest_LIB_A} ${gmock_LIB_A} pthread)
+add_test(NAME etcd_prefix_read_test_bin COMMAND etcd_prefix_read_test_bin)

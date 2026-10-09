@@ -16,6 +16,8 @@
 
 #include "etcd_kv_client_strategy.h"
 
+#include <algorithm>
+
 #include "async/asyncafter.hpp"
 #include "async/defer.hpp"
 #include "meta_store_client/utils/etcd_util.h"
@@ -40,6 +42,17 @@ void EtcdKvClientStrategy::Init()
 void EtcdKvClientStrategy::Finalize()
 {
     running_ = false;
+    std::unordered_set<std::shared_ptr<PrefixRead>> reads;
+    {
+        std::lock_guard<std::mutex> lock(prefixReadsMutex_);
+        reads.swap(prefixReads_);
+    }
+    for (const auto &read : reads) {
+        auto output = std::make_shared<GetResponse>();
+        output->status = Status(GRPC_CANCELLED, "etcd prefix read client stopped");
+        read->output.reset();
+        read->promise.SetValue(output);
+    }
 
     etcdserverpb::WatchRequest request;
     for (const auto &record : readyRecords_) {
@@ -205,6 +218,30 @@ litebus::Future<std::shared_ptr<GetResponse>> EtcdKvClientStrategy::Get(const st
     etcdserverpb::RangeRequest request;
     BuildRangeRequest(request, key, option);
 
+    if (option.prefix && option.limit == 0 && !option.countOnly && option.sortOrder == SortOrder::NONE
+        && option.sortTarget == SortTarget::KEY) {
+        if (timeoutOption_.prefixReadPageSize == 0 || timeoutOption_.prefixReadPageSize > 4096
+            || timeoutOption_.prefixReadTimeoutSeconds == 0 || timeoutOption_.prefixReadTimeoutSeconds > 3600) {
+            auto output = std::make_shared<GetResponse>();
+            output->status = Status(PARAMETER_ERROR, "invalid etcd prefix read budget");
+            return output;
+        }
+        auto read = std::make_shared<PrefixRead>(request, timeoutOption_.prefixReadPageSize,
+                                                 timeoutOption_.prefixReadTimeoutSeconds);
+        auto future = read->promise.GetFuture();
+        {
+            std::lock_guard<std::mutex> lock(prefixReadsMutex_);
+            if (!running_) {
+                auto output = std::make_shared<GetResponse>();
+                output->status = Status(GRPC_CANCELLED, "etcd prefix read client stopped");
+                return output;
+            }
+            prefixReads_.emplace(read);
+        }
+        (void)litebus::Async(GetAID(), &EtcdKvClientStrategy::ReadPrefixPage, read);
+        return future;
+    }
+
     auto response = std::make_shared<etcdserverpb::RangeResponse>();
     std::function<std::shared_ptr<GetResponse>(const functionsystem::Status &)> then =
         [request, response](const functionsystem::Status &status) -> std::shared_ptr<GetResponse> {
@@ -226,10 +263,91 @@ litebus::Future<std::shared_ptr<GetResponse>> EtcdKvClientStrategy::Get(const st
     return promise->GetFuture().Then(then);
 }
 
+bool EtcdKvClientStrategy::ReadPrefixPage(const std::shared_ptr<PrefixRead> &read)
+{
+    if (read->promise.GetFuture().IsOK() || read->promise.GetFuture().IsError()) {
+        return false;
+    }
+    if (!running_) {
+        FailPrefixRead(read, Status(GRPC_CANCELLED, "etcd prefix read client stopped"));
+        return false;
+    }
+    auto page = std::make_shared<etcdserverpb::RangeResponse>();
+    auto promise = std::make_shared<litebus::Promise<Status>>();
+    (void)promise->GetFuture().Then(litebus::Defer(GetAID(), &EtcdKvClientStrategy::OnPrefixPage,
+                                                 read, page, std::placeholders::_1));
+    DoGet(promise, read->request, page, 1, read->deadline);
+    return true;
+}
+
+void EtcdKvClientStrategy::FailPrefixRead(const std::shared_ptr<PrefixRead> &read, const Status &status)
+{
+    auto output = std::make_shared<GetResponse>();
+    output->status = status;
+    read->output.reset();
+    read->promise.SetValue(output);
+    std::lock_guard<std::mutex> lock(prefixReadsMutex_);
+    prefixReads_.erase(read);
+}
+
+bool EtcdKvClientStrategy::OnPrefixPage(const std::shared_ptr<PrefixRead> &read,
+                                        const std::shared_ptr<etcdserverpb::RangeResponse> &page, const Status &status)
+{
+    if (read->promise.GetFuture().IsOK() || read->promise.GetFuture().IsError()) {
+        return false;
+    }
+    if (status.IsError()) {
+        FailPrefixRead(read, status);
+        return false;
+    }
+    if (std::chrono::steady_clock::now() >= read->deadline) {
+        FailPrefixRead(read, Status(GRPC_DEADLINE_EXCEEDED, "etcd prefix snapshot deadline exceeded"));
+        return false;
+    }
+    std::vector<std::string> keys;
+    keys.reserve(page->kvs_size());
+    for (const auto &kv : page->kvs()) {
+        keys.emplace_back(kv.key());
+    }
+    bool first = read->cursor.Revision() == 0;
+    if (!read->cursor.Advance(page->header().revision(), page->header().cluster_id(), keys, page->more())) {
+        FailPrefixRead(read, Status(FAILED, "invalid etcd prefix snapshot page"));
+        return false;
+    }
+    if (first) {
+        Transform(read->output->header, page->header());
+        read->output->count = page->count();
+    }
+    for (auto &kv : *page->mutable_kvs()) {
+        read->output->kvs.emplace_back(std::move(kv));
+    }
+    if (!page->more()) {
+        if (read->output->count < 0
+            || static_cast<uint64_t>(read->output->count) != read->output->kvs.size()) {
+            FailPrefixRead(read, Status(FAILED, "incomplete etcd prefix snapshot"));
+            return false;
+        }
+        read->promise.SetValue(read->output);
+        std::lock_guard<std::mutex> lock(prefixReadsMutex_);
+        prefixReads_.erase(read);
+        return true;
+    }
+    read->request.set_key(read->cursor.Key());
+    read->request.set_revision(read->cursor.Revision());
+    // Queue the next page rather than retaining a recursive response chain.
+    (void)litebus::Async(GetAID(), &EtcdKvClientStrategy::ReadPrefixPage, read);
+    return true;
+}
+
 void EtcdKvClientStrategy::DoGet(const std::shared_ptr<litebus::Promise<functionsystem::Status>> &promise,
                                  const etcdserverpb::RangeRequest &request,
-                                 const std::shared_ptr<etcdserverpb::RangeResponse> &response, int retryTimes)
+                                 const std::shared_ptr<etcdserverpb::RangeResponse> &response, int retryTimes,
+                                 std::chrono::steady_clock::time_point deadline)
 {
+    if (std::chrono::steady_clock::now() >= deadline) {
+        promise->SetValue(Status(GRPC_DEADLINE_EXCEEDED, "etcd prefix snapshot deadline exceeded"));
+        return;
+    }
     if (healthyStatus_.IsError()) {
         promise->SetValue(
             Status(healthyStatus_.StatusCode(), "[fallbreak] failed to call Get: " + healthyStatus_.GetMessage()));
@@ -237,25 +355,43 @@ void EtcdKvClientStrategy::DoGet(const std::shared_ptr<litebus::Promise<function
     }
 
     std::function<bool(const functionsystem::Status &status)> then =
-        [aid(GetAID()), promise, request, response, retryTimes,
+        [aid(GetAID()), promise, request, response, retryTimes, deadline,
          timeoutOption(timeoutOption_)](const functionsystem::Status &status) -> bool {
         if (status.IsOk()) {
             promise->SetValue(status);
-        } else if (retryTimes == timeoutOption.operationRetryTimes) {
+        } else if (retryTimes >= timeoutOption.operationRetryTimes || status.StatusCode() == GRPC_OUT_OF_RANGE
+                   || status.StatusCode() == GRPC_PERMISSION_DENIED || status.StatusCode() == GRPC_INVALID_ARGUMENT) {
             YRLOG_ERROR("Get over times: {}", status.ToString());
             promise->SetValue(status);
         } else {
             YRLOG_WARN("Get error: {}, begin to retry", status.ToString());
             auto nextSleepTime = GenerateRandomNumber(timeoutOption.operationRetryIntervalLowerBound * retryTimes,
                                                       timeoutOption.operationRetryIntervalUpperBound * retryTimes);
+            if (deadline != std::chrono::steady_clock::time_point::max()) {
+                auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now()).count();
+                nextSleepTime = std::min(nextSleepTime, std::max<int64_t>(0, remaining));
+            }
             (void)litebus::AsyncAfter(nextSleepTime, aid, &EtcdKvClientStrategy::DoGet, promise, request, response,
-                                      retryTimes + 1);
+                                      retryTimes + 1, deadline);
         }
         return true;
     };
+    auto timeoutSeconds = timeoutOption_.grpcTimeout * retryTimes;
+    if (deadline != std::chrono::steady_clock::time_point::max()) {
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) {
+            promise->SetValue(Status(GRPC_DEADLINE_EXCEEDED, "etcd prefix snapshot deadline exceeded"));
+            return;
+        }
+        // CallAsyncX uses seconds. Round up, then reject late results above.
+        timeoutSeconds = std::min(timeoutSeconds, (remaining + 999) / 1000);
+    }
+    response->Clear();
     (void)kvClient_
         ->CallAsyncX("Get", request, response.get(), &etcdserverpb::KV::Stub::AsyncRange,
-                     timeoutOption_.grpcTimeout * retryTimes)
+                     timeoutSeconds)
         .Then(then);
 }
 
@@ -563,7 +699,12 @@ litebus::Future<std::shared_ptr<Watcher>> EtcdKvClientStrategy::GetAndWatch(
     if (option.revision == 0) {
         GetOption opts{ .prefix = option.prefix };
         return Get(key, opts).Then([aid(GetAID()), key, option, observer, syncer,
-                                    reconnectRecord](const std::shared_ptr<GetResponse> &getResponse) {
+                                    reconnectRecord](const std::shared_ptr<GetResponse> &getResponse)
+                                    -> litebus::Future<std::shared_ptr<Watcher>> {
+            if (getResponse == nullptr || getResponse->status.IsError()) {
+                YRLOG_ERROR("failed to read initial snapshot for key {}", key);
+                return nullptr;
+            }
             std::vector<WatchEvent> events;
             WatchOption watchOption{ option };
             events.reserve(getResponse->kvs.size());
@@ -572,8 +713,9 @@ litebus::Future<std::shared_ptr<Watcher>> EtcdKvClientStrategy::GetAndWatch(
                 (void)events.emplace_back(event);
             }
             YRLOG_DEBUG("process get response for key {}, event size: {}", key, events.size());
-            if (!events.empty()) {
-                (void)observer(events, true);
+            if (!observer(events, true)) {
+                YRLOG_ERROR("failed to apply initial snapshot for key {}", key);
+                return nullptr;
             }
             watchOption.revision = getResponse->header.revision + 1;
             return litebus::Async(aid, &EtcdKvClientStrategy::Watch, key, watchOption, observer, syncer,
@@ -593,9 +735,12 @@ litebus::Future<std::shared_ptr<Watcher>> EtcdKvClientStrategy::GetAndWatchWithH
         GetOption opts{ .prefix = option.prefix };
         return Get(key, opts).Then(
             [aid(GetAID()), key, option, handlers, reconnectRecord](const std::shared_ptr<GetResponse> &getResponse) {
+                if (getResponse == nullptr) {
+                    return litebus::Future<std::shared_ptr<Watcher>>(nullptr);
+                }
                 return handlers.responseHandler(getResponse)
                     .Then([=](const litebus::Future<Status> &status) -> litebus::Future<std::shared_ptr<Watcher>> {
-                        if (status.IsError() || status.Get().IsError()) {
+                        if (status.IsError() || status.Get().IsError() || getResponse->status.IsError()) {
                             YRLOG_ERROR("process key({}) get response Error", key);
                             return nullptr;
                         }
@@ -607,7 +752,10 @@ litebus::Future<std::shared_ptr<Watcher>> EtcdKvClientStrategy::GetAndWatchWithH
                             (void)events.emplace_back(event);
                         }
                         YRLOG_DEBUG("process get response for key {}, event size: {}", key, events.size());
-                        (void)handlers.observer(events, true);
+                        if (!handlers.observer(events, true)) {
+                            YRLOG_ERROR("failed to apply initial snapshot for key {}", key);
+                            return nullptr;
+                        }
                         watchOption.revision = getResponse->header.revision + 1;
                         return litebus::Async(aid, &EtcdKvClientStrategy::Watch, key, watchOption, handlers.observer,
                                               handlers.syncer, reconnectRecord);
