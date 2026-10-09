@@ -235,7 +235,7 @@ void MapMetaStoreCore::ReleaseGate(const TxnMatcher &matcher, CommitOutcome forc
         return;
     }
     if (forced == CommitOutcome::NULL_RESPONSE) {
-        promise->SetValue(nullptr);
+        promise->SetValue(std::shared_ptr<TxnResponse>());
         return;
     }
     if (forced == CommitOutcome::STATUS_ERROR) {
@@ -303,7 +303,7 @@ litebus::Future<std::shared_ptr<GetResponse>> MapMetaStore::Get(const std::strin
     auto rsp = std::make_shared<GetResponse>();
     rsp->status = Status::OK();
     if (forced == GetOutcome::NULL_RESPONSE) {
-        promise->SetValue(nullptr);
+        promise->SetValue(std::shared_ptr<GetResponse>());
         return future;
     }
     if (forced == GetOutcome::STATUS_ERROR) {
@@ -423,7 +423,7 @@ litebus::Future<std::shared_ptr<TxnResponse>> MapTxnTransaction::Commit() const
         return future;
     }
     if (forced == CommitOutcome::NULL_RESPONSE) {
-        promise->SetValue(nullptr);
+        promise->SetValue(std::shared_ptr<TxnResponse>());
         return future;
     }
     if (forced == CommitOutcome::STATUS_ERROR) {

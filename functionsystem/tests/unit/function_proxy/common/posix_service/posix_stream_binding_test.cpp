@@ -256,8 +256,8 @@ TEST_F(PosixStreamBindingFixture, RealStreamSaveLandsOnComposedGenerationKey)
     auto rsp = responsePromise_->GetFuture();
     ASSERT_AWAIT_READY(rsp);
     EXPECT_EQ(rsp.Get().saversp().code(), common::ERR_NONE) << rsp.Get().saversp().message();
-    EXPECT_TRUE(functionsystem::StateClient::IsSnapshotKey(rsp.Get()->saversp().checkpointid()))
-        << "v3: expected snapshot namespace, got: " << rsp.Get()->saversp().checkpointid();
+    EXPECT_TRUE(functionsystem::StateClient::IsSnapshotKey(rsp.Get().saversp().checkpointid()))
+        << "v3: expected snapshot namespace, got: " << rsp.Get().saversp().checkpointid();
 }
 
 // FIRST-CREATION ordering (root creation-order evidence): the stream
@@ -304,8 +304,8 @@ TEST_F(PosixStreamBindingFixture, EarlyConnectionDuringCreationSavesAfterRuntime
     auto rsp = responsePromise_->GetFuture();
     ASSERT_AWAIT_READY(rsp);
     EXPECT_EQ(rsp.Get().saversp().code(), common::ERR_NONE) << rsp.Get().saversp().message();
-    EXPECT_TRUE(functionsystem::StateClient::IsSnapshotKey(rsp.Get()->saversp().checkpointid()))
-        << "v3: expected snapshot namespace, got: " << rsp.Get()->saversp().checkpointid();
+    EXPECT_TRUE(functionsystem::StateClient::IsSnapshotKey(rsp.Get().saversp().checkpointid()))
+        << "v3: expected snapshot namespace, got: " << rsp.Get().saversp().checkpointid();
 }
 
 // Same window, hostile variant: a stream from the OLD runtime (rt-1)

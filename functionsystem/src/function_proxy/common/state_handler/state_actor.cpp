@@ -21,6 +21,7 @@
 
 #include "async/asyncafter.hpp"
 #include "async/async.hpp"
+#include "async/defer.hpp"
 #include "common/utils/generate_message.h"
 #include "common/utils/meta_store_kv_operation.h"
 #include "meta_store_client/txn_transaction.h"
@@ -1120,7 +1121,8 @@ litebus::Future<StateActor::RetireReport> StateActor::PromoteNextCleanedMarker(
                 finalReport.cursorPersisted =
                     !f.IsError() && rsp != nullptr && !rsp->status.IsError() && rsp->success;
                 if (!finalReport.cursorPersisted) {
-                    finalReport.refDetail += (finalReport.refDetail.empty() ? "" : "; ")
+                    finalReport.refDetail += (finalReport.refDetail.empty() ? std::string()
+                                                                            : std::string("; "))
                         + "cursor advance not persisted — next round re-processes idempotently";
                 }
                 promise->SetValue(std::move(finalReport));

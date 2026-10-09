@@ -215,7 +215,7 @@ public:
                         record.set_runtimeid(info.runtimeid());
                         record.set_function("default/0-test-helloWorld/$latest");
                         std::string json;
-                        if (TransToJsonFromInstanceInfo(record, json)) {
+                        if (TransToJsonFromInstanceInfo(json, record)) {
                             coreHolder_->Seed(key, json);
                         }
                     }
@@ -235,7 +235,7 @@ private:
 // reference resolution fails before it).
 class StubRecoverPosixClient : public ControlInterfacePosixClient {
 public:
-    StubRecoverPosixClient() : ControlInterfacePosixClient(nullptr)
+    StubRecoverPosixClient() : BaseClient(nullptr), ControlInterfacePosixClient(nullptr)
     {
     }
 
@@ -1066,8 +1066,8 @@ TEST_F(KillEntryIdentityFixture, DelayedFenceSameNameReplacementRefusesAllSideEf
 {
     auto controlView = std::make_shared<MockInstanceControlView>("node-test");
     DefaultIdentityFromView(controlView);  // default FIRST — the unknown-state override below wins
-    auto oldMachine = std::make_shared<MockInstanceStateMachine>("m-df-old");
-    const auto oldInfo = MakeElasticInfo("inst-df", "runtime-OLD");
+        auto oldMachine = std::make_shared<MockInstanceStateMachine>("m-df-old");
+    auto oldInfo = MakeElasticInfo("inst-df", "runtime-OLD");
     oldInfo.set_groupid("grp-df");  // the group side effect must be countable
     ON_CALL(*oldMachine, GetInstanceInfo()).WillByDefault(Return(oldInfo));
     ON_CALL(*oldMachine, GetRequestID()).WillByDefault(Return(oldInfo.requestid()));
@@ -1138,8 +1138,8 @@ TEST_F(KillEntryIdentityFixture, PostFenceUnknownRuntimeIdentityRefusesSideEffec
 {
     auto controlView = std::make_shared<MockInstanceControlView>("node-test");
     DefaultIdentityFromView(controlView);  // default FIRST — the unknown-state override below wins
-    auto machine = std::make_shared<MockInstanceStateMachine>("m-u1");
-    const auto info = MakeElasticInfo("inst-u1", "runtime-u1");
+        auto machine = std::make_shared<MockInstanceStateMachine>("m-u1");
+    auto info = MakeElasticInfo("inst-u1", "runtime-u1");
     info.set_groupid("grp-u1");  // make the group assertion meaningful
     ON_CALL(*machine, GetInstanceInfo()).WillByDefault(Return(info));
     ON_CALL(*machine, GetRequestID()).WillByDefault(Return(info.requestid()));
@@ -1176,8 +1176,8 @@ TEST_F(KillEntryIdentityFixture, PostFenceUnknownRequestIdentityRefusesSideEffec
 {
     auto controlView = std::make_shared<MockInstanceControlView>("node-test");
     DefaultIdentityFromView(controlView);  // default FIRST — the unknown-state override below wins
-    auto machine = std::make_shared<MockInstanceStateMachine>("m-u2");
-    const auto info = MakeElasticInfo("inst-u2", "runtime-u2");
+        auto machine = std::make_shared<MockInstanceStateMachine>("m-u2");
+    auto info = MakeElasticInfo("inst-u2", "runtime-u2");
     info.set_groupid("grp-u2");  // make the group assertion meaningful
     ON_CALL(*machine, GetInstanceInfo()).WillByDefault(Return(info));
     ON_CALL(*machine, GetRequestID()).WillByDefault(Return(info.requestid()));
@@ -1218,7 +1218,7 @@ TEST_F(KillEntryIdentityFixture, RecoverFailedResolutionFutureSurfacesExplicitEr
         .WillByDefault(Invoke([stub](const std::string &) {
             auto promise = std::make_shared<
                 litebus::Promise<std::shared_ptr<ControlInterfacePosixClient>>>();
-            promise->SetValue(stub);
+            promise->SetValue(std::shared_ptr<ControlInterfacePosixClient>(stub));
             return promise->GetFuture();
         }));
 
