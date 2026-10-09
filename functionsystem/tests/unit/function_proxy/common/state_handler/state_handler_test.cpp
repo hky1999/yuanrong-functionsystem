@@ -21,6 +21,8 @@
 #include "common/utils/files.h"
 #include "gtest/gtest.h"
 #include "mocks/mock_distributed_cache_client.h"
+#include "mocks/mock_meta_store_client.h"
+#include "mocks/mock_txn_transaction.h"
 #include "state_handler_helper.h"
 #include "utils/future_test_helper.h"
 
@@ -55,6 +57,19 @@ public:
                            const StateActor::GuardedStoreOp &op) {
                 return view->DeleteStateGuarded(id, runtime, op);
             });
+        // v3: bind the save registry (a mock meta-store returning ready
+        // success transactions — the DelInstanceTest recipe).
+        registryMeta_ = std::make_shared<MockMetaStoreClient>("127.0.0.1:1");
+        auto mockTxn = std::make_shared<MockTxnTransaction>(litebus::AID());
+        EXPECT_CALL(*registryMeta_, BeginTransaction).WillRepeatedly(Return(mockTxn));
+        EXPECT_CALL(*mockTxn, Commit).WillRepeatedly(
+            Return(litebus::Future<std::shared_ptr<TxnResponse>>(
+                []() {
+                    auto ok = std::make_shared<TxnResponse>();
+                    ok->success = true;
+                    return ok;
+                }())));
+        stateActor_->BindSaveRegistry(registryMeta_);
     }
 
     void TearDown() override
@@ -68,6 +83,7 @@ public:
 
 protected:
     std::shared_ptr<MockDistributedCacheClient> distributedCacheClient_;
+    std::shared_ptr<MockMetaStoreClient> registryMeta_;
     std::shared_ptr<StateActor> stateActor_;
     std::shared_ptr<StateClient> stateClient_;
     std::shared_ptr<functionsystem::InstanceControlView> view_;

@@ -32,6 +32,8 @@ public:
     // view's lock — the same lock generation changes take.
     static void BindSaveExecutor(const StateActor::SaveExecutor &executor);
     static void BindDeleteExecutor(const StateActor::DeleteExecutor &executor);
+    // v3: bind the meta-store registry used for registration-first saves.
+    static void BindSaveRegistry(const std::shared_ptr<MetaStoreClient> &metaStoreClient);
     // The posix handler signature: the STREAM-BOUND identity (creation
     // generation fixed at accept) travels with the message; an unbound
     // stream is refused by the actor, never silently degraded.

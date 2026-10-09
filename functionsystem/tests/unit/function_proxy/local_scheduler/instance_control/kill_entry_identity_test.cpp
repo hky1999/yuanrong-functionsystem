@@ -257,6 +257,17 @@ protected:
                                               const functionsystem::function_proxy::StateActor::GuardedStoreOp &op) {
             return actor_->GetInstanceControlView()->DeleteStateGuarded(instanceID, expectedRuntimeID, op);
         });
+        // v3: bind the save registry (mock meta-store, ready-success txns).
+        registryMeta_ = std::make_shared<MockMetaStoreClient>("127.0.0.1:1");
+        auto regTxn = std::make_shared<MockTxnTransaction>(litebus::AID());
+        ON_CALL(*registryMeta_, BeginTransaction).WillByDefault(Return(regTxn));
+        ON_CALL(*regTxn, Commit).WillByDefault(Invoke([]() {
+            auto ok = std::make_shared<TxnResponse>();
+            ok->success = true;
+            return litebus::Future<std::shared_ptr<TxnResponse>>(
+                std::shared_ptr<TxnResponse>(ok));
+        }));
+        stateActor_->BindSaveRegistry(registryMeta_);
         litebus::Spawn(actor_);
     }
 

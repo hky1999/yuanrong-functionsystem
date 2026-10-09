@@ -53,6 +53,15 @@ void StateHandler::BindDeleteExecutor(const StateActor::DeleteExecutor &executor
     litebus::Async(stateActorAid_, &StateActor::SetDeleteExecutor, executor);
 }
 
+void StateHandler::BindSaveRegistry(const std::shared_ptr<MetaStoreClient> &metaStoreClient)
+{
+    if (stateActorAid_.Name().empty()) {
+        YRLOG_ERROR("failed to bind save registry: don't init state actor");
+        return;
+    }
+    litebus::Async(stateActorAid_, &StateActor::BindSaveRegistry, metaStoreClient);
+}
+
 litebus::Future<std::shared_ptr<StreamingMessage>> StateHandler::SaveState(
     const grpc::PosixStreamIdentity &identity, const std::shared_ptr<StreamingMessage> &request)
 {

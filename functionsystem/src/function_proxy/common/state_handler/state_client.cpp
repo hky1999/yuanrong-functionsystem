@@ -16,6 +16,7 @@
 
 #include "state_client.h"
 
+#include "async/uuid_generator.hpp"
 #include "common/logs/logging.h"
 
 namespace functionsystem {
@@ -69,6 +70,7 @@ std::string UnescapeKeyPart(const std::string &in)
 }
 
 constexpr const char *STATE_KEY_SCHEME = "state:v1:";
+constexpr const char *SNAPSHOT_KEY_SCHEME = "state:snap:v1:";
 }  // namespace
 
 std::string StateClient::ComposeStateKey(const std::string &instanceId, const std::string &generation)
@@ -95,6 +97,21 @@ std::pair<std::string, std::string> StateClient::ParseStateKey(const std::string
         return { "", "" };
     }
     return { instancePart, generationPart };
+}
+
+std::string StateClient::ComposeSnapshotKey(const std::string &instanceId,
+                                            const std::string &creationRequest)
+{
+    // A fresh UUID on EVERY call makes the key globally unique per save
+    // operation — the physical isolation invariant (v3 §1.1).
+    const auto uuid = litebus::uuid_generator::UUID::GetRandomUUID().ToString();
+    return std::string(SNAPSHOT_KEY_SCHEME) + EscapeKeyPart(instanceId) + ":"
+        + EscapeKeyPart(creationRequest) + ":" + uuid;
+}
+
+bool StateClient::IsSnapshotKey(const std::string &key)
+{
+    return key.rfind(SNAPSHOT_KEY_SCHEME, 0) == 0;
 }
 
 Status StateClient::Init()

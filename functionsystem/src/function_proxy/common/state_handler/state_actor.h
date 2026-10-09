@@ -18,11 +18,14 @@
 #define BUSPROXY_BUSINESS_STATE_ACTOR_STATE_ACTOR_H
 
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "actor/actor.hpp"
 #include "async/future.hpp"
 #include "common/logs/logging.h"
 #include "common/proto/pb/posix_pb.h"
+#include "meta_store_client/meta_store_client.h"
 #include "state_client.h"
 
 namespace functionsystem::function_proxy {
@@ -79,10 +82,46 @@ public:
                                         const std::string &generation,
                                         const std::string &expectedRuntimeID);
 
+    // ── v3 registration-first isolation ──────────────────────────────────
+    // A persistent registry tracks every save operation's lifecycle in the
+    // meta-store (etcd) so that a timeout or process death NEVER produces
+    // an undiscoverable DS object. The registry is the single source of
+    // truth for reclamation — DS has no enumeration API.
+    //
+    // Registration states: PENDING → (COMMITTED | UNKNOWN).
+    //   PENDING  = registered, DS write in flight.
+    //   COMMITTED = DS write succeeded AND conditional publish matched.
+    //   UNKNOWN  = DS write outcome uncertain (timeout / publish conflict /
+    //              process death) — the registration is RETAINED so a
+    //              later reconciliation can discover the late object.
+    //              UNKNOWN registrations are NEVER cleared by a single
+    //              NOT_FOUND — a late write may still arrive after a Del.
+    struct SaveRegistration {
+        std::string saveOpID;
+        std::string snapshotKey;
+        std::string instanceID;
+        std::string creationRequest;
+        std::string runtimeID;
+        std::string status;  // PENDING | COMMITTED | UNKNOWN
+    };
+    // Binds the registry used for v3 saves. Both parameters are required
+    // (an unbound actor refuses v3 saves rather than silently falling back
+    // to unregistered writes).
+    void BindSaveRegistry(const std::shared_ptr<MetaStoreClient> &metaStoreClient);
+    // Serializes a registration record (deterministic, escaped).
+    static std::string SerializeRegistration(const SaveRegistration &reg);
+    // Parses a registration record; `.status` empty on parse failure.
+    static SaveRegistration ParseRegistration(const std::string &raw);
+    // Registration key in the meta-store for a given save operation.
+    static std::string RegistrationKey(const std::string &instanceID,
+                                       const std::string &creationRequest,
+                                       const std::string &saveOpID);
+
 private:
     std::shared_ptr<StateClient> stateClient_;
     SaveExecutor saveExecutor_;
     DeleteExecutor deleteExecutor_;
+    std::shared_ptr<MetaStoreClient> registry_;  // v3 save registry
 };
 
 }  // namespace functionsystem::function_proxy

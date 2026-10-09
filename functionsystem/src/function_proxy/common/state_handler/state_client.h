@@ -50,6 +50,18 @@ public:
 
     virtual Status Del(const std::string &key);
 
+    // ── v3 snapshot primitives (registration-first isolation) ────────────
+    // A snapshot key is globally unique per SAVE OPERATION:
+    // `state:snap:v1:<esc(instance)>:<esc(creationRequest)>:<saveOpID>`.
+    // Two saves — even same incarnation, same millisecond — produce
+    // different keys; a late-arriving write can only land on its OWN key
+    // (no overwrite target exists). The UUID is generated inside
+    // ComposeSnapshotKey on every call.
+    static std::string ComposeSnapshotKey(const std::string &instanceId,
+                                           const std::string &creationRequest);
+    // True when the key is in the snapshot namespace (v3 writes).
+    static bool IsSnapshotKey(const std::string &key);
+
 private:
     std::shared_ptr<DistributedCacheClient> distributedCacheClient_;
     bool isInited_;
