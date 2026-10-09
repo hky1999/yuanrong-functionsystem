@@ -1027,13 +1027,16 @@ TEST_F(KillEntryIdentityFixture, FullChainMidFlightRequestZeroCacheDel)
 // PostFence re-verification (root entry test): a same-name replacement
 // landing DURING the retirement-fence wait. The fence commits for the OLD
 // generation's identity, yet the PostFence entry re-check must refuse
-// EVERY control side effect — the NEW generation's route/group/metadata
-// are untouchable by the old chain.
+// EVERY control side effect. COVERED HERE: metadata (DelInstance forms)
+// and group cleanup (counting callback). NOT covered: traefik route —
+// the fixture binds no TraefikRegistry, so no route side effect can even
+// occur in this test; that arm stays to the traefik-registry suite.
 TEST_F(KillEntryIdentityFixture, DelayedFenceSameNameReplacementRefusesAllSideEffects)
 {
     auto controlView = std::make_shared<MockInstanceControlView>("node-test");
     auto oldMachine = std::make_shared<MockInstanceStateMachine>("m-df-old");
     const auto oldInfo = MakeElasticInfo("inst-df", "runtime-OLD");
+    oldInfo.set_groupid("grp-df");  // the group side effect must be countable
     ON_CALL(*oldMachine, GetInstanceInfo()).WillByDefault(Return(oldInfo));
     ON_CALL(*oldMachine, GetRequestID()).WillByDefault(Return(oldInfo.requestid()));
     machineSlot_ = nullptr;
@@ -1041,14 +1044,25 @@ TEST_F(KillEntryIdentityFixture, DelayedFenceSameNameReplacementRefusesAllSideEf
         .WillByDefault(Invoke([this, oldMachine](const std::string &) {
             return machineSlot_ ? machineSlot_ : oldMachine;
         }));
-    ON_CALL(*controlView, GetIncarnationSnapshot(Matcher<const std::string &>("inst-df")))
+    // The strict three-state identity snapshot follows the slot: OLD
+    // identity before the swap, NEW after.
+    ON_CALL(*controlView, GetInstanceIdentitySnapshot(Matcher<const std::string &>("inst-df")))
         .WillByDefault(Invoke([this, oldMachine](const std::string &) {
+            InstanceControlView::InstanceIdentitySnapshot snap;
             const auto machine = machineSlot_ ? machineSlot_ : oldMachine;
-            return std::make_pair(machine->GetInstanceInfo().runtimeid(), machine->GetRequestID());
+            snap.exists = true;
+            snap.runtimeID = machine->GetInstanceInfo().runtimeid();
+            snap.requestID = machine->GetRequestID();
+            return snap;
         }));
     // NEITHER metadata-delete form may fire for the new generation.
     EXPECT_CALL(*controlView, DelInstance("inst-df")).Times(0);
     EXPECT_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-df"), _, _)).Times(0);
+    // The GROUP side effect must not fire either (counting callback).
+    auto groupClears = std::make_shared<std::atomic<int>>(0);
+    actor_->RegisterClearGroupInstanceCallBack([groupClears](const InstanceInfo &) {
+        groupClears->fetch_add(1);
+    });
     actor_->BindInstanceControlView(controlView);
 
     // Gate the FENCE COMMIT itself (the tombstone Put for the OLD
@@ -1079,8 +1093,81 @@ TEST_F(KillEntryIdentityFixture, DelayedFenceSameNameReplacementRefusesAllSideEf
     EXPECT_NE(result.Get().GetMessage().find("rebound"), std::string::npos)
         << "the refusal must name the post-fence re-verification: "
         << result.Get().GetMessage();
+    EXPECT_EQ(groupClears->load(), 0) << "no group cleanup for the new generation";
     // The old generation's tombstone DID commit (its own isolation holds).
     EXPECT_TRUE(metaCore_->Exists(fenceKey));
+}
+
+// PostFence UNKNOWN identity, variant 1: the machine EXISTS but its
+// runtime field is unknown (empty). Unknown is NOT consent — every
+// control side effect is refused (metadata + group covered; route not
+// bound in this fixture).
+TEST_F(KillEntryIdentityFixture, PostFenceUnknownRuntimeIdentityRefusesSideEffects)
+{
+    auto controlView = std::make_shared<MockInstanceControlView>("node-test");
+    auto machine = std::make_shared<MockInstanceStateMachine>("m-u1");
+    const auto info = MakeElasticInfo("inst-u1", "runtime-u1");
+    info.set_groupid("grp-u1");  // make the group assertion meaningful
+    ON_CALL(*machine, GetInstanceInfo()).WillByDefault(Return(info));
+    ON_CALL(*machine, GetRequestID()).WillByDefault(Return(info.requestid()));
+    ON_CALL(*controlView, GetInstance("inst-u1")).WillByDefault(Return(machine));
+    // The identity snapshot reports EXISTING machine with an UNKNOWN
+    // runtime — the entry guard's two-read view passes, PostFence must
+    // not.
+    InstanceControlView::InstanceIdentitySnapshot unknownRuntime;
+    unknownRuntime.exists = true;
+    unknownRuntime.runtimeID = "";
+    unknownRuntime.requestID = info.requestid();
+    ON_CALL(*controlView, GetInstanceIdentitySnapshot(Matcher<const std::string &>("inst-u1")))
+        .WillByDefault(Return(unknownRuntime));
+    EXPECT_CALL(*controlView, DelInstance("inst-u1")).Times(0);
+    EXPECT_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-u1"), _, _)).Times(0);
+    auto groupClears = std::make_shared<std::atomic<int>>(0);
+    actor_->RegisterClearGroupInstanceCallBack([groupClears](const InstanceInfo &) {
+        groupClears->fetch_add(1);
+    });
+    actor_->BindInstanceControlView(controlView);
+
+    auto result = actor_->DeleteInstanceInControlView(Status::OK(), info);
+    ASSERT_AWAIT_READY(result);
+    ASSERT_TRUE(result.Get().IsError());
+    EXPECT_NE(result.Get().GetMessage().find("unknown"), std::string::npos)
+        << "the refusal must name the unknown identity: " << result.Get().GetMessage();
+    EXPECT_EQ(groupClears->load(), 0);
+}
+
+// PostFence UNKNOWN identity, variant 2: the machine exists with the SAME
+// runtime but an unknown (empty) request generation — same-runtime must
+// not smuggle an unknown request through.
+TEST_F(KillEntryIdentityFixture, PostFenceUnknownRequestIdentityRefusesSideEffects)
+{
+    auto controlView = std::make_shared<MockInstanceControlView>("node-test");
+    auto machine = std::make_shared<MockInstanceStateMachine>("m-u2");
+    const auto info = MakeElasticInfo("inst-u2", "runtime-u2");
+    info.set_groupid("grp-u2");  // make the group assertion meaningful
+    ON_CALL(*machine, GetInstanceInfo()).WillByDefault(Return(info));
+    ON_CALL(*machine, GetRequestID()).WillByDefault(Return(info.requestid()));
+    ON_CALL(*controlView, GetInstance("inst-u2")).WillByDefault(Return(machine));
+    InstanceControlView::InstanceIdentitySnapshot unknownRequest;
+    unknownRequest.exists = true;
+    unknownRequest.runtimeID = info.runtimeid();  // SAME runtime...
+    unknownRequest.requestID = "";                // ...unknown generation
+    ON_CALL(*controlView, GetInstanceIdentitySnapshot(Matcher<const std::string &>("inst-u2")))
+        .WillByDefault(Return(unknownRequest));
+    EXPECT_CALL(*controlView, DelInstance("inst-u2")).Times(0);
+    EXPECT_CALL(*controlView, DelInstance(Matcher<const std::string &>("inst-u2"), _, _)).Times(0);
+    auto groupClears = std::make_shared<std::atomic<int>>(0);
+    actor_->RegisterClearGroupInstanceCallBack([groupClears](const InstanceInfo &) {
+        groupClears->fetch_add(1);
+    });
+    actor_->BindInstanceControlView(controlView);
+
+    auto result = actor_->DeleteInstanceInControlView(Status::OK(), info);
+    ASSERT_AWAIT_READY(result);
+    ASSERT_TRUE(result.Get().IsError());
+    EXPECT_NE(result.Get().GetMessage().find("unknown"), std::string::npos)
+        << "the refusal must name the unknown identity: " << result.Get().GetMessage();
+    EXPECT_EQ(groupClears->load(), 0);
 }
 
 
@@ -1114,6 +1201,65 @@ TEST_F(KillEntryIdentityFixture, RecoverFailedResolutionFutureSurfacesExplicitEr
     EXPECT_NE(result.Get().GetMessage().find("future failed"), std::string::npos)
         << "the error must name the failed future explicitly, got: "
         << result.Get().GetMessage();
+}
+
+
+// REAL frontend Kill entry: the retirement-fence read FAILS AS A FUTURE.
+// Every Then between it and OnKill is skipped, so the kill RPC's chain
+// future arrives FAILED — OnKill must complete the RPC with an EXPLICIT
+// ready error (GenKillResponse), never a default-protobuf read (whose
+// code()==0 would fake success). The physical kill and settlement already
+// ran (the fence sits AFTER them in the exit chain) — the response names
+// the failed future, and the machine is NOT deleted.
+TEST_F(KillEntryIdentityFixture, RealKillEntryFenceFutureFailureGivesReadyError)
+{
+    auto harness = MakeRealView();
+    actor_->BindInstanceControlView(harness.view);
+    auto entry = MakeViewEntry("inst-fk2", "runtime-fk2", "sbox-fk2", "gen-fk2");
+    entry.set_functionproxyid("node-test");
+    entry.set_function("default/0-test-helloWorld/$latest");
+    entry.set_tenantid("tenant-fk2");
+    entry.mutable_instancestatus()->set_code(static_cast<int32_t>(InstanceState::RUNNING));
+    harness.view->GenerateStateMachine(entry.instanceid(), entry);
+    ServeView(MakeUnitWithEntry(entry));
+    EXPECT_CALL(*primary_, ApplyPhysicalRetirement(_))
+        .WillOnce(Invoke([this, entry](const resource_view::PhysicalRetirementReceipt &receipt) {
+            settleReceipts.push_back(receipt);
+            ServeView(MakeUnitWithEntry(MakeElasticInfo("inst-other", "runtime-other")));
+            auto promise = std::make_shared<litebus::Promise<Status>>();
+            promise->SetValue(Status::OK());
+            return promise->GetFuture();
+        }));
+    ON_CALL(*functionAgentMgr_, IsFuncAgentRecovering(_))
+        .WillByDefault(Return(litebus::Future<bool>(false)));
+    ON_CALL(*clientManager_, GetControlInterfacePosixClient(_))
+        .WillByDefault(Invoke([](const std::string &) {
+            auto promise = std::make_shared<
+                litebus::Promise<std::shared_ptr<ControlInterfacePosixClient>>>();
+            promise->SetValue(std::shared_ptr<ControlInterfacePosixClient>{});
+            return promise->GetFuture();
+        }));
+
+    // The FENCE READ inside RetireGeneration fails AS A FUTURE.
+    metaCore_->forcedGets.push_back(
+        { functionsystem::function_proxy::StateActor::RetirementKey("inst-fk2", entry.requestid()),
+          functionsystem::function_proxy::test::GetOutcome::FAIL_FUTURE });
+
+    auto killReq = std::make_shared<KillRequest>();
+    killReq->set_instanceid("inst-fk2");
+    killReq->set_requestid("req-kill-fk2-1");
+    killReq->set_signal(SHUT_DOWN_SIGNAL);
+    auto result = actor_->KillFrontend("tenant-fk2", killReq);
+    ASSERT_AWAIT_READY(result);  // READY error — not a hung RPC
+    EXPECT_EQ(static_cast<int>(result.Get().code()),
+              static_cast<int>(common::ERR_INNER_SYSTEM_ERROR));
+    EXPECT_NE(result.Get().message().find("chain future failed"), std::string::npos)
+        << "the ready error must name the failed future: " << result.Get().message();
+    // The chain ran DEEP (physical kill + settlement happened before the
+    // fence) — and the machine was NOT deleted (no false completion).
+    EXPECT_EQ(killRequests.size(), 1u);
+    EXPECT_EQ(settleReceipts.size(), 1u);
+    EXPECT_NE(harness.view->GetInstance("inst-fk2"), nullptr);
 }
 
 

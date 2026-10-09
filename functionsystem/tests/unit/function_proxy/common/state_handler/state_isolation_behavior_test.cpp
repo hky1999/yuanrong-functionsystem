@@ -24,6 +24,7 @@
 #include "function_proxy/common/state_handler/state_handler.h"
 
 #include <chrono>
+#include <cstdio>
 #include <thread>
 
 #include "common/metadata/metadata.h"
@@ -958,6 +959,101 @@ TEST_F(StateIsolation, ReplayConcurrencyCapHoldsWhileEightStuck)
         }
     }
     EXPECT_TRUE(tailConverged) << "released slots must let the cursor reach the tail";
+}
+
+// ── per-generation entry-cap fairness: 65+ registrations, tail converges ────
+// A generation with 70 registrations whose FIRST 64 are permanently
+// PENDING (uncertain heads). A head-truncating cap would starve the tail
+// forever; the tombstone cursor must let later rounds process past the
+// heads so the tail COMMITTED entries get Del/CLEANED, while a NEW
+// generation of the same instance stays untouched.
+TEST_F(StateIsolation, EntryCapCursorLetsTailConvergePastUncertainHeads)
+{
+    const std::string inst = "inst-ec";
+    const std::string req = "req-ec";
+    SeedRecord(inst, req, "rt-ec");
+    auto live = Save(inst, "rt-ec", req, "state-ec-live");
+    ASSERT_TRUE(WaitReady(live));
+    ASSERT_EQ(live.Get().code(), common::ErrorCode::ERR_NONE);
+
+    // Deterministic canonical UUIDs for the seeded registrations.
+    auto uuidOf = [](int i) {
+        char buf[37];
+        snprintf(buf, sizeof(buf), "%08x-0000-4000-8000-%012x",
+                 0xa0000000u + static_cast<unsigned>(i),
+                 0x555500000000u + static_cast<unsigned>(i));
+        return std::string(buf);
+    };
+    const std::string escInst = StateClient::EscapeKeyPart(inst);
+    const std::string escReq = StateClient::EscapeKeyPart(req);
+    // 70 seeded registrations: #0..#63 PENDING (permanently uncertain),
+    // #64..#69 COMMITTED — all strictly valid tuples for THIS generation.
+    for (int i = 0; i < 70; ++i) {
+        const std::string uuid = uuidOf(i);
+        const std::string regKey = "statereg:v1:" + escInst + ":" + escReq + ":" + uuid;
+        const std::string snapKey = "state:snap:v1:" + escInst + ":" + escReq + ":" + uuid;
+        StateActor::SaveRegistration reg;
+        reg.saveOpID = uuid;
+        reg.snapshotKey = snapKey;
+        reg.instanceID = inst;
+        reg.creationRequest = req;
+        reg.runtimeID = "rt-ec";
+        reg.status = (i < 64) ? "PENDING" : "COMMITTED";
+        reg.authorityRecordKey = GenInstanceKey(kFuncKey, inst, req).Get();
+        reg.authorityModRevision = 1;
+        metaCore_->Seed(regKey, StateActor::SerializeRegistration(reg));
+        // The COMMITTED tail entries have real data on their unique keys.
+        if (i >= 64) {
+            std::lock_guard<std::mutex> guard(ds_->lock);
+            ds_->data[snapKey] = "tail-state-" + std::to_string(i);
+        }
+    }
+    // The PENDING heads' DS writes are permanently uncertain (stuck
+    // store) — they must not consume the tail's chances forever.
+    for (int i = 0; i < 64; ++i) {
+        ds_->ForceSet("state:snap:v1:" + escInst + ":" + escReq + ":" + uuidOf(i),
+                      DsAction::TIMEOUT);
+    }
+
+    auto fence = StateHandler::RetireGeneration(inst, req, "rt-ec");
+    ASSERT_TRUE(WaitReady(fence));
+    ASSERT_TRUE(fence.Get().fenced);
+
+    // ROUND 1: quota (64) consumed by the uncertain heads; truncated.
+    auto round1 = StateHandler::CleanupRetiredSnapshots(inst, req, "rt-ec");
+    ASSERT_TRUE(WaitReady(round1));
+    ASSERT_TRUE(round1.Get().fenced);
+    EXPECT_TRUE(round1.Get().truncated);
+    EXPECT_EQ(round1.Get().entries.size(), 64u);
+
+    // ROUND 2: the cursor resumes AFTER the heads — the tail COMMITTED
+    // entries are reached, deleted, and CLEANED.
+    auto round2 = StateHandler::CleanupRetiredSnapshots(inst, req, "rt-ec");
+    ASSERT_TRUE(WaitReady(round2));
+    ASSERT_TRUE(round2.Get().fenced);
+    size_t cleaned = 0;
+    for (const auto &entry : round2.Get().entries) {
+        if (entry.cleanedMarker) { cleaned += 1; }
+    }
+    EXPECT_GE(cleaned, 6u) << "the tail COMMITTED entries must converge";
+    // The heads remain PENDING (never falsely promoted) and retained.
+    {
+        std::lock_guard<std::mutex> guard(metaCore_->lock);
+        size_t pendingHeads = 0;
+        for (const auto &kv : metaCore_->kv) {
+            if (kv.first.rfind("statereg:v1:" + escInst + ":" + escReq + ":", 0) != 0) { continue; }
+            const auto tuple = StateActor::ParseRegistration(kv.second);
+            if (tuple.status == "PENDING" || tuple.status == "UNKNOWN") { pendingHeads += 1; }
+        }
+        EXPECT_EQ(pendingHeads, 64u);
+    }
+    // A NEW generation of the SAME instance: untouched throughout.
+    SeedRecord(inst, "req-ec2", "rt-ec2");
+    auto neighbor = Save(inst, "rt-ec2", "req-ec2", "state-ec2");
+    ASSERT_TRUE(WaitReady(neighbor));
+    ASSERT_EQ(neighbor.Get().code(), common::ErrorCode::ERR_NONE);
+    EXPECT_EQ(ds_->DelCount(neighbor.Get().checkpointid()), 0);
+    EXPECT_TRUE(metaCore_->Exists(StateActor::StateRefKey(inst, "req-ec2")));
 }
 
 }  // namespace functionsystem::function_proxy::test

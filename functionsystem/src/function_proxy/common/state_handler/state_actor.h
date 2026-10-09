@@ -139,6 +139,13 @@ public:
         std::string authorityRecordKey;
         int64_t authorityModRevision = 0;
         std::string status;  // "RETIRED"
+        // Per-generation cleanup cursor: the last registration key whose
+        // entry this generation's cleanup already processed. Persisted IN
+        // the tombstone so the entry cap cannot starve the tail of a huge
+        // generation across rounds (or restarts): each round resumes
+        // AFTER the cursor and wraps; CLEANED/invalid entries pass free
+        // (no DS quota); a full wrap resets it.
+        std::string cleanupCursor;
     };
     static std::string SerializeFence(const FenceRecord &fence);
     static FenceRecord ParseFence(const std::string &raw);
@@ -212,6 +219,12 @@ public:
                                    // proven handled, nothing pending
         std::vector<RegistrationCleanup> entries;
         std::string reason;        // refusal reason when !fenced
+        // Internal plumbing (also observable by tests): the per-generation
+        // cursor advance persisted into the tombstone at the report's end.
+        std::string tombstoneKey;
+        std::string tombstoneValue;
+        std::string newCursor;
+        bool cursorAdvanced = false;
     };
     // FENCE (only): commits the generation tombstone conditionally on the
     // ORIGINAL authoritative record (captured raw value + mod_revision,
@@ -347,20 +360,31 @@ private:
         int64_t refModRevision = 0;
         // Reference state UNRESOLVED (read error, ambiguous, corrupt, or
         // foreign value): NO conditional delete is attempted, and
-        // allCleaned stays false — with the reason carried here.
+        // allCleaned stays false — with the reason carried here. An
+        // unresolved reference is NEVER reported as explicitly absent.
         bool refUnknown = false;
         std::string refDetail;
-        bool truncated = false;  // per-cleanup entry cap hit (explicit)
+        bool truncated = false;  // DS-work quota hit this round (explicit)
+        // Per-generation cursor persistence: the tombstone's raw captured
+        // value conditions the advance, so the entry quota can never
+        // starve the tail across rounds or restarts.
+        std::string tombstoneKey;
+        std::string tombstoneValue;
+        std::string newCursor;
+        bool cursorAdvanced = false;
         std::vector<RegistrationCleanup> entries;
     };
     // Actor phase, POST-fence: issues the registration-prefix enumeration
     // and the reference read (both AFTER the tombstone is confirmed — the
     // fence-absent condition in save-side transactions means nothing of
     // this generation can move anymore, so a linearizable read here sees
-    // every registration that will ever exist).
+    // every registration that will ever exist). fenceValue is the RAW
+    // captured tombstone — it carries the per-generation cleanup cursor
+    // and conditions the cursor's persisted advance.
     litebus::Future<RetireReport> EnumerateRetiredGeneration(const std::string &instanceId,
                                                              const std::string &creationRequest,
-                                                             const std::string &runtimeID);
+                                                             const std::string &runtimeID,
+                                                             const std::string &fenceValue);
     // Actor phase: conditional stateref delete, then hop to the report.
     litebus::Future<RetireReport> FinishRetirementCleanup(const std::string &instanceId,
                                                           const std::string &creationRequest,

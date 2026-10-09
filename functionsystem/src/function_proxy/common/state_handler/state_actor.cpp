@@ -797,9 +797,12 @@ litebus::Future<StateActor::RetireReport> StateActor::CleanupRetiredSnapshots(
             }
             // Tombstone confirmed: the enumeration (and reference read) may
             // now be issued — ON the actor, never from this completion
-            // thread.
+            // thread. The RAW tombstone value travels along: it carries
+            // the per-generation cleanup cursor AND conditions the
+            // cursor's later persisted advance.
             return litebus::Async(self, &StateActor::EnumerateRetiredGeneration, instanceId,
-                                  creationRequest, runtimeID);
+                                  creationRequest, runtimeID,
+                                  fenceRsp->kvs.front().value());
         });
 }
 
@@ -810,37 +813,78 @@ litebus::Future<StateActor::RetireReport> StateActor::CleanupRetiredSnapshots(
 // onto the actor.
 litebus::Future<StateActor::RetireReport> StateActor::EnumerateRetiredGeneration(
     const std::string &instanceId, const std::string &creationRequest,
-    const std::string &runtimeID)
+    const std::string &runtimeID, const std::string &fenceValue)
 {
     (void)runtimeID;
     const std::string tablePrefix = registry_->GetTablePrefix();
+    // The per-generation CURSOR from the tombstone — the entry cap would
+    // starve the tail of a huge generation without it (the same head 64
+    // would return every round).
+    FenceRecord fence = ParseFence(fenceValue);
+    const std::string cursor = fence.cleanupCursor;
     GetOption regPrefixOpt;
     regPrefixOpt.prefix = true;
     auto regFuture = registry_->Get(RegistrationPrefix(instanceId, creationRequest), regPrefixOpt);
     auto refFuture = registry_->Get(StateRefKey(instanceId, creationRequest), GetOption{});
     return regFuture.Then(
-        [self = GetAID(), instanceId, creationRequest, tablePrefix, refFuture]
+        [self = GetAID(), instanceId, creationRequest, tablePrefix, refFuture, fenceValue, cursor]
         (const std::shared_ptr<GetResponse> &regRsp) mutable -> litebus::Future<RetireReport> {
             RetireReport refused;
             if (regRsp == nullptr || regRsp->status.IsError()) {
                 refused.reason = "registration enumeration failed — retryable";
                 return refused;
             }
-            RetirementPlan plan;
+            // Classify EVERY entry (the read itself is a full prefix scan —
+            // see the cadence note: memory for one generation's
+            // registrations is unbounded and stated, not hidden).
+            std::map<std::string, RegistrationCleanup> sorted;
             for (const auto &kv : regRsp->kvs) {
-                if (plan.entries.size() >= static_cast<size_t>(kMaxCleanupEntriesPerRound)) {
-                    // EXPLICIT truncation, never silent: the remainder of a
-                    // huge generation stays registered and reconverges on
-                    // later replay rounds (CLEANED entries cost no DS
-                    // work, so the processed window slides forward).
-                    plan.truncated = true;
-                    break;
-                }
                 // Returned keys carry the meta-store table prefix.
-                plan.entries.push_back(ClassifyRegistrationEntry(
-                    TrimKeyPrefix(kv.key(), tablePrefix), kv.value(), instanceId,
-                    creationRequest));
+                auto entry = ClassifyRegistrationEntry(TrimKeyPrefix(kv.key(), tablePrefix),
+                                                       kv.value(), instanceId, creationRequest);
+                sorted.emplace(entry.regKey, std::move(entry));
             }
+            // CURSOR-FAIR SELECTION: resume AFTER the cursor, wrap to the
+            // head if quota remains. CLEANED and invalid entries pass FREE
+            // (no DS quota — a converged head never blocks the tail);
+            // PENDING/UNKNOWN/COMMITTED entries consume one DS-work slot
+            // each. Quota exhaustion leaves the remainder for the NEXT
+            // round, which resumes after everything already processed —
+            // bad or permanently-uncertain heads cannot starve the tail.
+            RetirementPlan plan;
+            plan.tombstoneKey = RetirementKey(instanceId, creationRequest);
+            plan.tombstoneValue = fenceValue;
+            size_t dsWork = 0;
+            std::string lastProcessed;
+            bool quotaFull = false;
+            auto tryAdd = [&plan, &dsWork, &lastProcessed, &quotaFull](
+                              const std::pair<const std::string, RegistrationCleanup> &item) {
+                if (quotaFull) { return; }
+                if (!item.second.invalid && !item.second.cleanedMarker) {
+                    if (dsWork >= static_cast<size_t>(kMaxCleanupEntriesPerRound)) {
+                        quotaFull = true;
+                        return;
+                    }
+                    dsWork += 1;
+                }
+                plan.entries.push_back(item.second);
+                lastProcessed = item.first;
+            };
+            for (auto it = sorted.upper_bound(cursor); it != sorted.end(); ++it) {
+                tryAdd(*it);
+            }
+            if (!quotaFull) {
+                for (auto it = sorted.begin();
+                     it != sorted.end() && it->first.compare(cursor) <= 0; ++it) {
+                    tryAdd(*it);
+                }
+            }
+            plan.truncated = quotaFull;
+            // Cursor advance: quota exhaustion keeps the LAST PROCESSED key
+            // (the next round resumes after it); a completed full cycle
+            // resets to "" so the next round restarts from the head.
+            plan.newCursor = quotaFull ? lastProcessed : std::string();
+            plan.cursorAdvanced = plan.newCursor != cursor;
             return refFuture.Then(
                 [self, instanceId, creationRequest, plan]
                 (const std::shared_ptr<GetResponse> &refRsp) mutable -> litebus::Future<RetireReport> {
@@ -888,9 +932,10 @@ litebus::Future<StateActor::RetireReport> StateActor::FinishRetirementCleanup(
     const RetirementPlan &plan)
 {
     if (!plan.refExists) {
-        // Explicitly absent at capture: nothing to delete, and that fact
-        // is passed EXPLICITLY into the report (never inferred).
-        return DelThenPromote(instanceId, creationRequest, plan, false, true);
+        // No reference to conditionally delete. refAbsent is TRUE only
+        // for an EXPLICIT absence — an unreadable/corrupt reference
+        // (refUnknown) must never masquerade as absent in the report.
+        return DelThenPromote(instanceId, creationRequest, plan, false, !plan.refUnknown);
     }
     const std::string refKey = StateRefKey(instanceId, creationRequest);
     auto txn = registry_->BeginTransaction();
@@ -975,6 +1020,10 @@ StateActor::RetireReport StateActor::DelRetiredSnapshots(const std::string &inst
     report.refAbsent = refAbsent;
     report.refUnknown = plan.refUnknown;
     report.refDetail = plan.refDetail;
+    report.tombstoneKey = plan.tombstoneKey;
+    report.tombstoneValue = plan.tombstoneValue;
+    report.newCursor = plan.newCursor;
+    report.cursorAdvanced = plan.cursorAdvanced;
     report.entries = plan.entries;
 
     for (auto &entry : report.entries) {
@@ -1039,6 +1088,24 @@ litebus::Future<StateActor::RetireReport> StateActor::PromoteNextCleanedMarker(
             allCleaned = allCleaned && entry.deleted && entry.cleanedMarker;
         }
         report.allCleaned = allCleaned;
+        // Persist the CURSOR ADVANCE (conditional on the captured
+        // tombstone value — a concurrent replayer cannot clobber a moved
+        // tombstone). Progress marker, not a proof: a failed write only
+        // means the next round re-processes some already-handled entries
+        // (CLEANED ones pass free), so fire-and-report is honest.
+        if (report.cursorAdvanced && !report.tombstoneKey.empty() && registry_ != nullptr) {
+            auto fence = ParseFence(report.tombstoneValue);
+            if (fence.status == "RETIRED") {
+                fence.cleanupCursor = report.newCursor;
+                auto txn = registry_->BeginTransaction();
+                txn->If(meta_store::TxnCompare::OfValue(
+                    report.tombstoneKey, meta_store::CompareOperator::EQUAL,
+                    report.tombstoneValue));
+                txn->Then(meta_store::TxnOperation::Create(
+                    report.tombstoneKey, SerializeFence(fence), PutOption{}));
+                (void)txn->Commit();
+            }
+        }
         return report;
     }
 
@@ -1479,7 +1546,7 @@ std::string StateActor::SerializeFence(const FenceRecord &fence)
     };
     return esc(fence.instanceID) + "|" + esc(fence.creationRequest) + "|" + esc(fence.runtimeID)
         + "|" + esc(fence.authorityRecordKey) + "|" + std::to_string(fence.authorityModRevision)
-        + "|" + esc(fence.status);
+        + "|" + esc(fence.status) + "|" + esc(fence.cleanupCursor);
 }
 
 StateActor::FenceRecord StateActor::ParseFence(const std::string &raw)
@@ -1498,7 +1565,7 @@ StateActor::FenceRecord StateActor::ParseFence(const std::string &raw)
         }
     }
     fields.push_back(current);
-    if (fields.size() != 6) { return fence; }
+    if (fields.size() != 7) { return fence; }
     errno = 0;
     char *end = nullptr;
     const long long parsed = std::strtoll(fields[4].c_str(), &end, 10);
@@ -1509,6 +1576,7 @@ StateActor::FenceRecord StateActor::ParseFence(const std::string &raw)
     fence.authorityRecordKey = fields[3];
     fence.authorityModRevision = static_cast<int64_t>(parsed);
     fence.status = fields[5];
+    fence.cleanupCursor = fields[6];
     return fence;
 }
 

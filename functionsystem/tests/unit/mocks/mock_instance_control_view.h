@@ -41,6 +41,13 @@ public:
                  const std::string &expectedRequestID), (override));
     MOCK_METHOD((std::pair<std::string, std::string>), GetIncarnationSnapshot,
                 (const std::string &instanceID), (override));
+    // Three-state identity snapshot (PostFence strict re-verification).
+    // Tests that drive a chain PAST the fence MUST set this (mirroring
+    // their machine), otherwise the mock falls back to the REAL base
+    // implementation reading the (empty) machines_ map — exists=false —
+    // and the PostFence unknown-identity protection is silently bypassed.
+    MOCK_METHOD((InstanceControlView::InstanceIdentitySnapshot), GetInstanceIdentitySnapshot,
+                (const std::string &instanceID), (override));
     MOCK_METHOD(void, Update,
                 (const std::string &instanceID, const resources::InstanceInfo &instanceInfo, bool isForceUpdate),
                 (override));

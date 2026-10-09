@@ -317,13 +317,15 @@ litebus::Future<Status> InstanceControlView::DelInstance(const std::string &inst
             return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
                 "control view bound to another incarnation"));
         }
-        const auto currentRequest = machine->GetRequestID();
-        if (!expectedRequestID.empty() && !currentRequest.empty()
-            && currentRequest != expectedRequestID) {
+        // STRICT request check: when the retiring chain carries a request
+        // (it always does), an UNKNOWN (empty) current request refuses —
+        // unknown is not consent.
+        if (!expectedRequestID.empty() && machine->GetRequestID() != expectedRequestID) {
             YRLOG_WARN("ownership-fenced delete refused: instance({}) request({}), "
-                       "retiring chain request({})", instanceID, currentRequest, expectedRequestID);
+                       "retiring chain request({})", instanceID, machine->GetRequestID(),
+                       expectedRequestID);
             return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
-                "control view request generation mismatch"));
+                "control view request generation mismatch or unknown"));
         }
     }
     // The expected identity travels to the point that actually reads the
@@ -384,6 +386,23 @@ std::pair<std::string, std::string> InstanceControlView::GetIncarnationSnapshot(
         return {"", ""};
     }
     return {it->second->GetInstanceInfo().runtimeid(), it->second->GetRequestID()};
+}
+
+InstanceControlView::InstanceIdentitySnapshot InstanceControlView::GetInstanceIdentitySnapshot(
+    const std::string &instanceID)
+{
+    std::lock_guard<std::mutex> guard(lock_);
+    InstanceIdentitySnapshot out;
+    auto it = machines_.find(instanceID);
+    if (it == machines_.end()) {
+        return out;  // truly absent
+    }
+    out.exists = true;
+    // Locked complete copy (machine's own recursive lock) — one consistent
+    // observation, never two torn reads.
+    out.runtimeID = it->second->GetInstanceInfo().runtimeid();
+    out.requestID = it->second->GetRequestID();
+    return out;
 }
 
 void InstanceControlView::OnDelInstance(const std::string &instanceID, const std::string &requestID, bool needErase)

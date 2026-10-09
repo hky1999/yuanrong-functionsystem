@@ -697,27 +697,26 @@ litebus::Future<Status> InstanceCtrlActor::DeleteInstanceInControlViewPostFence(
     if (status.IsError()) { return status; }
     // RE-VERIFY THE CURRENT GENERATION — the entry's identity check ran
     // BEFORE the async fence wait, and a same-name replacement may have
-    // landed in between. Every side effect below (route unregister, group
-    // cleanup, DelInstance, state deletes) is refused if the name now
-    // belongs to a different incarnation; only an ABSENT machine (nothing
-    // to contradict the fence-proven identity) proceeds. The per-effect
-    // fences (traefik route fencing, view-locked DelInstance re-check)
-    // remain in force — this closes the entry window, it does not replace
-    // them.
+    // landed in between. The check uses the LOCK-CONSISTENT three-state
+    // identity snapshot: only a machine that is TRULY ABSENT (nothing to
+    // contradict the fence-proven identity) proceeds; a machine that
+    // EXISTS must match BOTH fields EXACTLY — an UNKNOWN (empty) runtime
+    // or request is a REFUSAL, never a pass. The per-effect fences
+    // (traefik route fencing, view-locked DelInstance re-check) remain in
+    // force — this closes the entry window, it does not replace them.
     {
-        const auto snapshot = instanceControlView_->GetIncarnationSnapshot(
+        const auto identity = instanceControlView_->GetInstanceIdentitySnapshot(
             instanceInfo.instanceid());
-        if (!snapshot.first.empty()
-            && (snapshot.first != instanceInfo.runtimeid()
-                || (!snapshot.second.empty() && !instanceInfo.requestid().empty()
-                    && snapshot.second != instanceInfo.requestid()))) {
-            YRLOG_WARN("{}|post-fence re-verification refused: instance({}) now belongs to "
-                       "runtime({}) request({}); retiring chain was runtime({}) request({}) "
-                       "— no route/group/meta side effects",
-                       instanceInfo.requestid(), instanceInfo.instanceid(), snapshot.first,
-                       snapshot.second, instanceInfo.runtimeid(), instanceInfo.requestid());
+        if (identity.exists
+            && (identity.runtimeID != instanceInfo.runtimeid()
+                || identity.requestID != instanceInfo.requestid())) {
+            YRLOG_WARN("{}|post-fence re-verification refused: instance({}) machine exists as "
+                       "runtime({}) request({}) (empty field = unknown identity); retiring "
+                       "chain was runtime({}) request({}) — no route/group/meta side effects",
+                       instanceInfo.requestid(), instanceInfo.instanceid(), identity.runtimeID,
+                       identity.requestID, instanceInfo.runtimeid(), instanceInfo.requestid());
             return litebus::Future<Status>(Status(StatusCode::ERR_INSTANCE_BUSY,
-                "post-fence re-verification: instance name rebound to a new generation"));
+                "post-fence re-verification: instance name rebound or identity unknown"));
         }
     }
     if (traefikRegistry_) {
@@ -1401,6 +1400,18 @@ void InstanceCtrlActor::OnKill(const std::shared_ptr<KillRequest> &killReq, cons
         return;
     }
     const int &signal = killReq->signal();
+    // FAILED-FUTURE GUARD: a failed chain future would Get() a default-
+    // constructed response whose code() == 0 reads as ERR_NONE — a FALSE
+    // success for the kill RPC. Fail explicitly instead; never read the
+    // default protobuf.
+    if (rsp.IsError()) {
+        YRLOG_ERROR("{}|kill chain future FAILED for instance({}) — explicit error response",
+                    killReq->requestid(), killReq->instanceid());
+        iter->second->Associate(GenKillResponse(common::ErrorCode::ERR_INNER_SYSTEM_ERROR,
+            "kill failed: chain future failed (outcome unknown)"));
+        killingRequest_.erase(iter);
+        return;
+    }
     auto response = rsp.Get();
     if (response.code() == common::ErrorCode::ERR_INSTANCE_NOT_FOUND) {
         auto errorMsg = response.message();

@@ -57,6 +57,18 @@ public:
                                                 const std::string &expectedRequestID);
     // Lock-held identity snapshot for post-delete re-verification (#2).
     virtual std::pair<std::string, std::string> GetIncarnationSnapshot(const std::string &instanceID);
+
+    // Lock-consistent EXISTENCE + identity in ONE observation: callers must
+    // distinguish "machine truly absent" (nothing contradicts a fence-proven
+    // identity) from "present with UNKNOWN identity fields" (empty runtime
+    // or request while exists — refuses every side effect). Two separate
+    // reads cannot make that distinction.
+    struct InstanceIdentitySnapshot {
+        bool exists = false;
+        std::string runtimeID;  // empty while exists ⇒ unknown identity
+        std::string requestID;
+    };
+    virtual InstanceIdentitySnapshot GetInstanceIdentitySnapshot(const std::string &instanceID);
     // EXECUTION-POINT state guards (#S, root 16:5x): the ownership check
     // and the caller's SYNCHRONOUS store operation run together under the
     // VIEW lock — the same lock generation changes take (Update /
