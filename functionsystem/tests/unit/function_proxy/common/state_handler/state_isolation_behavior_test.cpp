@@ -28,6 +28,7 @@
 
 #include "common/metadata/metadata.h"
 #include "common/utils/meta_store_kv_operation.h"
+#include "function_proxy/common/state_handler/state_handler_helper.h"
 #include "function_proxy/common/state_machine/instance_control_view.h"
 #include "gtest/gtest.h"
 #include "mocks/mock_instance_state_machine.h"
@@ -64,31 +65,68 @@ class StateIsolation : public ::testing::Test {
 protected:
     void SetUp() override
     {
+        // Cadence FIRST, before ANY bind: the startup hook schedules with
+        // the CURRENT values — setting them after BindSaveRegistry would
+        // leave the production 3s timer already armed mid-test.
+        savedInitialDelayMs_ = StateActor::replayInitialDelayMs.exchange(60000);
+        savedPeriodMs_ = StateActor::replayPeriodMs.exchange(60000);
         ds_ = std::make_shared<MapDataStore>();
         stateClient_ = std::make_shared<StateClient>(ds_);
-        actor_ = std::make_shared<StateActor>(stateClient_);
-        litebus::Spawn(actor_);
-        StateHandler::BindStateActor(actor_);
         metaCore_ = std::make_shared<MapMetaStoreCore>();
         meta_ = std::make_shared<MapMetaStore>(metaCore_);
-        actor_->BindSaveRegistry(meta_, [](const std::string &, const std::string &,
-                                           const std::string &) { return kFuncKey; });
-        actor_->SetSaveExecutor([](const std::string &, const std::string &, const std::string &,
-                                   const StateActor::GuardedStoreOp &op) { return op(); });
-        // Keep the replay cadence out of the way unless a test opts in.
-        StateActor::replayInitialDelayMs.store(60000);
-        StateActor::replayPeriodMs.store(60000);
+        SpawnDefaultActor();
     }
 
     void TearDown() override
     {
-        StateActor::replayInitialDelayMs.store(3000);
-        StateActor::replayPeriodMs.store(60000);
+        // Reliable scoped exit: EVERY spawned actor (including temporary
+        // ones tests registered) is terminated and awaited BEFORE the
+        // global cadence values are restored — an ASSERT-failure exit
+        // cannot leave a live actor behind.
+        for (auto &actor : spawnedActors_) {
+            if (actor != nullptr) {
+                litebus::Terminate(actor->GetAID());
+                litebus::Await(actor->GetAID());
+                actor = nullptr;
+            }
+        }
+        spawnedActors_.clear();
+        actor_ = nullptr;
+        StateHandlerHelper::ClearStateActorHelper();
+        StateActor::replayInitialDelayMs.store(savedInitialDelayMs_);
+        StateActor::replayPeriodMs.store(savedPeriodMs_);
+    }
+
+    void SpawnDefaultActor()
+    {
+        actor_ = std::make_shared<StateActor>(stateClient_);
+        litebus::Spawn(actor_);
+        StateHandler::BindStateActor(actor_);
+        actor_->BindSaveRegistry(meta_, [](const std::string &, const std::string &,
+                                           const std::string &) { return kFuncKey; });
+        actor_->SetSaveExecutor([](const std::string &, const std::string &, const std::string &,
+                                   const StateActor::GuardedStoreOp &op) { return op(); });
+        spawnedActors_.push_back(actor_);
+    }
+
+    // Terminates the current actor and spawns a FRESH one on the SAME
+    // persistent stores with a short replay cadence — set BEFORE the
+    // bind, so the startup hook actually uses it. The fresh actor is
+    // registered for scoped teardown; ASSERT failures cannot leak it.
+    std::shared_ptr<StateActor> ReplaceActorWithShortCadence()
+    {
         if (actor_ != nullptr) {
             litebus::Terminate(actor_->GetAID());
             litebus::Await(actor_->GetAID());
+            for (auto &actor : spawnedActors_) {
+                if (actor == actor_) { actor = nullptr; }
+            }
             actor_ = nullptr;
         }
+        StateActor::replayInitialDelayMs.store(10);
+        StateActor::replayPeriodMs.store(50);
+        SpawnDefaultActor();
+        return actor_;
     }
 
     // Seeds the AUTHORITATIVE instance record exactly as the production
@@ -133,6 +171,9 @@ protected:
     std::shared_ptr<StateActor> actor_;
     std::shared_ptr<MapMetaStoreCore> metaCore_;
     std::shared_ptr<MapMetaStore> meta_;
+    std::vector<std::shared_ptr<StateActor>> spawnedActors_;
+    uint32_t savedInitialDelayMs_ = 3000;
+    uint32_t savedPeriodMs_ = 60000;
 };
 
 // ── unique-key-roundtrip ────────────────────────────────────────────────────
@@ -531,22 +572,12 @@ TEST_F(StateIsolation, RestartReplayNewActorCleansFromTombstone)
         metaCore_->gated.clear();  // the died process's parked txn evaporates
     }
     (void)clean;
-    litebus::Terminate(actor_->GetAID());
-    litebus::Await(actor_->GetAID());
-    actor_ = nullptr;
 
     // A NEW actor — no volatile tables, owner record gone — starts on the
     // SAME persistent stores; the real startup wiring must clean the
     // generation (Del of already-absent data returns OK in the map model;
     // the marker then persists and the report converges).
-    auto actor2 = std::make_shared<StateActor>(stateClient_);
-    litebus::Spawn(actor2);
-    StateActor::replayInitialDelayMs.store(10);
-    StateActor::replayPeriodMs.store(50);
-    actor2->BindSaveRegistry(meta_, [](const std::string &, const std::string &,
-                                       const std::string &) { return kFuncKey; });
-    actor2->SetSaveExecutor([](const std::string &, const std::string &, const std::string &,
-                               const StateActor::GuardedStoreOp &op) { return op(); });
+    ReplaceActorWithShortCadence();
 
     bool converged = false;
     for (int i = 0; i < 200 && !converged; ++i) {
@@ -557,8 +588,6 @@ TEST_F(StateIsolation, RestartReplayNewActorCleansFromTombstone)
             converged = (tuple.status == "CLEANED");
         }
     }
-    litebus::Terminate(actor2->GetAID());
-    litebus::Await(actor2->GetAID());
     EXPECT_TRUE(converged);
     // The tombstone itself is retained forever.
     EXPECT_TRUE(metaCore_->Exists(StateActor::RetirementKey("inst-m", "req-m")));
@@ -756,17 +785,7 @@ TEST_F(StateIsolation, ReplayCursorDoesNotStarveLaterTombstones)
     }
     // Actor 1 hands the SAME persistent stores to a brand-new actor with a
     // short replay cadence.
-    litebus::Terminate(actor_->GetAID());
-    litebus::Await(actor_->GetAID());
-    actor_ = nullptr;
-    auto actor2 = std::make_shared<StateActor>(stateClient_);
-    litebus::Spawn(actor2);
-    StateActor::replayInitialDelayMs.store(10);
-    StateActor::replayPeriodMs.store(50);
-    actor2->BindSaveRegistry(meta_, [](const std::string &, const std::string &,
-                                       const std::string &) { return kFuncKey; });
-    actor2->SetSaveExecutor([](const std::string &, const std::string &, const std::string &,
-                               const StateActor::GuardedStoreOp &op) { return op(); });
+    ReplaceActorWithShortCadence();
 
     // The LAST generation converges (CLEANED) although the stuck head can
     // never clear — the cursor advanced past it over multiple rounds.
@@ -778,8 +797,6 @@ TEST_F(StateIsolation, ReplayCursorDoesNotStarveLaterTombstones)
             tailConverged = (StateActor::ParseRegistration(rec.value).status == "CLEANED");
         }
     }
-    litebus::Terminate(actor2->GetAID());
-    litebus::Await(actor2->GetAID());
     EXPECT_TRUE(tailConverged) << "the cursor must reach past the stuck head";
 
     // The head stays RETAINED and unconverged (uncertain forever is the
@@ -819,17 +836,13 @@ TEST_F(StateIsolation, ReplayRecoversAfterFailedScanFuture)
     litebus::Terminate(actor_->GetAID());
     litebus::Await(actor_->GetAID());
     actor_ = nullptr;
+    for (auto &actor : spawnedActors_) {
+        actor = nullptr;
+    }
 
     // The FIRST scan round fails as a Future; the cadence must survive it.
     metaCore_->forcedGets.push_back({ "stateret:v1:", GetOutcome::FAIL_FUTURE, true });
-    auto actor2 = std::make_shared<StateActor>(stateClient_);
-    litebus::Spawn(actor2);
-    StateActor::replayInitialDelayMs.store(10);
-    StateActor::replayPeriodMs.store(50);
-    actor2->BindSaveRegistry(meta_, [](const std::string &, const std::string &,
-                                       const std::string &) { return kFuncKey; });
-    actor2->SetSaveExecutor([](const std::string &, const std::string &, const std::string &,
-                               const StateActor::GuardedStoreOp &op) { return op(); });
+    ReplaceActorWithShortCadence();
 
     bool converged = false;
     for (int i = 0; i < 600 && !converged; ++i) {
@@ -839,9 +852,112 @@ TEST_F(StateIsolation, ReplayRecoversAfterFailedScanFuture)
             converged = (StateActor::ParseRegistration(rec.value).status == "CLEANED");
         }
     }
-    litebus::Terminate(actor2->GetAID());
-    litebus::Await(actor2->GetAID());
     EXPECT_TRUE(converged) << "the replay cadence must survive a failed scan future";
+}
+
+// ── direct model verification: one txn = one revision; failure writes nothing
+TEST(StateIsolationModel, TxnModelSingleRevisionAndFailedNoWrite)
+{
+    MapMetaStoreCore core;
+    core.Seed("k1", "v1");
+    const int64_t revBefore = core.LatestRevision();
+
+    std::vector<meta_store::TxnCompare> compares{
+        meta_store::TxnCompare::OfVersion("k1", meta_store::CompareOperator::EQUAL, 1)
+    };
+    std::vector<meta_store::TxnOperation> ops{
+        meta_store::TxnOperation::Create("k1", "v2", PutOption{}),
+        meta_store::TxnOperation::Create("k2", "v9", PutOption{})
+    };
+    auto rsp = core.EvaluateAndApply(compares, ops);
+    EXPECT_TRUE(rsp->success);
+    MapRecord r1;
+    MapRecord r2;
+    ASSERT_TRUE(core.Lookup("k1", r1));
+    ASSERT_TRUE(core.Lookup("k2", r2));
+    EXPECT_EQ(r1.modRevision, r2.modRevision);        // ONE txn = ONE revision
+    EXPECT_EQ(core.LatestRevision(), revBefore + 1);  // exactly one bump
+
+    // A transaction whose compares fail writes NOTHING and does not move
+    // the revision.
+    const int64_t revMid = core.LatestRevision();
+    std::vector<meta_store::TxnCompare> bad{
+        meta_store::TxnCompare::OfValue("k1", meta_store::CompareOperator::EQUAL, "WRONG")
+    };
+    std::vector<meta_store::TxnOperation> badOps{
+        meta_store::TxnOperation::Create("k3", "x", PutOption{})
+    };
+    auto fail = core.EvaluateAndApply(bad, badOps);
+    EXPECT_FALSE(fail->success);
+    EXPECT_FALSE(core.Exists("k3"));
+    EXPECT_EQ(core.LatestRevision(), revMid);
+}
+
+// ── replay concurrency cap: 8 stuck, 9th+ untouched, release → fairness ─────
+TEST_F(StateIsolation, ReplayConcurrencyCapHoldsWhileEightStuck)
+{
+    constexpr int kGens = 10;
+    std::vector<std::string> refKeys;
+    std::vector<std::string> snapKeys;
+    std::vector<std::string> regKeys;
+    for (int i = 0; i < kGens; ++i) {
+        const std::string inst = "inst-c" + std::to_string(i);
+        const std::string req = "req-c" + std::to_string(i);
+        SeedRecord(inst, req, "rt-c");
+        auto f = Save(inst, "rt-c", req, "state-c" + std::to_string(i));
+        ASSERT_TRUE(WaitReady(f));
+        ASSERT_EQ(f.Get().code(), common::ErrorCode::ERR_NONE);
+        refKeys.push_back(StateActor::StateRefKey(inst, req));
+        snapKeys.push_back(f.Get().checkpointid());
+        std::string regKey;
+        {
+            const auto prefix = StateActor::RegistrationPrefix(inst, req);
+            std::lock_guard<std::mutex> guard(metaCore_->lock);
+            for (const auto &entry : metaCore_->kv) {
+                if (entry.first.rfind(prefix, 0) == 0) { regKey = entry.first; }
+            }
+        }
+        ASSERT_FALSE(regKey.empty());
+        regKeys.push_back(regKey);
+        auto fence = StateHandler::RetireGeneration(inst, req, "rt-c");
+        ASSERT_TRUE(WaitReady(fence));
+        ASSERT_TRUE(fence.Get().fenced);
+    }
+
+    // Gate the FIRST 8 cleanups at their reference-delete transaction —
+    // they park BEFORE any DS Del (gates are added after every save's
+    // publish has long completed, so only the cleanups match).
+    for (int i = 0; i < 8; ++i) {
+        metaCore_->AddGate(OnThenKey(refKeys[i]));
+    }
+    ReplaceActorWithShortCadence();
+
+    bool allParked = false;
+    for (int i = 0; i < 1000 && !allParked; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        allParked = metaCore_->GateCount() == 8;
+    }
+    ASSERT_TRUE(allParked) << "the 8 dispatched cleanups must park at their ref deletes";
+    // The HARD cap holds: generations 9 and 10 were never dispatched —
+    // no DS work for them (and none for the parked 8 either).
+    EXPECT_EQ(ds_->DelCount(snapKeys[8]), 0);
+    EXPECT_EQ(ds_->DelCount(snapKeys[9]), 0);
+    EXPECT_EQ(ds_->DelCount(snapKeys[0]), 0);
+
+    // Release the stuck window; later rounds must reach generations 9/10
+    // (cursor fairness past the freed slots).
+    for (int i = 0; i < 8; ++i) {
+        metaCore_->ReleaseGate(OnThenKey(refKeys[i]));
+    }
+    bool tailConverged = false;
+    for (int i = 0; i < 600 && !tailConverged; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        MapRecord rec;
+        if (metaCore_->Lookup(regKeys[9], rec)) {
+            tailConverged = (StateActor::ParseRegistration(rec.value).status == "CLEANED");
+        }
+    }
+    EXPECT_TRUE(tailConverged) << "released slots must let the cursor reach the tail";
 }
 
 }  // namespace functionsystem::function_proxy::test

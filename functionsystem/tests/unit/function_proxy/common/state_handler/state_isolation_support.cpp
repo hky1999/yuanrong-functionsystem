@@ -106,34 +106,39 @@ std::shared_ptr<TxnResponse> MapMetaStoreCore::EvaluateAndApply(
     if (!success) {
         return rsp;  // nothing applied — atomic
     }
-    // Apply every Then-op through the production serializer.
+    // Apply every Then-op through the production serializer. ONE atomic
+    // transaction = ONE global revision: every write it performs (put or
+    // an actual delete) shares a single revision, and the counter moves
+    // only when at least one write effect occurred.
+    const int64_t txnRevision = revision + 1;
+    bool wrote = false;
     for (const auto &op : thenOps) {
         ::etcdserverpb::RequestOp pb;
         op.Build(pb, "");
         if (pb.has_request_put()) {
             const auto &put = pb.request_put();
             auto it = kv.find(put.key());
-            revision += 1;
             if (it == kv.end()) {
                 MapRecord rec;
                 rec.value = put.value();
-                rec.createRevision = revision;
-                rec.modRevision = revision;
+                rec.createRevision = txnRevision;
+                rec.modRevision = txnRevision;
                 rec.version = 1;
                 kv[put.key()] = rec;
             } else {
                 it->second.value = put.value();
-                it->second.modRevision = revision;
+                it->second.modRevision = txnRevision;
                 it->second.version += 1;
             }
-            opLog.push_back("put:" + put.key() + "@" + std::to_string(revision));
+            wrote = true;
+            opLog.push_back("put:" + put.key() + "@" + std::to_string(txnRevision));
         } else if (pb.has_request_delete_range()) {
             const auto &del = pb.request_delete_range();
             const auto it = kv.find(del.key());
             if (it != kv.end()) {
                 kv.erase(it);
-                revision += 1;
-                opLog.push_back("del:" + del.key() + "@" + std::to_string(revision));
+                wrote = true;
+                opLog.push_back("del:" + del.key() + "@" + std::to_string(txnRevision));
             }
         } else if (pb.has_request_range()) {
             const auto &get = pb.request_range();
@@ -155,6 +160,9 @@ std::shared_ptr<TxnResponse> MapMetaStoreCore::EvaluateAndApply(
             opRsp.response = std::move(getRsp);
             rsp->responses.push_back(std::move(opRsp));
         }
+    }
+    if (wrote) {
+        revision = txnRevision;
     }
     return rsp;
 }
@@ -218,19 +226,43 @@ void MapMetaStoreCore::ReleaseGate(const TxnMatcher &matcher, CommitOutcome forc
         }
     }
     if (promise == nullptr) { return; }
+    // The failure-shaped outcomes return BEFORE any apply: a transaction
+    // that reports failure must leave the map untouched. Only EVALUATE
+    // and APPLY_THEN_FAIL run the real apply (the latter then loses the
+    // response — the "committed but response lost" scenario).
     if (forced == CommitOutcome::FAIL_FUTURE) {
         promise->SetFailed(litebus::Status::KERROR);
         return;
     }
-    // Real evaluation NOW (release time) — a late publish genuinely fails
-    // its conditions here.
-    auto rsp = EvaluateAndApply(compares, thenOps);
-    if (forced == CommitOutcome::SUCCESS_FALSE) {
-        rsp = std::make_shared<TxnResponse>();
-        rsp->status = Status::OK();
-        rsp->success = false;
+    if (forced == CommitOutcome::NULL_RESPONSE) {
+        promise->SetValue(nullptr);
+        return;
     }
-    promise->SetValue(std::move(rsp));
+    if (forced == CommitOutcome::STATUS_ERROR) {
+        auto rsp = std::make_shared<TxnResponse>();
+        rsp->status = Status(StatusCode::FAILED, "injected release status error");
+        rsp->success = false;
+        promise->SetValue(std::move(rsp));
+        return;
+    }
+    if (forced == CommitOutcome::SUCCESS_FALSE) {
+        auto rsp = std::make_shared<TxnResponse>();
+        rsp->status = Status::OK();
+        rsp->success = false;  // conditions/replay said no — NOTHING applied
+        promise->SetValue(std::move(rsp));
+        return;
+    }
+    if (forced == CommitOutcome::APPLY_THEN_FAIL) {
+        (void)EvaluateAndApply(compares, thenOps);
+        auto rsp = std::make_shared<TxnResponse>();
+        rsp->status = Status(StatusCode::FAILED, "response lost after apply");
+        rsp->success = false;
+        promise->SetValue(std::move(rsp));
+        return;
+    }
+    // EVALUATE: real evaluation NOW (release time) — a late publish
+    // genuinely fails its conditions against the moved map here.
+    promise->SetValue(EvaluateAndApply(compares, thenOps));
 }
 
 void MapMetaStoreCore::FailGate(const TxnMatcher &matcher)
@@ -286,7 +318,7 @@ litebus::Future<std::shared_ptr<GetResponse>> MapMetaStore::Get(const std::strin
             for (const auto &entry : core_->kv) {
                 if (entry.first.rfind(key, 0) != 0) { continue; }
                 if (option.limit > 0 && emitted >= option.limit) { break; }
-                mvcpb::KeyValue out;
+                mvccpb::KeyValue out;
                 out.set_key(entry.first);
                 out.set_value(entry.second.value);
                 out.set_create_revision(entry.second.createRevision);
@@ -298,7 +330,7 @@ litebus::Future<std::shared_ptr<GetResponse>> MapMetaStore::Get(const std::strin
         } else {
             const auto it = core_->kv.find(key);
             if (it != core_->kv.end()) {
-                mvcpb::KeyValue out;
+                mvccpb::KeyValue out;
                 out.set_key(it->first);
                 out.set_value(it->second.value);
                 out.set_create_revision(it->second.createRevision);

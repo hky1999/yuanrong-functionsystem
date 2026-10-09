@@ -201,6 +201,8 @@ public:
         bool fenced = false;       // tombstone committed & identity proven
         bool fenceFresh = false;   // committed by THIS call (vs verified existing)
         bool enumerated = false;   // registration prefix enumerated
+        bool truncated = false;    // entry cap hit — the rest stay registered
+                                   // and reconverge on later replay rounds
         bool refDeleted = false;   // conditional stateref delete committed
         bool refAbsent = false;    // reference explicitly absent at capture
         bool refUnknown = false;   // reference state unresolved — replay re-reads
@@ -348,6 +350,7 @@ private:
         // allCleaned stays false — with the reason carried here.
         bool refUnknown = false;
         std::string refDetail;
+        bool truncated = false;  // per-cleanup entry cap hit (explicit)
         std::vector<RegistrationCleanup> entries;
     };
     // Actor phase, POST-fence: issues the registration-prefix enumeration

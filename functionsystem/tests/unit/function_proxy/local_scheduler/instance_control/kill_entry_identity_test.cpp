@@ -230,6 +230,19 @@ private:
     std::shared_ptr<functionsystem::function_proxy::test::MapMetaStoreCore> coreHolder_;
 };
 
+// Minimal ControlInterfacePosixClient stub for the real-entry Recover
+// test: only Recover is mocked (and expected NEVER to fire when the
+// reference resolution fails before it).
+class StubRecoverPosixClient : public ControlInterfacePosixClient {
+public:
+    StubRecoverPosixClient() : ControlInterfacePosixClient(nullptr)
+    {
+    }
+
+    MOCK_METHOD(litebus::Future<runtime::RecoverResponse>, Recover,
+                (runtime::RecoverRequest &&request, uint64_t timeoutMs), (override));
+};
+
 class KillEntryIdentityFixture : public testing::Test {
 protected:
     void SetUp() override
@@ -1068,6 +1081,39 @@ TEST_F(KillEntryIdentityFixture, DelayedFenceSameNameReplacementRefusesAllSideEf
         << result.Get().GetMessage();
     // The old generation's tombstone DID commit (its own isolation holds).
     EXPECT_TRUE(metaCore_->Exists(fenceKey));
+}
+
+
+// Real-entry Recover: a FAILED checkpoint-reference-resolution future
+// must surface from the PRODUCTION Recover entry as an explicit error
+// status — never a default-protobuf fake success (code()==0), and the
+// runtime Recover must never be reached.
+TEST_F(KillEntryIdentityFixture, RecoverFailedResolutionFutureSurfacesExplicitError)
+{
+    const auto info = MakeElasticInfo("inst-rec", "runtime-rec");
+    auto stub = std::make_shared<StubRecoverPosixClient>();
+    EXPECT_CALL(*stub, Recover(_, _)).Times(0);
+    ON_CALL(*clientManager_, GetControlInterfacePosixClient("inst-rec"))
+        .WillByDefault(Invoke([stub](const std::string &) {
+            auto promise = std::make_shared<
+                litebus::Promise<std::shared_ptr<ControlInterfacePosixClient>>>();
+            promise->SetValue(stub);
+            return promise->GetFuture();
+        }));
+
+    // The fence read inside ResolveCheckpointRef fails AS A FUTURE (Then
+    // callbacks past it are skipped; the resolution future itself fails).
+    metaCore_->forcedGets.push_back(
+        { functionsystem::function_proxy::StateActor::RetirementKey("inst-rec", info.requestid()),
+          functionsystem::function_proxy::test::GetOutcome::FAIL_FUTURE });
+
+    auto result = actor_->Recover(info);
+    ASSERT_AWAIT_READY(result);
+    ASSERT_TRUE(result.Get().IsError())
+        << "a failed resolution future must NOT read as success";
+    EXPECT_NE(result.Get().GetMessage().find("future failed"), std::string::npos)
+        << "the error must name the failed future explicitly, got: "
+        << result.Get().GetMessage();
 }
 
 

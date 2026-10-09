@@ -122,9 +122,9 @@ litebus::Future<std::shared_ptr<StreamingMessage>> StateHandler::LoadState(
     }
 
     if (stateActorAid_.Name().empty()) {
-        YRLOG_ERROR("failed to save state: don't init state actor");
-        return GenStateSaveRspStreamMessage(common::ErrorCode::ERR_INNER_SYSTEM_ERROR,
-                                            "save state failed: don't init state actor");
+        YRLOG_ERROR("failed to load state: don't init state actor");
+        return GenStateLoadRspStreamMessage(common::ErrorCode::ERR_INNER_SYSTEM_ERROR,
+                                            "load state failed: don't init state actor");
     }
 
     auto stateLoadRequest = std::make_shared<StateLoadRequest>(std::move(*request->mutable_loadreq()));

@@ -190,6 +190,45 @@ protected:
     std::string target_;
 };
 
+// A FAILED actor-chain future must surface on the REAL stream as an
+// EXPLICIT RPC error response (the handler-level OnComplete bridge) —
+// never a hang, a dropped stream, or a fake success — with ZERO cache
+// writes.
+TEST_F(PosixStreamBindingFixture, FailedFutureSurfacesAsExplicitStreamError)
+{
+    client_ = Connect("inst-stream", "rt-1");
+    ASSERT_NE(client_, nullptr);
+
+    auto msg = SaveMessage("stream-state-failed-future");
+    awaitedMessageId_ = msg->messageid();
+    responsePromise_ = std::make_shared<litebus::Promise<runtime_rpc::StreamingMessage>>();
+    EXPECT_CALL(*client_, MockReceiver(_))
+        .WillRepeatedly(Invoke([this](const std::shared_ptr<runtime_rpc::StreamingMessage> &recv) {
+            if (recv->messageid() == awaitedMessageId_) {
+                responsePromise_->SetValue(*recv);
+            }
+        }));
+    EXPECT_CALL(*cache_, Set(Matcher<const std::string &>(_), Matcher<const std::string &>(_)))
+        .Times(0);
+
+    // The authoritative-record read fails AS A FUTURE inside the actor
+    // chain: every Then past it is skipped (litebus future_base); the
+    // bridge must convert that into an explicit error response.
+    metaCore_->forcedGets.push_back(
+        { GenInstanceKey("default/0-test-helloWorld/$latest", "inst-stream", "req-gen-1").Get(),
+          functionsystem::function_proxy::test::GetOutcome::FAIL_FUTURE });
+
+    auto sent = client_->Send(msg);
+    ASSERT_AWAIT_READY(sent);
+    EXPECT_TRUE(sent.Get());
+    auto rsp = responsePromise_->GetFuture();
+    ASSERT_AWAIT_READY(rsp);
+    EXPECT_NE(rsp.Get().saversp().code(), common::ERR_NONE);
+    EXPECT_THAT(rsp.Get().saversp().message(), testing::HasSubstr("future failed"))
+        << "the RPC must carry the explicit chain-failure message, got: "
+        << rsp.Get().saversp().message();
+}
+
 // The connected stream saves under the COMPOSED key of the machine's
 // creation generation — the accept-time binding flowed end-to-end through
 // the real dispatch chain.

@@ -33,6 +33,16 @@ namespace {
 // restart/recovery path for pending cleanups. Production defaults live in
 // the atomics below; tests may shorten them.
 constexpr int kReplayBatchSize = 8;
+// HARD cap on CONCURRENT cleanups across all replay rounds, and on DS
+// entries processed by ONE cleanup call (the rest of a huge generation
+// reconverges on later rounds — CLEANED entries cost no DS work, so the
+// window slides). The per-round prefix READ itself is a FULL scan: the
+// meta-store GetOption model exposes no range end, so legal server-side
+// pagination is impossible today — the full-scan read is a KNOWN,
+// explicit gap (cost grows with the total tombstone count), not a
+// hidden one.
+constexpr int kReplayConcurrencyCap = 8;
+constexpr int kMaxCleanupEntriesPerRound = 64;
 constexpr const char *kRetirementKeyPrefix = "stateret:v1:";
 }  // namespace
 
@@ -818,6 +828,14 @@ litebus::Future<StateActor::RetireReport> StateActor::EnumerateRetiredGeneration
             }
             RetirementPlan plan;
             for (const auto &kv : regRsp->kvs) {
+                if (plan.entries.size() >= static_cast<size_t>(kMaxCleanupEntriesPerRound)) {
+                    // EXPLICIT truncation, never silent: the remainder of a
+                    // huge generation stays registered and reconverges on
+                    // later replay rounds (CLEANED entries cost no DS
+                    // work, so the processed window slides forward).
+                    plan.truncated = true;
+                    break;
+                }
                 // Returned keys carry the meta-store table prefix.
                 plan.entries.push_back(ClassifyRegistrationEntry(
                     TrimKeyPrefix(kv.key(), tablePrefix), kv.value(), instanceId,
@@ -952,6 +970,7 @@ StateActor::RetireReport StateActor::DelRetiredSnapshots(const std::string &inst
     RetireReport report;
     report.fenced = true;
     report.enumerated = true;
+    report.truncated = plan.truncated;
     report.refDeleted = refDeleted;
     report.refAbsent = refAbsent;
     report.refUnknown = plan.refUnknown;
@@ -1010,7 +1029,8 @@ litebus::Future<StateActor::RetireReport> StateActor::PromoteNextCleanedMarker(
         // inferred from strings); an unresolved or failed one blocks
         // closure.
         const bool refHandled = report.refDeleted || report.refAbsent;
-        bool allCleaned = refHandled && !report.refUnknown;
+        // A truncated round proves nothing about the entries it never saw.
+        bool allCleaned = refHandled && !report.refUnknown && !report.truncated;
         for (const auto &entry : report.entries) {
             if (entry.invalid || entry.absent || entry.uncertain || entry.markerPending) {
                 allCleaned = false;
@@ -1393,19 +1413,35 @@ void StateActor::RunRetirementReplayRound()
 bool StateActor::DispatchRetirementReplay(std::vector<ReplayTarget> targets,
                                           const std::string &nextCursor)
 {
-    replayCursor_ = nextCursor;
-    bool dispatched = false;
+    // HARD global concurrency cap: at most kReplayConcurrencyCap cleanups
+    // in flight across ALL rounds — long-stuck generations cannot
+    // accumulate unbounded concurrent work. The cursor advances only past
+    // what was ACTUALLY dispatched; un-dispatched selections stay after
+    // the cursor for a later round (and wrap-around still reaches them).
+    std::string lastDispatchedKey;
     for (const auto &target : targets) {
+        if (replayInFlight_.size() >= static_cast<size_t>(kReplayConcurrencyCap)) {
+            break;
+        }
         const std::string fenceKey = RetirementKey(target.instanceId, target.creationRequest);
-        if (replayInFlight_.count(fenceKey) > 0) { continue; }  // bounded per round
+        if (replayInFlight_.count(fenceKey) > 0) { continue; }  // already running
         (void)replayInFlight_.insert(fenceKey);
-        dispatched = true;
+        lastDispatchedKey = fenceKey;
         CleanupRetiredSnapshots(target.instanceId, target.creationRequest, target.runtimeID)
             .OnComplete(litebus::Defer(GetAID(), &StateActor::OnRetirementReplayCleanupComplete,
                                        target.instanceId, target.creationRequest,
                                        target.runtimeID, std::placeholders::_1));
     }
-    return dispatched;
+    if (!lastDispatchedKey.empty()) {
+        replayCursor_ = lastDispatchedKey;
+    } else if (!targets.empty()) {
+        // Nothing dispatched (cap saturated by earlier rounds): hold the
+        // cursor so the same range is re-selected once slots free up.
+        (void)nextCursor;
+    } else {
+        replayCursor_ = nextCursor;  // empty selection: adopt the computed cursor
+    }
+    return !lastDispatchedKey.empty();
 }
 
 void StateActor::OnRetirementReplayCleanupComplete(
