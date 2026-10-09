@@ -38,6 +38,13 @@ namespace functionsystem::test {
 using ::testing::_;
 using ::testing::Return;
 
+// Captured identity of the LAST AdapterTrue invocation — the test asserts
+// the receiver saw the SAME FULL TRIPLE that entered CallResultAdapter
+// (not a collapsed instance-id string, and not self-verified from the
+// typedef). Reset by the fixture's SetUp/TearDown so no stale value can
+// let a later assertion pass vacuously.
+grpc::PosixStreamIdentity g_receivedIdentity;
+
 class InvocationHandlerTest : public ::testing::Test {
 public:
     void SetUp() override
@@ -62,6 +69,11 @@ public:
         memoryMonitor_ = std::make_shared<MemoryMonitor>(config);
         InvocationHandler::BindMemoryMonitor(memoryMonitor_);
         InternalIAM::Param param_{ false, "" };
+        // Order-pollution guard: every test starts from CLEAN static
+        // receivers and an EMPTY captured identity.
+        InvocationHandler::RegisterCreateCallResultReceiver(nullptr);
+        InvocationHandler::RegisterFrontendCallResultReceiver(nullptr);
+        g_receivedIdentity = grpc::PosixStreamIdentity{};
     }
 
     void TearDown() override
@@ -70,6 +82,12 @@ public:
         litebus::Terminate(traceActor_->GetAID());
         litebus::Await(traceActor_);
 #endif
+        // Static receivers are reset between tests: a stale registration
+        // from an earlier test (or a stale g_receivedIdentity triple)
+        // must never let a later test's assertions pass vacuously.
+        InvocationHandler::RegisterCreateCallResultReceiver(nullptr);
+        InvocationHandler::RegisterFrontendCallResultReceiver(nullptr);
+        g_receivedIdentity = grpc::PosixStreamIdentity{};
         InvocationHandler::UnBindInstanceProxy();
         instanceProxy_ = nullptr;
         memoryMonitor_ = nullptr;
@@ -99,16 +117,10 @@ TEST_F(InvocationHandlerTest, Invoke)
     response->mutable_callrsp()->set_code(common::ErrorCode::ERR_NONE);
     expectedAid_.SetName("from");
     EXPECT_CALL(*instanceProxy_, Call(expectedAid_, _, _, _, _)).WillOnce(Return(response));
-    auto responseFuture = InvocationHandler::Invoke("from", std::move(request));
+    auto responseFuture = InvocationHandler::Invoke({"from", "rt-from", "req-from"}, std::move(request));
     ASSERT_AWAIT_READY(responseFuture);
     EXPECT_EQ(responseFuture.Get()->invokersp().code(), common::ErrorCode::ERR_NONE);
 }
-
-// Captured identity of the LAST AdapterTrue invocation — the test asserts
-// the receiver saw the SAME FULL TRIPLE that entered CallResultAdapter
-// (not a collapsed instance-id string, and not self-verified from the
-// typedef).
-grpc::PosixStreamIdentity g_receivedIdentity;
 
 litebus::Future<std::pair<bool, std::shared_ptr<runtime_rpc::StreamingMessage>>> AdapterTrue(
     const grpc::PosixStreamIdentity &identity, std::shared_ptr<functionsystem::CallResult> &)
@@ -188,7 +200,7 @@ TEST_F(InvocationHandlerTest, FrontendConsumedCallResultCompletesProxyCall)
     ack->mutable_callresultack()->set_code(common::ERR_NONE);
     EXPECT_CALL(*instanceProxy_, CompleteFrontendCall(expectedAid_, request, _)).WillOnce(Return(ack));
 
-    auto responseFuture = InvocationHandler::CallResultAdapter("runtime-instance", request);
+    auto responseFuture = InvocationHandler::CallResultAdapter({"runtime-instance", "rt-runtime-instance", "req-runtime-instance"}, request);
     ASSERT_AWAIT_READY(responseFuture);
     EXPECT_EQ(responseFuture.Get()->callresultack().code(), common::ERR_NONE);
     InvocationHandler::RegisterFrontendCallResultReceiver(nullptr);
@@ -209,7 +221,7 @@ TEST_F(InvocationHandlerTest, AuthorizeTest)
     litebus::Future<busproxy::CallerInfo> callerInfoFuture;
     EXPECT_CALL(*instanceProxy_, Call(expectedAid_, _, _, _, _))
         .WillOnce(testing::DoAll(FutureArg<1>(&callerInfoFuture), Return(response)));
-    auto responseFuture = InvocationHandler::Invoke("fromIns", std::move(request));
+    auto responseFuture = InvocationHandler::Invoke({"fromIns", "rt-fromIns", "req-fromIns"}, std::move(request));
     ASSERT_AWAIT_READY(responseFuture);
     EXPECT_EQ(responseFuture.Get()->invokersp().code(), common::ErrorCode::ERR_NONE);
     ASSERT_AWAIT_READY(callerInfoFuture);
@@ -227,7 +239,7 @@ TEST_F(InvocationHandlerTest, AuthorizeTest)
     EXPECT_CALL(*instanceProxy_, GetTenantID).WillOnce(Return("tenant123"));
     std::unique_ptr<runtime_rpc::StreamingMessage> request1 = std::make_unique<runtime_rpc::StreamingMessage>();
     request1->mutable_invokereq()->set_instanceid("to");
-    InvocationHandler::Invoke("fromIns", std::move(request1));
+    InvocationHandler::Invoke({"fromIns", "rt-fromIns", "req-fromIns"}, std::move(request1));
     ASSERT_AWAIT_READY(callerInfoFuture1);
     EXPECT_EQ(callerInfoFuture1.Get().tenantID, "tenant123");
     EXPECT_EQ(callerInfoFuture1.Get().instanceID, "fromIns");
